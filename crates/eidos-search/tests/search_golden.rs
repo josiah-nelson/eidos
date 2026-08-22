@@ -522,3 +522,101 @@ fn empty_index_with_recorded_documents_is_rebuilt() {
     second.reload().unwrap();
     assert!(second.num_docs() > 0);
 }
+
+/// Beyond `LAZY_VERIFY_MIN` candidates, substring/regex clauses verify
+/// lazily in sort order: hits are exact, totals may be upper bounds.
+#[test]
+fn large_candidate_sets_verify_lazily_in_sort_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    for i in 0..2_600u32 {
+        // "item" names plus decoys that share trigrams but not the substring.
+        let name = if i % 5 == 0 {
+            format!("sub{i}/ite_m-{i:04}.txt")
+        } else {
+            format!("sub{}/item-{i:04}.txt", i % 7)
+        };
+        write(&root.join(name), 1 + (i % 13) as usize);
+    }
+    let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+    let host = catalog.ensure_host("h", "windows").unwrap();
+    let source = catalog
+        .add_source(&NewSource {
+            host_id: host,
+            name: "lazy".into(),
+            kind: SourceKind::WindowsGeneric,
+            root_path: root.display().to_string(),
+            aliases: vec![],
+        })
+        .unwrap();
+    let lister = eidos_scanner::default_lister();
+    run_scan(
+        &catalog,
+        source,
+        lister.as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    let index = CatalogIndex::open(dir.path().join("index")).unwrap();
+    index.sync_sources(&catalog).unwrap();
+    index.reload().unwrap();
+    let run = |q: &str, sort: SortField, desc: bool, limit: u32, cursor: Option<String>| {
+        let parsed = parse(q).unwrap();
+        let mut r = SearchRequest::new(parsed.query);
+        r.sort = Sort {
+            field: sort,
+            descending: desc,
+        };
+        r.limit = limit;
+        r.cursor = cursor;
+        r.explain = true;
+        search(&index, &catalog, &r, &ExecOptions::default()).unwrap()
+    };
+    // 2,080 real matches among 2,600 trigram candidates ("ite_m" shares
+    // "ite" but not "item").
+    let r = run("name:item", SortField::Name, false, 10, None);
+    assert_eq!(r.hits.len(), 10);
+    assert!(r.hits.iter().all(|h| h.name.contains("item")));
+    assert!(!r.total.exact, "upper bound expected: {:?}", r.total);
+    assert!(r.total.value >= 2_080);
+    let names: Vec<&str> = r.hits.iter().map(|h| h.name.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "name order across segments");
+    assert_eq!(names[0], "item-0001.txt");
+    // Second page continues the order.
+    let r2 = run(
+        "name:item",
+        SortField::Name,
+        false,
+        10,
+        r.next_cursor.clone(),
+    );
+    assert_eq!(r2.hits[0].name, "item-0013.txt");
+    // Descending size order with lazy verification.
+    let r = run("name:item", SortField::Size, true, 5, None);
+    assert_eq!(r.hits.len(), 5);
+    assert!(r.hits.iter().all(|h| h.size == 13));
+    assert!(r.hits.iter().all(|h| h.name.contains("item")));
+    // Walking to the end makes the total exact.
+    let mut cursor = None;
+    let mut seen = 0usize;
+    let mut last = None;
+    loop {
+        let r = run("name:item", SortField::Name, false, 1_000, cursor.take());
+        seen += r.hits.len();
+        cursor = r.next_cursor.clone();
+        last = Some(r);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let last = last.unwrap();
+    assert_eq!(seen, 2_080);
+    assert!(last.total.exact, "{:?}", last.total);
+    assert_eq!(last.total.value, 2_080);
+    // Small sets stay eager and exact.
+    let r = run("name:ite_m", SortField::Name, false, 10, None);
+    assert!(r.total.exact);
+    assert_eq!(r.total.value, 520);
+}

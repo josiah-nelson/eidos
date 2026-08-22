@@ -92,13 +92,17 @@ type Verifier = Box<dyn Fn(&Stored, &Catalog) -> bool + Send + Sync>;
 /// any stored document is fetched.
 type FastVerifier = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
-/// Sort keys and identity of a candidate read from fast fields.
+/// Sort keys and identity of a candidate read from fast fields. Folded
+/// strings are dictionary-encoded and cost microseconds to resolve, so they
+/// are read lazily (`resolve`).
 struct FastRow {
     addr: DocAddress,
     entry_id: i64,
     object_id: ObjectId,
-    name_folded: String,
-    path_folded: String,
+    name_ord: u64,
+    path_ord: u64,
+    name_folded: Option<String>,
+    path_folded: Option<String>,
     size: u64,
     alloc: u64,
     modified: i64,
@@ -135,24 +139,17 @@ impl FastCols {
             created: ff.i64("created")?,
         })
     }
-    fn strings(&self, doc: u32, name: &mut String, path: &mut String) {
-        name.clear();
-        path.clear();
-        if let Some(ord) = self.name.term_ords(doc).next() {
-            let _ = self.name.ord_to_str(ord, name);
-        }
-        if let Some(ord) = self.path.term_ords(doc).next() {
-            let _ = self.path.ord_to_str(ord, path);
-        }
-    }
-    fn row(&self, addr: DocAddress, name: &str, path: &str) -> FastRow {
+    /// Numeric keys and term ordinals only (cheap column reads).
+    fn row(&self, addr: DocAddress) -> FastRow {
         let d = addr.doc_id;
         FastRow {
             addr,
             entry_id: self.entry.first(d).unwrap_or(0) as i64,
             object_id: ObjectId(self.object.first(d).unwrap_or(0) as i64),
-            name_folded: name.to_string(),
-            path_folded: path.to_string(),
+            name_ord: self.name.term_ords(d).next().unwrap_or(0),
+            path_ord: self.path.term_ords(d).next().unwrap_or(0),
+            name_folded: None,
+            path_folded: None,
             size: self.size.first(d).unwrap_or(0),
             alloc: self.alloc.first(d).unwrap_or(0),
             modified: self.modified.first(d).unwrap_or(0),
@@ -160,7 +157,36 @@ impl FastCols {
             score: 1.0,
         }
     }
+    /// Resolve the folded name and path of a row (idempotent).
+    fn resolve(&self, r: &mut FastRow) {
+        if r.name_folded.is_none() {
+            let mut s = String::new();
+            let _ = self.name.ord_to_str(r.name_ord, &mut s);
+            r.name_folded = Some(s);
+        }
+        if r.path_folded.is_none() {
+            let mut s = String::new();
+            let _ = self.path.ord_to_str(r.path_ord, &mut s);
+            r.path_folded = Some(s);
+        }
+    }
+    fn passes(&self, r: &mut FastRow, verifiers: &[FastVerifier]) -> bool {
+        if verifiers.is_empty() {
+            return true;
+        }
+        self.resolve(r);
+        let (n, p) = (
+            r.name_folded.as_deref().unwrap_or(""),
+            r.path_folded.as_deref().unwrap_or(""),
+        );
+        verifiers.iter().all(|v| v(n, p))
+    }
 }
+
+/// Candidate sets larger than this are verified lazily in sort order, and
+/// the total becomes an upper bound (`exact = false`) unless the walk
+/// finishes.
+pub const LAZY_VERIFY_MIN: usize = 2_000;
 
 fn fast_sort_cmp(a: &FastRow, b: &FastRow, sort: Sort) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -168,6 +194,7 @@ fn fast_sort_cmp(a: &FastRow, b: &FastRow, sort: Sort) -> std::cmp::Ordering {
         SortField::Relevance => b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal),
         SortField::Name => a.name_folded.cmp(&b.name_folded),
         SortField::Path => a.path_folded.cmp(&b.path_folded),
+        // (resolved before sorting; `None` sorts first)
         SortField::Size | SortField::SubtreeSize => a.size.cmp(&b.size),
         SortField::AllocatedSize => a.alloc.cmp(&b.alloc),
         SortField::Modified => a.modified.cmp(&b.modified),
@@ -1264,191 +1291,333 @@ pub fn search_with_content(
             ));
         }
         let candidates = list.len() as u64;
-        // Fast-field pass: read sort keys and verify folded name/path
-        // clauses without touching the document store. Dictionary-encoded
-        // string columns cost microseconds per lookup, so the pass is split
-        // across threads.
+        // Fast-field pass: numeric keys and term ordinals for every
+        // candidate (cheap). Folded strings are resolved only when a verifier
+        // or a name/path sort needs them.
         let tv = Instant::now();
-        let mut rows: Vec<FastRow> = {
-            let threads = (list.len() / 2_000).clamp(1, VERIFY_THREADS);
-            let per = list.len().div_ceil(threads).max(1);
-            let verifiers = &ctx.fast_verifiers;
-            // Column readers are opened once per segment (opening loads the
-            // dictionary index) and shared by every thread.
-            let mut cols: HashMap<u32, FastCols> = HashMap::new();
-            for a in &list {
-                if let std::collections::hash_map::Entry::Vacant(e) = cols.entry(a.segment_ord) {
-                    e.insert(FastCols::open(&searcher, a.segment_ord)?);
-                }
+        let mut cols: HashMap<u32, FastCols> = HashMap::new();
+        for a in &list {
+            if let std::collections::hash_map::Entry::Vacant(e) = cols.entry(a.segment_ord) {
+                e.insert(FastCols::open(&searcher, a.segment_ord)?);
             }
-            let cols = &cols;
-            let parts: Vec<Result<Vec<FastRow>>> = std::thread::scope(|sc| {
-                let handles: Vec<_> = list
-                    .chunks(per)
-                    .map(|part| {
-                        sc.spawn(move || -> Result<Vec<FastRow>> {
-                            let mut out = Vec::with_capacity(part.len());
-                            let mut nbuf = String::new();
-                            let mut pbuf = String::new();
-                            for a in part {
-                                let c = cols.get(&a.segment_ord).expect("opened");
-                                c.strings(a.doc_id, &mut nbuf, &mut pbuf);
-                                if verifiers.iter().all(|v| v(&nbuf, &pbuf)) {
-                                    out.push(c.row(*a, &nbuf, &pbuf));
-                                }
-                            }
-                            Ok(out)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("fast-field thread"))
-                    .collect()
-            });
-            let mut rows = Vec::with_capacity(list.len());
-            for part in parts {
-                rows.extend(part?);
-            }
-            rows
-        };
-        if !ctx.fast_verifiers.is_empty() {
-            steps.push(PlanStep {
-                stage: "verify".into(),
-                description: format!("{candidates} candidates verified on folded fast fields"),
-                candidates: Some(candidates),
-                verified: Some(rows.len() as u64),
-                elapsed_ms: Some(tv.elapsed().as_secs_f64() * 1000.0),
-            });
         }
+        let mut rows: Vec<FastRow> = list
+            .iter()
+            .map(|a| cols.get(&a.segment_ord).expect("opened").row(*a))
+            .collect();
+        drop(list);
+        if has_content {
+            for r in rows.iter_mut() {
+                r.score = content_score(&ctx.content_sets, r.object_id);
+            }
+        }
+        let fast = &ctx.fast_verifiers;
         let need_stored = !ctx.verifiers.is_empty() || tight;
-        if need_stored {
-            let threads = (rows.len() / 500).clamp(1, VERIFY_THREADS);
-            let per = rows.len().div_ceil(threads).max(1);
-            let searcher_ref = &searcher;
-            let parts: Vec<Result<Vec<Stored>>> = std::thread::scope(|sc| {
-                let handles: Vec<_> = rows
-                    .chunks(per)
-                    .map(|part| {
-                        sc.spawn(move || -> Result<Vec<Stored>> {
-                            let mut out = Vec::with_capacity(part.len());
-                            for r in part {
-                                let doc: TantivyDocument = searcher_ref.doc(r.addr)?;
-                                out.push(read_stored(f, &doc, 1.0));
+        let sort_by_string = matches!(req.sort.field, SortField::Name | SortField::Path);
+        let lazy =
+            !need_stored && rows.len() > LAZY_VERIFY_MIN && (!fast.is_empty() || sort_by_string);
+
+        if !lazy {
+            // Eager: resolve strings where needed and verify everything.
+            if !fast.is_empty() || sort_by_string {
+                let threads = (rows.len() / 2_000).clamp(1, VERIFY_THREADS);
+                let per = rows.len().div_ceil(threads).max(1);
+                let cols_ref = &cols;
+                let mut parts: Vec<Vec<FastRow>> = Vec::new();
+                let mut chunks: Vec<Vec<FastRow>> = Vec::new();
+                let mut it = rows.into_iter().peekable();
+                while it.peek().is_some() {
+                    chunks.push(it.by_ref().take(per).collect());
+                }
+                std::thread::scope(|sc| {
+                    let handles: Vec<_> = chunks
+                        .into_iter()
+                        .map(|mut part| {
+                            sc.spawn(move || {
+                                part.retain_mut(|r| {
+                                    let c = cols_ref.get(&r.addr.segment_ord).expect("opened");
+                                    c.resolve(r);
+                                    c.passes(r, fast)
+                                });
+                                part
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        parts.push(h.join().expect("fast-field thread"));
+                    }
+                });
+                rows = parts.into_iter().flatten().collect();
+                if !fast.is_empty() {
+                    steps.push(PlanStep {
+                        stage: "verify".into(),
+                        description: format!(
+                            "{candidates} candidates verified on folded fast fields"
+                        ),
+                        candidates: Some(candidates),
+                        verified: Some(rows.len() as u64),
+                        elapsed_ms: Some(tv.elapsed().as_secs_f64() * 1000.0),
+                    });
+                }
+            }
+            if need_stored {
+                let threads = (rows.len() / 500).clamp(1, VERIFY_THREADS);
+                let per = rows.len().div_ceil(threads).max(1);
+                let searcher_ref = &searcher;
+                let parts: Vec<Result<Vec<Stored>>> = std::thread::scope(|sc| {
+                    let handles: Vec<_> = rows
+                        .chunks(per)
+                        .map(|part| {
+                            sc.spawn(move || -> Result<Vec<Stored>> {
+                                let mut out = Vec::with_capacity(part.len());
+                                for r in part {
+                                    let doc: TantivyDocument = searcher_ref.doc(r.addr)?;
+                                    out.push(read_stored(f, &doc, r.score));
+                                }
+                                Ok(out)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("store thread"))
+                        .collect()
+                });
+                let mut stored: Vec<Stored> = Vec::with_capacity(rows.len());
+                for part in parts {
+                    stored.extend(part?);
+                }
+                let fast_candidates = rows.len() as u64;
+                drop(rows);
+                let tv2 = Instant::now();
+                let mut verified: Vec<Stored> = stored
+                    .into_iter()
+                    .filter(|s| ctx.verifiers.iter().all(|v| v(s, catalog)))
+                    .collect();
+                if tight {
+                    // Rank the tightest containers first: a directory is "loose"
+                    // when a candidate beneath it also satisfies the predicate.
+                    let ids: HashSet<ObjectId> = verified.iter().map(|s| s.object_id).collect();
+                    let mut loose: HashSet<ObjectId> = HashSet::new();
+                    for s in &verified {
+                        for a in &s.ancestors {
+                            if ids.contains(a) {
+                                loose.insert(*a);
                             }
-                            Ok(out)
+                        }
+                    }
+                    for s in verified.iter_mut() {
+                        s.score = if loose.contains(&s.object_id) {
+                            0.5
+                        } else {
+                            1.0
+                        };
+                    }
+                    steps.push(PlanStep {
+                        stage: "rank".into(),
+                        description: "tightest containing directories first; ancestors that only contain matches via a child are ranked second".into(),
+                        candidates: Some(verified.len() as u64),
+                        verified: Some(verified.iter().filter(|s| s.score >= 1.0).count() as u64),
+                        elapsed_ms: None,
+                    });
+                }
+                verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
+                if !ctx.verifiers.is_empty() {
+                    steps.push(PlanStep {
+                        stage: "verify".into(),
+                        description: format!(
+                            "{fast_candidates} candidates verified against stored originals"
+                        ),
+                        candidates: Some(fast_candidates),
+                        verified: Some(verified.len() as u64),
+                        elapsed_ms: Some(tv2.elapsed().as_secs_f64() * 1000.0),
+                    });
+                }
+                let sort = if tight && req.sort.field == SortField::Relevance {
+                    Sort {
+                        field: SortField::Relevance,
+                        descending: true,
+                    }
+                } else {
+                    req.sort
+                };
+                verified.sort_by(|a, b| {
+                    if tight {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| {
+                                sort_key_cmp(
+                                    a,
+                                    b,
+                                    if sort.field == SortField::Relevance {
+                                        Sort {
+                                            field: SortField::Name,
+                                            descending: false,
+                                        }
+                                    } else {
+                                        sort
+                                    },
+                                )
+                            })
+                    } else {
+                        sort_key_cmp(a, b, sort)
+                    }
+                });
+                let total = verified.len() as u64;
+                let page: Vec<Stored> = verified.into_iter().skip(offset).take(limit).collect();
+                (page, total, !truncated && !content_truncated)
+            } else {
+                verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
+                rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
+                let total = rows.len() as u64;
+                let mut page = Vec::with_capacity(limit);
+                for r in rows.into_iter().skip(offset).take(limit) {
+                    let doc: TantivyDocument = searcher.doc(r.addr)?;
+                    page.push(read_stored(f, &doc, r.score));
+                }
+                (page, total, !truncated && !content_truncated)
+            }
+        } else {
+            // Lazy: order candidates by cheap keys, then resolve and verify
+            // in that order only until the page is filled. Every returned hit
+            // is verified; the total is an upper bound unless the walk ended.
+            let want = offset + limit;
+            let mut verified: Vec<FastRow> = Vec::with_capacity(want.min(rows.len()));
+            let mut examined = 0usize;
+            let exhausted;
+            if sort_by_string {
+                // Per-segment ordinal order is the folded string order within
+                // a segment; merge segments by comparing resolved heads.
+                let by_name = req.sort.field == SortField::Name;
+                let mut per_seg: HashMap<u32, Vec<FastRow>> = HashMap::new();
+                for r in rows {
+                    per_seg.entry(r.addr.segment_ord).or_default().push(r);
+                }
+                let desc = req.sort.descending;
+                let mut streams: Vec<std::vec::IntoIter<FastRow>> = per_seg
+                    .into_values()
+                    .map(|mut v| {
+                        v.sort_by(|a, b| {
+                            let k = if by_name {
+                                a.name_ord.cmp(&b.name_ord)
+                            } else {
+                                a.path_ord.cmp(&b.path_ord)
+                            };
+                            let k = if desc { k.reverse() } else { k };
+                            k.then(a.entry_id.cmp(&b.entry_id))
+                        });
+                        v.into_iter()
+                    })
+                    .collect();
+                let mut heads: Vec<Option<FastRow>> = streams
+                    .iter_mut()
+                    .map(|it| {
+                        it.next().map(|mut r| {
+                            cols.get(&r.addr.segment_ord)
+                                .expect("opened")
+                                .resolve(&mut r);
+                            r
                         })
                     })
                     .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("store thread"))
-                    .collect()
-            });
-            let mut stored: Vec<Stored> = Vec::with_capacity(rows.len());
-            for part in parts {
-                stored.extend(part?);
-            }
-            let fast_candidates = rows.len() as u64;
-            drop(rows);
-            let tv2 = Instant::now();
-            let mut verified: Vec<Stored> = stored
-                .into_iter()
-                .filter(|s| ctx.verifiers.iter().all(|v| v(s, catalog)))
-                .collect();
-            if has_content {
-                for s in verified.iter_mut() {
-                    s.score = content_score(&ctx.content_sets, s.object_id);
+                loop {
+                    if verified.len() >= want {
+                        exhausted = heads.iter().all(|h| h.is_none());
+                        break;
+                    }
+                    // Pick the smallest (or largest) head.
+                    let mut best: Option<usize> = None;
+                    for (i, h) in heads.iter().enumerate() {
+                        if let Some(r) = h {
+                            let better = match best {
+                                None => true,
+                                Some(j) => {
+                                    let o = heads[j].as_ref().expect("head");
+                                    let k = if by_name {
+                                        r.name_folded.cmp(&o.name_folded)
+                                    } else {
+                                        r.path_folded.cmp(&o.path_folded)
+                                    };
+                                    let k = if desc { k.reverse() } else { k };
+                                    k.then(r.entry_id.cmp(&o.entry_id)) == std::cmp::Ordering::Less
+                                }
+                            };
+                            if better {
+                                best = Some(i);
+                            }
+                        }
+                    }
+                    let i = match best {
+                        Some(i) => i,
+                        None => {
+                            exhausted = true;
+                            break;
+                        }
+                    };
+                    let mut r = heads[i].take().expect("head");
+                    heads[i] = streams[i].next().map(|mut n| {
+                        cols.get(&n.addr.segment_ord)
+                            .expect("opened")
+                            .resolve(&mut n);
+                        n
+                    });
+                    examined += 1;
+                    let c = cols.get(&r.addr.segment_ord).expect("opened");
+                    if c.passes(&mut r, fast) {
+                        verified.push(r);
+                    }
                 }
-            }
-            if tight {
-                // Rank the tightest containers first: a directory is "loose" when
-                // a candidate beneath it also satisfies the predicate.
-                let ids: HashSet<ObjectId> = verified.iter().map(|s| s.object_id).collect();
-                let mut loose: HashSet<ObjectId> = HashSet::new();
-                for s in &verified {
-                    for a in &s.ancestors {
-                        if ids.contains(a) {
-                            loose.insert(*a);
+            } else {
+                rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
+                let mut it = rows.into_iter();
+                loop {
+                    if verified.len() >= want {
+                        exhausted = it.len() == 0;
+                        break;
+                    }
+                    match it.next() {
+                        Some(mut r) => {
+                            examined += 1;
+                            let c = cols.get(&r.addr.segment_ord).expect("opened");
+                            if c.passes(&mut r, fast) {
+                                verified.push(r);
+                            }
+                        }
+                        None => {
+                            exhausted = true;
+                            break;
                         }
                     }
                 }
-                for s in verified.iter_mut() {
-                    s.score = if loose.contains(&s.object_id) {
-                        0.5
-                    } else {
-                        1.0
-                    };
-                }
-                steps.push(PlanStep {
-                    stage: "rank".into(),
-                    description: "tightest containing directories first; ancestors that only contain matches via a child are ranked second".into(),
-                    candidates: Some(verified.len() as u64),
-                    verified: Some(verified.iter().filter(|s| s.score >= 1.0).count() as u64),
-                    elapsed_ms: None,
-                });
             }
             verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
-            if !ctx.verifiers.is_empty() {
-                steps.push(PlanStep {
-                    stage: "verify".into(),
-                    description: format!(
-                        "{fast_candidates} candidates verified against stored originals"
-                    ),
-                    candidates: Some(fast_candidates),
-                    verified: Some(verified.len() as u64),
-                    elapsed_ms: Some(tv2.elapsed().as_secs_f64() * 1000.0),
-                });
-            }
-            let sort = if tight && req.sort.field == SortField::Relevance {
-                Sort {
-                    field: SortField::Relevance,
-                    descending: true,
-                }
+            let total = if exhausted {
+                verified.len() as u64
             } else {
-                req.sort
+                candidates
             };
-            verified.sort_by(|a, b| {
-                if tight {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| {
-                            sort_key_cmp(
-                                a,
-                                b,
-                                if sort.field == SortField::Relevance {
-                                    Sort {
-                                        field: SortField::Name,
-                                        descending: false,
-                                    }
-                                } else {
-                                    sort
-                                },
-                            )
-                        })
-                } else {
-                    sort_key_cmp(a, b, sort)
-                }
+            steps.push(PlanStep {
+                stage: "verify".into(),
+                description: format!(
+                    "lazy: {examined} of {candidates} candidates examined in sort order on folded fast fields{}",
+                    if exhausted { "" } else { "; total is an upper bound" }
+                ),
+                candidates: Some(candidates),
+                verified: Some(verified.len() as u64),
+                elapsed_ms: Some(verify_ms),
             });
-            let total = verified.len() as u64;
-            let page: Vec<Stored> = verified.into_iter().skip(offset).take(limit).collect();
-            (page, total, !truncated && !content_truncated)
-        } else {
-            if has_content {
-                for r in rows.iter_mut() {
-                    r.score = content_score(&ctx.content_sets, r.object_id);
-                }
+            if !exhausted {
+                warnings.push(format!(
+                    "{candidates} candidates; the total is an upper bound — hits shown are verified"
+                ));
             }
-            verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
-            rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
-            let total = rows.len() as u64;
             let mut page = Vec::with_capacity(limit);
-            for r in rows.into_iter().skip(offset).take(limit) {
+            for r in verified.into_iter().skip(offset).take(limit) {
                 let doc: TantivyDocument = searcher.doc(r.addr)?;
                 page.push(read_stored(f, &doc, r.score));
             }
-            (page, total, !truncated && !content_truncated)
+            (page, total, exhausted && !truncated && !content_truncated)
         }
     } else {
         let n = (offset + limit).max(1);
