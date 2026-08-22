@@ -663,10 +663,19 @@ input[type='number'].small { width: 64px; }
 .toggle { cursor: pointer; user-select: none; }
 
 /* ----- snippets ----- */
-.vrow.hitrow.with-snippets { align-items: flex-start; }
+.vrow.hitrow.with-snippets {
+  height: auto;
+  min-height: 30px;
+  grid-auto-rows: auto;
+  align-items: start;
+  padding-bottom: 4px;
+}
+.vrow.hitrow.with-snippets > .col { min-height: 30px; display: flex; align-items: center; }
 .snippets {
   grid-column: 1 / -1;
-  padding: 2px 0 6px 28px;
+  grid-row: 2;
+  padding: 0 0 4px 28px;
+  line-height: 18px;
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 12px;
   white-space: pre-wrap;
