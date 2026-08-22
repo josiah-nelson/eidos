@@ -98,6 +98,7 @@ impl CatalogIndex {
             )?;
         }
         let index = Index::open_in_dir(&dir)?;
+        content::register_tokenizers(&index);
         let writer = index.writer_with_num_threads(2, 96 * 1024 * 1024)?;
         let reader = index
             .reader_builder()

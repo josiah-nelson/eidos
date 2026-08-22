@@ -60,7 +60,7 @@ impl std::fmt::Debug for Catalog {
     }
 }
 
-const READER_POOL: usize = 4;
+const READER_POOL: usize = 12;
 
 impl Catalog {
     /// Open (creating if necessary) and migrate the catalog at `path`.

@@ -33,6 +33,8 @@ pub const TEXT_TOKENIZER: &str = "eidos_text";
 const META_FILE: &str = "eidos-content-schema.json";
 /// Tokens longer than this are not indexed in `text` (base64 blobs, hashes).
 pub const MAX_TOKEN_CHARS: usize = 64;
+/// Threads used to verify candidate chunks against stored text.
+pub const VERIFY_THREADS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ContentFields {
@@ -185,7 +187,7 @@ struct Meta {
     schema_version: u32,
 }
 
-fn register_tokenizers(index: &Index) {
+pub fn register_tokenizers(index: &Index) {
     index
         .tokenizers()
         .register(TRIGRAM_TOKENIZER, TrigramTokenizer);
@@ -747,13 +749,26 @@ pub fn retrieve(
                     let tris = trigrams(&clause.value);
                     if !tris.is_empty() {
                         let n = tris.len();
+                        let mut clauses: Vec<(Occur, Box<dyn TQuery>)> = tris
+                            .iter()
+                            .map(|t| (Occur::Must, term_text(f.trigrams, t)))
+                            .collect();
+                        // A whole-word literal that is a single token must also
+                        // appear as that token: far more selective than trigrams.
+                        let toks = text_tokens(&clause.value);
+                        let single_token = clause.mode == TextMode::Exact
+                            && toks.len() == 1
+                            && clause.value.chars().all(|c| c.is_alphanumeric());
+                        if single_token {
+                            clauses.push((Occur::Must, term_text(f.text, &toks[0])));
+                        }
                         (
-                            Box::new(BooleanQuery::new(
-                                tris.iter()
-                                    .map(|t| (Occur::Must, term_text(f.trigrams, t)))
-                                    .collect(),
-                            )),
-                            format!("{n} folded trigrams"),
+                            Box::new(BooleanQuery::new(clauses)),
+                            if single_token {
+                                format!("{n} folded trigrams + whole token")
+                            } else {
+                                format!("{n} folded trigrams")
+                            },
                         )
                     } else {
                         let toks = text_tokens(&clause.value);
@@ -787,30 +802,54 @@ pub fn retrieve(
             for a in list {
                 cands.push(ids.read(a, 0.0)?);
             }
-            // Verify against stored chunk text, grouped per object generation.
+            // Verify against stored chunk text, grouped per object generation
+            // and spread over a few threads (each uses a pooled reader).
             cands.sort_by_key(|c| (c.object_id.0, c.generation, c.ordinal));
-            let mut verified = 0u64;
-            let mut i = 0;
-            while i < cands.len() {
-                let (obj, gen) = (cands[i].object_id, cands[i].generation);
-                let mut j = i;
-                while j < cands.len() && cands[j].object_id == obj && cands[j].generation == gen {
-                    j += 1;
-                }
-                let ordinals: Vec<u32> = cands[i..j].iter().map(|c| c.ordinal).collect();
-                for row in catalog.chunks_for(obj, gen, &ordinals)? {
-                    let n = matcher.find(&row.text, 64).len();
-                    if n > 0 {
-                        verified += 1;
-                        ret.hits.push(ChunkHit {
-                            object_id: obj,
-                            generation: gen,
-                            ordinal: row.ordinal,
-                            score: n as f32,
-                        });
+            let mut groups: Vec<(ObjectId, u32, Vec<u32>)> = Vec::new();
+            for c in &cands {
+                match groups.last_mut() {
+                    Some((o, g, ords)) if *o == c.object_id && *g == c.generation => {
+                        ords.push(c.ordinal)
                     }
+                    _ => groups.push((c.object_id, c.generation, vec![c.ordinal])),
                 }
-                i = j;
+            }
+            let threads = groups.len().clamp(1, VERIFY_THREADS);
+            let per = groups.len().div_ceil(threads);
+            let results: Vec<Result<Vec<ChunkHit>>> = std::thread::scope(|s| {
+                let handles: Vec<_> = groups
+                    .chunks(per.max(1))
+                    .map(|part| {
+                        let matcher = &matcher;
+                        s.spawn(move || -> Result<Vec<ChunkHit>> {
+                            let mut out = Vec::new();
+                            for (obj, gen, ordinals) in part {
+                                for row in catalog.chunks_for(*obj, *gen, ordinals)? {
+                                    let n = matcher.find(&row.text, 64).len();
+                                    if n > 0 {
+                                        out.push(ChunkHit {
+                                            object_id: *obj,
+                                            generation: *gen,
+                                            ordinal: row.ordinal,
+                                            score: n as f32,
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("verification thread"))
+                    .collect()
+            });
+            let mut verified = 0u64;
+            for r in results {
+                let hits = r?;
+                verified += hits.len() as u64;
+                ret.hits.extend(hits);
             }
             ret.verified = Some(verified);
             ret.description = format!("{how}; candidates verified against stored chunk text");

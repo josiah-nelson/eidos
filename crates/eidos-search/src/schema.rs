@@ -12,7 +12,7 @@ use tantivy::schema::{
 };
 use tantivy::TantivyDocument;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 1;
+pub const CATALOG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Fields {
@@ -43,6 +43,10 @@ pub struct Fields {
     pub desc_ext: Field,
     pub generation: Field,
     pub link_count: Field,
+    /// Folded character trigrams of the name / full path (doc ids only):
+    /// candidate retrieval for substring, glob, and regex clauses.
+    pub name_tri: Field,
+    pub path_tri: Field,
 }
 
 pub fn build_schema() -> (Schema, Fields) {
@@ -66,6 +70,11 @@ pub fn build_schema() -> (Schema, Fields) {
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
     );
     let raw_fast = STRING | FAST;
+    let trigrams = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(crate::content::TRIGRAM_TOKENIZER)
+            .set_index_option(IndexRecordOption::Basic),
+    );
     let fields = Fields {
         entry_id: b.add_u64_field("entry_id", u64_fast_indexed.clone()),
         object_id: b.add_u64_field("object_id", u64_fast_indexed.clone()),
@@ -94,6 +103,8 @@ pub fn build_schema() -> (Schema, Fields) {
         desc_ext: b.add_text_field("desc_ext", STRING),
         generation: b.add_u64_field("generation", u64_fast.clone()),
         link_count: b.add_u64_field("link_count", u64_fast),
+        name_tri: b.add_text_field("name_tri", trigrams.clone()),
+        path_tri: b.add_text_field("path_tri", trigrams),
     };
     (b.build(), fields)
 }
@@ -206,5 +217,7 @@ pub fn document(f: &Fields, row: &ProjectionRow) -> TantivyDocument {
     }
     d.add_u64(f.generation, row.generation as u64);
     d.add_u64(f.link_count, row.link_count as u64);
+    d.add_text(f.name_tri, &row.name);
+    d.add_text(f.path_tri, &row.path);
     d
 }

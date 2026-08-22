@@ -398,6 +398,22 @@ impl Parser {
         }
         // Glob
         if value.contains('*') || value.contains('?') {
+            // `*.ext` is an extension filter, not a dictionary walk.
+            if field == TextField::Name {
+                if let Some(ext) = value.strip_prefix("*.") {
+                    if !ext.is_empty()
+                        && ext
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                    {
+                        self.notes
+                            .push(format!("\"{value}\" interpreted as extension {ext}"));
+                        return Ok(Query::Extension {
+                            values: vec![ext.to_string()],
+                        });
+                    }
+                }
+            }
             let re = glob_to_regex(value);
             self.notes
                 .push(format!("\"{value}\" interpreted as a glob"));
@@ -997,10 +1013,16 @@ mod tests {
         );
         assert_eq!(
             q("*.cs"),
+            Query::Extension {
+                values: vec!["cs".into()]
+            }
+        );
+        assert_eq!(
+            q("setup?.cs"),
             Query::Text {
                 field: TextField::Name,
                 mode: TextMode::Regex,
-                value: "^.*\\.cs$".into(),
+                value: "^setup.\\.cs$".into(),
                 case_sensitive: false,
                 slop: 0
             }

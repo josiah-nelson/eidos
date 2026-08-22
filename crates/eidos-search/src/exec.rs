@@ -88,6 +88,123 @@ pub struct Stored {
 }
 
 type Verifier = Box<dyn Fn(&Stored, &Catalog) -> bool + Send + Sync>;
+/// Verifier over the folded name and folded path fast fields; runs before
+/// any stored document is fetched.
+type FastVerifier = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+/// Sort keys and identity of a candidate read from fast fields.
+struct FastRow {
+    addr: DocAddress,
+    entry_id: i64,
+    object_id: ObjectId,
+    name_folded: String,
+    path_folded: String,
+    size: u64,
+    alloc: u64,
+    modified: i64,
+    created: i64,
+    score: f32,
+}
+
+struct FastCols {
+    name: tantivy::columnar::StrColumn,
+    path: tantivy::columnar::StrColumn,
+    entry: tantivy::columnar::Column<u64>,
+    object: tantivy::columnar::Column<u64>,
+    size: tantivy::columnar::Column<u64>,
+    alloc: tantivy::columnar::Column<u64>,
+    modified: tantivy::columnar::Column<i64>,
+    created: tantivy::columnar::Column<i64>,
+}
+
+impl FastCols {
+    fn open(searcher: &Searcher, segment: u32) -> Result<Self> {
+        let ff = searcher.segment_reader(segment).fast_fields();
+        let str_col = |name: &str| -> Result<tantivy::columnar::StrColumn> {
+            ff.str(name)?
+                .ok_or_else(|| SearchError::Other(format!("fast field {name} missing")))
+        };
+        Ok(Self {
+            name: str_col("name_folded")?,
+            path: str_col("path_folded")?,
+            entry: ff.u64("entry_id")?,
+            object: ff.u64("object_id")?,
+            size: ff.u64("subtree_logical")?,
+            alloc: ff.u64("subtree_allocated")?,
+            modified: ff.i64("newest_modified")?,
+            created: ff.i64("created")?,
+        })
+    }
+    fn strings(&self, doc: u32, name: &mut String, path: &mut String) {
+        name.clear();
+        path.clear();
+        if let Some(ord) = self.name.term_ords(doc).next() {
+            let _ = self.name.ord_to_str(ord, name);
+        }
+        if let Some(ord) = self.path.term_ords(doc).next() {
+            let _ = self.path.ord_to_str(ord, path);
+        }
+    }
+    fn row(&self, addr: DocAddress, name: &str, path: &str) -> FastRow {
+        let d = addr.doc_id;
+        FastRow {
+            addr,
+            entry_id: self.entry.first(d).unwrap_or(0) as i64,
+            object_id: ObjectId(self.object.first(d).unwrap_or(0) as i64),
+            name_folded: name.to_string(),
+            path_folded: path.to_string(),
+            size: self.size.first(d).unwrap_or(0),
+            alloc: self.alloc.first(d).unwrap_or(0),
+            modified: self.modified.first(d).unwrap_or(0),
+            created: self.created.first(d).unwrap_or(0),
+            score: 1.0,
+        }
+    }
+}
+
+fn fast_sort_cmp(a: &FastRow, b: &FastRow, sort: Sort) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ord = match sort.field {
+        SortField::Relevance => b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal),
+        SortField::Name => a.name_folded.cmp(&b.name_folded),
+        SortField::Path => a.path_folded.cmp(&b.path_folded),
+        SortField::Size | SortField::SubtreeSize => a.size.cmp(&b.size),
+        SortField::AllocatedSize => a.alloc.cmp(&b.alloc),
+        SortField::Modified => a.modified.cmp(&b.modified),
+        SortField::Created => a.created.cmp(&b.created),
+    };
+    let ord = if sort.field == SortField::Relevance || !sort.descending {
+        ord
+    } else {
+        ord.reverse()
+    };
+    ord.then_with(|| a.entry_id.cmp(&b.entry_id))
+}
+
+/// `AND` of the folded trigrams of every literal (None when no literal has
+/// three characters).
+fn trigram_query(field: tantivy::schema::Field, literals: &[String]) -> Option<Box<dyn TQuery>> {
+    let mut tris: Vec<String> = Vec::new();
+    for l in literals {
+        for t in content::trigrams(l) {
+            if !tris.contains(&t) {
+                tris.push(t);
+            }
+        }
+    }
+    if tris.is_empty() {
+        return None;
+    }
+    Some(all_of(tris.iter().map(|t| term_text(field, t)).collect()))
+}
+
+/// Literal runs of a glob (between `*` / `?`).
+fn glob_literals(glob: &str) -> Vec<String> {
+    glob.split(['*', '?'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
 
 struct Ctx<'a> {
     f: &'a Fields,
@@ -98,6 +215,11 @@ struct Ctx<'a> {
     warnings: Vec<String>,
     scope_sources: Option<Vec<SourceId>>,
     tight_dirs: bool,
+    fast_verifiers: Vec<FastVerifier>,
+    /// Greater than zero while compiling inside `OR` / `NOT`: verifiers
+    /// (which filter the whole candidate set) would be wrong there, so
+    /// clauses must compile to exact index queries or fail explicitly.
+    neg_depth: u32,
     content: Option<&'a ContentIndex>,
     content_opts: ContentOpts,
     content_sets: Vec<ContentSet>,
@@ -207,24 +329,6 @@ fn fst_regex(pattern: &str, case_sensitive: bool) -> std::result::Result<String,
     Ok(out)
 }
 
-fn regex_is_broad(pattern: &str) -> bool {
-    use regex_syntax::hir::{Hir, HirKind};
-    fn has_literal(h: &Hir) -> bool {
-        match h.kind() {
-            HirKind::Literal(_) => true,
-            HirKind::Concat(v) => v.iter().any(has_literal),
-            HirKind::Alternation(v) => v.iter().all(has_literal),
-            HirKind::Capture(c) => has_literal(&c.sub),
-            HirKind::Repetition(r) => r.min > 0 && has_literal(&r.sub),
-            _ => false,
-        }
-    }
-    match regex_syntax::parse(pattern) {
-        Ok(h) => !has_literal(&h),
-        Err(_) => true,
-    }
-}
-
 fn make_regex(
     field: tantivy::schema::Field,
     fst: &str,
@@ -271,13 +375,20 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
             all_of(qs)
         }
         Query::Or { clauses } => {
+            ctx.neg_depth += 1;
             let mut qs = Vec::new();
             for c in clauses {
                 qs.push(compile(c, ctx)?);
             }
+            ctx.neg_depth -= 1;
             any_of(qs)
         }
-        Query::Not { clause } => not(compile(clause, ctx)?),
+        Query::Not { clause } => {
+            ctx.neg_depth += 1;
+            let q = compile(clause, ctx)?;
+            ctx.neg_depth -= 1;
+            not(q)
+        }
         Query::Text {
             field,
             mode,
@@ -325,6 +436,7 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
             ctx.readable.push(format!("under directory {directory}"));
             let base = term_u64(f.ancestors, directory.0 as u64);
             if let Some(d) = max_depth {
+                needs_positive(ctx, "a depth-limited `in:` clause")?;
                 let dir = *directory;
                 let d = *d as usize;
                 ctx.verifiers.push(Box::new(move |s, _| {
@@ -398,6 +510,7 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
             ctx.tight_dirs = true;
             let base = all_of(vec![term_text(f.kind, "directory"), term_text(f.desc_ext, &ext)]);
             if *min_count > 1 || max_count.is_some() {
+                needs_positive(ctx, "a `has:` clause with a count")?;
                 let (min, max, ext) = (*min_count, *max_count, ext.clone());
                 ctx.verifiers.push(Box::new(move |s, catalog| {
                     let n = catalog
@@ -440,9 +553,9 @@ fn compile_text(
     if field == TextField::Content {
         return compile_content(mode, value, case_sensitive, slop, ctx);
     }
-    let (tok_field, folded_field, label) = match field {
-        TextField::Name => (f.name, f.name_folded, "name"),
-        TextField::Path => (f.path_tokens, f.path_folded, "path"),
+    let (tok_field, folded_field, tri_field, label) = match field {
+        TextField::Name => (f.name, f.name_folded, f.name_tri, "name"),
+        TextField::Path => (f.path_tokens, f.path_folded, f.path_tri, "path"),
         TextField::Content => unreachable!(),
     };
     let stored_of = move |s: &Stored| -> String {
@@ -498,6 +611,7 @@ fn compile_text(
                 }
             ));
             if case_sensitive {
+                needs_positive(ctx, "a case-sensitive clause")?;
                 let v = value.to_string();
                 ctx.verifiers.push(Box::new(move |s, _| stored_of(s) == v));
             }
@@ -512,20 +626,54 @@ fn compile_text(
                     ""
                 }
             ));
-            let pat = format!(".*{}.*", regex::escape(&fold(value)));
             if case_sensitive {
+                needs_positive(ctx, "a case-sensitive clause")?;
                 let v = value.to_string();
                 ctx.verifiers
                     .push(Box::new(move |s, _| stored_of(s).contains(&v)));
             }
-            ctx.steps.push(PlanStep {
-                stage: "candidates".into(),
-                description: format!("substring automaton over the {label} term dictionary"),
-                candidates: None,
-                verified: None,
-                elapsed_ms: None,
-            });
-            make_regex(folded_field, &pat)?
+            let needle = fold(value);
+            let candidates = if ctx.neg_depth == 0 {
+                trigram_query(tri_field, std::slice::from_ref(&needle))
+            } else {
+                None
+            };
+            match candidates {
+                Some(q) => {
+                    let is_name = field == TextField::Name;
+                    let n = needle.clone();
+                    ctx.fast_verifiers.push(Box::new(move |name, path| {
+                        if is_name {
+                            name.contains(&n)
+                        } else {
+                            path.contains(&n)
+                        }
+                    }));
+                    ctx.steps.push(PlanStep {
+                        stage: "candidates".into(),
+                        description: format!(
+                            "folded trigrams of \"{needle}\" on {label}; candidates verified on the folded {label} fast field"
+                        ),
+                        candidates: None,
+                        verified: None,
+                        elapsed_ms: None,
+                    });
+                    q
+                }
+                None => {
+                    let pat = format!(".*{}.*", regex::escape(&needle));
+                    ctx.steps.push(PlanStep {
+                        stage: "candidates".into(),
+                        description: format!(
+                            "substring automaton over the {label} term dictionary"
+                        ),
+                        candidates: None,
+                        verified: None,
+                        elapsed_ms: None,
+                    });
+                    make_regex(folded_field, &pat)?
+                }
+            }
         }
         TextMode::Regex => {
             ctx.readable.push(format!(
@@ -536,15 +684,17 @@ fn compile_text(
                     " (case-insensitive)"
                 }
             ));
-            // The dictionary is folded, so candidates are always matched
-            // case-insensitively; case sensitivity is enforced by the verifier.
-            let fst = fst_regex(value, false)?;
-            if regex_is_broad(value) {
-                ctx.warnings.push(format!(
-                    "regex /{value}/ has no required literal; it scans the whole {label} dictionary"
-                ));
-            }
+            // Folded text is always checked case-insensitively; case
+            // sensitivity is enforced against the stored original.
+            let re_folded = regex::RegexBuilder::new(value)
+                .case_insensitive(true)
+                .size_limit(1 << 20)
+                .build()
+                .map_err(|e| QueryError::InvalidRegex {
+                    message: e.to_string(),
+                })?;
             if case_sensitive {
+                needs_positive(ctx, "a case-sensitive regex")?;
                 let re = regex::RegexBuilder::new(value)
                     .size_limit(1 << 20)
                     .build()
@@ -554,14 +704,68 @@ fn compile_text(
                 ctx.verifiers
                     .push(Box::new(move |s, _| re.is_match(&stored_of(s))));
             }
-            ctx.steps.push(PlanStep {
-                stage: "candidates".into(),
-                description: format!("regex automaton over the {label} term dictionary"),
-                candidates: None,
-                verified: None,
-                elapsed_ms: None,
-            });
-            make_regex(folded_field, &fst)?
+            let is_name = field == TextField::Name;
+            let literals = content::required_literals(value);
+            let positive = ctx.neg_depth == 0;
+            let candidates = if positive {
+                trigram_query(tri_field, &literals)
+            } else {
+                None
+            };
+            match candidates {
+                Some(q) => {
+                    ctx.fast_verifiers.push(Box::new(move |name, path| {
+                        re_folded.is_match(if is_name { name } else { path })
+                    }));
+                    ctx.steps.push(PlanStep {
+                        stage: "candidates".into(),
+                        description: format!(
+                            "trigrams of required literals [{}] on {label}; candidates verified on the folded {label} fast field",
+                            literals.join(", ")
+                        ),
+                        candidates: None,
+                        verified: None,
+                        elapsed_ms: None,
+                    });
+                    q
+                }
+                None => {
+                    if positive {
+                        ctx.warnings.push(format!(
+                            "regex /{value}/ has no required literal of 3+ characters; it scans the whole {label} dictionary"
+                        ));
+                    }
+                    match fst_regex(value, false).and_then(|fst| make_regex(folded_field, &fst)) {
+                        Ok(q) => {
+                            ctx.steps.push(PlanStep {
+                                stage: "candidates".into(),
+                                description: format!(
+                                    "regex automaton over the {label} term dictionary"
+                                ),
+                                candidates: None,
+                                verified: None,
+                                elapsed_ms: None,
+                            });
+                            q
+                        }
+                        Err(_) => {
+                            // Too complex for the dictionary automaton: scan
+                            // every entry in scope and verify on fast fields.
+                            needs_positive(
+                                ctx,
+                                "this regex (too complex for the dictionary automaton)",
+                            )?;
+                            ctx.warnings.push(format!(
+                                "regex /{value}/ is too complex for the dictionary automaton; every entry in scope is checked"
+                            ));
+                            ctx.fast_verifiers.push(Box::new(move |name, path| {
+                                re_folded.is_match(if is_name { name } else { path })
+                            }));
+                            Box::new(AllQuery)
+                        }
+                    }
+                }
+            }
         }
     })
 }
@@ -716,6 +920,15 @@ fn pre_scope(q: &Query, catalog: &Catalog) -> Option<Vec<SourceId>> {
     }
 }
 
+fn needs_positive(ctx: &Ctx<'_>, what: &str) -> std::result::Result<(), QueryError> {
+    if ctx.neg_depth > 0 {
+        return Err(QueryError::Other {
+            message: format!("{what} cannot be used inside OR or NOT; move it to the top level"),
+        });
+    }
+    Ok(())
+}
+
 fn content_score(sets: &[ContentSet], object: ObjectId) -> f32 {
     sets.iter()
         .filter_map(|s| s.by_object.get(&object).map(|m| m.score))
@@ -734,6 +947,7 @@ fn compile_path(
         PathMode::Exact => {
             ctx.readable.push(format!("path is \"{norm}\""));
             if case_sensitive {
+                needs_positive(ctx, "a case-sensitive clause")?;
                 let v = norm.clone();
                 ctx.verifiers.push(Box::new(move |s, _| s.path == v));
             }
@@ -744,6 +958,7 @@ fn compile_path(
             ctx.readable.push(format!("path under \"{trimmed}\""));
             let pat = format!("{}(\\\\.*)?", regex::escape(&fold(&trimmed)));
             if case_sensitive {
+                needs_positive(ctx, "a case-sensitive clause")?;
                 let v = trimmed.clone();
                 ctx.verifiers.push(Box::new(move |s, _| {
                     s.path == v || s.path.starts_with(&format!("{v}\\"))
@@ -753,13 +968,39 @@ fn compile_path(
         }
         PathMode::Glob => {
             ctx.readable.push(format!("path matches glob \"{norm}\""));
-            let re = glob_to_regex(&fold(&norm));
+            let folded = fold(&norm);
+            let re = glob_to_regex(&folded);
             let pat = if norm.contains('\\') {
                 re
             } else {
                 format!(".*{re}")
             };
-            make_regex(f.path_folded, &pat)?
+            let candidates = if ctx.neg_depth == 0 {
+                trigram_query(f.path_tri, &glob_literals(&folded))
+            } else {
+                None
+            };
+            match candidates {
+                Some(q) => {
+                    let anchored = regex::RegexBuilder::new(&format!("^{pat}$"))
+                        .size_limit(1 << 20)
+                        .build()
+                        .map_err(|e| QueryError::InvalidRegex {
+                            message: e.to_string(),
+                        })?;
+                    ctx.fast_verifiers
+                        .push(Box::new(move |_, path| anchored.is_match(path)));
+                    ctx.steps.push(PlanStep {
+                        stage: "candidates".into(),
+                        description: "trigrams of the glob's literal parts on path; candidates verified on the folded path fast field".into(),
+                        candidates: None,
+                        verified: None,
+                        elapsed_ms: None,
+                    });
+                    q
+                }
+                None => make_regex(f.path_folded, &pat)?,
+            }
         }
         PathMode::Regex => compile_text(
             TextField::Path,
@@ -887,6 +1128,8 @@ pub fn search_with_content(
         warnings: Vec::new(),
         scope_sources: None,
         tight_dirs: false,
+        fast_verifiers: Vec::new(),
+        neg_depth: 0,
         content: content_index,
         content_opts: opts.content,
         content_sets: Vec::new(),
@@ -935,7 +1178,8 @@ pub fn search_with_content(
     let tight = ctx.tight_dirs && req.mode == ResultMode::Directories;
     let has_content = !ctx.content_sets.is_empty();
     let content_truncated = ctx.content_sets.iter().any(|s| s.truncated);
-    let collect_all = !ctx.verifiers.is_empty() || tight || has_content;
+    let collect_all =
+        !ctx.verifiers.is_empty() || !ctx.fast_verifiers.is_empty() || tight || has_content;
     let searcher = index.searcher();
     let t1 = Instant::now();
     let mut warnings = ctx.warnings.clone();
@@ -956,93 +1200,144 @@ pub fn search_with_content(
             ));
         }
         let candidates = list.len() as u64;
-        let mut stored: Vec<Stored> = Vec::with_capacity(list.len());
-        for a in list {
-            let doc: TantivyDocument = searcher.doc(a)?;
-            stored.push(read_stored(f, &doc, 1.0));
-        }
+        // Fast-field pass: read sort keys and verify folded name/path
+        // clauses without touching the document store.
         let tv = Instant::now();
-        let mut verified: Vec<Stored> = stored
-            .into_iter()
-            .filter(|s| ctx.verifiers.iter().all(|v| v(s, catalog)))
-            .collect();
-        if has_content {
-            for s in verified.iter_mut() {
-                s.score = content_score(&ctx.content_sets, s.object_id);
-            }
-        }
-        if tight {
-            // Rank the tightest containers first: a directory is "loose" when
-            // a candidate beneath it also satisfies the predicate.
-            let ids: HashSet<ObjectId> = verified.iter().map(|s| s.object_id).collect();
-            let mut loose: HashSet<ObjectId> = HashSet::new();
-            for s in &verified {
-                for a in &s.ancestors {
-                    if ids.contains(a) {
-                        loose.insert(*a);
+        let mut rows: Vec<FastRow> = Vec::with_capacity(list.len());
+        {
+            let mut cols: HashMap<u32, FastCols> = HashMap::new();
+            let mut nbuf = String::new();
+            let mut pbuf = String::new();
+            for a in list {
+                let c = match cols.entry(a.segment_ord) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(FastCols::open(&searcher, a.segment_ord)?)
                     }
+                };
+                c.strings(a.doc_id, &mut nbuf, &mut pbuf);
+                if ctx.fast_verifiers.iter().all(|v| v(&nbuf, &pbuf)) {
+                    rows.push(c.row(a, &nbuf, &pbuf));
                 }
             }
-            for s in verified.iter_mut() {
-                s.score = if loose.contains(&s.object_id) {
-                    0.5
-                } else {
-                    1.0
-                };
-            }
+        }
+        if !ctx.fast_verifiers.is_empty() {
             steps.push(PlanStep {
-                stage: "rank".into(),
-                description: "tightest containing directories first; ancestors that only contain matches via a child are ranked second".into(),
-                candidates: Some(verified.len() as u64),
-                verified: Some(verified.iter().filter(|s| s.score >= 1.0).count() as u64),
-                elapsed_ms: None,
+                stage: "verify".into(),
+                description: format!("{candidates} candidates verified on folded fast fields"),
+                candidates: Some(candidates),
+                verified: Some(rows.len() as u64),
+                elapsed_ms: Some(tv.elapsed().as_secs_f64() * 1000.0),
             });
         }
-        verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
-        steps.push(PlanStep {
-            stage: "verify".into(),
-            description: format!(
-                "{} candidates verified against stored originals",
-                candidates
-            ),
-            candidates: Some(candidates),
-            verified: Some(verified.len() as u64),
-            elapsed_ms: Some(verify_ms),
-        });
-        let sort = if tight && req.sort.field == SortField::Relevance {
-            Sort {
-                field: SortField::Relevance,
-                descending: true,
+        let need_stored = !ctx.verifiers.is_empty() || tight;
+        if need_stored {
+            let mut stored: Vec<Stored> = Vec::with_capacity(rows.len());
+            for r in &rows {
+                let doc: TantivyDocument = searcher.doc(r.addr)?;
+                stored.push(read_stored(f, &doc, 1.0));
             }
-        } else {
-            req.sort
-        };
-        verified.sort_by(|a, b| {
+            let fast_candidates = rows.len() as u64;
+            drop(rows);
+            let tv2 = Instant::now();
+            let mut verified: Vec<Stored> = stored
+                .into_iter()
+                .filter(|s| ctx.verifiers.iter().all(|v| v(s, catalog)))
+                .collect();
+            if has_content {
+                for s in verified.iter_mut() {
+                    s.score = content_score(&ctx.content_sets, s.object_id);
+                }
+            }
             if tight {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| {
-                        sort_key_cmp(
-                            a,
-                            b,
-                            if sort.field == SortField::Relevance {
-                                Sort {
-                                    field: SortField::Name,
-                                    descending: false,
-                                }
-                            } else {
-                                sort
-                            },
-                        )
-                    })
-            } else {
-                sort_key_cmp(a, b, sort)
+                // Rank the tightest containers first: a directory is "loose" when
+                // a candidate beneath it also satisfies the predicate.
+                let ids: HashSet<ObjectId> = verified.iter().map(|s| s.object_id).collect();
+                let mut loose: HashSet<ObjectId> = HashSet::new();
+                for s in &verified {
+                    for a in &s.ancestors {
+                        if ids.contains(a) {
+                            loose.insert(*a);
+                        }
+                    }
+                }
+                for s in verified.iter_mut() {
+                    s.score = if loose.contains(&s.object_id) {
+                        0.5
+                    } else {
+                        1.0
+                    };
+                }
+                steps.push(PlanStep {
+                    stage: "rank".into(),
+                    description: "tightest containing directories first; ancestors that only contain matches via a child are ranked second".into(),
+                    candidates: Some(verified.len() as u64),
+                    verified: Some(verified.iter().filter(|s| s.score >= 1.0).count() as u64),
+                    elapsed_ms: None,
+                });
             }
-        });
-        let total = verified.len() as u64;
-        let page: Vec<Stored> = verified.into_iter().skip(offset).take(limit).collect();
-        (page, total, !truncated && !content_truncated)
+            verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
+            if !ctx.verifiers.is_empty() {
+                steps.push(PlanStep {
+                    stage: "verify".into(),
+                    description: format!(
+                        "{fast_candidates} candidates verified against stored originals"
+                    ),
+                    candidates: Some(fast_candidates),
+                    verified: Some(verified.len() as u64),
+                    elapsed_ms: Some(tv2.elapsed().as_secs_f64() * 1000.0),
+                });
+            }
+            let sort = if tight && req.sort.field == SortField::Relevance {
+                Sort {
+                    field: SortField::Relevance,
+                    descending: true,
+                }
+            } else {
+                req.sort
+            };
+            verified.sort_by(|a, b| {
+                if tight {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            sort_key_cmp(
+                                a,
+                                b,
+                                if sort.field == SortField::Relevance {
+                                    Sort {
+                                        field: SortField::Name,
+                                        descending: false,
+                                    }
+                                } else {
+                                    sort
+                                },
+                            )
+                        })
+                } else {
+                    sort_key_cmp(a, b, sort)
+                }
+            });
+            let total = verified.len() as u64;
+            let page: Vec<Stored> = verified.into_iter().skip(offset).take(limit).collect();
+            (page, total, !truncated && !content_truncated)
+        } else {
+            if has_content {
+                for r in rows.iter_mut() {
+                    r.score = content_score(&ctx.content_sets, r.object_id);
+                }
+            }
+            verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
+            rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
+            let total = rows.len() as u64;
+            let mut page = Vec::with_capacity(limit);
+            for r in rows.into_iter().skip(offset).take(limit) {
+                let doc: TantivyDocument = searcher.doc(r.addr)?;
+                page.push(read_stored(f, &doc, r.score));
+            }
+            (page, total, !truncated && !content_truncated)
+        }
     } else {
         let n = (offset + limit).max(1);
         let top = TopDocs::with_limit(n);
