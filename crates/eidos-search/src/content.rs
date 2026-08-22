@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(ci.find(text, 10).len(), 3);
         let terms = Matcher::Terms(vec!["lower".into(), "the".into()]);
         assert_eq!(terms.find(text, 10), vec![(0, 3), (26, 31)]);
-        let re = Matcher::Regex(regex::Regex::new(r"Tq\w+").unwrap());
+        let re = Matcher::Regex(regex::Regex::new(r"Qz\w+").unwrap());
         assert_eq!(re.find(text, 10), vec![(4, 14)]);
     }
 
