@@ -120,30 +120,46 @@ extractor's rate regardless of reader count.
 
 ## Query latency on the full catalog (4 sources, 4.15 M entries, 1.82 M chunks)
 
-Same `eidos bench search` run as above but on the catalog with both SMB
-shares loaded (30 iterations per query, release, idle machine):
+`eidos bench search` on the catalog with both SMB shares loaded (30
+iterations per query, release, idle machine). Two runs: the first with the
+Milestone-3 executor (dictionary automata, store fetches for every
+candidate), the second after ADR-0006 (trigram candidates, fast-field and
+lazy verification, case-preserving token field).
 
-| Family | Queries | p50 | p95 | p99 | max |
+| Family | Queries | before p95 | **after p95** | after p50 | after p99 |
 |---|---|---:|---:|---:|---:|
-| metadata | `ext:cs` (27,660), `ext:dmp`, `size:>1G`, `mtime:>=30d ext:log`, `ext:log size:>100M`, `state:excluded` (2,154,278) | 17 ms | 87 ms | 91 ms | 98 ms |
-| directory | `has:idb has:cs`, `kind:dir subtree:>1G`, `kind:dir files:>1000` | 23 ms | 31 ms | 35 ms | 35 ms |
-| name | `readme` (12,306), `name:config` (31,436), `*.json` (148,482), three ranked terms, `name:=README.md` (8,484) | 80 ms | **1,878 ms** | 1,931 ms | 1,977 ms |
-| regex (name/path) | `name:/postgresql-.*\.log$/` (191), `name:/^[A-Z]{3}-\d{4}/c`, `path:/\\bin\\/ ext:dll` (6,188) | 1,810 ms | **4,191 ms** | 4,198 ms | 4,258 ms |
-| content (ranked/phrase) | `content:error` (234), `content:"connection refused"` (30), `content:exception ext:log mtime:>=365d` (55) | 37 ms | **54 ms** ✓ | 57 ms | 60 ms |
-| content-exact | `content:=Exception` (72), `content:~localhost:` (173) | 1,454 ms | **1,502 ms** | 1,535 ms | 1,564 ms |
-| content-regex | `content:/timed? ?out after \d+/` (5), `content:/[A-Z][a-z]+Exception: /c ext:log` (117) | 1,352 ms | **1,403 ms** | 1,416 ms | 1,422 ms |
+| metadata | `ext:cs` (27,660), `ext:dmp`, `size:>1G`, `mtime:>=30d ext:log`, `ext:log size:>100M`, `state:excluded` (2,172,020) | 87 ms | **91 ms** | 14 ms | 98 ms |
+| directory | `has:idb has:cs`, `kind:dir subtree:>1G`, `kind:dir files:>1000` | 31 ms | **26 ms** | 22 ms | 29 ms |
+| name | `readme` (12,585), `name:config` (31,658), `*.json` (147,992), three ranked terms, `name:=README.md` (8,737) | 1,878 ms | **49 ms** | 15 ms | 52 ms |
+| regex (selective) | `name:/postgresql-.*\.log$/` (191), `name:/^[A-Z]{3}-\d{4}/c` (69), `path:/\bin\/ ext:dll` (6,744) | 4,191 ms | **43 ms** | 25 ms | 43 ms |
+| regex (no literal) | IPv4-shaped `name:/^\d{1,3}(\.\d{1,3}){3}( \(\d+\))?$/` (614) | rejected | **1,103 ms** (flagged dictionary walk) | | |
+| content (ranked/phrase) | `content:error` (234), `content:"connection refused"` (30), `content:exception ext:log mtime:>=365d` (54) | 54 ms | **55 ms** | 41 ms | 60 ms |
+| content exact token | `content:=Exception` (2,607 files, case-sensitive, exact) | 1,535 ms (truncated) | **39 ms** | | |
+| content substring | `content:~localhost:` (173 files, 6,681 matching chunks) | 1,502 ms | **536 ms** | 498 ms | 536 ms |
+| content regex | `content:/timed? ?out after \d+/` (5), `content:/[A-Z][a-z]+Exception: /c ext:log` (55) | 1,403 ms | **655 ms** | 620 ms | 655 ms |
 
-Reading: ranked content retrieval meets its gate at first try. Everything
-that walks a term dictionary does not scale from 125 k to 4.15 M entries:
-an unanchored name/path regex or substring visits every term of the folded
-dictionary (≈3 M unique names), so 40 ms became 1.9 s. Verified content
-clauses are bounded by verification cost: common trigrams (`exception`)
-yield far more than the 20,000-candidate cap, and fetching and checking
-20 k stored chunks serially costs ≈1 s. Both are addressed next (name/path
-trigram candidates with fast-field verification; parallel chunk
-verification and a token pre-filter for whole-word literals). An
-IPv4-shaped regex with nested repetitions also exceeded the FST automaton's
-1,000-state limit and was rejected rather than executed.
+Reading:
+
+- The metadata p95 is one query: counting 2.17 M hits of `state:excluded`
+  costs ≈90 ms on 4.15 M entries; every other metadata query is 6–24 ms.
+- Name/path clauses now retrieve candidates through trigrams and verify on
+  fast fields; beyond 2,000 candidates they verify lazily in sort order and
+  report the total as an upper bound. `name:config` went from 1.9 s to
+  52 ms at the cost of an inexact total (31,658+).
+- A regex with no literal of three characters cannot use trigrams, and an
+  IPv4 shape exceeds the FST automaton's state limit, so it walks the
+  3 M-term folded dictionary with the regex crate (≈1.1 s) — flagged in the
+  response, never silently truncated.
+- Single-word case-sensitive literals (the Q-2 pattern) are exact term
+  queries on the case-preserving token field: 39 ms with no verification.
+- Content substring/regex clauses are bounded by fetching candidate chunks
+  from the catalog: ≈70 µs per chunk serially and only ≈2× faster across 8
+  threads on this host (`eidos bench chunks`; SQLite readers do not scale
+  here while pure CPU work does 3.8×). `content:~localhost:` verifies 6.7 k
+  true-match chunks for 173 files; the regexes examine the 20 k-chunk cap.
+  Page-driven verification for content (as for names) and a faster chunk
+  store are the next steps; these two families remain above the 250 ms
+  gate.
 
 ## Gates status (v0.5)
 
@@ -151,9 +167,9 @@ IPv4-shaped regex with nested repetitions also exceeded the FST automaton's
 |---|---|---|
 | complete local metadata scan | < 30 s | 3.5–4.5 s warm (cold not yet measured) |
 | incremental metadata visibility | < 2 s | 0.5 s |
-| metadata query p95 (G+R catalog) | < 50 ms | 3.9 ms (87 ms with 4.15 M entries, driven by exact counts of 2 M-hit queries) |
-| selective name/path regex p95 | < 250 ms | 73 ms on G+R; 4.2 s on 4.15 M entries — being fixed |
+| metadata query p95 | < 50 ms | 3.9 ms on the G+R catalog; 91 ms on 4.15 M entries (one 2 M-hit count) |
+| selective name/path regex p95 | < 250 ms | 43 ms on 4.15 M entries (literal-free shapes walk the dictionary: 1.1 s, flagged) |
 | multi-GB files with bounded memory | required | 2.14 GiB at 8.6 MiB peak working set |
 | candidate content indexed | 30 min | ≈ 17 min for 28.8 GiB |
-| ordinary content query p95 | < 150 ms | 54 ms |
-| selective content regex p95 | < 250 ms | 1.4 s — being fixed |
+| ordinary content query p95 | < 150 ms | 55 ms (ranked/phrase), 39 ms (exact token) |
+| selective content regex/substring p95 | < 250 ms | 536–655 ms — open (chunk fetch bound) |
