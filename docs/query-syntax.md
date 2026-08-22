@@ -72,3 +72,7 @@ are request parameters, not syntax. Directory predicates (`has:`, `files:`,
   (chunks are ≈16 KB, split on line ends).
 - Regexes with no required literal of three or more characters (for example
   `/\d+/`) scan every chunk in scope; they are allowed but flagged.
+- Broad name/path substring, glob, and regex clauses (more than 2,000
+  candidates) verify results lazily in sort order: the hits you see are all
+  verified, but the reported total is an upper bound (`exact: false`,
+  rendered as "N+") until a page reaches the end of the result set.

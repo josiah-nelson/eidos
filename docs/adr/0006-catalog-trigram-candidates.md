@@ -65,6 +65,19 @@ tens of microseconds per document.
   synchronised).
 - Explain steps report candidate-selection and verification timings
   separately.
+- Resolving a folded string from a dictionary-encoded fast field costs
+  ≈15 µs, and SQLite reads on this host scale to only ≈2× across threads,
+  so verifying every candidate of a broad clause cannot meet the latency
+  gates on a 4 M-entry catalog. Beyond 2,000 candidates, name/path clauses
+  therefore verify **lazily in sort order**: candidates are ordered by
+  numeric fast fields, or — for name/path order — by per-segment term
+  ordinals merged by comparing resolved heads, and strings are resolved and
+  verified only until the requested page is filled. Every hit returned is
+  verified; the total is reported as an upper bound (`exact = false`, "N+"
+  in the UI) unless the walk reached the end, and the response says so.
+  Case-sensitive clauses, directory ranking, and count/depth predicates stay
+  eager and exact. Content clauses keep a candidate cap (20,000 chunks) and
+  report truncation the same way.
 
 ## Consequences
 
