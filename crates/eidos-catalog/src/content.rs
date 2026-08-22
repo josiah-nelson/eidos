@@ -95,8 +95,16 @@ fn compress(text: &str) -> Vec<u8> {
 }
 
 fn decompress(blob: &[u8], chars_hint: u32) -> String {
+    match zstd::bulk::Decompressor::new() {
+        Ok(mut dec) => decompress_with(&mut dec, blob, chars_hint),
+        Err(_) => String::from_utf8_lossy(blob).into_owned(),
+    }
+}
+
+/// Decompress with a reusable context (creating one per chunk is costly).
+fn decompress_with(dec: &mut zstd::bulk::Decompressor<'_>, blob: &[u8], chars_hint: u32) -> String {
     let cap = (chars_hint as usize).saturating_mul(4).max(64);
-    match zstd::bulk::decompress(blob, cap.max(blob.len() * 8)) {
+    match dec.decompress(blob, cap.max(blob.len() * 8)) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(_) => String::from_utf8_lossy(blob).into_owned(),
     }
@@ -375,6 +383,49 @@ impl Catalog {
         })
     }
 
+    /// Fetch many chunks by key inside one read transaction (one WAL lock
+    /// acquisition for the whole batch instead of one per statement).
+    pub fn chunks_for_many(&self, keys: &[(ObjectId, u32, u32)]) -> Result<Vec<ChunkRow>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_reader(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut out = Vec::with_capacity(keys.len());
+            let mut dec = zstd::bulk::Decompressor::new()?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT ordinal, byte_start, byte_end, line_start, line_end, chars, text FROM chunks
+                     WHERE object_id = ?1 AND generation = ?2 AND ordinal = ?3",
+                )?;
+                for (object, generation, ordinal) in keys {
+                    if let Some(row) = stmt
+                        .query_row(params![object.0, *generation as i64, *ordinal as i64], |r| {
+                            let chars: i64 = r.get(5)?;
+                            let blob: Vec<u8> = r.get(6)?;
+                            Ok(ChunkRow {
+                                object_id: *object,
+                                generation: *generation,
+                                ordinal: r.get::<_, i64>(0)? as u32,
+                                byte_start: r.get::<_, i64>(1)? as u64,
+                                byte_end: r.get::<_, i64>(2)? as u64,
+                                line_start: r.get::<_, i64>(3)? as u64,
+                                line_end: r.get::<_, i64>(4)? as u64,
+                                chars: chars as u32,
+                                text: decompress_with(&mut dec, &blob, chars as u32),
+                            })
+                        })
+                        .optional()?
+                    {
+                        out.push(row);
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(out)
+        })
+    }
+
     /// Stream all chunks of an object generation in a range of ordinals.
     pub fn chunks_range(
         &self,
@@ -409,6 +460,23 @@ impl Catalog {
         })
     }
 
+    /// A deterministic sample of chunk keys `(object, generation, ordinal)`
+    /// for benchmarks.
+    pub fn sample_chunk_keys(&self, n: u32) -> Result<Vec<(ObjectId, u32, u32)>> {
+        self.with_reader(|conn| {
+            Ok(conn
+                .prepare("SELECT object_id, generation, ordinal FROM chunks WHERE object_id % 97 = 0 LIMIT ?1")?
+                .query_map(params![n as i64], |r| {
+                    Ok((
+                        ObjectId(r.get(0)?),
+                        r.get::<_, i64>(1)? as u32,
+                        r.get::<_, i64>(2)? as u32,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
     /// Stream every stored chunk of an indexed/partial content record in
     /// object order (for index rebuilds without re-reading files).
     pub fn for_each_indexed_chunk(
@@ -424,10 +492,11 @@ impl Catalog {
             )?;
             let mut rows = stmt.query([])?;
             let mut n = 0u64;
+            let mut dec = zstd::bulk::Decompressor::new()?;
             while let Some(row) = rows.next()? {
                 let chars: i64 = row.get(4)?;
                 let blob: Vec<u8> = row.get(5)?;
-                let text = decompress(&blob, chars as u32);
+                let text = decompress_with(&mut dec, &blob, chars as u32);
                 f(
                     ObjectId(row.get(0)?),
                     SourceId(row.get(1)?),

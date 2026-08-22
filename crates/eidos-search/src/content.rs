@@ -940,13 +940,17 @@ pub fn retrieve(
                         let matcher = &matcher;
                         s.spawn(move || -> Result<Vec<ChunkHit>> {
                             let mut out = Vec::new();
-                            for (obj, gen, ordinals) in part {
-                                for row in catalog.chunks_for(*obj, *gen, ordinals)? {
+                            let keys: Vec<(ObjectId, u32, u32)> = part
+                                .iter()
+                                .flat_map(|(o, g, ords)| ords.iter().map(move |k| (*o, *g, *k)))
+                                .collect();
+                            for batch in keys.chunks(256) {
+                                for row in catalog.chunks_for_many(batch)? {
                                     let n = matcher.find(&row.text, 64).len();
                                     if n > 0 {
                                         out.push(ChunkHit {
-                                            object_id: *obj,
-                                            generation: *gen,
+                                            object_id: row.object_id,
+                                            generation: row.generation,
                                             ordinal: row.ordinal,
                                             score: n as f32,
                                         });

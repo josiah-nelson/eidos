@@ -42,6 +42,13 @@ pub enum BenchCommand {
         #[arg(long)]
         rebuild: bool,
     },
+    /// Time stored-chunk lookups (`chunks_for`) serially and in parallel.
+    Chunks {
+        #[arg(long, default_value_t = 2000)]
+        sample: u32,
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+    },
     /// Stream one file through the extractor (sniff/decode/chunk/hash) with a
     /// null sink; reports throughput and peak working set. Read-only.
     Content {
@@ -237,7 +244,112 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             bench_out,
             label,
         } => bench_content(&file, bench_out, label),
+        BenchCommand::Chunks { sample, threads } => bench_chunks(&args.data_dir, sample, threads),
     }
+}
+
+fn bench_chunks(data_dir: &std::path::Path, sample: u32, threads: usize) -> anyhow::Result<()> {
+    let catalog = Catalog::open(data_dir.join("catalog.db"))?;
+    let keys = catalog.sample_chunk_keys(sample)?;
+    anyhow::ensure!(!keys.is_empty(), "no chunks stored");
+    for pass in ["cold", "warm"] {
+        let t = Instant::now();
+        let mut bytes = 0usize;
+        for (o, g, k) in &keys {
+            for row in catalog.chunks_for(*o, *g, &[*k])? {
+                bytes += row.text.len();
+            }
+        }
+        let d = t.elapsed();
+        println!(
+            "serial {pass}: {} lookups in {:.0} ms = {:.0} us each ({} text bytes)",
+            keys.len(),
+            d.as_secs_f64() * 1000.0,
+            d.as_secs_f64() * 1e6 / keys.len() as f64,
+            bytes
+        );
+    }
+    let per = keys.len().div_ceil(threads.max(1));
+    let t = Instant::now();
+    std::thread::scope(|s| {
+        for part in keys.chunks(per) {
+            let catalog = &catalog;
+            s.spawn(move || {
+                for (o, g, k) in part {
+                    let _ = catalog.chunks_for(*o, *g, &[*k]);
+                }
+            });
+        }
+    });
+    let d = t.elapsed();
+    println!(
+        "parallel x{threads} (one txn per lookup): {} lookups in {:.0} ms = {:.0} us each wall",
+        keys.len(),
+        d.as_secs_f64() * 1000.0,
+        d.as_secs_f64() * 1e6 / keys.len() as f64
+    );
+    let t = Instant::now();
+    std::thread::scope(|s| {
+        for part in keys.chunks(per) {
+            let catalog = &catalog;
+            s.spawn(move || {
+                for batch in part.chunks(256) {
+                    let _ = catalog.chunks_for_many(batch);
+                }
+            });
+        }
+    });
+    let d = t.elapsed();
+    // Pure CPU scaling check on the same texts (no SQLite involved).
+    let texts: Vec<String> = keys
+        .chunks(256)
+        .flat_map(|b| catalog.chunks_for_many(b).unwrap_or_default())
+        .map(|r| r.text)
+        .collect();
+    let re = regex::Regex::new(r"[A-Z][a-z]+Exception: ").unwrap();
+    let t = Instant::now();
+    let mut hits = 0usize;
+    for _ in 0..20 {
+        for tx in &texts {
+            hits += re.find_iter(tx).count();
+        }
+    }
+    let serial = t.elapsed();
+    let t = Instant::now();
+    let per_t = texts.len().div_ceil(threads.max(1));
+    let parallel_hits: usize = std::thread::scope(|s| {
+        let hs: Vec<_> = texts
+            .chunks(per_t)
+            .map(|part| {
+                let re = &re;
+                s.spawn(move || {
+                    let mut h = 0usize;
+                    for _ in 0..20 {
+                        for tx in part {
+                            h += re.find_iter(tx).count();
+                        }
+                    }
+                    h
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+    let par = t.elapsed();
+    println!(
+        "cpu regex over {} texts x20: serial {:.0} ms, parallel x{threads} {:.0} ms (speedup {:.1}x, hits {hits}/{parallel_hits})",
+        texts.len(),
+        serial.as_secs_f64() * 1000.0,
+        par.as_secs_f64() * 1000.0,
+        serial.as_secs_f64() / par.as_secs_f64().max(1e-9)
+    );
+    println!(
+        "parallel x{threads} (batched txns): {} lookups in {:.0} ms = {:.0} us each wall",
+        keys.len(),
+        d.as_secs_f64() * 1000.0,
+        d.as_secs_f64() * 1e6 / keys.len() as f64
+    );
+    Ok(())
 }
 
 /// Peak working set of this process in bytes (Windows); 0 elsewhere.

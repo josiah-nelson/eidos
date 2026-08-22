@@ -65,6 +65,7 @@ const READER_POOL: usize = 12;
 impl Catalog {
     /// Open (creating if necessary) and migrate the catalog at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<Catalog>> {
+        configure_sqlite();
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -116,6 +117,25 @@ impl Catalog {
     pub fn recover(&self) -> Result<RecoveryReport> {
         self.with_writer(scan::recover_open_generations)
     }
+}
+
+static SQLITE_CONFIGURED: std::sync::Once = std::sync::Once::new();
+
+/// Process-wide SQLite configuration, applied before the first connection.
+/// Memory statistics are off: with them on, every allocation in every
+/// connection takes one global mutex, which serialises parallel readers.
+fn configure_sqlite() {
+    SQLITE_CONFIGURED.call_once(|| {
+        // SAFETY: called once, before any connection exists in this process
+        // (sqlite3_config must precede sqlite3_initialize); the argument list
+        // matches SQLITE_CONFIG_MEMSTATUS's (int).
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0i32)
+        };
+        if rc != rusqlite::ffi::SQLITE_OK {
+            tracing::warn!(rc, "sqlite3_config(MEMSTATUS) failed; readers may serialise");
+        }
+    });
 }
 
 fn open_connection(path: &Path) -> Result<Connection> {

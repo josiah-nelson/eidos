@@ -1273,23 +1273,25 @@ pub fn search_with_content(
             let threads = (list.len() / 2_000).clamp(1, VERIFY_THREADS);
             let per = list.len().div_ceil(threads).max(1);
             let verifiers = &ctx.fast_verifiers;
-            let searcher_ref = &searcher;
+            // Column readers are opened once per segment (opening loads the
+            // dictionary index) and shared by every thread.
+            let mut cols: HashMap<u32, FastCols> = HashMap::new();
+            for a in &list {
+                if let std::collections::hash_map::Entry::Vacant(e) = cols.entry(a.segment_ord) {
+                    e.insert(FastCols::open(&searcher, a.segment_ord)?);
+                }
+            }
+            let cols = &cols;
             let parts: Vec<Result<Vec<FastRow>>> = std::thread::scope(|sc| {
                 let handles: Vec<_> = list
                     .chunks(per)
                     .map(|part| {
                         sc.spawn(move || -> Result<Vec<FastRow>> {
                             let mut out = Vec::with_capacity(part.len());
-                            let mut cols: HashMap<u32, FastCols> = HashMap::new();
                             let mut nbuf = String::new();
                             let mut pbuf = String::new();
                             for a in part {
-                                let c = match cols.entry(a.segment_ord) {
-                                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                                    std::collections::hash_map::Entry::Vacant(e) => {
-                                        e.insert(FastCols::open(searcher_ref, a.segment_ord)?)
-                                    }
-                                };
+                                let c = cols.get(&a.segment_ord).expect("opened");
                                 c.strings(a.doc_id, &mut nbuf, &mut pbuf);
                                 if verifiers.iter().all(|v| v(&nbuf, &pbuf)) {
                                     out.push(c.row(*a, &nbuf, &pbuf));
