@@ -131,7 +131,7 @@ lazy verification, case-preserving token field).
 | metadata | `ext:cs` (27,660), `ext:dmp`, `size:>1G`, `mtime:>=30d ext:log`, `ext:log size:>100M`, `state:excluded` (2,172,020) | 87 ms | **91 ms** | 14 ms | 98 ms |
 | directory | `has:idb has:cs`, `kind:dir subtree:>1G`, `kind:dir files:>1000` | 31 ms | **26 ms** | 22 ms | 29 ms |
 | name | `readme` (12,585), `name:config` (31,658), `*.json` (147,992), three ranked terms, `name:=README.md` (8,737) | 1,878 ms | **49 ms** | 15 ms | 52 ms |
-| regex (selective) | `name:/postgresql-.*\.log$/` (191), `name:/^[A-Z]{3}-\d{4}/c` (69), `path:/\bin\/ ext:dll` (6,744) | 4,191 ms | **43 ms** | 25 ms | 43 ms |
+| regex (selective) | `name:/postgresql-.*\.log$/` (191), `name:/^[A-Z]{3}-\d{4}/c` (69), `path:/\\bin\\/ ext:dll` (6,744) | 4,191 ms | **43 ms** | 25 ms | 43 ms |
 | regex (no literal) | IPv4-shaped `name:/^\d{1,3}(\.\d{1,3}){3}( \(\d+\))?$/` (614) | rejected | **1,103 ms** (flagged dictionary walk) | | |
 | content (ranked/phrase) | `content:error` (234), `content:"connection refused"` (30), `content:exception ext:log mtime:>=365d` (54) | 54 ms | **55 ms** | 41 ms | 60 ms |
 | content exact token | `content:=Exception` (2,607 files, case-sensitive, exact) | 1,535 ms (truncated) | **39 ms** | | |

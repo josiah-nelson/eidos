@@ -129,11 +129,13 @@ fn configure_sqlite() {
         // SAFETY: called once, before any connection exists in this process
         // (sqlite3_config must precede sqlite3_initialize); the argument list
         // matches SQLITE_CONFIG_MEMSTATUS's (int).
-        let rc = unsafe {
-            rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0i32)
-        };
+        let rc =
+            unsafe { rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0i32) };
         if rc != rusqlite::ffi::SQLITE_OK {
-            tracing::warn!(rc, "sqlite3_config(MEMSTATUS) failed; readers may serialise");
+            tracing::warn!(
+                rc,
+                "sqlite3_config(MEMSTATUS) failed; readers may serialise"
+            );
         }
     });
 }
