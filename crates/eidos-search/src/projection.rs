@@ -86,6 +86,10 @@ impl CatalogIndex {
         if force {
             tracing::warn!("catalog index was recreated; rebuilding every source");
         }
+        // Same situation left behind by a process that recreated the index
+        // and exited before rebuilding: an empty index whose projection
+        // record claims documents.
+        let empty = self.num_docs() == 0;
         for s in catalog.list_sources()? {
             let published = match s.published_generation {
                 Some(g) => g,
@@ -97,11 +101,10 @@ impl CatalogIndex {
                 }
                 continue;
             }
-            let built = catalog
-                .projection_source(PROJECTION_NAME, s.id)?
-                .map(|p| p.generation)
-                .unwrap_or(-1);
-            if force || built != published {
+            let record = catalog.projection_source(PROJECTION_NAME, s.id)?;
+            let built = record.as_ref().map(|p| p.generation).unwrap_or(-1);
+            let stale_empty = empty && record.as_ref().is_some_and(|p| p.documents > 0);
+            if force || stale_empty || built != published {
                 out.push(self.rebuild_source(catalog, s.id)?);
             }
         }

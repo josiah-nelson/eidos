@@ -500,3 +500,28 @@ fn recreated_index_is_rebuilt_despite_recorded_generation() {
     reopened.reload().unwrap();
     assert!(reopened.num_docs() > 0);
 }
+
+#[test]
+fn empty_index_with_recorded_documents_is_rebuilt() {
+    let fx = fixture();
+    let dir = fx.index.dir().to_path_buf();
+    drop(fx.index.clone());
+    // Wipe everything (meta included) so a fresh open creates a v-current
+    // index with no "recreated" memory, then open twice: the second open
+    // must still rebuild because the catalog record claims documents.
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_file() {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+    }
+    let first = CatalogIndex::open(&dir).unwrap();
+    assert!(first.take_recreated());
+    drop(first);
+    let second = CatalogIndex::open(&dir).unwrap();
+    assert!(!second.take_recreated());
+    let rebuilt = second.sync_sources(&fx.catalog).unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    second.reload().unwrap();
+    assert!(second.num_docs() > 0);
+}
