@@ -1,4 +1,5 @@
-import type { ContentState, SourceCompleteness, SourceState } from './api'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { api, type ContentState, type SourceCompleteness, type SourceState } from './api'
 import { ago, count, humanState } from './format'
 
 export function StateBadge({ state }: { state: SourceState }) {
@@ -108,6 +109,50 @@ export function CompletenessBanner({ c }: { c: SourceCompleteness }) {
         <strong>{c.name}</strong> is fully indexed. Last scan {ago(c.last_scan_completed)}.
       </span>
     </div>
+  )
+}
+
+/** Per-source content policy switch (extraction on/off). */
+export function ContentPolicyControl({
+  sourceId,
+  enabled,
+  concurrency,
+}: {
+  sourceId: number
+  enabled: boolean
+  concurrency: number
+}) {
+  const qc = useQueryClient()
+  const m = useMutation({
+    mutationFn: (body: { enabled?: boolean; concurrency?: number }) => api.setContentPolicy(sourceId, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['source', sourceId] })
+      qc.invalidateQueries({ queryKey: ['sources'] })
+      qc.invalidateQueries({ queryKey: ['activity'] })
+    },
+  })
+  return (
+    <span className="toggle-group" title="Literal-text extraction for this source">
+      <button className={`btn small ${enabled ? '' : 'primary'}`} disabled={m.isPending} onClick={() => m.mutate({ enabled: !enabled })}>
+        content {enabled ? 'on' : 'off'}
+      </button>{' '}
+      <label className="muted small">
+        ×
+        <input
+          type="number"
+          className="small"
+          min={1}
+          max={64}
+          defaultValue={concurrency}
+          key={concurrency}
+          disabled={m.isPending}
+          onBlur={(e) => {
+            const v = Number(e.target.value)
+            if (Number.isFinite(v) && v >= 1 && v !== concurrency) m.mutate({ concurrency: v })
+          }}
+        />
+      </label>
+    </span>
   )
 }
 

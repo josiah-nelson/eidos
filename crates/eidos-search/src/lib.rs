@@ -6,9 +6,13 @@
 //! Tantivy queries, verifies exact/case-sensitive semantics against stored
 //! originals, and joins current state from the catalog.
 
+pub mod content;
 pub mod exec;
+pub mod pipeline;
 pub mod projection;
 pub mod schema;
+
+pub use content::ContentIndex;
 
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};

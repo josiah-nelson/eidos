@@ -165,6 +165,17 @@ impl Catalog {
 
     /// Claim the highest-priority due job in any of `stages`.
     pub fn claim_job(&self, stages: &[JobStage], worker: &str) -> Result<Option<JobRecord>> {
+        self.claim_job_filtered(stages, worker, &[])
+    }
+
+    /// Like `claim_job`, skipping jobs of `exclude_sources` (sources whose
+    /// concurrency budget is currently exhausted).
+    pub fn claim_job_filtered(
+        &self,
+        stages: &[JobStage],
+        worker: &str,
+        exclude_sources: &[SourceId],
+    ) -> Result<Option<JobRecord>> {
         if stages.is_empty() {
             return Ok(None);
         }
@@ -173,11 +184,23 @@ impl Catalog {
             .map(|s| format!("'{}'", s.as_str()))
             .collect::<Vec<_>>()
             .join(",");
+        let exclude = if exclude_sources.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND source_id NOT IN ({})",
+                exclude_sources
+                    .iter()
+                    .map(|s| s.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let now = UnixNanos::now().0;
             let sql = format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued' AND stage IN ({stage_list}) AND scheduled_at <= ?1
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued' AND stage IN ({stage_list}) AND scheduled_at <= ?1{exclude}
                  ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT 1"
             );
             let job = tx.query_row(&sql, params![now], job_from_row).optional()?;
@@ -197,6 +220,38 @@ impl Catalog {
                 worker: Some(worker.to_string()),
                 ..job
             }))
+        })
+    }
+
+    /// Drop a job entirely (used when its source's content policy was
+    /// disabled after it was queued, so re-enabling re-queues it).
+    pub fn delete_job(&self, id: JobId) -> Result<()> {
+        self.with_writer(|conn| {
+            conn.execute("DELETE FROM jobs WHERE job_id = ?1", params![id.0])?;
+            Ok(())
+        })
+    }
+
+    /// Queued + running job counts per source for one stage.
+    pub fn jobs_by_source(&self, stage: JobStage) -> Result<BTreeMap<SourceId, (u64, u64)>> {
+        self.with_reader(|conn| {
+            let mut out: BTreeMap<SourceId, (u64, u64)> = BTreeMap::new();
+            let mut stmt = conn.prepare_cached(
+                "SELECT source_id, state, COUNT(*) FROM jobs WHERE stage = ?1 AND state IN ('queued','running') GROUP BY source_id, state",
+            )?;
+            let rows = stmt.query_map(params![stage.as_str()], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u64))
+            })?;
+            for row in rows {
+                let (sid, state, n) = row?;
+                let e = out.entry(SourceId(sid)).or_default();
+                if state == "queued" {
+                    e.0 += n;
+                } else {
+                    e.1 += n;
+                }
+            }
+            Ok(out)
         })
     }
 

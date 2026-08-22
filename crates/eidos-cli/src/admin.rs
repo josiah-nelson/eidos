@@ -42,6 +42,17 @@ pub enum SourceCommand {
         #[arg(long)]
         bench_out: Option<PathBuf>,
     },
+    /// Set the content policy of a source (extraction on/off, concurrency).
+    Content {
+        name: String,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        /// Concurrent content jobs for this source (1 for HDDs/SMB).
+        #[arg(long)]
+        concurrency: Option<u32>,
+    },
 }
 
 pub fn run(args: SourceArgs) -> anyhow::Result<()> {
@@ -108,6 +119,32 @@ pub fn run(args: SourceArgs) -> anyhow::Result<()> {
                     s.root_path
                 );
             }
+        }
+        SourceCommand::Content {
+            name,
+            enable,
+            disable,
+            concurrency,
+        } => {
+            let s = catalog
+                .find_source_by_name(&name)?
+                .with_context(|| format!("no source named '{name}'"))?;
+            let enabled = if enable {
+                true
+            } else if disable {
+                false
+            } else {
+                s.content_enabled
+            };
+            let concurrency = concurrency.unwrap_or(s.content_concurrency).clamp(1, 64);
+            catalog.set_content_policy(s.id, enabled, concurrency)?;
+            println!(
+                "source {} '{}': content {} concurrency {}",
+                s.id,
+                s.name,
+                if enabled { "enabled" } else { "disabled" },
+                concurrency
+            );
         }
         SourceCommand::Scan {
             name,

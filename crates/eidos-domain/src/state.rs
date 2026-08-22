@@ -186,6 +186,12 @@ str_enum! {
         PathRule => "path_rule",
         ExtensionRule => "extension_rule",
         ReparseNotTraversed => "reparse_not_traversed",
+        /// File symlink / app-execution alias: the target is catalogued on its own.
+        Symlink => "symlink",
+        /// Cloud, projected-filesystem, or tiering placeholder: reading would hydrate it.
+        Placeholder => "placeholder",
+        /// Socket, FIFO, or device node surfaced as a file.
+        SpecialFile => "special_file",
     }
 }
 

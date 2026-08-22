@@ -346,7 +346,9 @@ impl<'a> Applier<'a> {
         if snap.kind != ObjectKind::File {
             return (ContentState::NotApplicable, ContentDecision::Unsupported);
         }
-        let d = self.policy.file(name, snap.attributes, ctx);
+        let d = self
+            .policy
+            .file(name, snap.attributes, snap.reparse_tag, ctx);
         let st = match d {
             ContentDecision::Candidate => ContentState::Pending,
             ContentDecision::Unsupported => ContentState::Unsupported,
@@ -448,6 +450,15 @@ impl<'a> Applier<'a> {
                 if content_changed {
                     self.record_policy(ex.id, decision)?;
                     self.outbox(ex.id, "content", generation)?;
+                    if state == ContentState::Pending {
+                        crate::content::enqueue_content_for(
+                            self.tx,
+                            self.source_id,
+                            ex.id,
+                            generation as u32,
+                            snap.size,
+                        )?;
+                    }
                 } else {
                     self.outbox(ex.id, "upsert", generation)?;
                 }
@@ -523,15 +534,19 @@ impl<'a> Applier<'a> {
                 params![id.0, self.source_id.0],
             )?;
         }
+        let content_candidate = snap.kind == ObjectKind::File && new_state == ContentState::Pending;
         self.outbox(
             id,
-            if snap.kind == ObjectKind::File && new_state == ContentState::Pending {
+            if content_candidate {
                 "content"
             } else {
                 "upsert"
             },
             1,
         )?;
+        if content_candidate {
+            crate::content::enqueue_content_for(self.tx, self.source_id, id, 1, snap.size)?;
+        }
         Ok((id, true, None))
     }
 

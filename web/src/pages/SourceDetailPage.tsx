@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
 import { api } from '../api'
-import { CompletenessBanner, ErrorBox, Spinner, StateBadge } from '../components'
+import { CompletenessBanner, ContentPolicyControl, ErrorBox, Spinner, StateBadge } from '../components'
 import { bytes, count, duration, humanState, when } from '../format'
 
 export default function SourceDetailPage() {
@@ -32,6 +32,7 @@ export default function SourceDetailPage() {
           <Link to="/sources">Sources</Link> / {s.name} <StateBadge state={s.state} />
         </h1>
         <div style={{ flex: 1 }} />
+        <ContentPolicyControl sourceId={s.id} enabled={s.content_enabled} concurrency={s.content_concurrency} />
         {s.root_object_id != null && (
           <Link className="btn" to={`/browse/${s.root_object_id}`}>
             Browse

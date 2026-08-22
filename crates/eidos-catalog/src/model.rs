@@ -34,6 +34,10 @@ pub struct SourceRecord {
     pub preserve_offline: bool,
     /// Seconds between periodic reconciliations for feed-less sources.
     pub reconcile_interval_s: Option<i64>,
+    /// Literal-text extraction enabled for this source (default on).
+    pub content_enabled: bool,
+    /// Concurrent content jobs allowed on this source (HDD-aware budget).
+    pub content_concurrency: u32,
     pub checkpoint_kind: Option<String>,
     pub checkpoint_at: Option<UnixNanos>,
     pub last_scan_started_at: Option<UnixNanos>,
@@ -60,6 +64,8 @@ impl SourceRecord {
             volume_id: r.get::<_, Option<i64>>("volume_id")?.map(VolumeId),
             preserve_offline: r.get::<_, i64>("preserve_offline")? != 0,
             reconcile_interval_s: r.get("reconcile_interval_s")?,
+            content_enabled: r.get::<_, i64>("content_enabled")? != 0,
+            content_concurrency: r.get::<_, i64>("content_concurrency")?.max(1) as u32,
             checkpoint_kind: r.get("checkpoint_kind")?,
             checkpoint_at: r.get::<_, Option<i64>>("checkpoint_at")?.map(UnixNanos),
             last_scan_started_at: r

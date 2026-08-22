@@ -445,6 +445,45 @@ impl Catalog {
         })
     }
 
+    /// The content index was (re)created empty: every object whose content
+    /// was published must be extracted again. Stored chunks are dropped so
+    /// the catalog never claims coverage the index cannot serve.
+    pub fn reset_content_for_reindex(&self) -> Result<u64> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let objects: Vec<i64> = tx
+                .prepare("SELECT object_id FROM objects WHERE content_state IN ('indexed','partial') AND deleted_at IS NULL")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for o in &objects {
+                flip_state(&tx, ObjectId(*o), ContentState::Pending, None)?;
+            }
+            tx.execute("DELETE FROM content_records", [])?;
+            tx.execute("DELETE FROM chunks", [])?;
+            tx.execute(
+                "UPDATE jobs SET state = 'superseded', finished_at = ?1 WHERE stage = 'content_text' AND state IN ('queued','running')",
+                params![UnixNanos::now().0],
+            )?;
+            tx.commit()?;
+            Ok(objects.len() as u64)
+        })
+    }
+
+    /// Objects per content state for a source (for activity views).
+    pub fn content_state_counts(&self, source: SourceId) -> Result<BTreeMap<String, u64>> {
+        self.with_reader(|conn| {
+            let mut out = BTreeMap::new();
+            let mut stmt = conn.prepare_cached(
+                "SELECT content_state, COUNT(*) FROM objects WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file' GROUP BY content_state",
+            )?;
+            for row in stmt.query_map(params![source.0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))? {
+                let (k, v) = row?;
+                out.insert(k, v);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn set_content_policy(
         &self,
         source: SourceId,
@@ -587,9 +626,8 @@ pub(crate) fn enqueue_pending_content_conn(
     Ok(n as u64)
 }
 
-/// Enqueue a content job for one object (used by incremental changes).
-// Milestone 4: called from `changes.rs` once the change-event hook lands.
-#[allow(dead_code)]
+/// Enqueue a content job for one object (incremental changes; the
+/// coordinator's periodic top-up covers everything else).
 pub(crate) fn enqueue_content_for(
     conn: &Connection,
     source: SourceId,

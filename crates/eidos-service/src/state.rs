@@ -15,7 +15,14 @@ use std::time::Instant;
 pub struct AppState {
     pub catalog: Arc<Catalog>,
     pub index: Arc<eidos_search::CatalogIndex>,
+    pub content_index: Arc<eidos_search::ContentIndex>,
     pub follower: Arc<crate::follower::FollowerStatus>,
+    pub content_workers: Arc<crate::content_workers::ContentWorkersStatus>,
+    /// Global content switch (`--no-content` keeps workers idle).
+    pub content_enabled: AtomicBool,
+    pub content_worker_count: usize,
+    /// Per-source concurrency budgets, refreshed by the coordinator.
+    pub content_budgets: Mutex<HashMap<SourceId, u32>>,
     pub exec_opts: eidos_search::exec::ExecOptions,
     pub host_id: HostId,
     pub host_name: String,
@@ -52,10 +59,28 @@ impl AppState {
         let host_id = catalog.ensure_host(&host_name, std::env::consts::OS)?;
         let index =
             eidos_search::CatalogIndex::open(config.data_dir.join("index").join("catalog"))?;
+        let content_index =
+            eidos_search::ContentIndex::open(config.data_dir.join("index").join("content"))?;
+        if content_index.is_fresh() {
+            // A (re)created content index holds nothing: every indexed object
+            // must be re-extracted so the catalog and index agree.
+            let n = catalog.reset_content_for_reindex()?;
+            if n > 0 {
+                tracing::warn!(
+                    n,
+                    "content index is empty; indexed objects reset to pending"
+                );
+            }
+        }
         Ok(Self {
             catalog,
             index,
+            content_index,
             follower: Arc::new(crate::follower::FollowerStatus::default()),
+            content_workers: Arc::new(crate::content_workers::ContentWorkersStatus::default()),
+            content_enabled: AtomicBool::new(config.content),
+            content_worker_count: config.content_workers,
+            content_budgets: Mutex::new(HashMap::new()),
             exec_opts: eidos_search::exec::ExecOptions::default(),
             host_id,
             host_name,
@@ -96,6 +121,7 @@ impl AppState {
         }
         crate::watcher::spawn_reconciler(self);
         crate::follower::spawn_follower(self);
+        crate::content_workers::spawn_content_workers(self, self.content_worker_count);
         Ok(())
     }
 

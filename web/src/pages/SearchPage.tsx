@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Link, useSearchParams } from 'react-router'
@@ -15,7 +15,10 @@ const EXAMPLES: [string, string][] = [
   ['name:=README.md', 'exact, case-sensitive file name'],
   ['ext:dmp', 'every dump file across all sources'],
   ['has:idb has:cs', 'directories containing both .idb and .cs beneath them (use Directories mode)'],
-  ['name:/^10\\.92\\.161\\.\\d+( \\(\\d+\\))?$/', 'regex on directory names (Directories mode, sort by subtree size)'],
+  ['name:/^192\\.0\\.2\\.\\d+( \\(\\d+\\))?$/', 'regex on directory names (Directories mode, sort by subtree size)'],
+  ['ext:md mtime:>=30d content:zephyr content:"build 4.2"', 'recent Markdown whose text has the terms and the exact phrase'],
+  ['content:=Qz mtime:>=30d', 'files whose text contains the whole word Qz, case-sensitive, with line snippets'],
+  ['content:/needle-[0-9a-f]+/ ext:log', 'regex over content: required literals pick candidates, every match is verified'],
   ['size:>1G -ext:vhdx', 'large files that are not VM disks'],
   ['G:\\Tools ext:json', 'JSON files under a path'],
 ]
@@ -83,7 +86,7 @@ export default function SearchPage() {
           className="searchbox"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          placeholder="Search names and paths — e.g.  readme ext:md mtime:>=30d   ·   name:=README.md   ·   has:idb has:cs"
+          placeholder="Search names, paths, and content — e.g.  readme ext:md mtime:>=30d   ·   content:=Qz   ·   has:idb has:cs"
           autoFocus
           spellCheck={false}
         />
@@ -120,8 +123,8 @@ export default function SearchPage() {
               </span>
             ))}
             {parsed.data.needs_content && (
-              <span className="badge warn" style={{ marginLeft: 6 }}>
-                content search arrives in Milestone 4
+              <span className="badge info" style={{ marginLeft: 6 }} title="Sources whose content is still being indexed are reported as partial">
+                content clause
               </span>
             )}
           </>
@@ -157,7 +160,7 @@ export default function SearchPage() {
             </tbody>
           </table>
           <p className="muted" style={{ marginBottom: 0 }}>
-            Fields: name, path, ext, kind, size, alloc, mtime, ctime, state, has, files, subtree, attr, source, in.
+            Fields: name, path, ext, kind, size, alloc, mtime, ctime, state, has, files, subtree, attr, source, in, content.
             Modifiers: <code>=</code> exact (case-sensitive), <code>~</code> contains (case-sensitive),{' '}
             <code>/re/</code> regex (<code>/re/c</code> case-sensitive), <code>*</code> glob, <code>-</code> not,{' '}
             <code>OR</code>, parentheses.
@@ -292,7 +295,7 @@ function HitTable({
   const virtualizer = useVirtualizer({
     count: hits.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 30,
+    estimateSize: (i) => 30 + (hits[i]?.snippets?.length ?? 0) * 18,
     overscan: 20,
   })
   const items = virtualizer.getVirtualItems()
@@ -317,10 +320,13 @@ function HitTable({
           const h = hits[vi.index]
           const isDir = h.kind === 'directory'
           const parent = h.path ? h.path.slice(0, Math.max(0, h.path.lastIndexOf('\\'))) : ''
+          const snippets = h.snippets ?? []
           return (
             <div
               key={`${h.entry_id ?? h.object_id}`}
-              className="vrow hitrow"
+              data-index={vi.index}
+              ref={virtualizer.measureElement}
+              className={`vrow hitrow ${snippets.length ? 'with-snippets' : ''}`}
               style={{ position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${vi.start}px)` }}
             >
               <div className={`col name ${isDir ? 'dir' : ''}`}>
@@ -356,6 +362,16 @@ function HitTable({
                   <ContentBadge state={h.content.state} />
                 )}
               </div>
+              {snippets.length > 0 && (
+                <div className="snippets">
+                  {snippets.map((s) => (
+                    <div key={s.chunk_ordinal + ':' + s.line_start}>
+                      <span className="line">L{s.line_start + 1}</span>
+                      <Highlighted text={s.text} ranges={s.highlights} />
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )
         })}
@@ -367,4 +383,19 @@ function HitTable({
       )}
     </div>
   )
+}
+
+/** Render text with `[start, end)` character ranges wrapped in <mark>. */
+function Highlighted({ text, ranges }: { text: string; ranges: [number, number][] }) {
+  const chars = Array.from(text)
+  const parts: ReactNode[] = []
+  let pos = 0
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0])
+  sorted.forEach(([a, b], i) => {
+    if (a > pos) parts.push(chars.slice(pos, a).join(''))
+    if (b > a) parts.push(<mark key={i}>{chars.slice(Math.max(a, pos), b).join('')}</mark>)
+    pos = Math.max(pos, b)
+  })
+  if (pos < chars.length) parts.push(chars.slice(pos).join(''))
+  return <>{parts}</>
 }

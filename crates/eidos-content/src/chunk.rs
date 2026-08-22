@@ -192,37 +192,18 @@ impl Chunker {
                 }
                 end
             }
-            Encoding::Utf8 => {
-                let mut e = end.min(self.buf.len());
-                let mut back = 0;
-                while e > 0 && back < 4 && (self.buf[e - 1] & 0xC0) == 0x80 {
-                    e -= 1;
-                    back += 1;
-                }
-                // If we backed onto a lead byte whose sequence is complete, keep it.
-                if e > 0 && e < end {
-                    let lead = self.buf[e - 1];
-                    let need = if lead >= 0xF0 {
-                        4
-                    } else if lead >= 0xE0 {
-                        3
-                    } else if lead >= 0xC0 {
-                        2
-                    } else {
-                        1
-                    };
-                    if end - (e - 1) >= need {
-                        return e - 1 + need;
-                    }
-                    return e - 1;
-                }
-                e
-            }
+            Encoding::Utf8 => utf8_boundary(&self.buf, end),
             Encoding::Windows1252 => end,
         }
     }
 
     fn take_segment(&mut self, start: usize, end: usize, is_line_end: bool, out: &mut Vec<Chunk>) {
+        debug_assert!(
+            self.encoding != Encoding::Utf8
+                || end == self.buf.len()
+                || (self.buf[end] & 0xC0) != 0x80,
+            "segment end {end} is not a UTF-8 boundary"
+        );
         let bytes = &self.buf[start..end];
         let (decoded, _, _) = self.encoding.rs().decode(bytes);
         // `sniff` already consumed any BOM, so the decoder never sees one here.
@@ -269,6 +250,55 @@ impl Chunker {
         self.cur_split = false;
         self.cur_text = String::with_capacity(self.cfg.target_bytes + 1024);
     }
+}
+
+#[inline]
+fn is_continuation(b: u8) -> bool {
+    (b & 0xC0) == 0x80
+}
+
+/// Length of the UTF-8 sequence introduced by `lead` (1 for ASCII and for
+/// invalid lead bytes, which the decoder will replace).
+#[inline]
+fn sequence_len(lead: u8) -> usize {
+    if lead >= 0xF0 {
+        4
+    } else if lead >= 0xE0 {
+        3
+    } else if lead >= 0xC0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Largest split position `<= end` that does not fall inside a UTF-8
+/// sequence. A position is a boundary when the byte *at* it is not a
+/// continuation byte. When `end` reaches the end of the buffer, the last
+/// (possibly incomplete) sequence is inspected so a chunk never ends halfway
+/// through a character whose remaining bytes have not been pushed yet.
+fn utf8_boundary(buf: &[u8], end: usize) -> usize {
+    let mut e = end.min(buf.len());
+    if e < buf.len() {
+        let floor = e.saturating_sub(3);
+        while e > floor && is_continuation(buf[e]) {
+            e -= 1;
+        }
+        return e;
+    }
+    // `e == buf.len()`: find the last lead byte within the final 4 bytes.
+    let floor = e.saturating_sub(4);
+    let mut k = e;
+    while k > floor {
+        k -= 1;
+        if !is_continuation(buf[k]) {
+            if k + sequence_len(buf[k]) > e {
+                return k;
+            }
+            return e;
+        }
+    }
+    e
 }
 
 #[cfg(test)]
@@ -356,17 +386,58 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "KNOWN FAILURE (M4 in progress): safe_boundary() mis-backs off multi-byte UTF-8 in force-split long lines; see docs/STATUS.md"]
     fn utf8_multibyte_not_split() {
         let s = "é".repeat(3000); // 6000 bytes, 2 per char
         let cfg = ChunkerConfig {
             target_bytes: 500,
             max_line_bytes: 1001, // odd to force boundary adjustment
         };
-        let (chunks, _) = run(Encoding::Utf8, 0, cfg, s.as_bytes(), 333);
-        let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(joined, s);
-        assert!(!joined.contains('\u{FFFD}'));
+        for block in [333usize, 1001, 1000, 7, 6000] {
+            let (chunks, _) = run(Encoding::Utf8, 0, cfg, s.as_bytes(), block);
+            let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(joined, s, "block {block}");
+            assert!(!joined.contains('\u{FFFD}'), "block {block}");
+            for w in chunks.windows(2) {
+                assert_eq!(w[0].byte_end, w[1].byte_start);
+            }
+            for c in &chunks {
+                assert_eq!(&s[c.byte_start as usize..c.byte_end as usize], c.text);
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_four_byte_sequences_and_mixed_widths() {
+        // 1-, 2-, 3-, and 4-byte characters with no newline at all.
+        let unit = "a€😀é";
+        let s = unit.repeat(800);
+        let cfg = ChunkerConfig {
+            target_bytes: 300,
+            max_line_bytes: 257,
+        };
+        for block in [1usize, 2, 3, 5, 257, 258, 1024] {
+            let (chunks, _) = run(Encoding::Utf8, 0, cfg, s.as_bytes(), block);
+            let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(joined, s, "block {block}");
+            assert!(chunks.iter().all(|c| c.text.len() <= 300 + 257));
+        }
+    }
+
+    #[test]
+    fn utf8_boundary_rules() {
+        let b = "é".as_bytes(); // C3 A9
+        assert_eq!(utf8_boundary(b, 1), 0, "inside a complete sequence");
+        assert_eq!(utf8_boundary(b, 2), 2);
+        assert_eq!(utf8_boundary(&b[..1], 1), 0, "buffer ends mid-sequence");
+        let ascii = b"abc";
+        assert_eq!(utf8_boundary(ascii, 2), 2);
+        assert_eq!(utf8_boundary(ascii, 3), 3);
+        let smile = "😀".as_bytes(); // F0 9F 98 80
+        for cut in 1..4 {
+            assert_eq!(utf8_boundary(smile, cut), 0, "cut {cut}");
+            assert_eq!(utf8_boundary(&smile[..cut], cut), 0, "partial {cut}");
+        }
+        assert_eq!(utf8_boundary(smile, 4), 4);
     }
 
     #[test]

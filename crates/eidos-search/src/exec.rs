@@ -4,6 +4,7 @@
 //! candidates, verify exact/case-sensitive clauses against stored originals,
 //! join current state and completeness from the catalog, and explain.
 
+use crate::content::{self, ContentClause, ContentIndex, ContentOpts, Matcher};
 use crate::schema::{attr_bit, attr_name, fold, Fields};
 use crate::{CatalogIndex, Result, SearchError, PROJECTION_NAME};
 use eidos_catalog::Catalog;
@@ -14,7 +15,7 @@ use std::time::Instant;
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
 use tantivy::query::{
     AllQuery, BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query as TQuery, RangeQuery,
-    RegexQuery, TermQuery,
+    RegexQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{IndexRecordOption, Value};
 use tantivy::{DocAddress, Order, Searcher, TantivyDocument, Term};
@@ -26,6 +27,11 @@ pub struct ExecOptions {
     pub oversample: usize,
     /// Hard cap on candidates examined in collect-all mode.
     pub max_candidates: usize,
+    pub content: ContentOpts,
+    /// Snippets returned per file hit.
+    pub max_snippets: usize,
+    /// Snippet window in characters.
+    pub snippet_chars: usize,
 }
 
 impl Default for ExecOptions {
@@ -34,8 +40,27 @@ impl Default for ExecOptions {
             limits: QueryLimits::default(),
             oversample: 8,
             max_candidates: 100_000,
+            content: ContentOpts::default(),
+            max_snippets: 3,
+            snippet_chars: 240,
         }
     }
+}
+
+/// Per-object result of one content clause.
+#[derive(Debug, Clone)]
+pub struct ObjectMatch {
+    pub score: f32,
+    pub generation: u32,
+    /// `(chunk ordinal, score)`
+    pub chunks: Vec<(u32, f32)>,
+}
+
+/// Everything one content clause retrieved, keyed by object.
+pub struct ContentSet {
+    pub by_object: HashMap<ObjectId, ObjectMatch>,
+    pub matcher: Matcher,
+    pub truncated: bool,
 }
 
 /// Stored fields of a hit candidate.
@@ -73,6 +98,12 @@ struct Ctx<'a> {
     warnings: Vec<String>,
     scope_sources: Option<Vec<SourceId>>,
     tight_dirs: bool,
+    content: Option<&'a ContentIndex>,
+    content_opts: ContentOpts,
+    content_sets: Vec<ContentSet>,
+    /// Source scope known before compilation (top-level `source:` clauses).
+    content_scope: Option<Vec<SourceId>>,
+    retired: Vec<SourceId>,
 }
 
 fn term_u64(f: tantivy::schema::Field, v: u64) -> Box<dyn TQuery> {
@@ -407,9 +438,7 @@ fn compile_text(
 ) -> std::result::Result<Box<dyn TQuery>, QueryError> {
     let f = ctx.f;
     if field == TextField::Content {
-        return Err(QueryError::Other {
-            message: "content search is not available until the content index exists (Milestone 4); name and path clauses work".into(),
-        });
+        return compile_content(mode, value, case_sensitive, slop, ctx);
     }
     let (tok_field, folded_field, label) = match field {
         TextField::Name => (f.name, f.name_folded, "name"),
@@ -537,6 +566,162 @@ fn compile_text(
     })
 }
 
+/// A content clause runs against the content index eagerly and compiles to
+/// a set of object ids over the catalog index, so it composes with every
+/// other clause (including `OR` and `NOT`).
+fn compile_content(
+    mode: TextMode,
+    value: &str,
+    case_sensitive: bool,
+    slop: u32,
+    ctx: &mut Ctx<'_>,
+) -> std::result::Result<Box<dyn TQuery>, QueryError> {
+    let index = ctx.content.ok_or_else(|| QueryError::Other {
+        message: "content search is not available: the service has no content index open".into(),
+    })?;
+    let clause = ContentClause {
+        mode,
+        value: value.to_string(),
+        case_sensitive,
+        slop,
+    };
+    let desc = match mode {
+        TextMode::Ranked => format!(
+            "content has terms [{}]",
+            content::text_tokens(value).join(", ")
+        ),
+        TextMode::Phrase => format!("content phrase \"{value}\""),
+        TextMode::Proximity => format!(
+            "content terms [{}] within {slop}",
+            content::text_tokens(value).join(", ")
+        ),
+        TextMode::Exact => format!(
+            "content contains the word \"{value}\"{}",
+            if case_sensitive {
+                " (case-sensitive)"
+            } else {
+                ""
+            }
+        ),
+        TextMode::Substring => format!(
+            "content contains \"{value}\"{}",
+            if case_sensitive {
+                " (case-sensitive)"
+            } else {
+                ""
+            }
+        ),
+        TextMode::Regex => format!(
+            "content matches /{value}/{}",
+            if case_sensitive {
+                " (case-sensitive)"
+            } else {
+                " (case-insensitive)"
+            }
+        ),
+    };
+    ctx.readable.push(desc);
+    let (ret, matcher) = content::retrieve(
+        index,
+        ctx.catalog,
+        &clause,
+        ctx.content_scope.as_deref(),
+        &ctx.retired,
+        &ctx.content_opts,
+    )
+    .map_err(|e| QueryError::Other {
+        message: e.to_string(),
+    })?;
+    if ret.broad {
+        ctx.warnings.push(format!(
+            "content clause \"{value}\" has no selective literal; every chunk in scope was examined"
+        ));
+    }
+    if ret.truncated {
+        ctx.warnings.push(format!(
+            "content clause \"{value}\" matched more chunks than the limit; results are a subset — narrow the query"
+        ));
+    }
+    let mut by_object: HashMap<ObjectId, ObjectMatch> = HashMap::new();
+    for h in &ret.hits {
+        let e = by_object.entry(h.object_id).or_insert(ObjectMatch {
+            score: 0.0,
+            generation: h.generation,
+            chunks: Vec::new(),
+        });
+        // Newer generation wins if both are somehow present.
+        if h.generation > e.generation {
+            e.generation = h.generation;
+            e.chunks.clear();
+            e.score = 0.0;
+        }
+        if h.generation == e.generation {
+            e.score = e.score.max(h.score) + h.score * 0.1;
+            e.chunks.push((h.ordinal, h.score));
+        }
+    }
+    ctx.steps.push(PlanStep {
+        stage: "content".into(),
+        description: format!("{} → {} file(s)", ret.description, by_object.len()),
+        candidates: Some(ret.candidates),
+        verified: ret.verified,
+        elapsed_ms: Some(ret.elapsed_ms),
+    });
+    let terms: Vec<Term> = by_object
+        .keys()
+        .map(|o| Term::from_field_u64(ctx.f.object_id, o.0 as u64))
+        .collect();
+    let q: Box<dyn TQuery> = if terms.is_empty() {
+        Box::new(EmptyQuery)
+    } else {
+        Box::new(TermSetQuery::new(terms))
+    };
+    ctx.content_sets.push(ContentSet {
+        by_object,
+        matcher,
+        truncated: ret.truncated,
+    });
+    Ok(q)
+}
+
+/// Source scope visible before compilation: `source:` clauses that are
+/// top-level `AND` conjuncts.
+fn pre_scope(q: &Query, catalog: &Catalog) -> Option<Vec<SourceId>> {
+    fn collect(q: &Query, catalog: &Catalog, out: &mut Vec<SourceId>) -> bool {
+        match q {
+            Query::Source { ids, names } => {
+                out.extend(ids.iter().copied());
+                for n in names {
+                    if let Ok(Some(s)) = catalog.find_source_by_name(n) {
+                        out.push(s.id);
+                    }
+                }
+                true
+            }
+            Query::And { clauses } => {
+                let mut any = false;
+                for c in clauses {
+                    any |= collect(c, catalog, out);
+                }
+                any
+            }
+            _ => false,
+        }
+    }
+    let mut out = Vec::new();
+    if collect(q, catalog, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn content_score(sets: &[ContentSet], object: ObjectId) -> f32 {
+    sets.iter()
+        .filter_map(|s| s.by_object.get(&object).map(|m| m.score))
+        .sum()
+}
+
 fn compile_path(
     mode: PathMode,
     value: &str,
@@ -659,9 +844,21 @@ fn decode_cursor(c: &Option<String>) -> std::result::Result<usize, QueryError> {
     }
 }
 
-/// Execute a search request.
+/// Execute a search request without a content index (content clauses are
+/// rejected with an explanation).
 pub fn search(
     index: &CatalogIndex,
+    catalog: &Catalog,
+    req: &SearchRequest,
+    opts: &ExecOptions,
+) -> Result<SearchResponse> {
+    search_with_content(index, None, catalog, req, opts)
+}
+
+/// Execute a search request.
+pub fn search_with_content(
+    index: &CatalogIndex,
+    content_index: Option<&ContentIndex>,
     catalog: &Catalog,
     req: &SearchRequest,
     opts: &ExecOptions,
@@ -671,6 +868,16 @@ pub fn search(
     let offset = decode_cursor(&req.cursor)?;
     let limit = req.limit.max(1) as usize;
     let f = index.fields();
+    let all_sources = catalog.list_sources()?;
+    let retired: Vec<SourceId> = if req.include_retired {
+        Vec::new()
+    } else {
+        all_sources
+            .iter()
+            .filter(|s| s.state == SourceState::Retired)
+            .map(|s| s.id)
+            .collect()
+    };
     let mut ctx = Ctx {
         f,
         catalog,
@@ -680,6 +887,11 @@ pub fn search(
         warnings: Vec::new(),
         scope_sources: None,
         tight_dirs: false,
+        content: content_index,
+        content_opts: opts.content,
+        content_sets: Vec::new(),
+        content_scope: pre_scope(&req.query, catalog),
+        retired,
     };
     let mut root = compile(&req.query, &mut ctx)?;
 
@@ -703,7 +915,6 @@ pub fn search(
         )),
         ResultMode::Both => {}
     }
-    let all_sources = catalog.list_sources()?;
     let in_scope: Vec<&eidos_catalog::SourceRecord> = all_sources
         .iter()
         .filter(|s| req.include_retired || s.state != SourceState::Retired)
@@ -722,7 +933,9 @@ pub fn search(
     let plan_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let tight = ctx.tight_dirs && req.mode == ResultMode::Directories;
-    let collect_all = !ctx.verifiers.is_empty() || tight;
+    let has_content = !ctx.content_sets.is_empty();
+    let content_truncated = ctx.content_sets.iter().any(|s| s.truncated);
+    let collect_all = !ctx.verifiers.is_empty() || tight || has_content;
     let searcher = index.searcher();
     let t1 = Instant::now();
     let mut warnings = ctx.warnings.clone();
@@ -753,6 +966,11 @@ pub fn search(
             .into_iter()
             .filter(|s| ctx.verifiers.iter().all(|v| v(s, catalog)))
             .collect();
+        if has_content {
+            for s in verified.iter_mut() {
+                s.score = content_score(&ctx.content_sets, s.object_id);
+            }
+        }
         if tight {
             // Rank the tightest containers first: a directory is "loose" when
             // a candidate beneath it also satisfies the predicate.
@@ -824,7 +1042,7 @@ pub fn search(
         });
         let total = verified.len() as u64;
         let page: Vec<Stored> = verified.into_iter().skip(offset).take(limit).collect();
-        (page, total, !truncated)
+        (page, total, !truncated && !content_truncated)
     } else {
         let n = (offset + limit).max(1);
         let top = TopDocs::with_limit(n);
@@ -894,7 +1112,16 @@ pub fn search(
     };
     let retrieve_ms = t1.elapsed().as_secs_f64() * 1000.0 - verify_ms;
     let t2 = Instant::now();
-    let (hits, facets) = build_hits(index, catalog, req, &searcher, page, root.as_ref())?;
+    let (hits, facets) = build_hits(
+        index,
+        catalog,
+        req,
+        &searcher,
+        page,
+        root.as_ref(),
+        &ctx.content_sets,
+        opts,
+    )?;
     let join_ms = t2.elapsed().as_secs_f64() * 1000.0;
     let completeness = completeness_for(
         catalog,
@@ -935,6 +1162,7 @@ pub fn search(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_hits(
     index: &CatalogIndex,
     catalog: &Catalog,
@@ -942,6 +1170,8 @@ fn build_hits(
     searcher: &Searcher,
     page: Vec<Stored>,
     facet_query: &dyn TQuery,
+    content_sets: &[ContentSet],
+    opts: &ExecOptions,
 ) -> Result<(Vec<Hit>, Vec<Facet>)> {
     let sources: HashMap<SourceId, eidos_catalog::SourceRecord> = catalog
         .list_sources()?
@@ -977,16 +1207,32 @@ fn build_hits(
         } else {
             None
         };
-        let content = if obj.kind == ObjectKind::File {
-            ContentSummary {
+        let (content, snippets) = if obj.kind == ObjectKind::File {
+            let rec = catalog.content_record(s.object_id)?;
+            let summary = ContentSummary {
                 state: obj.content_state,
-                coverage: Coverage::None,
-                indexed_bytes: None,
+                coverage: rec
+                    .as_ref()
+                    .filter(|r| r.generation == obj.generation)
+                    .map(|r| r.coverage)
+                    .unwrap_or(Coverage::None),
+                indexed_bytes: rec
+                    .as_ref()
+                    .filter(|r| r.generation == obj.generation)
+                    .map(|r| r.indexed_bytes),
                 content_id: obj.content_id.map(|c| c.to_hex()),
-                reason: None,
-            }
+                reason: rec
+                    .as_ref()
+                    .and_then(|r| r.reason.clone().or_else(|| r.error.clone())),
+            };
+            let snippets = if content_sets.is_empty() {
+                Vec::new()
+            } else {
+                snippets_for(catalog, content_sets, s.object_id, obj.generation, opts)?
+            };
+            (summary, snippets)
         } else {
-            ContentSummary::not_applicable()
+            (ContentSummary::not_applicable(), Vec::new())
         };
         hits.push(Hit {
             object_id: s.object_id,
@@ -1007,7 +1253,7 @@ fn build_hits(
             hard_link_count: obj.link_count,
             content,
             score: Some(s.score),
-            snippets: Vec::new(),
+            snippets,
             directory,
             archive: None,
             source_state: src.map(|x| x.state).unwrap_or(SourceState::New),
@@ -1019,6 +1265,112 @@ fn build_hits(
         facets_for(index, searcher, facet_query, &req.facets, &sources, catalog)?
     };
     Ok((hits, facets))
+}
+
+/// Diverse line-aware snippets for one file: the best-scoring chunks across
+/// every content clause, one window per chunk around the first match.
+fn snippets_for(
+    catalog: &Catalog,
+    sets: &[ContentSet],
+    object: ObjectId,
+    generation: u32,
+    opts: &ExecOptions,
+) -> Result<Vec<Snippet>> {
+    let mut per_ordinal: BTreeMap<u32, f32> = BTreeMap::new();
+    for set in sets {
+        if let Some(m) = set.by_object.get(&object) {
+            if m.generation != generation {
+                continue; // stale: the object changed since retrieval
+            }
+            for (ord, score) in &m.chunks {
+                *per_ordinal.entry(*ord).or_insert(0.0) += score;
+            }
+        }
+    }
+    if per_ordinal.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ranked: Vec<(u32, f32)> = per_ordinal.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    ranked.truncate(opts.max_snippets.max(1));
+    let ordinals: Vec<u32> = ranked.iter().map(|r| r.0).collect();
+    let rows = catalog.chunks_for(object, generation, &ordinals)?;
+    let matchers: Vec<&Matcher> = sets.iter().map(|s| &s.matcher).collect();
+    let mut out = Vec::new();
+    for row in rows {
+        if let Some(s) = make_snippet(&row, &matchers, opts.snippet_chars) {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+fn make_snippet(
+    row: &eidos_catalog::content::ChunkRow,
+    matchers: &[&Matcher],
+    window_chars: usize,
+) -> Option<Snippet> {
+    let text = row.text.as_str();
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    for m in matchers {
+        matches.extend(m.find(text, 32));
+    }
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort();
+    let (ms, me) = matches[0];
+    // The line containing the first match.
+    let line_start = text[..ms].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = text[ms..].find('\n').map(|i| ms + i).unwrap_or(text.len());
+    let line_index = row.line_start + text[..line_start].matches('\n').count() as u64;
+    // Bound the window around the match (char-aware).
+    let mut ws = line_start;
+    let mut we = line_end;
+    if text[ws..we].chars().count() > window_chars {
+        let before = window_chars / 3;
+        let mut s = ms;
+        let mut n = 0;
+        while s > ws && n < before {
+            s -= 1;
+            while s > ws && !text.is_char_boundary(s) {
+                s -= 1;
+            }
+            n += 1;
+        }
+        ws = s;
+        let mut e = me.max(ms);
+        let mut n = text[ws..e].chars().count();
+        while e < we && n < window_chars {
+            e += 1;
+            while e < we && !text.is_char_boundary(e) {
+                e += 1;
+            }
+            n += 1;
+        }
+        we = e;
+    }
+    let window = text[ws..we].trim_end_matches('\r');
+    let we = ws + window.len();
+    let char_at = |b: usize| text[ws..b].chars().count() as u32;
+    let highlights: Vec<[u32; 2]> = matches
+        .iter()
+        .filter(|(s, e)| *s >= ws && *e <= we)
+        .map(|(s, e)| [char_at(*s), char_at(*e)])
+        .collect();
+    Some(Snippet {
+        chunk_ordinal: row.ordinal,
+        byte_start: row.byte_start,
+        byte_end: row.byte_end,
+        line_start: line_index,
+        line_end: line_index,
+        text: window.to_string(),
+        highlights,
+    })
 }
 
 fn facets_for(

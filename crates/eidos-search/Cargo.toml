@@ -9,6 +9,7 @@ description = "Tantivy catalog and content indexes: schema, projection follower,
 [dependencies]
 eidos-domain = { workspace = true }
 eidos-catalog = { workspace = true }
+eidos-content = { workspace = true }
 tantivy = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true }

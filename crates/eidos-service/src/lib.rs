@@ -6,6 +6,7 @@
 //! the scanner behind a transport without changing the API layer.
 
 pub mod api;
+pub mod content_workers;
 pub mod follower;
 pub mod scanner;
 pub mod state;
@@ -28,6 +29,10 @@ pub struct ServiceConfig {
     pub scan_threads: usize,
     /// Let the reconciler start periodic rescans of feed-less sources.
     pub auto_reconcile: bool,
+    /// Run literal-text content extraction.
+    pub content: bool,
+    /// Extraction threads (global; per-source budgets apply on top).
+    pub content_workers: usize,
 }
 
 impl Default for ServiceConfig {
@@ -38,6 +43,8 @@ impl Default for ServiceConfig {
             web_dir: Some(PathBuf::from("web/dist")),
             scan_threads: 8,
             auto_reconcile: true,
+            content: true,
+            content_workers: 4,
         }
     }
 }

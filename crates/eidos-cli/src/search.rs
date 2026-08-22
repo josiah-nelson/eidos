@@ -152,6 +152,10 @@ fn print_table(v: &SearchView, q: &str) {
             "{size}  {when}  {}{state}",
             h.path.clone().unwrap_or_else(|| h.name.clone())
         );
+        for s in &h.snippets {
+            let text = s.text.replace(['\r', '\n'], " ");
+            println!("      L{:<7} {}", s.line_start + 1, text);
+        }
     }
     for f in &r.facets {
         println!("facet {:?}:", f.field);

@@ -16,6 +16,8 @@ eidos-catalog = { workspace = true }
 eidos-service = { workspace = true }
 eidos-search = { workspace = true }
 eidos-query = { workspace = true }
+eidos-content = { workspace = true }
+windows-sys = { workspace = true }
 ureq = { version = "3.4", features = ["json"] }
 anyhow = { workspace = true }
 clap = { workspace = true }

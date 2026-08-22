@@ -643,3 +643,35 @@ table.grid tr:hover td {
 .error-text {
   color: var(--bad);
 }
+
+/* ----- activity ----- */
+.statebar {
+  display: flex;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--bg-2, #2a2f3a);
+}
+.statebar .seg.indexed { background: #3fb950; }
+.statebar .seg.partial { background: #58a6ff; }
+.statebar .seg.pending, .statebar .seg.stale { background: #d29922; }
+.statebar .seg.failed { background: #f85149; }
+.statebar .seg.unsupported { background: #8b949e; }
+.statebar .seg.excluded { background: #6e7681; }
+.small { font-size: 12px; }
+input[type='number'].small { width: 64px; }
+.toggle { cursor: pointer; user-select: none; }
+
+/* ----- snippets ----- */
+.vrow.hitrow.with-snippets { align-items: flex-start; }
+.snippets {
+  grid-column: 1 / -1;
+  padding: 2px 0 6px 28px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fg-1, #c9d1d9);
+}
+.snippets .line { color: var(--fg-2, #8b949e); margin-right: 8px; }
+.snippets mark { background: rgba(210, 153, 34, 0.35); color: inherit; border-radius: 2px; }

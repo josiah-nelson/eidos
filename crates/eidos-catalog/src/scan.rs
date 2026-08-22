@@ -335,7 +335,7 @@ impl ScanSession {
         };
 
         let decision = match e.kind {
-            ObjectKind::File => self.policy.file(&e.name, e.attributes, ctx),
+            ObjectKind::File => self.policy.file(&e.name, e.attributes, e.reparse_tag, ctx),
             _ => ContentDecision::Unsupported,
         };
         let (confidence, serial, high, low) = match native {

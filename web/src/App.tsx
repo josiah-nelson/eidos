@@ -40,9 +40,9 @@ export default function App() {
           Search
         </NavLink>
         <div className="section">Operations</div>
-        <a className="disabled" title="Milestone 4/5">
+        <NavLink to="/activity" className={({ isActive }) => (isActive ? 'active' : '')}>
           Activity
-        </a>
+        </NavLink>
         <a className="disabled" title="Milestone 5">
           Policies
         </a>

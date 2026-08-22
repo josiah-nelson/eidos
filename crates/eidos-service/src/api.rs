@@ -29,6 +29,8 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
         .route("/sources/{id}/errors", get(source_errors))
         .route("/sources/{id}/exclusions", get(source_exclusions))
         .route("/sources/{id}/generations", get(source_generations))
+        .route("/sources/{id}/content", post(set_content_policy))
+        .route("/activity", get(activity))
         .route("/objects/{id}", get(get_object))
         .route("/objects/{id}/children", get(children))
         .route("/objects/{id}/extensions", get(extensions))
@@ -598,7 +600,13 @@ async fn run_search(st: Arc<AppState>, body: SearchBody) -> ApiResult<SearchView
     let rendered = eidos_query::render(&query);
     let st2 = st.clone();
     let response = tokio::task::spawn_blocking(move || {
-        eidos_search::exec::search(&st2.index, &st2.catalog, &req, &st2.exec_opts)
+        eidos_search::exec::search_with_content(
+            &st2.index,
+            Some(&st2.content_index),
+            &st2.catalog,
+            &req,
+            &st2.exec_opts,
+        )
     })
     .await
     .map_err(|e| ApiError::bad_request(e.to_string()))?
@@ -715,6 +723,103 @@ async fn search_parse(Query(q): Query<ParseQuery>) -> ApiResult<ParseView> {
         notes: parsed.notes,
         needs_content,
     }))
+}
+
+#[derive(Deserialize)]
+struct ContentPolicyBody {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    concurrency: Option<u32>,
+}
+
+async fn set_content_policy(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<ContentPolicyBody>,
+) -> ApiResult<SourceView> {
+    let sid = SourceId(id);
+    let s = st
+        .catalog
+        .get_source(sid)?
+        .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
+    let enabled = body.enabled.unwrap_or(s.content_enabled);
+    let concurrency = body
+        .concurrency
+        .unwrap_or(s.content_concurrency)
+        .clamp(1, 64);
+    st.catalog.set_content_policy(sid, enabled, concurrency)?;
+    st.content_budgets.lock().insert(sid, concurrency);
+    let s = st
+        .catalog
+        .get_source(sid)?
+        .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
+    Ok(Json(source_view(&st, s)?))
+}
+
+#[derive(Serialize)]
+pub struct ActivitySourceView {
+    pub source_id: SourceId,
+    pub name: String,
+    pub state: eidos_domain::SourceState,
+    pub content_enabled: bool,
+    pub content_concurrency: u32,
+    pub jobs_queued: u64,
+    pub jobs_running: u64,
+    pub content_states: std::collections::BTreeMap<String, u64>,
+    pub content_bytes_indexed: u64,
+}
+
+#[derive(Serialize)]
+pub struct ActivityView {
+    pub content_enabled: bool,
+    pub jobs: eidos_catalog::jobs::JobCounts,
+    pub content: eidos_catalog::content::ContentStats,
+    pub workers: crate::content_workers::ContentWorkersView,
+    pub follower: crate::follower::FollowerView,
+    pub content_index_documents: u64,
+    pub sources: Vec<ActivitySourceView>,
+    pub recent_failures: Vec<eidos_catalog::jobs::JobRecord>,
+}
+
+async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
+    let st2 = st.clone();
+    let view = tokio::task::spawn_blocking(move || -> Result<ActivityView, ApiError> {
+        let by_source = st2
+            .catalog
+            .jobs_by_source(eidos_domain::JobStage::ContentText)?;
+        let mut sources = Vec::new();
+        for s in st2.catalog.list_sources()? {
+            let q = by_source.get(&s.id).copied().unwrap_or((0, 0));
+            let stats = st2.catalog.content_stats(Some(s.id))?;
+            sources.push(ActivitySourceView {
+                source_id: s.id,
+                name: s.name.clone(),
+                state: s.state,
+                content_enabled: s.content_enabled,
+                content_concurrency: s.content_concurrency,
+                jobs_queued: q.0,
+                jobs_running: q.1,
+                content_states: st2.catalog.content_state_counts(s.id)?,
+                content_bytes_indexed: stats.indexed_bytes,
+            });
+        }
+        Ok(ActivityView {
+            content_enabled: st2
+                .content_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            jobs: st2.catalog.job_counts(None)?,
+            content: st2.catalog.content_stats(None)?,
+            workers: st2.content_workers.view(st2.content_index.uncommitted()),
+            follower: st2.follower.view(&st2),
+            content_index_documents: st2.content_index.num_docs(),
+            sources,
+            recent_failures: st2.catalog.recent_failed_jobs(20)?,
+        })
+    })
+    .await
+    .map_err(|e| ApiError::bad_request(e.to_string()))??;
+    Ok(Json(view))
 }
 
 #[derive(Serialize)]

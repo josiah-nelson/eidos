@@ -48,7 +48,21 @@ the catalog outbox every 500 ms (`GET /api/index` shows follower state).
 `serve` flags / environment: `--data-dir` (`EIDOS_DATA_DIR`), `--bind`
 (`EIDOS_BIND`, default loopback — the API has no authentication yet and warns
 when bound elsewhere), `--web-dir` (`EIDOS_WEB_DIR`, empty for API only),
-`--scan-threads`, `--no-auto-reconcile`.
+`--scan-threads`, `--no-auto-reconcile`, `--no-content` (metadata only),
+`--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4).
+
+Content extraction runs in the service for every source whose content
+policy is enabled (the default). Turn it off or bound it per source before
+the first crawl of a slow or remote root:
+
+```powershell
+.\target\release\eidos.exe source content share --disable          # SMB: metadata only
+.\target\release\eidos.exe source content projects --concurrency 1  # HDD: one reader
+.\target\release\eidos.exe activity --watch 5                        # queues, workers, throughput
+```
+
+The same controls are on the Activity and source pages of the web UI and at
+`POST /api/sources/{id}/content` / `GET /api/activity`.
 
 Searching through the running service:
 

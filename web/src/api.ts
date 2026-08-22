@@ -25,6 +25,8 @@ export type ContentState =
 export type ObjectKind = 'file' | 'directory' | 'reparse' | 'virtual_file' | 'virtual_directory'
 
 export interface SourceRecord {
+  content_enabled: boolean
+  content_concurrency: number
   id: number
   host_id: number
   name: string
@@ -492,4 +494,89 @@ export const api = {
       `/api/search/parse?q=${encodeURIComponent(q)}`,
     ),
   indexStatus: () => request<IndexStatus>('/api/index'),
+  activity: () => request<ActivityView>('/api/activity'),
+  setContentPolicy: (id: number, body: { enabled?: boolean; concurrency?: number }) =>
+    request<SourceView>(`/api/sources/${id}/content`, { method: 'POST', body: JSON.stringify(body) }),
+}
+
+export interface WorkerCurrent {
+  worker: string
+  source_id: number
+  object_id: number
+  path: string
+  size: number
+  started_ms_ago: number
+}
+
+export interface ContentWorkersView {
+  workers: number
+  current: WorkerCurrent[]
+  files_indexed: number
+  files_unsupported: number
+  files_failed: number
+  files_skipped: number
+  files_retried: number
+  bytes_read: number
+  chunks_written: number
+  commits: number
+  published: number
+  enqueued: number
+  pending_publish: number
+  uncommitted_documents: number
+  last_commit_ms: number
+  last_error?: string | null
+  throughput_bytes_per_s: number
+  uptime_s: number
+}
+
+export interface JobCounts {
+  by_stage: Record<string, Record<string, number>>
+  queued: number
+  running: number
+  failed: number
+  oldest_queued_age_ms?: number | null
+}
+
+export interface ContentStats {
+  by_state: Record<string, [number, number, number]>
+  total_records: number
+  indexed_bytes: number
+  chunks: number
+}
+
+export interface ActivitySourceView {
+  source_id: number
+  name: string
+  state: SourceState
+  content_enabled: boolean
+  content_concurrency: number
+  jobs_queued: number
+  jobs_running: number
+  content_states: Record<string, number>
+  content_bytes_indexed: number
+}
+
+export interface JobRecord {
+  id: number
+  source_id: number
+  object_id?: number | null
+  object_generation: number
+  stage: string
+  priority: number
+  state: string
+  attempts: number
+  last_error?: string | null
+  failure_class?: string | null
+  finished_at?: number | null
+}
+
+export interface ActivityView {
+  content_enabled: boolean
+  jobs: JobCounts
+  content: ContentStats
+  workers: ContentWorkersView
+  follower: IndexStatus['follower']
+  content_index_documents: number
+  sources: ActivitySourceView[]
+  recent_failures: JobRecord[]
 }

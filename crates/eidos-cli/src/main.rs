@@ -7,6 +7,7 @@
 //! Search commands (Milestone 3) talk to the running service so the CLI and
 //! web UI share one query contract.
 
+mod activity;
 mod admin;
 mod bench;
 mod profile;
@@ -40,6 +41,8 @@ enum Command {
     Search(search::SearchArgs),
     /// Benchmarks over an existing data directory.
     Bench(bench::BenchArgs),
+    /// Indexing activity of the running service (queues, workers, throughput).
+    Activity(activity::ActivityArgs),
 }
 
 #[derive(Args, Debug)]
@@ -59,6 +62,12 @@ struct ServeArgs {
     /// Disable automatic periodic rescans of sources without a change feed.
     #[arg(long)]
     no_auto_reconcile: bool,
+    /// Do not extract or index file content (metadata only).
+    #[arg(long)]
+    no_content: bool,
+    /// Content extraction threads (per-source budgets apply on top).
+    #[arg(long, env = "EIDOS_CONTENT_WORKERS", default_value_t = 4)]
+    content_workers: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -68,6 +77,7 @@ fn main() -> anyhow::Result<()> {
         Command::Profile(args) => profile::run(args),
         Command::Source(args) => admin::run(args),
         Command::Bench(args) => bench::run(args),
+        Command::Activity(args) => activity::run(args),
         Command::Search(args) => {
             let code = search::run(args)?;
             if code != 0 {
@@ -89,6 +99,8 @@ fn main() -> anyhow::Result<()> {
                 },
                 scan_threads: args.scan_threads,
                 auto_reconcile: !args.no_auto_reconcile,
+                content: !args.no_content,
+                content_workers: args.content_workers,
             })
         }
     }

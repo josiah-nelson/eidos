@@ -9,7 +9,57 @@
 
 use eidos_domain::{extension_of, FileAttributes, FileKind, ReasonCode};
 
-pub const POLICY_VERSION: u32 = 1;
+pub const POLICY_VERSION: u32 = 2;
+
+/// Reparse tags (winnt.h) that matter for the content policy. Values are
+/// ABI-stable.
+pub mod reparse {
+    pub const SYMLINK: u32 = 0xA000_000C;
+    pub const WIM: u32 = 0x8000_0008;
+    pub const DEDUP: u32 = 0x8000_0013;
+    pub const APPEXECLINK: u32 = 0x8000_001B;
+    pub const WCI: u32 = 0x8000_0018;
+    pub const STORAGE_SYNC: u32 = 0x8000_001E;
+    pub const ONEDRIVE: u32 = 0x8000_0021;
+    pub const AF_UNIX: u32 = 0x8000_0023;
+    pub const LX_FIFO: u32 = 0x8000_0024;
+    pub const LX_CHR: u32 = 0x8000_0025;
+    pub const LX_BLK: u32 = 0x8000_0026;
+    pub const LX_SYMLINK: u32 = 0xA000_001D;
+    pub const PROJFS: u32 = 0x9000_001C;
+    pub const PROJFS_TNG: u32 = 0x9000_0018;
+    /// `IO_REPARSE_TAG_CLOUD` family: `0x9000x01A` where `x` is a provider nibble.
+    pub const CLOUD: u32 = 0x9000_001A;
+    pub const CLOUD_MASK: u32 = 0x0000_F000;
+
+    pub fn is_cloud(tag: u32) -> bool {
+        (tag & !CLOUD_MASK) == CLOUD
+    }
+
+    /// Classify a *file* reparse tag for content processing.
+    pub fn content_rule(tag: u32) -> ReparseClass {
+        match tag {
+            0 => ReparseClass::Plain,
+            SYMLINK | LX_SYMLINK | APPEXECLINK => ReparseClass::Symlink,
+            AF_UNIX | LX_FIFO | LX_CHR | LX_BLK => ReparseClass::Special,
+            PROJFS | PROJFS_TNG | STORAGE_SYNC | ONEDRIVE => ReparseClass::Placeholder,
+            t if is_cloud(t) => ReparseClass::Placeholder,
+            // WIM/dedup/WCI-backed data reads transparently.
+            WIM | DEDUP | WCI => ReparseClass::Plain,
+            // Unknown tags: the data stream is usually real (custom filters);
+            // treat as readable and let sniffing decide.
+            _ => ReparseClass::Plain,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ReparseClass {
+        Plain,
+        Symlink,
+        Special,
+        Placeholder,
+    }
+}
 
 /// Context inherited down a directory chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,10 +131,34 @@ impl PolicyEngine {
         &self,
         name: &str,
         attributes: FileAttributes,
+        reparse_tag: u32,
         parent: &PolicyCtx,
     ) -> ContentDecision {
         if let Some((reason, rule)) = parent.inherited_content_exclusion {
             return ContentDecision::Excluded { reason, rule };
+        }
+        if attributes.is_reparse() || reparse_tag != 0 {
+            match reparse::content_rule(reparse_tag) {
+                reparse::ReparseClass::Symlink => {
+                    return ContentDecision::Excluded {
+                        reason: ReasonCode::Symlink,
+                        rule: "reparse-symlink",
+                    }
+                }
+                reparse::ReparseClass::Special => {
+                    return ContentDecision::Excluded {
+                        reason: ReasonCode::SpecialFile,
+                        rule: "reparse-special-file",
+                    }
+                }
+                reparse::ReparseClass::Placeholder => {
+                    return ContentDecision::Excluded {
+                        reason: ReasonCode::Placeholder,
+                        rule: "reparse-placeholder",
+                    }
+                }
+                reparse::ReparseClass::Plain => {}
+            }
         }
         let folded = fold(name);
         if parent.depth == 0
@@ -192,7 +266,7 @@ mod tests {
         let bin = p.directory("bin", &root);
         assert!(bin.inherited_content_exclusion.is_none());
         assert_eq!(
-            p.file("tool.cs", FileAttributes::default(), &bin),
+            p.file("tool.cs", FileAttributes::default(), 0, &bin),
             ContentDecision::Candidate
         );
     }
@@ -218,14 +292,14 @@ mod tests {
         let p = PolicyEngine::new();
         let root = PolicyCtx::root();
         assert!(matches!(
-            p.file("disk.vhdx", FileAttributes::default(), &root),
+            p.file("disk.vhdx", FileAttributes::default(), 0, &root),
             ContentDecision::Excluded {
                 reason: ReasonCode::VmDiskImage,
                 ..
             }
         ));
         assert!(matches!(
-            p.file("pagefile.sys", FileAttributes::default(), &root),
+            p.file("pagefile.sys", FileAttributes::default(), 0, &root),
             ContentDecision::Excluded {
                 reason: ReasonCode::SwapOrHibernation,
                 ..
@@ -234,22 +308,22 @@ mod tests {
         let sub = p.directory("x", &root);
         // Not at root: a file merely named pagefile.sys is a binary by extension.
         assert!(matches!(
-            p.file("pagefile.sys", FileAttributes::default(), &sub),
+            p.file("pagefile.sys", FileAttributes::default(), 0, &sub),
             ContentDecision::Excluded {
                 reason: ReasonCode::BinaryData,
                 ..
             }
         ));
         assert_eq!(
-            p.file("report.pdf", FileAttributes::default(), &root),
+            p.file("report.pdf", FileAttributes::default(), 0, &root),
             ContentDecision::Unsupported
         );
         assert_eq!(
-            p.file("notes.md", FileAttributes::default(), &root),
+            p.file("notes.md", FileAttributes::default(), 0, &root),
             ContentDecision::Candidate
         );
         assert_eq!(
-            p.file("README", FileAttributes::default(), &root),
+            p.file("README", FileAttributes::default(), 0, &root),
             ContentDecision::Candidate
         );
     }

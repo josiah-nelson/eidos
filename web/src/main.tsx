@@ -7,6 +7,7 @@ import SourcesPage from './pages/SourcesPage'
 import SourceDetailPage from './pages/SourceDetailPage'
 import BrowsePage from './pages/BrowsePage'
 import SearchPage from './pages/SearchPage'
+import ActivityPage from './pages/ActivityPage'
 import './styles.css'
 
 const queryClient = new QueryClient({
@@ -26,6 +27,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Navigate to="/search" replace /> },
       { path: 'search', element: <SearchPage /> },
+      { path: 'activity', element: <ActivityPage /> },
       { path: 'sources', element: <SourcesPage /> },
       { path: 'sources/:id', element: <SourceDetailPage /> },
       { path: 'browse/:objectId', element: <BrowsePage /> },

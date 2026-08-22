@@ -11,6 +11,7 @@ eidos-domain = { workspace = true }
 eidos-catalog = { workspace = true }
 eidos-scanner = { workspace = true }
 eidos-search = { workspace = true }
+eidos-content = { workspace = true }
 eidos-query = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }

@@ -34,7 +34,7 @@ editable.
 | `attr:` | `attr:hidden`, `attr:hidden,system`, `-attr:reparse` | readonly hidden system archive temporary sparse reparse compressed offline encrypted |
 | `source:` | `source:G`, `source:G,R`, `source:2` | configured source name or id |
 | `in:` | `in:o:123`, `in:o:123~2` | under an object id (optional max depth) |
-| `content:` | `content:zephyr`, `content:=ErrCode`, `content:"exact phrase"`, `content:/re/` | Milestone 4; rejected with an explanation until then |
+| `content:` | `content:zephyr`, `content:"build 4.2"`, `content:=ErrCode`, `content:~Err`, `content:/re/`, `content:/re/c` | literal text of indexed files. Plain value: tokenised phrase (case-insensitive; one word = term); `=` whole word, case-sensitive; `~` substring, case-sensitive; `/re/` regex (case-insensitive unless `/c`). Exact, substring, and regex clauses are verified against the stored original text and return line-aware snippets |
 
 ## Result mode and sort
 
@@ -56,3 +56,12 @@ are request parameters, not syntax. Directory predicates (`has:`, `files:`,
 - `has:` ranking: the tightest directories (those with no matching directory
   beneath them) come first; ancestors that match only through a child come
   second.
+- Content clauses run against the chunk index first and then compose with
+  every other clause (including `OR` and `-`) as a set of matching files.
+  Ranked and phrase clauses return the best 5,000 chunks; exact/substring/
+  regex clauses examine up to 20,000 candidate chunks. When either cap is
+  hit the response says so and `total.exact` is false — narrow the query
+  with metadata filters. Phrases do not match across chunk boundaries
+  (chunks are ≈16 KB, split on line ends).
+- Regexes with no required literal of three or more characters (for example
+  `/\d+/`) scan every chunk in scope; they are allowed but flagged.

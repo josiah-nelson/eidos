@@ -544,6 +544,7 @@ dependencies = [
  "anyhow",
  "clap",
  "eidos-catalog",
+ "eidos-content",
  "eidos-domain",
  "eidos-query",
  "eidos-scanner",
@@ -554,6 +555,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -610,6 +612,7 @@ name = "eidos-search"
 version = "0.5.0-dev"
 dependencies = [
  "eidos-catalog",
+ "eidos-content",
  "eidos-domain",
  "eidos-query",
  "eidos-scanner",
@@ -631,6 +634,7 @@ dependencies = [
  "anyhow",
  "axum",
  "eidos-catalog",
+ "eidos-content",
  "eidos-domain",
  "eidos-query",
  "eidos-scanner",
