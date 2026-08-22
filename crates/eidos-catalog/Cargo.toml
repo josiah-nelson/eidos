@@ -1,0 +1,23 @@
+[package]
+name = "eidos-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Canonical SQLite catalog: sources, objects, entries, generations, aggregates"
+
+[dependencies]
+eidos-domain = { workspace = true }
+eidos-scanner = { workspace = true }
+eidos-content = { workspace = true }
+zstd = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "eidos-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared identity, state, query AST, and result contracts for the filesystem indexer"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

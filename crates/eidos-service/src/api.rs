@@ -1,0 +1,772 @@
+//! HTTP API (Axum).
+//!
+//! Every listing is paginated server-side. Every source-level response
+//! carries completeness. Errors are JSON `{ "error": ..., "kind": ... }`.
+
+use crate::scanner::{start_scan, ScanProgressView, StartScanError};
+use crate::state::AppState;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use eidos_catalog::{
+    ChildSort, ChildrenPage, ChildrenResult, DirectoryAggregate, EntryRecord, ErrorRecord,
+    ExtensionCount, NewSource, ObjectRecord, PolicyDecisionRecord, ScanGenerationRecord,
+    SourceCounts, SourceRecord,
+};
+use eidos_domain::{ObjectId, SourceCompleteness, SourceId, SourceKind};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router {
+    let api = Router::new()
+        .route("/health", get(health))
+        .route("/sources", get(list_sources).post(add_source))
+        .route("/sources/{id}", get(get_source))
+        .route("/sources/{id}/scan", post(scan_source))
+        .route("/sources/{id}/scan/cancel", post(cancel_scan))
+        .route("/sources/{id}/errors", get(source_errors))
+        .route("/sources/{id}/exclusions", get(source_exclusions))
+        .route("/sources/{id}/generations", get(source_generations))
+        .route("/objects/{id}", get(get_object))
+        .route("/objects/{id}/children", get(children))
+        .route("/objects/{id}/extensions", get(extensions))
+        .route("/resolve", get(resolve))
+        .route("/search", post(search).get(search_get))
+        .route("/search/parse", get(search_parse))
+        .route("/index", get(index_status))
+        .with_state(state);
+    let mut app = Router::new().nest("/api", api);
+    if let Some(dir) = web_dir {
+        if dir.join("index.html").exists() {
+            let index = dir.join("index.html");
+            // `fallback` (not `not_found_service`) keeps the 200 status so
+            // deep links into the SPA are real pages, not 404s with a body.
+            let serve = tower_http::services::ServeDir::new(dir)
+                .fallback(tower_http::services::ServeFile::new(index));
+            app = app.fallback_service(serve);
+            tracing::info!(dir = %dir.display(), "serving web UI");
+        } else {
+            tracing::warn!(dir = %dir.display(), "web UI directory has no index.html; API only");
+        }
+    }
+    app.layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+// ----- errors --------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    kind: &'static str,
+    message: String,
+}
+
+impl ApiError {
+    fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            kind: "not_found",
+            message: msg.into(),
+        }
+    }
+    fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "bad_request",
+            message: msg.into(),
+        }
+    }
+    fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            kind: "conflict",
+            message: msg.into(),
+        }
+    }
+}
+
+impl From<eidos_catalog::CatalogError> for ApiError {
+    fn from(e: eidos_catalog::CatalogError) -> Self {
+        match e {
+            eidos_catalog::CatalogError::NotFound(m) => ApiError::not_found(m),
+            eidos_catalog::CatalogError::InvalidState(m) => ApiError::conflict(m),
+            other => ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                kind: "internal",
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = serde_json::json!({ "error": self.message, "kind": self.kind });
+        (self.status, Json(body)).into_response()
+    }
+}
+
+type ApiResult<T> = Result<Json<T>, ApiError>;
+
+// ----- health --------------------------------------------------------------
+
+#[derive(Serialize)]
+struct Health {
+    version: &'static str,
+    schema_version: u32,
+    host: String,
+    uptime_s: u64,
+    catalog_path: String,
+    sources: usize,
+    running_scans: usize,
+}
+
+async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
+    let sources = st.catalog.list_sources()?;
+    let running = st
+        .scans
+        .lock()
+        .values()
+        .filter(|p| !p.is_finished())
+        .count();
+    Ok(Json(Health {
+        version: env!("CARGO_PKG_VERSION"),
+        schema_version: eidos_domain::SCHEMA_VERSION,
+        host: st.host_name.clone(),
+        uptime_s: st.started_at.elapsed().as_secs(),
+        catalog_path: st.catalog.path().display().to_string(),
+        sources: sources.len(),
+        running_scans: running,
+    }))
+}
+
+// ----- sources -------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct SourceView {
+    pub source: SourceRecord,
+    pub counts: SourceCounts,
+    pub completeness: SourceCompleteness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan: Option<ScanProgressView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watcher: Option<crate::watcher::WatcherView>,
+}
+
+fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, ApiError> {
+    let counts = st.catalog.source_counts(s.id)?;
+    let listing_errors = st.catalog.published_listing_errors(s.id)?;
+    let mut completeness = eidos_catalog::read::completeness_from(&s, &counts, listing_errors);
+    let scan = st.scan_progress(s.id).map(|p| p.view());
+    let watcher = st.watcher_status(s.id).map(|w| w.view());
+    // A stored checkpoint only means "live" while a watcher is actually
+    // consuming it.
+    if completeness.freshness == eidos_domain::Freshness::Live
+        && !watcher.as_ref().is_some_and(|w| w.live)
+    {
+        completeness.freshness = eidos_domain::Freshness::Unknown;
+    }
+    Ok(SourceView {
+        source: s,
+        counts,
+        completeness,
+        scan,
+        watcher,
+    })
+}
+
+async fn list_sources(State(st): State<Arc<AppState>>) -> ApiResult<Vec<SourceView>> {
+    let st2 = st.clone();
+    let views = tokio::task::spawn_blocking(move || -> Result<Vec<SourceView>, ApiError> {
+        st2.catalog
+            .list_sources()?
+            .into_iter()
+            .map(|s| source_view(&st2, s))
+            .collect()
+    })
+    .await
+    .map_err(|e| ApiError::bad_request(e.to_string()))??;
+    Ok(Json(views))
+}
+
+#[derive(Deserialize)]
+struct AddSourceBody {
+    name: String,
+    root_path: String,
+    #[serde(default)]
+    kind: Option<SourceKind>,
+    #[serde(default)]
+    aliases: Vec<String>,
+    /// Start a scan immediately.
+    #[serde(default)]
+    scan: bool,
+}
+
+async fn add_source(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<AddSourceBody>,
+) -> Result<(StatusCode, Json<SourceView>), ApiError> {
+    if body.name.trim().is_empty() || body.root_path.trim().is_empty() {
+        return Err(ApiError::bad_request("name and root_path are required"));
+    }
+    let root_path = eidos_scanner::normalize_root(body.root_path.trim());
+    let root = std::path::Path::new(&root_path);
+    if !root.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "root_path is not an accessible directory: {root_path}"
+        )));
+    }
+    let kind = match body.kind {
+        Some(k) => k,
+        None => match st.lister.volume_info(root) {
+            Ok(v) if v.is_remote() => SourceKind::Smb,
+            Ok(v) if v.is_native_local() => SourceKind::WindowsLocal,
+            _ => SourceKind::WindowsGeneric,
+        },
+    };
+    if st.catalog.find_source_by_name(&body.name)?.is_some() {
+        return Err(ApiError::conflict(format!(
+            "source '{}' already exists",
+            body.name
+        )));
+    }
+    let id = st.catalog.add_source(&NewSource {
+        host_id: st.host_id,
+        name: body.name.clone(),
+        kind,
+        root_path: root_path.clone(),
+        aliases: body.aliases.clone(),
+    })?;
+    if let Ok(v) = st.lister.volume_info(root) {
+        st.catalog.upsert_volume(st.host_id, id, &v)?;
+    }
+    if body.scan {
+        let _ = start_scan(&st, id);
+    }
+    let s = st
+        .catalog
+        .get_source(id)?
+        .ok_or_else(|| ApiError::not_found("source vanished"))?;
+    Ok((StatusCode::CREATED, Json(source_view(&st, s)?)))
+}
+
+#[derive(Serialize)]
+struct SourceDetail {
+    #[serde(flatten)]
+    view: SourceView,
+    generations: Vec<ScanGenerationRecord>,
+    root_aggregate: Option<DirectoryAggregate>,
+    exclusions: Vec<ExclusionRow>,
+}
+
+#[derive(Serialize)]
+struct ExclusionRow {
+    stage: String,
+    reason: String,
+    count: u64,
+    bytes: u64,
+}
+
+async fn get_source(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult<SourceDetail> {
+    let sid = SourceId(id);
+    let s = st
+        .catalog
+        .get_source(sid)?
+        .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
+    let root_aggregate = match s.root_object_id {
+        Some(r) => st.catalog.directory_aggregate(r)?,
+        None => None,
+    };
+    let view = source_view(&st, s)?;
+    let generations = st.catalog.list_generations(sid, 20)?;
+    let exclusions = st
+        .catalog
+        .exclusion_summary(sid)?
+        .into_iter()
+        .map(|(stage, reason, count, bytes)| ExclusionRow {
+            stage,
+            reason,
+            count,
+            bytes,
+        })
+        .collect();
+    Ok(Json(SourceDetail {
+        view,
+        generations,
+        root_aggregate,
+        exclusions,
+    }))
+}
+
+async fn scan_source(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<(StatusCode, Json<ScanProgressView>), ApiError> {
+    let sid = SourceId(id);
+    st.catalog
+        .get_source(sid)?
+        .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
+    match start_scan(&st, sid) {
+        Ok(p) => Ok((StatusCode::ACCEPTED, Json(p.view()))),
+        Err(StartScanError::AlreadyRunning) => Err(ApiError::conflict("scan already running")),
+        Err(StartScanError::Catalog(e)) => Err(e.into()),
+    }
+}
+
+async fn cancel_scan(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult<ScanProgressView> {
+    let sid = SourceId(id);
+    let p = st
+        .scan_progress(sid)
+        .ok_or_else(|| ApiError::not_found("no scan running"))?;
+    p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(Json(p.view()))
+}
+
+#[derive(Deserialize)]
+struct ErrorsQuery {
+    #[serde(default)]
+    include_resolved: bool,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+fn default_limit() -> u32 {
+    200
+}
+
+async fn source_errors(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(q): Query<ErrorsQuery>,
+) -> ApiResult<Vec<ErrorRecord>> {
+    Ok(Json(st.catalog.list_errors(
+        Some(SourceId(id)),
+        q.include_resolved,
+        q.limit.min(5000),
+    )?))
+}
+
+async fn source_exclusions(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult<Vec<ExclusionRow>> {
+    Ok(Json(
+        st.catalog
+            .exclusion_summary(SourceId(id))?
+            .into_iter()
+            .map(|(stage, reason, count, bytes)| ExclusionRow {
+                stage,
+                reason,
+                count,
+                bytes,
+            })
+            .collect(),
+    ))
+}
+
+async fn source_generations(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult<Vec<ScanGenerationRecord>> {
+    Ok(Json(st.catalog.list_generations(SourceId(id), 50)?))
+}
+
+// ----- objects -------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ObjectDetail {
+    object: ObjectRecord,
+    path: Option<String>,
+    entries: Vec<EntryRecord>,
+    aggregate: Option<DirectoryAggregate>,
+    policy: Vec<PolicyDecisionRecord>,
+    source: SourceCompleteness,
+}
+
+async fn get_object(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult<ObjectDetail> {
+    let oid = ObjectId(id);
+    let object = st
+        .catalog
+        .get_object(oid)?
+        .ok_or_else(|| ApiError::not_found(format!("object {oid}")))?;
+    let path = st.catalog.render_path(oid)?;
+    let entries = st.catalog.entries_for_object(oid)?;
+    let aggregate = if object.kind.is_directory_like() {
+        st.catalog.directory_aggregate(oid)?
+    } else {
+        None
+    };
+    let policy = st.catalog.policy_decisions(oid)?;
+    let source = st.catalog.source_completeness(object.source_id)?;
+    Ok(Json(ObjectDetail {
+        object,
+        path,
+        entries,
+        aggregate,
+        policy,
+        source,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ChildrenQuery {
+    #[serde(default)]
+    sort: ChildSort,
+    #[serde(default)]
+    desc: bool,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default = "default_children_limit")]
+    limit: u32,
+    #[serde(default = "default_true")]
+    hidden: bool,
+}
+
+fn default_children_limit() -> u32 {
+    200
+}
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct ChildrenView {
+    #[serde(flatten)]
+    result: ChildrenResult,
+    path: Option<String>,
+    parent_id: Option<ObjectId>,
+    source: SourceCompleteness,
+}
+
+async fn children(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(q): Query<ChildrenQuery>,
+) -> ApiResult<ChildrenView> {
+    let oid = ObjectId(id);
+    let object = st
+        .catalog
+        .get_object(oid)?
+        .ok_or_else(|| ApiError::not_found(format!("object {oid}")))?;
+    if !object.kind.is_directory_like() {
+        return Err(ApiError::bad_request("object is not a directory"));
+    }
+    let page = ChildrenPage {
+        sort: q.sort,
+        descending: q.desc,
+        offset: q.offset,
+        limit: q.limit.clamp(1, 2000),
+        include_hidden: q.hidden,
+    };
+    let st2 = st.clone();
+    let result = tokio::task::spawn_blocking(move || st2.catalog.list_children(oid, &page))
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))??;
+    let path = st.catalog.render_path(oid)?;
+    let parent_id = st
+        .catalog
+        .entries_for_object(oid)?
+        .first()
+        .and_then(|e| e.parent_id);
+    let source = st.catalog.source_completeness(object.source_id)?;
+    Ok(Json(ChildrenView {
+        result,
+        path,
+        parent_id,
+        source,
+    }))
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    #[serde(default = "default_ext_limit")]
+    limit: u32,
+}
+fn default_ext_limit() -> u32 {
+    50
+}
+
+async fn extensions(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(q): Query<LimitQuery>,
+) -> ApiResult<Vec<ExtensionCount>> {
+    Ok(Json(
+        st.catalog
+            .extension_counts(ObjectId(id), q.limit.min(1000))?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct ResolveQuery {
+    source: i64,
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Serialize)]
+struct ResolveView {
+    object_id: ObjectId,
+    path: Option<String>,
+}
+
+// ----- search --------------------------------------------------------------
+
+/// Body of `POST /api/search`. Either `q` (syntax) or `query` (AST) must be
+/// present; when both are given the AST wins.
+#[derive(Deserialize)]
+struct SearchBody {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    query: Option<eidos_domain::Query>,
+    #[serde(default)]
+    mode: eidos_domain::ResultMode,
+    #[serde(default)]
+    sort: eidos_domain::Sort,
+    #[serde(default = "default_search_limit")]
+    limit: u32,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    explain: bool,
+    #[serde(default)]
+    facets: Vec<eidos_domain::FacetRequest>,
+    #[serde(default)]
+    include_retired: bool,
+}
+
+fn default_search_limit() -> u32 {
+    50
+}
+
+#[derive(Serialize)]
+struct SearchView {
+    #[serde(flatten)]
+    response: eidos_domain::SearchResponse,
+    /// The compiled AST (editable interpretation).
+    query: eidos_domain::Query,
+    /// Readable rendering of the AST in query syntax.
+    rendered: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
+}
+
+fn build_request(body: SearchBody) -> Result<(eidos_domain::SearchRequest, Vec<String>), ApiError> {
+    let (query, notes) = match (body.query, body.q) {
+        (Some(q), _) => (q, Vec::new()),
+        (None, Some(text)) => {
+            let parsed =
+                eidos_query::parse(&text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            (parsed.query, parsed.notes)
+        }
+        (None, None) => (
+            eidos_domain::Query::All,
+            vec!["empty query matches everything".into()],
+        ),
+    };
+    Ok((
+        eidos_domain::SearchRequest {
+            query,
+            mode: body.mode,
+            sort: body.sort,
+            limit: body.limit,
+            cursor: body.cursor,
+            explain: body.explain,
+            snippets: true,
+            facets: body.facets,
+            include_retired: body.include_retired,
+        },
+        notes,
+    ))
+}
+
+async fn run_search(st: Arc<AppState>, body: SearchBody) -> ApiResult<SearchView> {
+    let (req, notes) = build_request(body)?;
+    let query = req.query.clone();
+    let rendered = eidos_query::render(&query);
+    let st2 = st.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        eidos_search::exec::search(&st2.index, &st2.catalog, &req, &st2.exec_opts)
+    })
+    .await
+    .map_err(|e| ApiError::bad_request(e.to_string()))?
+    .map_err(search_error)?;
+    Ok(Json(SearchView {
+        response,
+        query,
+        rendered,
+        notes,
+    }))
+}
+
+fn search_error(e: eidos_search::SearchError) -> ApiError {
+    match e {
+        eidos_search::SearchError::Query(q) => ApiError {
+            status: StatusCode::BAD_REQUEST,
+            kind: "query",
+            message: q.to_string(),
+        },
+        eidos_search::SearchError::Catalog(c) => c.into(),
+        other => ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            kind: "search",
+            message: other.to_string(),
+        },
+    }
+}
+
+async fn search(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<SearchBody>,
+) -> ApiResult<SearchView> {
+    run_search(st, body).await
+}
+
+#[derive(Deserialize)]
+struct SearchGetQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    mode: Option<eidos_domain::ResultMode>,
+    #[serde(default)]
+    sort: Option<eidos_domain::SortField>,
+    #[serde(default)]
+    desc: bool,
+    #[serde(default = "default_search_limit")]
+    limit: u32,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    explain: bool,
+    /// Comma-separated facet fields.
+    #[serde(default)]
+    facets: String,
+}
+
+async fn search_get(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<SearchGetQuery>,
+) -> ApiResult<SearchView> {
+    let facets = q
+        .facets
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            serde_json::from_value::<eidos_domain::FacetField>(serde_json::Value::String(
+                s.to_string(),
+            ))
+            .ok()
+        })
+        .map(|field| eidos_domain::FacetRequest { field, limit: 20 })
+        .collect();
+    run_search(
+        st,
+        SearchBody {
+            q: Some(q.q),
+            query: None,
+            mode: q.mode.unwrap_or_default(),
+            sort: eidos_domain::Sort {
+                field: q.sort.unwrap_or_default(),
+                descending: q.desc,
+            },
+            limit: q.limit,
+            cursor: q.cursor,
+            explain: q.explain,
+            facets,
+            include_retired: false,
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct ParseQuery {
+    #[serde(default)]
+    q: String,
+}
+
+#[derive(Serialize)]
+struct ParseView {
+    query: eidos_domain::Query,
+    rendered: String,
+    notes: Vec<String>,
+    needs_content: bool,
+}
+
+async fn search_parse(Query(q): Query<ParseQuery>) -> ApiResult<ParseView> {
+    let parsed = eidos_query::parse(&q.q).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let rendered = eidos_query::render(&parsed.query);
+    let needs_content = parsed.query.needs_content();
+    Ok(Json(ParseView {
+        query: parsed.query,
+        rendered,
+        notes: parsed.notes,
+        needs_content,
+    }))
+}
+
+#[derive(Serialize)]
+struct IndexStatus {
+    follower: crate::follower::FollowerView,
+    sources: Vec<IndexSourceState>,
+}
+
+#[derive(Serialize)]
+struct IndexSourceState {
+    source_id: SourceId,
+    name: String,
+    published_generation: Option<i64>,
+    indexed_generation: Option<i64>,
+    documents: u64,
+    in_sync: bool,
+}
+
+async fn index_status(State(st): State<Arc<AppState>>) -> ApiResult<IndexStatus> {
+    let mut sources = Vec::new();
+    for s in st.catalog.list_sources()? {
+        let p = st
+            .catalog
+            .projection_source(eidos_search::PROJECTION_NAME, s.id)?;
+        sources.push(IndexSourceState {
+            source_id: s.id,
+            name: s.name.clone(),
+            published_generation: s.published_generation,
+            indexed_generation: p.as_ref().map(|p| p.generation),
+            documents: p.as_ref().map(|p| p.documents).unwrap_or(0),
+            in_sync: p
+                .as_ref()
+                .map(|p| Some(p.generation) == s.published_generation)
+                .unwrap_or(false),
+        });
+    }
+    Ok(Json(IndexStatus {
+        follower: st.follower.view(&st),
+        sources,
+    }))
+}
+
+async fn resolve(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ResolveQuery>,
+) -> ApiResult<ResolveView> {
+    let id = st
+        .catalog
+        .resolve_relative(SourceId(q.source), &q.path)?
+        .ok_or_else(|| ApiError::not_found(format!("path not in catalog: {}", q.path)))?;
+    Ok(Json(ResolveView {
+        object_id: id,
+        path: st.catalog.render_path(id)?,
+    }))
+}

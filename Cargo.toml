@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/eidos-domain",
+    "crates/eidos-catalog",
+    "crates/eidos-scanner",
+    "crates/eidos-content",
+    "crates/eidos-search",
+    "crates/eidos-query",
+    "crates/eidos-service",
+    "crates/eidos-cli",
+]
+
+[workspace.package]
+version = "0.5.0-dev"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/josiah-nelson/eidos"
+
+[workspace.dependencies]
+eidos-domain = { path = "crates/eidos-domain" }
+eidos-catalog = { path = "crates/eidos-catalog" }
+eidos-scanner = { path = "crates/eidos-scanner" }
+eidos-content = { path = "crates/eidos-content" }
+eidos-search = { path = "crates/eidos-search" }
+eidos-query = { path = "crates/eidos-query" }
+eidos-service = { path = "crates/eidos-service" }
+
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util"] }
+axum = { version = "0.8", features = ["json", "query", "tokio", "http1"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs", "compression-gzip"] }
+rusqlite = { version = "0.40", features = ["bundled", "blob"] }
+tantivy = "0.26"
+blake3 = "1.8"
+clap = { version = "4.6", features = ["derive", "env"] }
+regex = "1.13"
+regex-syntax = "0.8"
+encoding_rs = "0.8"
+zstd = "0.13"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+memchr = "2.8"
+bytes = "1.12"
+tempfile = "3.27"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_System_SystemServices",
+] }
+
+[profile.release]
+debug = 1
+codegen-units = 4
+lto = "thin"
+
+[profile.bench]
+inherits = "release"

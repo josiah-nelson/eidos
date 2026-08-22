@@ -1,0 +1,25 @@
+[package]
+name = "eidos-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "eidos"
+path = "src/main.rs"
+
+[dependencies]
+eidos-domain = { workspace = true }
+eidos-scanner = { workspace = true }
+eidos-catalog = { workspace = true }
+eidos-service = { workspace = true }
+eidos-search = { workspace = true }
+eidos-query = { workspace = true }
+ureq = { version = "3.4", features = ["json"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "eidos-content"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Streaming literal-text extraction: sniffing, decoding, chunking, hashing"
+
+[dependencies]
+eidos-domain = { workspace = true }
+encoding_rs = { workspace = true }
+blake3 = { workspace = true }
+memchr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

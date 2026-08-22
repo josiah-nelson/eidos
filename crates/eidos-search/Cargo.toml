@@ -1,0 +1,24 @@
+[package]
+name = "eidos-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tantivy catalog and content indexes: schema, projection follower, retrieval"
+
+[dependencies]
+eidos-domain = { workspace = true }
+eidos-catalog = { workspace = true }
+tantivy = { workspace = true }
+regex = { workspace = true }
+regex-syntax = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+eidos-scanner = { workspace = true }
+eidos-query = { workspace = true }

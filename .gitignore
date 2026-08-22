@@ -1,0 +1,23 @@
+# Build output
+/target
+/web/node_modules
+/web/dist
+
+# Local runtime state (catalog, indexes) and raw benchmark output
+/data
+/bench-results
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Private planning documents, work notes, and session prompts.
+# Public documentation lives in docs/ and is distilled from these.
+/notes
+/CLAUDE.md
+/AGENTS.md
+/.claude
+
+# Secrets and local overrides
+.env
+*.local
