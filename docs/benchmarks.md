@@ -92,12 +92,68 @@ An early run showed a flat ≈40 ms floor per query caused by grouped object
 counts in the completeness join; completeness now reads the root aggregate
 (O(1)).
 
+## Content crawl (service workers, volumes G + R, 2026-08-22)
+
+`eidos serve --content-workers 4 --no-auto-reconcile`; G budget 3 readers,
+R (HDD) 1 reader for the first 8.5 minutes, then 3. The two SMB shares had
+content disabled. Warm metadata cache; file data mostly cold.
+
+| Metric | Value |
+|---|---:|
+| candidate files (after policy exclusions) | 97,031 |
+| indexed (full coverage) | 58,691 |
+| sniffed as binary (`unsupported`) | 38,338 |
+| failed (access denied: files held by a running VM) | 2 |
+| transient retries | 0 |
+| literal text read and hashed | 28.84 GiB |
+| chunk documents | 1,821,820 |
+| index commits | 310 |
+| wall time until both sources reported `content_complete` | ≈ 17 min |
+| sustained throughput on large files | 45–52 MiB/s |
+| content index on disk | 7.1 GB |
+| catalog growth (stored zstd chunks + records) | 1.9 GB → 8.5 GB |
+
+Small files are I/O-bound on the HDD: with one reader R processed ≈15 tiny
+extensionless files per second (its random-read rate); three readers
+cleared the remaining 12 k in two minutes. Large logs stream at the
+extractor's rate regardless of reader count.
+
+## Query latency on the full catalog (4 sources, 4.15 M entries, 1.82 M chunks)
+
+Same `eidos bench search` run as above but on the catalog with both SMB
+shares loaded (30 iterations per query, release, idle machine):
+
+| Family | Queries | p50 | p95 | p99 | max |
+|---|---|---:|---:|---:|---:|
+| metadata | `ext:cs` (27,660), `ext:dmp`, `size:>1G`, `mtime:>=30d ext:log`, `ext:log size:>100M`, `state:excluded` (2,154,278) | 17 ms | 87 ms | 91 ms | 98 ms |
+| directory | `has:idb has:cs`, `kind:dir subtree:>1G`, `kind:dir files:>1000` | 23 ms | 31 ms | 35 ms | 35 ms |
+| name | `readme` (12,306), `name:config` (31,436), `*.json` (148,482), three ranked terms, `name:=README.md` (8,484) | 80 ms | **1,878 ms** | 1,931 ms | 1,977 ms |
+| regex (name/path) | `name:/postgresql-.*\.log$/` (191), `name:/^[A-Z]{3}-\d{4}/c`, `path:/\\bin\\/ ext:dll` (6,188) | 1,810 ms | **4,191 ms** | 4,198 ms | 4,258 ms |
+| content (ranked/phrase) | `content:error` (234), `content:"connection refused"` (30), `content:exception ext:log mtime:>=365d` (55) | 37 ms | **54 ms** ✓ | 57 ms | 60 ms |
+| content-exact | `content:=Exception` (72), `content:~localhost:` (173) | 1,454 ms | **1,502 ms** | 1,535 ms | 1,564 ms |
+| content-regex | `content:/timed? ?out after \d+/` (5), `content:/[A-Z][a-z]+Exception: /c ext:log` (117) | 1,352 ms | **1,403 ms** | 1,416 ms | 1,422 ms |
+
+Reading: ranked content retrieval meets its gate at first try. Everything
+that walks a term dictionary does not scale from 125 k to 4.15 M entries:
+an unanchored name/path regex or substring visits every term of the folded
+dictionary (≈3 M unique names), so 40 ms became 1.9 s. Verified content
+clauses are bounded by verification cost: common trigrams (`exception`)
+yield far more than the 20,000-candidate cap, and fetching and checking
+20 k stored chunks serially costs ≈1 s. Both are addressed next (name/path
+trigram candidates with fast-field verification; parallel chunk
+verification and a token pre-filter for whole-word literals). An
+IPv4-shaped regex with nested repetitions also exceeded the FST automaton's
+1,000-state limit and was rejected rather than executed.
+
 ## Gates status (v0.5)
 
 | Gate | Target | Measured |
 |---|---|---|
 | complete local metadata scan | < 30 s | 3.5–4.5 s warm (cold not yet measured) |
 | incremental metadata visibility | < 2 s | 0.5 s |
-| metadata query p95 | < 50 ms | 3.9 ms |
-| selective name/path regex p95 | < 250 ms | 73 ms |
-| content query p95 / 26 GB in 30 min | < 150 ms / 30 min | not yet measured (milestone 4) |
+| metadata query p95 (G+R catalog) | < 50 ms | 3.9 ms (87 ms with 4.15 M entries, driven by exact counts of 2 M-hit queries) |
+| selective name/path regex p95 | < 250 ms | 73 ms on G+R; 4.2 s on 4.15 M entries — being fixed |
+| multi-GB files with bounded memory | required | 2.14 GiB at 8.6 MiB peak working set |
+| candidate content indexed | 30 min | ≈ 17 min for 28.8 GiB |
+| ordinary content query p95 | < 150 ms | 54 ms |
+| selective content regex p95 | < 250 ms | 1.4 s — being fixed |
