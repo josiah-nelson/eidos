@@ -44,6 +44,9 @@ pub struct CatalogIndex {
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
     fields: schema::Fields,
+    /// Set when `open` (re)created the directory: the catalog's recorded
+    /// projection state is then stale and every source must be rebuilt.
+    recreated: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for CatalogIndex {
@@ -110,6 +113,7 @@ impl CatalogIndex {
             reader,
             writer: Mutex::new(writer),
             fields,
+            recreated: std::sync::atomic::AtomicBool::new(needs_create),
         }))
     }
 
@@ -145,5 +149,11 @@ impl CatalogIndex {
     /// Whether the index was just (re)created and is empty.
     pub fn is_empty(&self) -> bool {
         self.num_docs() == 0
+    }
+
+    /// True once after a (re)creation; `sync_sources` consumes it.
+    pub fn take_recreated(&self) -> bool {
+        self.recreated
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 }

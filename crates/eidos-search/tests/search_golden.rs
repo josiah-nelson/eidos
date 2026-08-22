@@ -451,3 +451,52 @@ fn invalid_queries_error_cleanly() {
     };
     assert!(search(&fx.index, &fx.catalog, &req, &ExecOptions::default()).is_err());
 }
+
+#[test]
+fn verification_clauses_are_rejected_inside_or_and_not() {
+    let fx = fixture();
+    for q in [
+        "ext:cs -name:=Main.cs",
+        "ext:cs OR name:~Main",
+        "-name:/main/c",
+        "-has:cs>=2",
+    ] {
+        let parsed = parse(q).unwrap();
+        let req = SearchRequest::new(parsed.query);
+        let err = search(&fx.index, &fx.catalog, &req, &ExecOptions::default())
+            .err()
+            .unwrap_or_else(|| panic!("{q} should be rejected"));
+        assert!(
+            err.to_string().contains("inside OR or NOT"),
+            "{q}: {err}"
+        );
+    }
+    // Case-insensitive substring/glob/regex still work there, exactly.
+    assert_eq!(fx.names("ext:cs -path:util"), vec!["Main.cs", "Program.cs"]);
+    assert_eq!(
+        fx.names("ext:cs -name:/^main/"),
+        vec!["Helpers.cs", "Program.cs"]
+    );
+    assert_eq!(
+        fx.names("(name:helpers OR name:/^main/) ext:cs"),
+        vec!["Helpers.cs", "Main.cs"]
+    );
+}
+
+#[test]
+fn recreated_index_is_rebuilt_despite_recorded_generation() {
+    let fx = fixture();
+    assert!(fx.run("ext:cs").total.value > 0);
+    let dir = fx.index.dir().to_path_buf();
+    drop(fx.index.clone());
+    // Simulate a schema bump: wipe the index files but keep the catalog's
+    // projection state.
+    let meta = dir.join("eidos-schema.json");
+    std::fs::remove_file(&meta).unwrap();
+    let reopened = CatalogIndex::open(&dir).unwrap();
+    assert!(reopened.is_empty());
+    let rebuilt = reopened.sync_sources(&fx.catalog).unwrap();
+    assert_eq!(rebuilt.len(), 1, "recreated index must rebuild the source");
+    reopened.reload().unwrap();
+    assert!(reopened.num_docs() > 0);
+}

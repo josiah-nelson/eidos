@@ -47,9 +47,16 @@ are request parameters, not syntax. Directory predicates (`has:`, `files:`,
 
 - Name/path matching is case-insensitive unless a case-sensitive modifier is
   used; case-sensitive modes are verified against the stored original text.
-- Regexes are unanchored unless you write `^`/`$`. They run over the folded
-  name/path dictionary; patterns without any required literal are allowed
-  but flagged as broad.
+- Regexes are unanchored unless you write `^`/`$`. Substring, glob, and
+  regex clauses on names and paths find candidates through folded trigrams
+  of their literal parts and verify them; patterns without any literal of
+  three or more characters walk the folded dictionary instead and are
+  flagged as broad. `*.ext` is an extension filter.
+- Inside `OR` and `-`/`NOT`, substring/glob/regex clauses run as exact
+  dictionary automata (correct, slower on large catalogs), and clauses that
+  need verification — case-sensitive modes (`=`, `~`, `/re/c`), `in:` with a
+  depth, `has:` with a count — are rejected with an explanation rather
+  than applied to the wrong set. Put them at the top level.
 - Every response carries per-source completeness. Results from an
   `enumerating`, `degraded`, `offline`, or `stale` source are partial and the
   UI/CLI say so; the CLI exits with status 2 in that case.

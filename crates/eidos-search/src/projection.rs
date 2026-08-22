@@ -79,6 +79,13 @@ impl CatalogIndex {
     /// projection's. Returns the sources rebuilt.
     pub fn sync_sources(&self, catalog: &Catalog) -> Result<Vec<RebuildStats>> {
         let mut out = Vec::new();
+        // A recreated (empty) index invalidates the catalog's record of what
+        // was built; without this, equal generation numbers would make an
+        // empty index look synchronised.
+        let force = self.take_recreated();
+        if force {
+            tracing::warn!("catalog index was recreated; rebuilding every source");
+        }
         for s in catalog.list_sources()? {
             let published = match s.published_generation {
                 Some(g) => g,
@@ -94,7 +101,7 @@ impl CatalogIndex {
                 .projection_source(PROJECTION_NAME, s.id)?
                 .map(|p| p.generation)
                 .unwrap_or(-1);
-            if built != published {
+            if force || built != published {
                 out.push(self.rebuild_source(catalog, s.id)?);
             }
         }
