@@ -43,10 +43,28 @@ tens of microseconds per document.
   count — are rejected with an explanation. Previously they were silently
   wrong there.
 - `*.ext` globs compile to the extension filter.
-- Content: a whole-word literal that is a single token additionally
-  requires that token in the `text` field (far more selective than its
-  trigrams); candidate chunks are verified on 8 threads with a reader pool
-  of 12 connections.
+- Verification work is parallel: fast-field passes and stored-document
+  fetches run on up to 8 threads, as does chunk verification (reader pool
+  of 12 connections).
+- Regexes the FST automaton cannot compile (nested repetitions such as an
+  IPv4 shape) walk the folded dictionary with the `regex` crate and match
+  the resulting terms exactly, instead of scanning documents under a
+  candidate cap that could drop matches.
+- Content index schema 2 adds `text_cs`, the same tokenisation without case
+  folding. A whole-word literal that is a single alphanumeric token
+  (`content:=Tq`-style identifiers — the Q-2 case) is an exact term query
+  on `text_cs` (or on `text` when case-insensitive) with no verification at
+  all; "whole word" therefore means alphanumeric boundaries, matching the
+  tokenizer. Multi-word literals keep trigram candidates plus verification.
+- An empty content index (schema change, lost directory) is rebuilt from the
+  catalog's stored chunks in a background thread — no source file is read —
+  and every search reports content as incomplete with a warning until the
+  rebuild commits. Likewise a recreated catalog index forces a rebuild of
+  every source even when the catalog's projection record still shows the
+  current generation (which previously left an empty index looking
+  synchronised).
+- Explain steps report candidate-selection and verification timings
+  separately.
 
 ## Consequences
 
