@@ -120,7 +120,9 @@ impl Catalog {
 
 fn open_connection(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    // Scan sessions hold their own write connection through batch commits and
+    // the aggregate rebuild at publish; the shared writer must outwait them.
+    conn.busy_timeout(std::time::Duration::from_secs(120))?;
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
         tracing::warn!(mode, "catalog could not enable WAL");

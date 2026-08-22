@@ -188,6 +188,9 @@ fn saturated_sources(state: &AppState) -> Vec<SourceId> {
         .collect()
 }
 
+/// Jobs claimed per worker round trip (all from one source).
+pub const CLAIM_BATCH: u32 = 16;
+
 fn worker_loop(state: &AppState, name: &str) {
     let status = &state.content_workers;
     let limits = Limits::default();
@@ -200,109 +203,112 @@ fn worker_loop(state: &AppState, name: &str) {
             continue;
         }
         let exclude = saturated_sources(state);
-        let job = match state
-            .catalog
-            .claim_job_filtered(&[JobStage::ContentText], name, &exclude)
-        {
-            Ok(Some(j)) => j,
-            Ok(None) => {
-                std::thread::sleep(IDLE_SLEEP);
-                continue;
+        let jobs =
+            match state
+                .catalog
+                .claim_jobs(&[JobStage::ContentText], name, &exclude, CLAIM_BATCH)
+            {
+                Ok(j) if j.is_empty() => {
+                    std::thread::sleep(IDLE_SLEEP);
+                    continue;
+                }
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::error!(error = %e, "claim_jobs failed");
+                    *status.last_error.lock() = Some(e.to_string());
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+        let source = jobs[0].source_id;
+        *status.running_per_source.lock().entry(source).or_default() += 1;
+        for job in jobs {
+            if state.shutdown.load(Ordering::Relaxed) {
+                // Leave the rest `running`; startup re-queues them.
+                break;
             }
-            Err(e) => {
-                tracing::error!(error = %e, "claim_job failed");
+            let object = match job.object_id {
+                Some(o) => o,
+                None => {
+                    let _ = state.catalog.complete_job(job.id);
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            status.current.lock().insert(
+                name.to_string(),
+                (
+                    started,
+                    WorkerCurrent {
+                        worker: name.to_string(),
+                        source_id: job.source_id,
+                        object_id: object,
+                        path: String::new(),
+                        size: job.estimated_cost,
+                        started_ms_ago: 0,
+                    },
+                ),
+            );
+            let result = process_object(
+                &state.catalog,
+                &state.content_index,
+                object,
+                job.object_generation,
+                &limits,
+                Some(job.id),
+            );
+            status.current.lock().remove(name);
+            let outcome = match result {
+                Ok(ProcessResult::Indexed(st)) => {
+                    status.files_indexed.fetch_add(1, Ordering::Relaxed);
+                    status.record_bytes(st.bytes);
+                    status
+                        .chunks_written
+                        .fetch_add(st.chunks as u64, Ordering::Relaxed);
+                    status.pending_publish.lock().push(object);
+                    Ok(())
+                }
+                Ok(ProcessResult::Done(st)) => {
+                    if st.state == eidos_domain::ContentState::Failed {
+                        status.files_failed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        status.files_unsupported.fetch_add(1, Ordering::Relaxed);
+                    }
+                    status.record_bytes(st.bytes);
+                    Ok(())
+                }
+                Ok(ProcessResult::Skipped(why)) => {
+                    tracing::debug!(object = object.0, why, "content job skipped");
+                    status.files_skipped.fetch_add(1, Ordering::Relaxed);
+                    state.catalog.complete_job(job.id)
+                }
+                Ok(ProcessResult::Disabled) => state.catalog.delete_job(job.id),
+                Ok(ProcessResult::Retry { class, error }) => {
+                    status.files_retried.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(object = object.0, %error, "content extraction will retry");
+                    state.catalog.fail_job(job.id, class, &error).map(|_| ())
+                }
+                Err(e) => {
+                    status.files_retried.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(object = object.0, error = %e, "content pipeline error");
+                    state
+                        .catalog
+                        .fail_job(
+                            job.id,
+                            eidos_domain::FailureClass::Transient,
+                            &e.to_string(),
+                        )
+                        .map(|_| ())
+                }
+            };
+            if let Err(e) = outcome {
+                tracing::error!(error = %e, "job bookkeeping failed");
                 *status.last_error.lock() = Some(e.to_string());
-                std::thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-        };
-        let object = match job.object_id {
-            Some(o) => o,
-            None => {
-                let _ = state.catalog.complete_job(job.id);
-                continue;
-            }
-        };
-        *status
-            .running_per_source
-            .lock()
-            .entry(job.source_id)
-            .or_default() += 1;
-        let started = Instant::now();
-        status.current.lock().insert(
-            name.to_string(),
-            (
-                started,
-                WorkerCurrent {
-                    worker: name.to_string(),
-                    source_id: job.source_id,
-                    object_id: object,
-                    path: String::new(),
-                    size: job.estimated_cost,
-                    started_ms_ago: 0,
-                },
-            ),
-        );
-        let result = process_object(
-            &state.catalog,
-            &state.content_index,
-            object,
-            job.object_generation,
-            &limits,
-        );
-        status.current.lock().remove(name);
-        {
-            let mut r = status.running_per_source.lock();
-            if let Some(n) = r.get_mut(&job.source_id) {
-                *n = n.saturating_sub(1);
             }
         }
-        let outcome = match result {
-            Ok(ProcessResult::Indexed(st)) => {
-                status.files_indexed.fetch_add(1, Ordering::Relaxed);
-                status.record_bytes(st.bytes);
-                status
-                    .chunks_written
-                    .fetch_add(st.chunks as u64, Ordering::Relaxed);
-                status.pending_publish.lock().push(object);
-                state.catalog.complete_job(job.id)
-            }
-            Ok(ProcessResult::Done(st)) => {
-                if st.state == eidos_domain::ContentState::Failed {
-                    status.files_failed.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    status.files_unsupported.fetch_add(1, Ordering::Relaxed);
-                }
-                status.record_bytes(st.bytes);
-                state.catalog.complete_job(job.id)
-            }
-            Ok(ProcessResult::Skipped(why)) => {
-                tracing::debug!(object = object.0, why, "content job skipped");
-                status.files_skipped.fetch_add(1, Ordering::Relaxed);
-                state.catalog.complete_job(job.id)
-            }
-            Ok(ProcessResult::Disabled) => state.catalog.delete_job(job.id),
-            Ok(ProcessResult::Retry { class, error }) => {
-                status.files_retried.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(object = object.0, %error, "content extraction will retry");
-                state.catalog.fail_job(job.id, class, &error).map(|_| ())
-            }
-            Err(e) => {
-                status.files_retried.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(object = object.0, error = %e, "content pipeline error");
-                state
-                    .catalog
-                    .fail_job(
-                        job.id,
-                        eidos_domain::FailureClass::Transient,
-                        &e.to_string(),
-                    )
-                    .map(|_| ())
-            }
-        };
-        if let Err(e) = outcome {
-            tracing::error!(error = %e, "job bookkeeping failed");
-            *status.last_error.lock() = Some(e.to_string());
+        let mut r = status.running_per_source.lock();
+        if let Some(n) = r.get_mut(&source) {
+            *n = n.saturating_sub(1);
         }
     }
 }

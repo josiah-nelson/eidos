@@ -176,8 +176,24 @@ impl Catalog {
         worker: &str,
         exclude_sources: &[SourceId],
     ) -> Result<Option<JobRecord>> {
-        if stages.is_empty() {
-            return Ok(None);
+        Ok(self
+            .claim_jobs(stages, worker, exclude_sources, 1)?
+            .into_iter()
+            .next())
+    }
+
+    /// Claim up to `limit` due jobs in one transaction. All claimed jobs
+    /// belong to the source of the highest-priority one, so a worker's
+    /// batch counts once against that source's concurrency budget.
+    pub fn claim_jobs(
+        &self,
+        stages: &[JobStage],
+        worker: &str,
+        exclude_sources: &[SourceId],
+        limit: u32,
+    ) -> Result<Vec<JobRecord>> {
+        if stages.is_empty() || limit == 0 {
+            return Ok(Vec::new());
         }
         let stage_list = stages
             .iter()
@@ -203,23 +219,46 @@ impl Catalog {
                 "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued' AND stage IN ({stage_list}) AND scheduled_at <= ?1{exclude}
                  ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT 1"
             );
-            let job = tx.query_row(&sql, params![now], job_from_row).optional()?;
-            let job = match job {
+            let first = tx.query_row(&sql, params![now], job_from_row).optional()?;
+            let first = match first {
                 Some(j) => j,
-                None => return Ok(None),
+                None => return Ok(Vec::new()),
             };
-            tx.execute(
-                "UPDATE jobs SET state = 'running', attempts = attempts + 1, started_at = ?2, worker = ?3 WHERE job_id = ?1",
-                params![job.id.0, now, worker],
-            )?;
+            let mut jobs = vec![first];
+            if limit > 1 {
+                let more_sql = format!(
+                    "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued' AND stage IN ({stage_list}) AND scheduled_at <= ?1
+                       AND source_id = ?2 AND job_id != ?3
+                     ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT ?4"
+                );
+                let more: Vec<JobRecord> = tx
+                    .prepare(&more_sql)?
+                    .query_map(
+                        params![now, jobs[0].source_id.0, jobs[0].id.0, (limit - 1) as i64],
+                        job_from_row,
+                    )?
+                    .collect::<rusqlite::Result<_>>()?;
+                jobs.extend(more);
+            }
+            {
+                let mut upd = tx.prepare_cached(
+                    "UPDATE jobs SET state = 'running', attempts = attempts + 1, started_at = ?2, worker = ?3 WHERE job_id = ?1",
+                )?;
+                for j in &jobs {
+                    upd.execute(params![j.id.0, now, worker])?;
+                }
+            }
             tx.commit()?;
-            Ok(Some(JobRecord {
-                state: JobState::Running,
-                attempts: job.attempts + 1,
-                started_at: Some(UnixNanos(now)),
-                worker: Some(worker.to_string()),
-                ..job
-            }))
+            Ok(jobs
+                .into_iter()
+                .map(|job| JobRecord {
+                    state: JobState::Running,
+                    attempts: job.attempts + 1,
+                    started_at: Some(UnixNanos(now)),
+                    worker: Some(worker.to_string()),
+                    ..job
+                })
+                .collect())
         })
     }
 

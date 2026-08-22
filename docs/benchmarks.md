@@ -58,6 +58,22 @@ Catalog after all four sources: 1.87 GB.
 | restart catch-up (2 changes made while stopped) | 52 ms |
 | journal overflow → reconcile → live again | < 15 s |
 
+## Content streaming (`eidos bench content`, single file, null sink, 2026-08-22)
+
+The extractor streams `open → sniff → decode → chunk → hash` with a 1 MiB
+read buffer and at most one chunk in flight; memory does not depend on file
+size.
+
+| Fixture | Size | Encoding | Chunks | Lines | Time | Throughput | Peak working set |
+|---|---:|---|---:|---:|---:|---:|---:|
+| PostgreSQL log (volume G) | 2.14 GiB | UTF-8 | 138,975 | 9.45 M | 3.0 s | 732 MB/s | 8.6 MiB |
+| Application XML log (volume R) | 1.05 GiB | UTF-8 | 68,875 | 45.0 M | 5.0 s | 216 MB/s | 8.6 MiB |
+
+Both files were fully covered and hashed (BLAKE3 computed from the same
+read pass); the process baseline before extraction was 5.4 MiB. Timings are
+warm-cache; the XML's lower rate is its 45 M short lines (per-line
+accounting), not I/O.
+
 ## Query latency (`eidos bench search`, G+R catalog index, 30 iterations per query)
 
 | Family | Queries | p50 | p95 | p99 | max | p95 during concurrent rescan of G |

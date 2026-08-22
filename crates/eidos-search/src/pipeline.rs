@@ -14,8 +14,9 @@ use eidos_content::{extract, Chunk, Limits, EXTRACTION_VERSION};
 use eidos_domain::{ContentState, Coverage, FailureClass, ObjectId, UnixNanos};
 use std::time::Instant;
 
-/// Chunks buffered before a catalog write + index add.
-pub const CHUNK_BATCH: usize = 32;
+/// Chunks buffered before a catalog write + index add (files up to this
+/// many chunks are stored in a single transaction).
+pub const CHUNK_BATCH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessStats {
@@ -43,13 +44,17 @@ pub enum ProcessResult {
     Retry { class: FailureClass, error: String },
 }
 
-/// Process one object at `expected_generation`.
+/// Process one object at `expected_generation`. When `job` is given it is
+/// marked done in the same transaction that stores the outcome
+/// (`Indexed`/`Done`); for `Skipped`, `Disabled`, and `Retry` the caller
+/// owns the job.
 pub fn process_object(
     catalog: &Catalog,
     index: &ContentIndex,
     object: ObjectId,
     expected_generation: u32,
     limits: &Limits,
+    job: Option<eidos_domain::JobId>,
 ) -> Result<ProcessResult> {
     let started = Instant::now();
     let target = match catalog.content_target(object)? {
@@ -84,6 +89,8 @@ pub fn process_object(
     index.delete_object(object);
 
     let (source, generation) = (target.source_id, target.generation);
+    // Chunks of a small file stay in `batch` and are stored in the same
+    // transaction as the content record; larger files stream batches.
     let mut batch: Vec<Chunk> = Vec::with_capacity(CHUNK_BATCH);
     let mut sink_err: Option<String> = None;
     let outcome = {
@@ -95,16 +102,10 @@ pub fn process_object(
             }
             Ok(())
         };
-        let o = extract(std::path::Path::new(&target.path), limits, &mut sink);
-        if !batch.is_empty() {
-            if let Err(e) = flush(catalog, index, object, source, generation, &mut batch) {
-                sink_err = Some(e.to_string());
-            }
-        }
-        o
+        extract(std::path::Path::new(&target.path), limits, &mut sink)
     };
     let mut outcome = outcome;
-    if let Some(e) = sink_err {
+    if let Some(e) = sink_err.take() {
         outcome.state = ContentState::Failed;
         outcome.failure = Some((FailureClass::Transient, e));
     }
@@ -141,7 +142,8 @@ pub fn process_object(
     };
     match outcome.state {
         ContentState::Indexed | ContentState::Partial => {
-            catalog.finish_content(&rec, false)?;
+            catalog.store_content(&rec, &batch, false, job)?;
+            index.add_chunks(object, source, generation, &batch)?;
             Ok(ProcessResult::Indexed(stats))
         }
         ContentState::Failed => {
@@ -156,13 +158,13 @@ pub fn process_object(
                     coverage: Coverage::None,
                     ..rec
                 };
-                catalog.finish_content(&rec, true)?;
+                catalog.store_content(&rec, &[], true, job)?;
                 Ok(ProcessResult::Done(stats))
             }
         }
         _ => {
             // Unsupported (binary) and anything else terminal.
-            catalog.finish_content(&rec, true)?;
+            catalog.store_content(&rec, &[], true, job)?;
             Ok(ProcessResult::Done(stats))
         }
     }
@@ -200,12 +202,17 @@ pub fn drain_content_jobs(
                 continue;
             }
         };
-        match process_object(catalog, index, object, job.object_generation, limits)? {
-            ProcessResult::Indexed(_) => {
-                pending.push(object);
-                catalog.complete_job(job.id)?;
-            }
-            ProcessResult::Done(_) | ProcessResult::Skipped(_) => catalog.complete_job(job.id)?,
+        match process_object(
+            catalog,
+            index,
+            object,
+            job.object_generation,
+            limits,
+            Some(job.id),
+        )? {
+            ProcessResult::Indexed(_) => pending.push(object),
+            ProcessResult::Done(_) => {}
+            ProcessResult::Skipped(_) => catalog.complete_job(job.id)?,
             ProcessResult::Disabled => catalog.delete_job(job.id)?,
             ProcessResult::Retry { class, error } => {
                 catalog.fail_job(job.id, class, &error)?;

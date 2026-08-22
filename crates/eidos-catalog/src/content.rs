@@ -10,7 +10,7 @@ use crate::jobs::{enqueue_conn, outbox_append_conn, NewJob};
 use crate::{Catalog, CatalogError, Result};
 use eidos_content::Chunk;
 use eidos_domain::{
-    ContentId, ContentState, Coverage, FailureClass, JobStage, ObjectId, Priority, SourceId,
+    ContentId, ContentState, Coverage, FailureClass, JobId, JobStage, ObjectId, Priority, SourceId,
     UnixNanos,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -179,8 +179,39 @@ impl Catalog {
     /// Workers call this with `publish = false` ("indexing") before the index
     /// commit and `mark_content_indexed` after it.
     pub fn finish_content(&self, rec: &ContentRecord, publish: bool) -> Result<()> {
+        self.store_content(rec, &[], publish, None)
+    }
+
+    /// One transaction for the common small-file case: store the final batch
+    /// of chunks, the content record, and (optionally) mark the job done.
+    pub fn store_content(
+        &self,
+        rec: &ContentRecord,
+        chunks: &[Chunk],
+        publish: bool,
+        complete_job: Option<JobId>,
+    ) -> Result<()> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !chunks.is_empty() {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO chunks (object_id, generation, ordinal, byte_start, byte_end, line_start, line_end, chars, text)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )?;
+                for c in chunks {
+                    stmt.execute(params![
+                        rec.object_id.0,
+                        rec.generation as i64,
+                        c.ordinal as i64,
+                        c.byte_start as i64,
+                        c.byte_end as i64,
+                        c.line_start as i64,
+                        c.line_end as i64,
+                        c.text.chars().count() as i64,
+                        compress(&c.text),
+                    ])?;
+                }
+            }
             let state_str = if publish { rec.state.as_str().to_string() } else { "indexing".to_string() };
             tx.execute(
                 "INSERT INTO content_records (object_id, source_id, generation, extraction_version, encoding, coverage, indexed_bytes,
@@ -222,6 +253,12 @@ impl Catalog {
             )?;
             if publish {
                 flip_state(&tx, rec.object_id, rec.state, rec.content_id)?;
+            }
+            if let Some(job) = complete_job {
+                tx.execute(
+                    "UPDATE jobs SET state = 'done', finished_at = ?2, last_error = NULL WHERE job_id = ?1",
+                    params![job.0, UnixNanos::now().0],
+                )?;
             }
             tx.commit()?;
             Ok(())
