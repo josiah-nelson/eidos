@@ -27,9 +27,11 @@ use tantivy::tokenizer::{
 };
 use tantivy::{DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
-pub const CONTENT_SCHEMA_VERSION: u32 = 1;
+pub const CONTENT_SCHEMA_VERSION: u32 = 2;
 pub const TRIGRAM_TOKENIZER: &str = "eidos_trigram";
 pub const TEXT_TOKENIZER: &str = "eidos_text";
+/// Same tokenisation without case folding: exact whole-word literals.
+pub const TEXT_CS_TOKENIZER: &str = "eidos_text_cs";
 const META_FILE: &str = "eidos-content-schema.json";
 /// Tokens longer than this are not indexed in `text` (base64 blobs, hashes).
 pub const MAX_TOKEN_CHARS: usize = 64;
@@ -43,6 +45,7 @@ pub struct ContentFields {
     pub generation: Field,
     pub ordinal: Field,
     pub text: Field,
+    pub text_cs: Field,
     pub trigrams: Field,
 }
 
@@ -58,6 +61,11 @@ pub fn build_schema() -> (Schema, ContentFields) {
             .set_tokenizer(TEXT_TOKENIZER)
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
     );
+    let text_cs = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(TEXT_CS_TOKENIZER)
+            .set_index_option(IndexRecordOption::Basic),
+    );
     let trigrams = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer(TRIGRAM_TOKENIZER)
@@ -69,6 +77,7 @@ pub fn build_schema() -> (Schema, ContentFields) {
         generation: b.add_u64_field("generation", fast.clone()),
         ordinal: b.add_u64_field("ordinal", fast),
         text: b.add_text_field("text", text),
+        text_cs: b.add_text_field("text_cs", text_cs),
         trigrams: b.add_text_field("trigrams", trigrams),
     };
     (b.build(), fields)
@@ -153,6 +162,20 @@ pub fn text_analyzer() -> TextAnalyzer {
         .build()
 }
 
+pub fn text_cs_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(MAX_TOKEN_CHARS))
+        .build()
+}
+
+/// A literal that the case-preserving token field can answer exactly: one
+/// alphanumeric token (the tokenizer splits on everything else).
+pub fn single_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|c| c.is_alphanumeric())
+        && value.chars().count() <= MAX_TOKEN_CHARS
+}
+
 /// Query-side tokenisation matching `text_analyzer`.
 pub fn text_tokens(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric())
@@ -172,6 +195,7 @@ pub struct ContentIndex {
     /// Documents added since the last commit.
     uncommitted: AtomicU64,
     commits: AtomicU64,
+    rebuilding: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ContentIndex {
@@ -192,6 +216,9 @@ pub fn register_tokenizers(index: &Index) {
         .tokenizers()
         .register(TRIGRAM_TOKENIZER, TrigramTokenizer);
     index.tokenizers().register(TEXT_TOKENIZER, text_analyzer());
+    index
+        .tokenizers()
+        .register(TEXT_CS_TOKENIZER, text_cs_analyzer());
 }
 
 impl ContentIndex {
@@ -244,6 +271,7 @@ impl ContentIndex {
             fields,
             uncommitted: AtomicU64::new(0),
             commits: AtomicU64::new(0),
+            rebuilding: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -309,6 +337,7 @@ impl ContentIndex {
             d.add_u64(f.generation, generation as u64);
             d.add_u64(f.ordinal, c.ordinal as u64);
             d.add_text(f.text, &c.text);
+            d.add_text(f.text_cs, &c.text);
             d.add_text(f.trigrams, &c.text);
             writer.add_document(d)?;
         }
@@ -329,6 +358,59 @@ impl ContentIndex {
 
     fn writer(&self) -> parking_lot::MutexGuard<'_, IndexWriter> {
         self.writer.lock()
+    }
+
+    /// True while `rebuild_from_chunks` runs: content results are partial.
+    pub fn is_rebuilding(&self) -> bool {
+        self.rebuilding.load(Ordering::Relaxed)
+    }
+
+    /// Rebuild every chunk document from the catalog's stored chunks
+    /// (schema change, lost index) without reading any source file.
+    pub fn rebuild_from_chunks(&self, catalog: &Catalog) -> Result<u64> {
+        self.rebuilding.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        let result = (|| -> Result<u64> {
+            {
+                let writer = self.writer();
+                writer.delete_all_documents()?;
+            }
+            let f = self.fields();
+            let mut docs = 0u64;
+            let mut since_commit = 0u64;
+            catalog.for_each_indexed_chunk(|object, source, generation, ordinal, text| {
+                let mut d = TantivyDocument::new();
+                d.add_u64(f.object_id, object.0 as u64);
+                d.add_u64(f.source_id, source.0 as u64);
+                d.add_u64(f.generation, generation as u64);
+                d.add_u64(f.ordinal, ordinal as u64);
+                d.add_text(f.text, text);
+                d.add_text(f.text_cs, text);
+                d.add_text(f.trigrams, text);
+                self.writer().add_document(d).map_err(|e| {
+                    eidos_catalog::CatalogError::InvalidState(format!("index write: {e}"))
+                })?;
+                docs += 1;
+                since_commit += 1;
+                if since_commit >= 200_000 {
+                    since_commit = 0;
+                    self.writer().commit().map_err(|e| {
+                        eidos_catalog::CatalogError::InvalidState(format!("index commit: {e}"))
+                    })?;
+                }
+                Ok(())
+            })?;
+            self.commit()?;
+            Ok(docs)
+        })();
+        self.rebuilding.store(false, Ordering::Relaxed);
+        let docs = result?;
+        tracing::info!(
+            docs,
+            ms = started.elapsed().as_millis() as u64,
+            "content index rebuilt from stored chunks"
+        );
+        Ok(docs)
     }
 }
 
@@ -374,7 +456,7 @@ pub enum Matcher {
 }
 
 fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    c.is_alphanumeric()
 }
 
 impl Matcher {
@@ -713,8 +795,41 @@ pub fn retrieve(
                 ),
             };
         }
+        TextMode::Exact if single_token(&clause.value) => {
+            // Whole word = token boundary: the token index answers exactly,
+            // case-sensitively or folded. No verification needed.
+            let q: Box<dyn TQuery> = if clause.case_sensitive {
+                term_text(f.text_cs, &clause.value)
+            } else {
+                term_text(f.text, &clause.value.to_lowercase())
+            };
+            let q = with_scope(q);
+            let addrs = searcher.search(&q, &DocSetCollector)?;
+            let mut list: Vec<DocAddress> = addrs.into_iter().collect();
+            list.sort();
+            ret.candidates = list.len() as u64;
+            if list.len() > opts.max_verify * 5 {
+                ret.truncated = true;
+                list.truncate(opts.max_verify * 5);
+            }
+            let mut ids = IdReader::new(&searcher);
+            for a in list {
+                ret.hits.push(ids.read(a, 1.0)?);
+            }
+            ret.description = format!(
+                "exact {} token \"{}\" ({:.0} ms)",
+                if clause.case_sensitive {
+                    "case-sensitive"
+                } else {
+                    "folded"
+                },
+                clause.value,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         TextMode::Exact | TextMode::Substring | TextMode::Regex => {
             // Candidate selection.
+            let tc = Instant::now();
             let (cand_q, how): (Box<dyn TQuery>, String) = match clause.mode {
                 TextMode::Regex => {
                     let lits = required_literals(&clause.value);
@@ -802,6 +917,8 @@ pub fn retrieve(
             for a in list {
                 cands.push(ids.read(a, 0.0)?);
             }
+            let candidates_ms = tc.elapsed().as_secs_f64() * 1000.0;
+            let tvf = Instant::now();
             // Verify against stored chunk text, grouped per object generation
             // and spread over a few threads (each uses a pooled reader).
             cands.sort_by_key(|c| (c.object_id.0, c.generation, c.ordinal));
@@ -852,7 +969,10 @@ pub fn retrieve(
                 ret.hits.extend(hits);
             }
             ret.verified = Some(verified);
-            ret.description = format!("{how}; candidates verified against stored chunk text");
+            ret.description = format!(
+                "{how}; candidates verified against stored chunk text (candidates {candidates_ms:.0} ms, verify {:.0} ms)",
+                tvf.elapsed().as_secs_f64() * 1000.0
+            );
         }
     }
     ret.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;

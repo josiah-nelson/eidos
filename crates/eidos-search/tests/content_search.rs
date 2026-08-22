@@ -235,12 +235,18 @@ fn q2_exact_case_sensitive_identifier_with_snippets() {
         fx.names("content:qz"),
         vec!["Zephyr diagnostics.md", "notes.txt"]
     );
+    // A single-token exact literal is answered by the case-preserving token
+    // index (no verification step); multi-word literals are verified.
     let steps = fx.run("content:=Qz").explanation.unwrap().steps;
     let c = steps.iter().find(|s| s.stage == "content").unwrap();
-    assert!(
-        c.verified.is_some(),
-        "exact clauses verify against stored text: {c:?}"
-    );
+    assert!(c.verified.is_none(), "{c:?}");
+    assert!(c.description.contains("case-sensitive token"), "{c:?}");
+    let r = fx.run("content:=\"Qz responded\"");
+    assert_eq!(r.hits.len(), 1);
+    let steps = r.explanation.unwrap().steps;
+    let c = steps.iter().find(|s| s.stage == "content").unwrap();
+    assert!(c.verified.is_some(), "{c:?}");
+    assert!(fx.names("content:=\"qz responded\"").is_empty());
 }
 
 #[test]

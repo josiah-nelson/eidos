@@ -409,6 +409,38 @@ impl Catalog {
         })
     }
 
+    /// Stream every stored chunk of an indexed/partial content record in
+    /// object order (for index rebuilds without re-reading files).
+    pub fn for_each_indexed_chunk(
+        &self,
+        mut f: impl FnMut(ObjectId, SourceId, u32, u32, &str) -> Result<()>,
+    ) -> Result<u64> {
+        self.with_reader(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT c.object_id, r.source_id, c.generation, c.ordinal, c.chars, c.text
+                 FROM content_records r JOIN chunks c ON c.object_id = r.object_id AND c.generation = r.generation
+                 WHERE r.state IN ('indexed', 'partial', 'indexing')
+                 ORDER BY c.object_id, c.ordinal",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut n = 0u64;
+            while let Some(row) = rows.next()? {
+                let chars: i64 = row.get(4)?;
+                let blob: Vec<u8> = row.get(5)?;
+                let text = decompress(&blob, chars as u32);
+                f(
+                    ObjectId(row.get(0)?),
+                    SourceId(row.get(1)?),
+                    row.get::<_, i64>(2)? as u32,
+                    row.get::<_, i64>(3)? as u32,
+                    &text,
+                )?;
+                n += 1;
+            }
+            Ok(n)
+        })
+    }
+
     /// Enqueue content jobs for every pending file of a source that has no
     /// queued/running job for its current generation. Returns the number
     /// enqueued. Respects `sources.content_enabled`.

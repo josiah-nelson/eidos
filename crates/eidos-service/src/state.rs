@@ -61,18 +61,21 @@ impl AppState {
             eidos_search::CatalogIndex::open(config.data_dir.join("index").join("catalog"))?;
         let content_index =
             eidos_search::ContentIndex::open(config.data_dir.join("index").join("content"))?;
+        let mut rebuild_content = false;
         if content_index.is_fresh() {
-            // A (re)created content index holds nothing: every indexed object
-            // must be re-extracted so the catalog and index agree.
-            let n = catalog.reset_content_for_reindex()?;
-            if n > 0 {
+            // A (re)created content index holds nothing. The catalog keeps
+            // every chunk's text, so the index is rebuilt from storage in the
+            // background instead of re-reading the sources.
+            let stats = catalog.content_stats(None)?;
+            if stats.chunks > 0 {
                 tracing::warn!(
-                    n,
-                    "content index is empty; indexed objects reset to pending"
+                    chunks = stats.chunks,
+                    "content index is empty; rebuilding it from stored chunks"
                 );
+                rebuild_content = true;
             }
         }
-        Ok(Self {
+        let state = Self {
             catalog,
             index,
             content_index,
@@ -91,7 +94,20 @@ impl AppState {
             scan_threads: config.scan_threads,
             shutdown: Arc::new(AtomicBool::new(false)),
             auto_reconcile: config.auto_reconcile,
-        })
+        };
+        if rebuild_content {
+            let catalog = state.catalog.clone();
+            let index = state.content_index.clone();
+            std::thread::Builder::new()
+                .name("content-rebuild".into())
+                .spawn(move || {
+                    if let Err(e) = index.rebuild_from_chunks(&catalog) {
+                        tracing::error!(error = %e, "content index rebuild failed");
+                    }
+                })
+                .expect("spawn content rebuild");
+        }
+        Ok(state)
     }
 
     /// Progress of a running (or just-finished, not yet reaped) scan.

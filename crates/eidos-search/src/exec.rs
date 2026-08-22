@@ -4,7 +4,7 @@
 //! candidates, verify exact/case-sensitive clauses against stored originals,
 //! join current state and completeness from the catalog, and explain.
 
-use crate::content::{self, ContentClause, ContentIndex, ContentOpts, Matcher};
+use crate::content::{self, ContentClause, ContentIndex, ContentOpts, Matcher, VERIFY_THREADS};
 use crate::schema::{attr_bit, attr_name, fold, Fields};
 use crate::{CatalogIndex, Result, SearchError, PROJECTION_NAME};
 use eidos_catalog::Catalog;
@@ -208,6 +208,7 @@ fn glob_literals(glob: &str) -> Vec<String> {
 
 struct Ctx<'a> {
     f: &'a Fields,
+    searcher: &'a Searcher,
     catalog: &'a Catalog,
     verifiers: Vec<Verifier>,
     steps: Vec<PlanStep>,
@@ -749,19 +750,39 @@ fn compile_text(
                             q
                         }
                         Err(_) => {
-                            // Too complex for the dictionary automaton: scan
-                            // every entry in scope and verify on fast fields.
-                            needs_positive(
-                                ctx,
-                                "this regex (too complex for the dictionary automaton)",
+                            // Too complex for the dictionary automaton: walk
+                            // the folded dictionary with the regex crate and
+                            // match the resulting terms exactly.
+                            let t = Instant::now();
+                            let (terms, truncated) = dictionary_scan(
+                                ctx.searcher,
+                                folded_field,
+                                &re_folded,
+                                DICTIONARY_SCAN_TERMS,
                             )?;
                             ctx.warnings.push(format!(
-                                "regex /{value}/ is too complex for the dictionary automaton; every entry in scope is checked"
+                                "regex /{value}/ is too complex for the dictionary automaton; the whole {label} dictionary was walked"
                             ));
-                            ctx.fast_verifiers.push(Box::new(move |name, path| {
-                                re_folded.is_match(if is_name { name } else { path })
-                            }));
-                            Box::new(AllQuery)
+                            if truncated {
+                                ctx.warnings.push(format!(
+                                    "regex /{value}/ matched more than {DICTIONARY_SCAN_TERMS} distinct {label}s; results are a subset"
+                                ));
+                            }
+                            ctx.steps.push(PlanStep {
+                                stage: "candidates".into(),
+                                description: format!(
+                                    "{} distinct {label}s matched by walking the folded dictionary",
+                                    terms.len()
+                                ),
+                                candidates: Some(terms.len() as u64),
+                                verified: None,
+                                elapsed_ms: Some(t.elapsed().as_secs_f64() * 1000.0),
+                            });
+                            if terms.is_empty() {
+                                Box::new(EmptyQuery)
+                            } else {
+                                Box::new(TermSetQuery::new(terms))
+                            }
                         }
                     }
                 }
@@ -918,6 +939,48 @@ fn pre_scope(q: &Query, catalog: &Catalog) -> Option<Vec<SourceId>> {
     } else {
         None
     }
+}
+
+/// Distinct dictionary terms a regex may match before the result is cut.
+pub const DICTIONARY_SCAN_TERMS: usize = 50_000;
+
+/// Every term of `field`'s dictionary (all segments) that the regex
+/// matches, as index terms. Linear in the dictionary size; used only when
+/// the FST automaton cannot be built.
+fn dictionary_scan(
+    searcher: &Searcher,
+    field: tantivy::schema::Field,
+    re: &regex::Regex,
+    limit: usize,
+) -> std::result::Result<(Vec<Term>, bool), QueryError> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut truncated = false;
+    'outer: for seg in searcher.segment_readers() {
+        let inv = seg.inverted_index(field).map_err(|e| QueryError::Other {
+            message: e.to_string(),
+        })?;
+        let dict = inv.terms();
+        let mut stream = dict.stream().map_err(|e| QueryError::Other {
+            message: e.to_string(),
+        })?;
+        while stream.advance() {
+            if let Ok(t) = std::str::from_utf8(stream.key()) {
+                if re.is_match(t) && !seen.contains(t) {
+                    if seen.len() >= limit {
+                        truncated = true;
+                        break 'outer;
+                    }
+                    seen.insert(t.to_string());
+                }
+            }
+        }
+    }
+    Ok((
+        seen.into_iter()
+            .map(|t| Term::from_field_text(field, &t))
+            .collect(),
+        truncated,
+    ))
 }
 
 fn needs_positive(ctx: &Ctx<'_>, what: &str) -> std::result::Result<(), QueryError> {
@@ -1119,8 +1182,10 @@ pub fn search_with_content(
             .map(|s| s.id)
             .collect()
     };
+    let searcher = index.searcher();
     let mut ctx = Ctx {
         f,
+        searcher: &searcher,
         catalog,
         verifiers: Vec::new(),
         steps: Vec::new(),
@@ -1180,7 +1245,6 @@ pub fn search_with_content(
     let content_truncated = ctx.content_sets.iter().any(|s| s.truncated);
     let collect_all =
         !ctx.verifiers.is_empty() || !ctx.fast_verifiers.is_empty() || tight || has_content;
-    let searcher = index.searcher();
     let t1 = Instant::now();
     let mut warnings = ctx.warnings.clone();
     let mut steps = ctx.steps.clone();
@@ -1201,26 +1265,51 @@ pub fn search_with_content(
         }
         let candidates = list.len() as u64;
         // Fast-field pass: read sort keys and verify folded name/path
-        // clauses without touching the document store.
+        // clauses without touching the document store. Dictionary-encoded
+        // string columns cost microseconds per lookup, so the pass is split
+        // across threads.
         let tv = Instant::now();
-        let mut rows: Vec<FastRow> = Vec::with_capacity(list.len());
-        {
-            let mut cols: HashMap<u32, FastCols> = HashMap::new();
-            let mut nbuf = String::new();
-            let mut pbuf = String::new();
-            for a in list {
-                let c = match cols.entry(a.segment_ord) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(FastCols::open(&searcher, a.segment_ord)?)
-                    }
-                };
-                c.strings(a.doc_id, &mut nbuf, &mut pbuf);
-                if ctx.fast_verifiers.iter().all(|v| v(&nbuf, &pbuf)) {
-                    rows.push(c.row(a, &nbuf, &pbuf));
-                }
+        let mut rows: Vec<FastRow> = {
+            let threads = (list.len() / 2_000).clamp(1, VERIFY_THREADS);
+            let per = list.len().div_ceil(threads).max(1);
+            let verifiers = &ctx.fast_verifiers;
+            let searcher_ref = &searcher;
+            let parts: Vec<Result<Vec<FastRow>>> = std::thread::scope(|sc| {
+                let handles: Vec<_> = list
+                    .chunks(per)
+                    .map(|part| {
+                        sc.spawn(move || -> Result<Vec<FastRow>> {
+                            let mut out = Vec::with_capacity(part.len());
+                            let mut cols: HashMap<u32, FastCols> = HashMap::new();
+                            let mut nbuf = String::new();
+                            let mut pbuf = String::new();
+                            for a in part {
+                                let c = match cols.entry(a.segment_ord) {
+                                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                    std::collections::hash_map::Entry::Vacant(e) => {
+                                        e.insert(FastCols::open(searcher_ref, a.segment_ord)?)
+                                    }
+                                };
+                                c.strings(a.doc_id, &mut nbuf, &mut pbuf);
+                                if verifiers.iter().all(|v| v(&nbuf, &pbuf)) {
+                                    out.push(c.row(*a, &nbuf, &pbuf));
+                                }
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("fast-field thread"))
+                    .collect()
+            });
+            let mut rows = Vec::with_capacity(list.len());
+            for part in parts {
+                rows.extend(part?);
             }
-        }
+            rows
+        };
         if !ctx.fast_verifiers.is_empty() {
             steps.push(PlanStep {
                 stage: "verify".into(),
@@ -1232,10 +1321,31 @@ pub fn search_with_content(
         }
         let need_stored = !ctx.verifiers.is_empty() || tight;
         if need_stored {
+            let threads = (rows.len() / 500).clamp(1, VERIFY_THREADS);
+            let per = rows.len().div_ceil(threads).max(1);
+            let searcher_ref = &searcher;
+            let parts: Vec<Result<Vec<Stored>>> = std::thread::scope(|sc| {
+                let handles: Vec<_> = rows
+                    .chunks(per)
+                    .map(|part| {
+                        sc.spawn(move || -> Result<Vec<Stored>> {
+                            let mut out = Vec::with_capacity(part.len());
+                            for r in part {
+                                let doc: TantivyDocument = searcher_ref.doc(r.addr)?;
+                                out.push(read_stored(f, &doc, 1.0));
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("store thread"))
+                    .collect()
+            });
             let mut stored: Vec<Stored> = Vec::with_capacity(rows.len());
-            for r in &rows {
-                let doc: TantivyDocument = searcher.doc(r.addr)?;
-                stored.push(read_stored(f, &doc, 1.0));
+            for part in parts {
+                stored.extend(part?);
             }
             let fast_candidates = rows.len() as u64;
             drop(rows);
@@ -1418,11 +1528,20 @@ pub fn search_with_content(
         opts,
     )?;
     let join_ms = t2.elapsed().as_secs_f64() * 1000.0;
-    let completeness = completeness_for(
+    let mut completeness = completeness_for(
         catalog,
         &in_scope.iter().map(|s| s.id).collect::<Vec<_>>(),
         &mut warnings,
     )?;
+    if content_index.is_some_and(|c| c.is_rebuilding()) {
+        warnings.push(
+            "the content index is being rebuilt from stored chunks; content results are partial until it finishes"
+                .into(),
+        );
+        for c in completeness.iter_mut() {
+            c.content_complete = false;
+        }
+    }
     let next_cursor = if (offset + hits.len()) < total as usize {
         Some(format!("o:{}", offset + hits.len()))
     } else {

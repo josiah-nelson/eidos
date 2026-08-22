@@ -466,10 +466,7 @@ fn verification_clauses_are_rejected_inside_or_and_not() {
         let err = search(&fx.index, &fx.catalog, &req, &ExecOptions::default())
             .err()
             .unwrap_or_else(|| panic!("{q} should be rejected"));
-        assert!(
-            err.to_string().contains("inside OR or NOT"),
-            "{q}: {err}"
-        );
+        assert!(err.to_string().contains("inside OR or NOT"), "{q}: {err}");
     }
     // Case-insensitive substring/glob/regex still work there, exactly.
     assert_eq!(fx.names("ext:cs -path:util"), vec!["Main.cs", "Program.cs"]);
