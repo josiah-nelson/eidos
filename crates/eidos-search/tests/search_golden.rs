@@ -601,17 +601,14 @@ fn large_candidate_sets_verify_lazily_in_sort_order() {
     // Walking to the end makes the total exact.
     let mut cursor = None;
     let mut seen = 0usize;
-    let mut last = None;
-    loop {
+    let last = loop {
         let r = run("name:item", SortField::Name, false, 1_000, cursor.take());
         seen += r.hits.len();
-        cursor = r.next_cursor.clone();
-        last = Some(r);
-        if cursor.is_none() {
-            break;
+        if r.next_cursor.is_none() {
+            break r;
         }
-    }
-    let last = last.unwrap();
+        cursor = r.next_cursor.clone();
+    };
     assert_eq!(seen, 2_080);
     assert!(last.total.exact, "{:?}", last.total);
     assert_eq!(last.total.value, 2_080);
