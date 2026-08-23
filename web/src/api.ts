@@ -573,6 +573,34 @@ export const api = {
   activity: () => request<ActivityView>('/api/activity'),
   setContentPolicy: (id: number, body: { enabled?: boolean; concurrency?: number }) =>
     request<SourceView>(`/api/sources/${id}/content`, { method: 'POST', body: JSON.stringify(body) }),
+  retryJob: (id: number) =>
+    request<RetryReport>(`/api/jobs/${id}/retry`, { method: 'POST', body: JSON.stringify({ preview: false }) }),
+  retrySourceContent: (
+    id: number,
+    body: {
+      class?: string
+      reason_prefix?: string
+      preview: boolean
+      limit?: number
+      as_of?: number
+      confirmation?: string
+    },
+  ) =>
+    request<RetryReport>(`/api/sources/${id}/content/retry`, { method: 'POST', body: JSON.stringify(body) }),
+}
+
+// Result of a retry action (`preview: true` counts without acting).
+export interface RetryReport {
+  preview: boolean
+  as_of: number
+  confirmation: string | null
+  accepted: number
+  skipped: number
+  rejected: number
+  bytes: number
+  skipped_reasons: Record<string, number>
+  rejected_reasons: Record<string, number>
+  job_ids: number[]
 }
 
 export interface WorkerCurrent {
@@ -630,6 +658,8 @@ export interface ActivitySourceView {
   content_peak_reserved: number
   jobs_queued: number
   jobs_running: number
+  jobs_failed: number
+  jobs_failed_bytes: number
   content_states: Record<string, number>
   content_bytes_indexed: number
 }
@@ -646,6 +676,8 @@ export interface JobRecord {
   last_error?: string | null
   failure_class?: string | null
   finished_at?: number | null
+  requeue_count: number
+  requeued_at?: number | null
 }
 
 export interface ActivityView {

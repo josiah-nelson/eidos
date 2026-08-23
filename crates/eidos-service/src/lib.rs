@@ -10,6 +10,7 @@ pub mod api;
 pub mod content_preview;
 pub mod content_workers;
 pub mod follower;
+pub mod retry_api;
 pub mod scanner;
 pub mod source_budget;
 pub mod state;

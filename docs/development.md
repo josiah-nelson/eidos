@@ -105,6 +105,38 @@ the first crawl of a slow or remote root:
 The same controls are on the Activity and source pages of the web UI and at
 `POST /api/sources/{id}/content` / `GET /api/activity`.
 
+Transient failures (share offline, sharing violation) retry on their own with
+exponential backoff. Deterministic, corrupt, unsupported, and resource-limit
+failures are terminal on purpose: they come back only through an explicit
+operator retry, once the extractor, the limit, or the share is fixed. A retry
+covers both places a failure can live — a job left `failed` after its
+transient budget ran out, and an object whose extraction failed for good
+(the failure is on the content record and the job finished; the object goes
+back to `pending` with a fresh content job).
+
+```powershell
+.\target\release\eidos.exe content retry --source share --preview            # how many, how many bytes
+.\target\release\eidos.exe content retry --source share --class resource_limit
+.\target\release\eidos.exe content retry --source share --reason-prefix "extract:" --limit 500
+.\target\release\eidos.exe content retry 4213                                # one job id
+```
+
+Retrying keeps the diagnosis: `attempts`, `last_error`, and `failure_class`
+stay on the job, `requeue_count`/`requeued_at` record the action, and the
+automatic transient budget starts again from the requeue. A retry never
+touches a running job, never creates a second active job for one object, and
+skips objects that were deleted, superseded by a newer generation, retired,
+or whose source has content extraction disabled — the response reports
+`accepted`, `skipped`, `rejected`, and `bytes` with per-reason counts. The
+Activity page has a retry button per recent failure and a two-step bulk retry
+per source that shows the preview count before acting. The confirmation
+carries that preview's `as_of`, count, and opaque exact-set token. Failures
+that appear later wait for the next round; if an older previewed failure
+becomes ineligible, the action returns `409` and asks the operator to preview
+again instead of substituting a different pre-existing failure. The endpoints
+are `POST /api/jobs/{id}/retry` and
+`POST /api/sources/{id}/content/retry`.
+
 ### Stored-text preview
 
 `GET /api/objects/{id}/content?generation=G&ordinal=N&before=B&after=A`

@@ -535,6 +535,7 @@ dependencies = [
 name = "eidos-catalog"
 version = "0.5.0-dev"
 dependencies = [
+ "blake3",
  "crossbeam-channel",
  "eidos-content",
  "eidos-domain",

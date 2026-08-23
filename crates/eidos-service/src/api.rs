@@ -41,6 +41,7 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
             get(crate::content_preview::object_content),
         )
         .route("/sources/{id}/archives", post(requeue_archives))
+        .merge(crate::retry_api::routes())
         .route("/resolve", get(resolve))
         .route("/search", post(search).get(search_get))
         .route("/search/parse", get(search_parse))
@@ -938,6 +939,9 @@ pub struct ActivitySourceView {
     pub content_peak_reserved: u32,
     pub jobs_queued: u64,
     pub jobs_running: u64,
+    pub jobs_failed: u64,
+    /// Estimated bytes behind the failed jobs of this source.
+    pub jobs_failed_bytes: u64,
     pub content_states: std::collections::BTreeMap<String, u64>,
     pub content_bytes_indexed: u64,
 }
@@ -965,9 +969,13 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
         let by_source = st2
             .catalog
             .jobs_by_source(eidos_domain::JobStage::ContentText)?;
+        let failed_by_source = st2
+            .catalog
+            .failed_work_by_source(eidos_domain::JobStage::ContentText)?;
         let mut sources = Vec::new();
         for s in st2.catalog.list_sources()? {
             let q = by_source.get(&s.id).copied().unwrap_or((0, 0));
+            let failed = failed_by_source.get(&s.id).copied().unwrap_or((0, 0));
             let stats = st2.catalog.content_stats(Some(s.id))?;
             sources.push(ActivitySourceView {
                 source_id: s.id,
@@ -979,6 +987,8 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
                 content_peak_reserved: st2.content_budgets().peak_reserved(s.id),
                 jobs_queued: q.0,
                 jobs_running: q.1,
+                jobs_failed: failed.0,
+                jobs_failed_bytes: failed.1,
                 content_states: st2.catalog.content_state_counts(s.id)?,
                 content_bytes_indexed: stats.indexed_bytes,
             });

@@ -25,4 +25,5 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `ServiceExt::oneshot` drives the axum router in API tests.
 tower = { workspace = true }

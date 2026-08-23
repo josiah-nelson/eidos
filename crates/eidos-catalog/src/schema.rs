@@ -360,6 +360,18 @@ CREATE UNIQUE INDEX entries_virtual_object
     ON entries (object_id) WHERE is_virtual = 1;
 "#,
     ),
+    (
+        "operator retry bookkeeping for jobs",
+        r#"
+ALTER TABLE jobs ADD COLUMN requeued_at INTEGER;
+ALTER TABLE jobs ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0;
+-- `attempts` at the last operator requeue: history is preserved while the
+-- automatic transient budget starts again from that baseline.
+ALTER TABLE jobs ADD COLUMN retry_base_attempts INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX jobs_failed ON jobs (source_id, stage, failure_class) WHERE state = 'failed';
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.
@@ -393,7 +405,7 @@ mod tests {
     fn migrations_apply_once_and_are_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         let first = migrate(&mut conn).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7]);
         let second = migrate(&mut conn).unwrap();
         assert!(second.is_empty());
         let v: i64 = conn
