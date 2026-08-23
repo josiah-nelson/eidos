@@ -2450,6 +2450,9 @@ fn build_hits(
                     .filter(|r| r.generation == obj.generation)
                     .map(|r| r.coverage)
                     .unwrap_or(Coverage::None),
+                // The generation the stored chunks belong to, which may lag
+                // the object when a change is waiting for re-extraction.
+                generation: rec.as_ref().map(|r| r.generation),
                 indexed_bytes: rec
                     .as_ref()
                     .filter(|r| r.generation == obj.generation)
