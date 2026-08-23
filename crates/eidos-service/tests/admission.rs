@@ -554,6 +554,17 @@ async fn activity_and_index_report_admission_counters() {
             assert!(a.get(field).is_some(), "{uri} missing admission.{field}");
         }
         if uri == "/api/activity" {
+            let recovery = &res.body["startup_recovery"];
+            for field in [
+                "aborted_scan_generations",
+                "requeued_running_jobs",
+                "requeued_unfinished_content",
+            ] {
+                assert!(
+                    recovery.get(field).is_some(),
+                    "{uri} missing startup_recovery.{field}"
+                );
+            }
             let writer = &res.body["catalog_writer"];
             for field in [
                 "acquisitions",

@@ -184,6 +184,10 @@ export default function ActivityPage() {
   if (q.isError) return <ErrorBox error={q.error} />
   const a = q.data
   const w = a.workers
+  const recovered =
+    integerNumber(a.startup_recovery.aborted_scan_generations) +
+    integerNumber(a.startup_recovery.requeued_running_jobs) +
+    integerNumber(a.startup_recovery.requeued_unfinished_content)
   const settled = integerNumber(w.files_indexed) + integerNumber(w.files_unsupported) + integerNumber(w.files_failed)
   return (
     <>
@@ -258,6 +262,15 @@ export default function ActivityPage() {
           <div className="value">{duration(a.catalog_writer.max_hold_ms)}</div>
           <div className="sub">
             max · {duration(a.catalog_writer.total_hold_ms)} total
+          </div>
+        </div>
+        <div className="stat">
+          <div className="label">Recovered at startup</div>
+          <div className="value">{count(recovered)}</div>
+          <div className="sub">
+            {count(a.startup_recovery.aborted_scan_generations)} scans aborted ·{' '}
+            {count(a.startup_recovery.requeued_running_jobs)} running jobs requeued ·{' '}
+            {count(a.startup_recovery.requeued_unfinished_content)} unfinished content records requeued
           </div>
         </div>
       </div>

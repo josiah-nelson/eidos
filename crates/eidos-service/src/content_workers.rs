@@ -169,14 +169,6 @@ pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
         .workers
         .store(workers, Ordering::Relaxed);
     *state.content_workers.started.lock() = Some(Instant::now());
-    match state.catalog.requeue_unfinished_content() {
-        Ok(n) if n > 0 => tracing::warn!(
-            n,
-            "re-queued content records left `indexing` by a previous process"
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::error!(error = %e, "requeue_unfinished_content failed"),
-    }
     // Install persisted budgets *before* the first worker can claim, or a
     // source configured below the default would be oversubscribed for the
     // few seconds until the coordinator's first refresh. If this fails the

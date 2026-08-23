@@ -28,6 +28,16 @@ pub(crate) enum ReconciliationDeferralCause {
     Content,
 }
 
+/// Durable work repaired synchronously by the most recent service open.
+/// These counters stay fixed for the process lifetime so operators can see
+/// what startup changed even after workers have drained the recovered queue.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, TS)]
+pub struct StartupRecovery {
+    pub aborted_scan_generations: u64,
+    pub requeued_running_jobs: u64,
+    pub requeued_unfinished_content: u64,
+}
+
 #[derive(Debug, Clone)]
 struct StoredReconciliationDeferral {
     view: ReconciliationDeferral,
@@ -65,6 +75,8 @@ pub struct AppState {
     /// A content-index rebuild from stored chunks was scheduled at open and
     /// runs once `start_background` spawns it.
     pub content_rebuild: bool,
+    /// Synchronous durable-state repairs performed by [`AppState::open`].
+    pub startup_recovery: StartupRecovery,
 }
 
 impl AppState {
@@ -79,13 +91,25 @@ impl AppState {
                 "aborted interrupted scan generation at startup"
             );
         }
-        let requeued = catalog.requeue_running_jobs()?;
-        if requeued > 0 {
+        let requeued_running_jobs = catalog.requeue_running_jobs()?;
+        if requeued_running_jobs > 0 {
             tracing::warn!(
-                requeued,
+                requeued = requeued_running_jobs,
                 "re-queued jobs left running by a previous process"
             );
         }
+        let requeued_unfinished_content = catalog.requeue_unfinished_content()?;
+        if requeued_unfinished_content > 0 {
+            tracing::warn!(
+                requeued = requeued_unfinished_content,
+                "re-queued content records left `indexing` by a previous process"
+            );
+        }
+        let startup_recovery = StartupRecovery {
+            aborted_scan_generations: report.aborted_generations.len() as u64,
+            requeued_running_jobs,
+            requeued_unfinished_content,
+        };
         let host_name = eidos_domain::bench::hostname();
         let host_id = catalog.ensure_host(&host_name, std::env::consts::OS)?;
         let index =
@@ -150,6 +174,7 @@ impl AppState {
             shutdown: Arc::new(AtomicBool::new(false)),
             auto_reconcile: config.auto_reconcile,
             content_rebuild: rebuild_content,
+            startup_recovery,
         };
         Ok(state)
     }

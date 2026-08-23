@@ -998,6 +998,8 @@ pub struct ActivitySourceView {
 #[derive(Serialize, TS)]
 pub struct ActivityView {
     pub content_enabled: bool,
+    /// Durable scan/job repairs performed synchronously at this process start.
+    pub startup_recovery: crate::state::StartupRecovery,
     pub jobs: eidos_catalog::jobs::JobCounts,
     pub content: eidos_catalog::content::ContentStats,
     pub archives: eidos_catalog::archive::ArchiveStats,
@@ -1049,6 +1051,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
             content_enabled: st2
                 .content_enabled
                 .load(std::sync::atomic::Ordering::Relaxed),
+            startup_recovery: st2.startup_recovery,
             jobs: st2.catalog.job_counts(None)?,
             content: st2.catalog.content_stats(None)?,
             archives: st2.catalog.archive_stats(None)?,
