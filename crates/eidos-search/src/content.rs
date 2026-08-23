@@ -35,8 +35,6 @@ pub const TEXT_CS_TOKENIZER: &str = "eidos_text_cs";
 const META_FILE: &str = "eidos-content-schema.json";
 /// Tokens longer than this are not indexed in `text` (base64 blobs, hashes).
 pub const MAX_TOKEN_CHARS: usize = 64;
-/// Threads used to verify candidate chunks against stored text.
-pub const VERIFY_THREADS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ContentFields {
@@ -615,29 +613,6 @@ pub struct Retrieval {
     pub elapsed_ms: f64,
 }
 
-/// Required literal fragments of a regex (all must occur in any match).
-pub fn required_literals(pattern: &str) -> Vec<String> {
-    use regex_syntax::hir::{Hir, HirKind};
-    fn walk(h: &Hir, out: &mut Vec<String>) {
-        match h.kind() {
-            HirKind::Literal(l) => {
-                if let Ok(s) = std::str::from_utf8(&l.0) {
-                    out.push(s.to_string());
-                }
-            }
-            HirKind::Concat(v) => v.iter().for_each(|c| walk(c, out)),
-            HirKind::Capture(c) => walk(&c.sub, out),
-            HirKind::Repetition(r) if r.min > 0 => walk(&r.sub, out),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    if let Ok(h) = regex_syntax::parse(pattern) {
-        walk(&h, &mut out);
-    }
-    out
-}
-
 fn term_u64(f: Field, v: u64) -> Box<dyn TQuery> {
     Box::new(TermQuery::new(
         Term::from_field_u64(f, v),
@@ -855,32 +830,20 @@ pub fn retrieve(
             let tc = Instant::now();
             let (cand_q, how): (Box<dyn TQuery>, String) = match clause.mode {
                 TextMode::Regex => {
-                    let lits = required_literals(&clause.value);
-                    let mut tris: Vec<String> = Vec::new();
-                    for l in &lits {
-                        for t in trigrams(l) {
-                            if !tris.contains(&t) {
-                                tris.push(t);
-                            }
+                    let plan = crate::regex_plan::TrigramPlan::for_regex(&clause.value);
+                    match plan.query(&|t| term_text(f.trigrams, t)) {
+                        Some(q) => (
+                            q,
+                            format!("trigram plan {plan} ({} terms)", plan.term_count()),
+                        ),
+                        None => {
+                            ret.broad = true;
+                            (
+                                Box::new(AllQuery),
+                                "no required literal of 3+ characters; scanning every chunk in scope"
+                                    .into(),
+                            )
                         }
-                    }
-                    if tris.is_empty() {
-                        ret.broad = true;
-                        (
-                            Box::new(AllQuery),
-                            "no required literal of 3+ characters; scanning every chunk in scope"
-                                .into(),
-                        )
-                    } else {
-                        let n = tris.len();
-                        (
-                            Box::new(BooleanQuery::new(
-                                tris.iter()
-                                    .map(|t| (Occur::Must, term_text(f.trigrams, t)))
-                                    .collect(),
-                            )),
-                            format!("{n} required trigrams from literals [{}]", lits.join(", ")),
-                        )
                     }
                 }
                 _ => {
@@ -967,7 +930,7 @@ pub fn retrieve(
                     _ => groups.push((c.object_id, c.generation, vec![c.ordinal])),
                 }
             }
-            let threads = groups.len().clamp(1, VERIFY_THREADS);
+            let threads = groups.len().clamp(1, verify_threads());
             let per = groups.len().div_ceil(threads);
             let results: Vec<Result<Vec<ChunkHit>>> = std::thread::scope(|s| {
                 let handles: Vec<_> = groups
@@ -1034,59 +997,123 @@ pub struct ObjectVerdict {
     pub budget_short: bool,
 }
 
-/// Page-driven verification of one object: fetch its candidate chunks in
-/// growing batches and stop as soon as `SCORE_CAP` of them match, every
-/// candidate is examined, or `budget` (remaining chunk fetches, shared
-/// across threads) is exhausted.
-pub fn verify_object(
+/// One object awaiting page-driven verification: which matcher applies and
+/// which candidate chunk ordinals (of `generation`) to examine.
+pub struct VerifyJob<'a> {
+    pub matcher: &'a Matcher,
+    pub object: ObjectId,
+    pub generation: u32,
+    pub ordinals: &'a [u32],
+}
+
+/// Verification threads: chunk fetches are memory reads that still scale
+/// sub-linearly, so more threads than cores only add contention.
+pub fn verify_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .clamp(4, 16)
+}
+
+/// Page-driven verification of several objects on one thread. Each round
+/// fetches the next batch of every unfinished object in a single catalog
+/// read (batches grow per object from `SCORE_CAP` to 256 chunks) and an
+/// object is finished as soon as `SCORE_CAP` of its chunks match or every
+/// candidate is examined. `budget` (remaining chunk fetches, shared across
+/// threads) bounds the work; when it runs out the affected objects are
+/// reported undecided.
+pub fn verify_objects(
     catalog: &Catalog,
-    matcher: &Matcher,
-    object: ObjectId,
-    generation: u32,
-    ordinals: &[u32],
+    jobs: &[VerifyJob<'_>],
     budget: &std::sync::atomic::AtomicUsize,
-) -> Result<ObjectVerdict> {
-    let mut v = ObjectVerdict::default();
-    let mut from = 0usize;
-    let mut batch = SCORE_CAP;
-    while from < ordinals.len() && v.matched.len() < SCORE_CAP {
-        let want = batch.min(ordinals.len() - from);
+) -> Result<Vec<ObjectVerdict>> {
+    struct State {
+        from: usize,
+        batch: usize,
+        done: bool,
+    }
+    let mut verdicts: Vec<ObjectVerdict> = jobs.iter().map(|_| ObjectVerdict::default()).collect();
+    let mut states: Vec<State> = jobs
+        .iter()
+        .map(|_| State {
+            from: 0,
+            batch: SCORE_CAP,
+            done: false,
+        })
+        .collect();
+    loop {
+        // Plan this round: the next batch of every unfinished object.
+        let mut keys: Vec<(ObjectId, u32, u32)> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new(); // (job, keys this round)
+        for (i, job) in jobs.iter().enumerate() {
+            let st = &states[i];
+            if st.done || st.from >= job.ordinals.len() {
+                continue;
+            }
+            let want = st.batch.min(job.ordinals.len() - st.from);
+            keys.extend(
+                job.ordinals[st.from..st.from + want]
+                    .iter()
+                    .map(|o| (job.object, job.generation, *o)),
+            );
+            spans.push((i, want));
+        }
+        if keys.is_empty() {
+            break;
+        }
         // Reserve from the shared budget; take what is left if short.
         let mut got = 0usize;
         let _ = budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |b| {
-            got = want.min(b);
+            got = keys.len().min(b);
             Some(b - got)
         });
-        if got == 0 {
-            v.undecided = true;
-            v.budget_short = true;
-            return Ok(v);
-        }
-        let keys: Vec<(ObjectId, u32, u32)> = ordinals[from..from + got]
-            .iter()
-            .map(|o| (object, generation, *o))
+        let short = got < keys.len();
+        keys.truncate(got);
+        let rows = if keys.is_empty() {
+            Vec::new()
+        } else {
+            catalog.chunks_for_many(&keys)?
+        };
+        let mut by_key: HashMap<(ObjectId, u32, u32), eidos_catalog::content::ChunkRow> = rows
+            .into_iter()
+            .map(|r| ((r.object_id, r.generation, r.ordinal), r))
             .collect();
-        from += got;
-        v.fetched += got;
-        for row in catalog.chunks_for_many(&keys)? {
-            let n = matcher.find(&row.text, 64).len();
-            if n > 0 {
-                v.matched.push((row, n));
-                if v.matched.len() >= SCORE_CAP {
-                    break;
+        let mut offset = 0usize;
+        for (i, want) in spans {
+            let job = &jobs[i];
+            let st = &mut states[i];
+            let v = &mut verdicts[i];
+            let granted = want.min(got.saturating_sub(offset));
+            let ords = &job.ordinals[st.from..st.from + granted];
+            st.from += granted;
+            v.fetched += granted;
+            for o in ords {
+                if let Some(row) = by_key.remove(&(job.object, job.generation, *o)) {
+                    let n = job.matcher.find(&row.text, 64).len();
+                    if n > 0 {
+                        v.matched.push((row, n));
+                        if v.matched.len() >= SCORE_CAP {
+                            st.done = true;
+                            break;
+                        }
+                    }
                 }
             }
+            offset += want;
+            if granted < want {
+                // Budget exhausted mid-object: a match already found still
+                // counts, but the walk must report a subset either way.
+                v.budget_short = true;
+                v.undecided = v.matched.is_empty();
+                st.done = true;
+            }
+            st.batch = (st.batch * 2).min(256);
         }
-        if got < want {
-            // Budget exhausted mid-object: a match already found still
-            // counts, but the walk must report a subset either way.
-            v.budget_short = true;
-            v.undecided = v.matched.is_empty();
-            return Ok(v);
+        if short {
+            break;
         }
-        batch = (batch * 2).min(256);
     }
-    Ok(v)
+    Ok(verdicts)
 }
 
 trait CloneBoxed {
@@ -1162,15 +1189,5 @@ mod tests {
         assert_eq!(terms.find(text, 10), vec![(0, 3), (26, 31)]);
         let re = Matcher::Regex(regex::Regex::new(r"Qz\w+").unwrap());
         assert_eq!(re.find(text, 10), vec![(4, 14)]);
-    }
-
-    #[test]
-    fn regex_required_literals() {
-        assert_eq!(
-            required_literals(r"postgresql-.*\.log$"),
-            vec!["postgresql-", ".log"]
-        );
-        assert!(required_literals(r"\d+").is_empty());
-        assert_eq!(required_literals(r"(error|warn)ing"), vec!["ing"]);
     }
 }

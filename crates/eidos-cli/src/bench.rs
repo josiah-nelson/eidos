@@ -41,6 +41,10 @@ pub enum BenchCommand {
         /// Rebuild the index from the catalog before measuring.
         #[arg(long)]
         rebuild: bool,
+        /// Only run these query families (e.g. `content-regex`); custom
+        /// queries always run.
+        #[arg(long)]
+        family: Vec<String>,
     },
     /// Time stored-chunk lookups (`chunks_for`) serially and in parallel.
     Chunks {
@@ -48,6 +52,11 @@ pub enum BenchCommand {
         sample: u32,
         #[arg(long, default_value_t = 8)]
         threads: usize,
+        /// Instead of a sample, time the candidate chunks of this content
+        /// clause (eidos syntax, e.g. `content:/timed? ?out after \d+/`),
+        /// including the matcher's cost on the fetched text.
+        #[arg(long)]
+        query: Option<String>,
     },
     /// Stream one file through the extractor (sniff/decode/chunk/hash) with a
     /// null sink; reports throughput and peak working set. Read-only.
@@ -231,6 +240,7 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             bench_out,
             query,
             rebuild,
+            family,
         } => bench_search(
             &args.data_dir,
             iterations,
@@ -238,20 +248,76 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             bench_out,
             query,
             rebuild,
+            family,
         ),
         BenchCommand::Content {
             file,
             bench_out,
             label,
         } => bench_content(&file, bench_out, label),
-        BenchCommand::Chunks { sample, threads } => bench_chunks(&args.data_dir, sample, threads),
+        BenchCommand::Chunks {
+            sample,
+            threads,
+            query,
+        } => bench_chunks(&args.data_dir, sample, threads, query),
     }
 }
 
-fn bench_chunks(data_dir: &std::path::Path, sample: u32, threads: usize) -> anyhow::Result<()> {
+fn bench_chunks(
+    data_dir: &std::path::Path,
+    sample: u32,
+    threads: usize,
+    query: Option<String>,
+) -> anyhow::Result<()> {
+    use eidos_search::content::{self, ContentClause, ContentOpts};
     let catalog = Catalog::open(data_dir.join("catalog.db"))?;
-    let keys = catalog.sample_chunk_keys(sample)?;
+    let mut matcher: Option<content::Matcher> = None;
+    let keys = match &query {
+        Some(q) => {
+            let parsed = eidos_query::parse(q).context("parse query")?;
+            fn find(q: &eidos_domain::Query) -> Option<ContentClause> {
+                use eidos_domain::Query as Q;
+                match q {
+                    Q::Text {
+                        field: eidos_domain::TextField::Content,
+                        mode,
+                        value,
+                        case_sensitive,
+                        slop,
+                    } => Some(ContentClause {
+                        mode: *mode,
+                        value: value.clone(),
+                        case_sensitive: *case_sensitive,
+                        slop: *slop,
+                    }),
+                    Q::And { clauses } | Q::Or { clauses } => clauses.iter().find_map(find),
+                    Q::Not { clause } => find(clause),
+                    _ => None,
+                }
+            }
+            let clause = find(&parsed.query).context("query has no content clause")?;
+            let index = ContentIndex::open(data_dir.join("index").join("content"))?;
+            let opts = ContentOpts {
+                lazy_min: 0,
+                ..ContentOpts::default()
+            };
+            let (ret, m) = content::retrieve(&index, &catalog, &clause, None, &[], &opts)?;
+            println!("{}", ret.description);
+            matcher = Some(m);
+            ret.hits
+                .iter()
+                .map(|h| (h.object_id, h.generation, h.ordinal))
+                .collect()
+        }
+        None => catalog.sample_chunk_keys(sample)?,
+    };
     anyhow::ensure!(!keys.is_empty(), "no chunks stored");
+    let objects = keys
+        .iter()
+        .map(|k| k.0)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    println!("{} chunk keys over {objects} objects", keys.len());
     for pass in ["cold", "warm"] {
         let t = Instant::now();
         let mut bytes = 0usize;
@@ -306,6 +372,22 @@ fn bench_chunks(data_dir: &std::path::Path, sample: u32, threads: usize) -> anyh
         .flat_map(|b| catalog.chunks_for_many(b).unwrap_or_default())
         .map(|r| r.text)
         .collect();
+    if let Some(m) = &matcher {
+        let t = Instant::now();
+        let mut matched = 0usize;
+        for tx in &texts {
+            if !m.find(tx, 64).is_empty() {
+                matched += 1;
+            }
+        }
+        let d = t.elapsed();
+        println!(
+            "matcher over {} texts: {:.0} ms = {:.0} us each ({matched} chunks match)",
+            texts.len(),
+            d.as_secs_f64() * 1000.0,
+            d.as_secs_f64() * 1e6 / texts.len().max(1) as f64
+        );
+    }
     let re = regex::Regex::new(r"[A-Z][a-z]+Exception: ").unwrap();
     let t = Instant::now();
     let mut hits = 0usize;
@@ -472,6 +554,7 @@ fn bench_search(
     bench_out: Option<PathBuf>,
     extra: Vec<String>,
     rebuild: bool,
+    families: Vec<String>,
 ) -> anyhow::Result<()> {
     let catalog = Catalog::open(data_dir.join("catalog.db"))?;
     let index = CatalogIndex::open(data_dir.join("index").join("catalog"))?;
@@ -524,6 +607,7 @@ fn bench_search(
 
     let mut cases: Vec<(String, String, ResultMode, SortField)> = CASES
         .iter()
+        .filter(|c| families.is_empty() || families.iter().any(|f| f == c.family))
         .map(|c| (c.family.to_string(), c.text.to_string(), c.mode, c.sort))
         .collect();
     for q in &extra {

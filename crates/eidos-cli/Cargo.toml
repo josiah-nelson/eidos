@@ -19,6 +19,7 @@ eidos-query = { workspace = true }
 eidos-content = { workspace = true }
 windows-sys = { workspace = true }
 regex = { workspace = true }
+mimalloc = { workspace = true }
 ureq = { version = "3.4", features = ["json"] }
 anyhow = { workspace = true }
 clap = { workspace = true }

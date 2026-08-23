@@ -96,7 +96,16 @@ named by `--bench-out`, optionally with a full report via `--report-out`.
 # while measuring. Stop `serve` first: only one process may hold the index writer.
 .\target\release\eidos.exe bench search --data-dir data --iterations 30 --bench-out bench-results\query.jsonl
 .\target\release\eidos.exe bench search --data-dir data --concurrent-scan projects
+# One family plus ad-hoc queries; and the chunk-store cost on the candidate
+# chunks a content clause actually touches (fetch serial/parallel + matcher).
+.\target\release\eidos.exe bench search --data-dir data --family content-regex --query "content:/colou?r/"
+.\target\release\eidos.exe bench chunks --data-dir data --threads 16 --query "content:/timed? ?out after \d+/"
 ```
+
+`.cargo/config.toml` builds the bundled SQLite with a raised
+`SQLITE_MAX_MMAP_SIZE` so the catalog can be memory-mapped in full
+(ADR-0009); a build without it still works but chunk fetches fall back to
+read calls and content verification is ≈2–3× slower.
 
 Benchmark records carry workload labels, never file names or secrets.
 
