@@ -8,6 +8,7 @@
 pub mod api;
 pub mod content_workers;
 pub mod follower;
+pub mod retry_api;
 pub mod scanner;
 pub mod state;
 #[cfg(windows)]
