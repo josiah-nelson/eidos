@@ -387,6 +387,49 @@ async fn abandoned_request_keeps_its_permit_until_the_work_finishes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadlines_racing_completion_keep_the_gauges_consistent() {
+    // Deadline and work duration are equal, so both outcomes happen and the
+    // detach and completion paths interleave under real contention. The
+    // narrow window between marking a detach and counting it is closed by
+    // construction (the count is published first); this is the volume check
+    // that the gauges still settle exactly, including a `u64` that would show
+    // an underflow as a value that never returns to zero.
+    let e = env(AdmissionConfig {
+        concurrency: 8,
+        queue_depth: 512,
+        queue_wait: Duration::from_secs(5),
+        search_timeout: Duration::from_millis(2),
+        ..Default::default()
+    });
+    let mut tasks = Vec::new();
+    for _ in 0..200 {
+        let admission = e.state.admission.clone();
+        tasks.push(tokio::spawn(async move {
+            admission
+                .run(eidos_service::admission::Expensive::Search, || {
+                    std::thread::sleep(Duration::from_millis(2));
+                })
+                .await
+                .is_ok()
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    wait_for(
+        || {
+            let v = e.state.admission.view();
+            v.in_flight == 0 && v.detached == 0 && v.admitted == v.completed
+        },
+        "gauges settle after 200 racing deadlines",
+    )
+    .await;
+    let v = e.state.admission.view();
+    assert_eq!(v.admitted, 200, "{v:?}");
+    assert_eq!(v.rejected_busy, 0, "{v:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oversized_request_body_is_rejected() {
     let e = env(AdmissionConfig {
         max_body_bytes: 2048,

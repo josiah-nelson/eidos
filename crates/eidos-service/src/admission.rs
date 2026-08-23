@@ -172,12 +172,19 @@ struct Abandoned {
 
 impl Drop for Abandoned {
     fn drop(&mut self) {
+        // Count first, publish second. The completing side only decrements
+        // after it reads `DETACHED`, which the release below orders after
+        // this increment, so the gauge can never go negative when the work
+        // finishes in the middle of this.
+        self.counters.detached.fetch_add(1, Ordering::Relaxed);
         if self
             .state
             .compare_exchange(RUNNING, DETACHED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_err()
         {
-            self.counters.detached.fetch_add(1, Ordering::Relaxed);
+            // The work finished first and will never see `DETACHED`; it was
+            // not abandoned after all.
+            self.counters.detached.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
