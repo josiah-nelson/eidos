@@ -325,6 +325,95 @@ fn facets() {
     assert_eq!(sizes.values.iter().map(|v| v.count).sum::<u64>(), 17);
 }
 
+/// Every size and modification-time bucket carries clauses that reproduce
+/// exactly the bucket the user clicked — including the first (open below),
+/// the last (open above), and the exclusions — in both result modes.
+#[test]
+fn range_bucket_clauses_reproduce_their_bucket() {
+    let fx = fixture();
+    for (mode, base) in [
+        (ResultMode::Files, ""),
+        (ResultMode::Directories, ""),
+        // An existing bound on the same field must still combine, not be
+        // silently replaced.
+        (ResultMode::Files, "size:>=100"),
+    ] {
+        let mut req = fx.req(base);
+        req.mode = mode;
+        req.facets = vec![
+            FacetRequest {
+                field: FacetField::SizeBucket,
+                limit: 10,
+            },
+            FacetRequest {
+                field: FacetField::ModifiedBucket,
+                limit: 10,
+            },
+        ];
+        let r = fx.run_req(req);
+        let total = r.total.value;
+        assert!(total > 0, "{mode:?} {base:?} has no results");
+        let mut open_below = 0;
+        let mut open_above = 0;
+        for facet in &r.facets {
+            let mut summed = 0;
+            for v in &facet.values {
+                let range = v.range.as_ref().unwrap_or_else(|| {
+                    panic!("{:?} bucket {} has no clause", facet.field, v.value)
+                });
+                open_below += u32::from(range.from.is_none());
+                open_above += u32::from(range.to.is_none());
+                let mut include = fx.req(&format!("{base} {}", range.clause));
+                include.mode = mode;
+                assert_eq!(
+                    fx.run_req(include).total.value,
+                    v.count,
+                    "{:?} include {} in {mode:?}",
+                    facet.field,
+                    range.clause
+                );
+                let mut exclude = fx.req(&format!("{base} {}", range.exclude));
+                exclude.mode = mode;
+                assert_eq!(
+                    fx.run_req(exclude).total.value,
+                    total - v.count,
+                    "{:?} exclude {} in {mode:?}",
+                    facet.field,
+                    range.exclude
+                );
+                summed += v.count;
+            }
+            assert_eq!(summed, total, "{:?} buckets cover every hit", facet.field);
+        }
+        // Everything in the fixture is small, so the open-below first bucket
+        // is always exercised above; the open-above bucket is whichever
+        // modification-time bucket the run lands in (`facets.rs` unit tests
+        // pin the clause text for both ends).
+        assert_eq!(r.facets.len(), 2);
+        assert!(open_below >= 1, "no open-ended first bucket in {mode:?}");
+        let _ = open_above;
+    }
+}
+
+/// The buckets mix per-file and per-subtree values in `both` mode, so they
+/// are labelled but carry no clause rather than a clause that means
+/// something else.
+#[test]
+fn range_buckets_are_display_only_in_both_mode() {
+    let fx = fixture();
+    let mut req = fx.req("");
+    req.mode = ResultMode::Both;
+    req.facets = vec![FacetRequest {
+        field: FacetField::SizeBucket,
+        limit: 10,
+    }];
+    let r = fx.run_req(req);
+    let sizes = &r.facets[0];
+    assert!(!sizes.values.is_empty());
+    assert!(sizes.values.iter().all(|v| v.range.is_none()));
+    assert!(sizes.values.iter().all(|v| v.label.is_some()));
+}
+
 #[test]
 fn content_clause_is_rejected_truthfully() {
     let fx = fixture();

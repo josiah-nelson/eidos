@@ -30,6 +30,7 @@ if (-not $SkipWeb) {
     try {
         if (-not (Test-Path node_modules)) { Step "npm ci" { npm ci } }
         Step "npm run lint"  { npm run lint }
+        Step "npm test"      { npm test }
         Step "npm run build" { npm run build }
     } finally { Pop-Location }
 }
