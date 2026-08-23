@@ -195,6 +195,11 @@ impl PolicyEngine {
                 reason: ReasonCode::BinaryData,
                 rule: "extension-binary",
             },
+            // ZIP-family containers are candidates: the content job reads
+            // their member inventory (ADR-0010), never member data.
+            FileKind::Archive if eidos_domain::archive::archive_format(name).is_some() => {
+                ContentDecision::Candidate
+            }
             FileKind::Archive | FileKind::Document => ContentDecision::Unsupported,
             FileKind::Text
             | FileKind::Code
@@ -321,6 +326,15 @@ mod tests {
         assert_eq!(
             p.file("notes.md", FileAttributes::default(), 0, &root),
             ContentDecision::Candidate
+        );
+        assert_eq!(
+            p.file("tool.zip", FileAttributes::default(), 0, &root),
+            ContentDecision::Candidate,
+            "ZIP containers are manifest candidates"
+        );
+        assert_eq!(
+            p.file("backup.7z", FileAttributes::default(), 0, &root),
+            ContentDecision::Unsupported
         );
         assert_eq!(
             p.file("README", FileAttributes::default(), 0, &root),

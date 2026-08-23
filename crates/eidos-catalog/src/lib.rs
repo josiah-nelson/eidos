@@ -13,6 +13,7 @@
 //! - a directory that could not be listed keeps its previous children.
 
 pub mod aggregates;
+pub mod archive;
 pub mod changes;
 pub mod content;
 pub mod jobs;

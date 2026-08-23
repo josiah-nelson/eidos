@@ -34,6 +34,8 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
         .route("/objects/{id}", get(get_object))
         .route("/objects/{id}/children", get(children))
         .route("/objects/{id}/extensions", get(extensions))
+        .route("/objects/{id}/archive", get(archive))
+        .route("/sources/{id}/archives", post(requeue_archives))
         .route("/resolve", get(resolve))
         .route("/search", post(search).get(search_get))
         .route("/search/parse", get(search_parse))
@@ -491,6 +493,85 @@ async fn children(
 }
 
 #[derive(Deserialize)]
+struct ArchiveQuery {
+    /// List the children of this virtual directory (`""` for the root).
+    parent: Option<String>,
+    /// List every member whose path starts with this prefix.
+    prefix: Option<String>,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default = "default_member_limit")]
+    limit: u32,
+}
+fn default_member_limit() -> u32 {
+    200
+}
+
+#[derive(Serialize)]
+pub struct ArchiveView {
+    pub object_id: ObjectId,
+    pub path: Option<String>,
+    pub record: eidos_catalog::archive::ArchiveRecord,
+    pub members: Vec<eidos_catalog::archive::ArchiveMember>,
+    pub total: u64,
+    pub query: eidos_catalog::archive::MemberQuery,
+}
+
+/// Manifest of a container object: its record plus one page of members.
+async fn archive(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(q): Query<ArchiveQuery>,
+) -> ApiResult<ArchiveView> {
+    let oid = ObjectId(id);
+    let record = st
+        .catalog
+        .archive_record(oid)?
+        .ok_or_else(|| ApiError::not_found(format!("object {oid} has no archive manifest")))?;
+    let query = eidos_catalog::archive::MemberQuery {
+        parent: q.parent,
+        prefix: q.prefix,
+        offset: q.offset,
+        limit: q.limit.clamp(1, 5000),
+    };
+    let (st2, q2) = (st.clone(), query.clone());
+    let (members, total) =
+        tokio::task::spawn_blocking(move || st2.catalog.archive_members(oid, &q2))
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))??;
+    Ok(Json(ArchiveView {
+        object_id: oid,
+        path: st.catalog.render_path(oid)?,
+        record,
+        members,
+        total,
+        query,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct RequeueView {
+    pub queued: u64,
+}
+
+/// Queue manifest jobs for every container file of the source that has no
+/// manifest for its current generation.
+async fn requeue_archives(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult<RequeueView> {
+    let sid = SourceId(id);
+    st.catalog
+        .get_source(sid)?
+        .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
+    let st2 = st.clone();
+    let queued = tokio::task::spawn_blocking(move || st2.catalog.requeue_archives(Some(sid)))
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))??;
+    Ok(Json(RequeueView { queued }))
+}
+
+#[derive(Deserialize)]
 struct LimitQuery {
     #[serde(default = "default_ext_limit")]
     limit: u32,
@@ -775,6 +856,7 @@ pub struct ActivityView {
     pub content_enabled: bool,
     pub jobs: eidos_catalog::jobs::JobCounts,
     pub content: eidos_catalog::content::ContentStats,
+    pub archives: eidos_catalog::archive::ArchiveStats,
     pub workers: crate::content_workers::ContentWorkersView,
     pub follower: crate::follower::FollowerView,
     pub content_index_documents: u64,
@@ -810,6 +892,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
                 .load(std::sync::atomic::Ordering::Relaxed),
             jobs: st2.catalog.job_counts(None)?,
             content: st2.catalog.content_stats(None)?,
+            archives: st2.catalog.archive_stats(None)?,
             workers: st2.content_workers.view(st2.content_index.uncommitted()),
             follower: st2.follower.view(&st2),
             content_index_documents: st2.content_index.num_docs(),
