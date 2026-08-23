@@ -149,13 +149,14 @@ impl CatalogIndex {
                         self.fields().ancestors,
                         row.object_id.0 as u64,
                     ));
-                    if seen.insert(row.object_id) {
-                        self.reindex_object(catalog, row.object_id, &mut stats)?;
-                    }
+                    // Reindex unconditionally: the ancestry deletion above
+                    // invalidates descendants already handled earlier in
+                    // this batch, so `seen` cannot suppress this rebuild.
+                    self.reindex_object(catalog, row.object_id, &mut stats)?;
+                    seen.insert(row.object_id);
                     for d in catalog.descendant_object_ids(row.object_id)? {
-                        if seen.insert(d) {
-                            self.reindex_object(catalog, d, &mut stats)?;
-                        }
+                        self.reindex_object(catalog, d, &mut stats)?;
+                        seen.insert(d);
                     }
                 }
                 _ => {

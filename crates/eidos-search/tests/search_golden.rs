@@ -435,6 +435,44 @@ fn follower_applies_catalog_changes() {
 }
 
 #[test]
+fn later_subtree_event_readds_a_descendant_seen_earlier_in_the_batch() {
+    let fx = fixture();
+    let ancestor = fx
+        .catalog
+        .resolve_relative(fx.source, "proj")
+        .unwrap()
+        .unwrap();
+    let descendant = fx
+        .catalog
+        .resolve_relative(fx.source, "proj/src/util/Helpers.cs")
+        .unwrap()
+        .unwrap();
+    let now = UnixNanos::now();
+    let rows = [
+        eidos_catalog::jobs::OutboxRow {
+            seq: 1,
+            source_id: fx.source,
+            object_id: descendant,
+            op: "upsert".into(),
+            generation: 1,
+            created_at: now,
+        },
+        eidos_catalog::jobs::OutboxRow {
+            seq: 2,
+            source_id: fx.source,
+            object_id: ancestor,
+            op: "subtree".into(),
+            generation: 1,
+            created_at: now,
+        },
+    ];
+
+    fx.index.apply_outbox(&fx.catalog, &rows).unwrap();
+    fx.index.reload().unwrap();
+    assert!(fx.names("name:=Helpers.cs").contains(&"Helpers.cs".into()));
+}
+
+#[test]
 fn invalid_queries_error_cleanly() {
     let fx = fixture();
     let mut req = fx.req("name:/(unclosed/");
