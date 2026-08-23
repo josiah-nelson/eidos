@@ -5,7 +5,7 @@
 use eidos_catalog::jobs::NewJob;
 use eidos_catalog::NewSource;
 use eidos_domain::{JobStage, Priority, SourceId, SourceKind};
-use eidos_service::content_workers::reserve_and_claim;
+use eidos_service::content_workers::{reserve_and_claim, spawn_content_workers};
 use eidos_service::state::AppState;
 use eidos_service::ServiceConfig;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -225,6 +225,33 @@ fn a_saturated_source_does_not_starve_the_others() {
     drop((next, again));
     assert_eq!(e.state.content_budgets().reserved(busy), 0);
     assert_eq!(e.state.content_budgets().reserved(idle), 0);
+}
+
+/// Persisted budgets are installed before the first worker can claim.
+/// Otherwise a source configured below the default would be oversubscribed
+/// for the seconds between startup and the coordinator's first refresh.
+#[test]
+fn startup_loads_budgets_before_any_worker_claims() {
+    let e = env();
+    let sid = add_source(&e.state, "hdd");
+    e.state.catalog.set_content_policy(sid, true, 1).unwrap();
+    queue_jobs(&e.state, sid, 40);
+    assert_eq!(
+        e.state.content_budgets().budget(sid),
+        eidos_service::source_budget::DEFAULT_BUDGET,
+        "nothing is known about the source before startup"
+    );
+    // Extraction paused, so the coordinator's periodic refresh is skipped:
+    // only startup can have installed the budget.
+    e.state.content_enabled.store(false, Ordering::Relaxed);
+
+    spawn_content_workers(&e.state, 4);
+    assert_eq!(
+        e.state.content_budgets().budget(sid),
+        1,
+        "workers must not start against the default budget"
+    );
+    e.state.request_shutdown();
 }
 
 /// Nothing stays reserved when a claim finds no work, when the caller drops

@@ -176,6 +176,12 @@ pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
         Ok(_) => {}
         Err(e) => tracing::error!(error = %e, "requeue_unfinished_content failed"),
     }
+    // Install persisted budgets *before* the first worker can claim, or a
+    // source configured below the default would be oversubscribed for the
+    // few seconds until the coordinator's first refresh.
+    if let Err(e) = refresh_budgets(state) {
+        tracing::error!(error = %e, "loading content concurrency budgets failed");
+    }
     for i in 0..workers {
         let st = state.clone();
         std::thread::Builder::new()
@@ -405,9 +411,7 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
     let status = &state.content_workers;
     let by_source = state.catalog.jobs_by_source(JobStage::ContentText)?;
     let mut total = 0;
-    let mut budgets = HashMap::new();
-    for s in state.catalog.list_sources()? {
-        budgets.insert(s.id, s.content_concurrency);
+    for s in refresh_budgets(state)? {
         if !s.content_enabled
             || s.published_generation.is_none()
             || matches!(s.state, SourceState::Retired | SourceState::Offline)
@@ -424,7 +428,20 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
         }
         total += n;
     }
-    status.budgets.set_all(&budgets);
     status.enqueued.fetch_add(total, Ordering::Relaxed);
     Ok(total)
+}
+
+/// Load every source's `content_concurrency` into the reservation table and
+/// return the sources. Live reservations are preserved, so this is safe to
+/// call while workers are running; it is called once before the pool starts
+/// and again on every enqueue interval.
+pub fn refresh_budgets(state: &AppState) -> anyhow::Result<Vec<eidos_catalog::SourceRecord>> {
+    let sources = state.catalog.list_sources()?;
+    let budgets: HashMap<SourceId, u32> = sources
+        .iter()
+        .map(|s| (s.id, s.content_concurrency))
+        .collect();
+    state.content_workers.budgets.set_all(&budgets);
+    Ok(sources)
 }
