@@ -1,4 +1,4 @@
-# ADR-0011: Content sink failures are retryable and leave nothing behind
+# ADR-0012: Content sink failures are retryable and leave nothing behind
 
 Status: accepted (amends ADR-0005)  
 Date: 2026-08-23  

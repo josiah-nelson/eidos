@@ -244,7 +244,7 @@ an index writer error — are classified separately from failures of the input.
 They are transient by definition and retry under the same backoff, and the
 attempt discards whatever it already wrote for that object generation so no
 later commit can publish partial output. The failure reason keeps the whole
-underlying error chain (ADR-0011).
+underlying error chain (ADR-0012).
 
 ## 9. Content records and chunks
 
