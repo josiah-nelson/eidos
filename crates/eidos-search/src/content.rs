@@ -1028,6 +1028,10 @@ pub struct ObjectVerdict {
     pub fetched: usize,
     /// The fetch budget ran out before a verdict: the object is undecided.
     pub undecided: bool,
+    /// The budget could not cover the last batch. Even when a match was
+    /// already found (the object counts, its score may be incomplete), the
+    /// caller must treat the walk as truncated.
+    pub budget_short: bool,
 }
 
 /// Page-driven verification of one object: fetch its candidate chunks in
@@ -1055,6 +1059,7 @@ pub fn verify_object(
         });
         if got == 0 {
             v.undecided = true;
+            v.budget_short = true;
             return Ok(v);
         }
         let keys: Vec<(ObjectId, u32, u32)> = ordinals[from..from + got]
@@ -1073,8 +1078,10 @@ pub fn verify_object(
             }
         }
         if got < want {
-            // Budget exhausted mid-object; a match already found still counts.
-            v.undecided = v.matched.is_empty() && from < ordinals.len();
+            // Budget exhausted mid-object: a match already found still
+            // counts, but the walk must report a subset either way.
+            v.budget_short = true;
+            v.undecided = v.matched.is_empty();
             return Ok(v);
         }
         batch = (batch * 2).min(256);

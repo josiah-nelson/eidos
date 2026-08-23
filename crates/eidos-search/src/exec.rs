@@ -1292,8 +1292,10 @@ impl<'a> LazyContent<'a> {
         for r in results {
             for (i, o, g, v) in r? {
                 self.fetched += v.fetched;
-                if v.undecided {
+                if v.budget_short {
                     self.exhausted = true;
+                }
+                if v.undecided {
                     continue;
                 }
                 if v.matched.is_empty() {
@@ -1411,7 +1413,14 @@ fn lazy_walk<T: WalkRow>(
             let stop = match (by_bound, rows.peek()) {
                 (true, Some(next)) => {
                     verified.sort_by(by_score_then_entry);
-                    next.score() <= verified[want - 1].score()
+                    // Rows arrive in (bound desc, entry asc) order and a
+                    // verified score never exceeds its bound, so the walk
+                    // may stop once the next row would sort after the
+                    // page boundary even at its best — including the
+                    // entry-id tie-break on equal scores.
+                    let kth = &verified[want - 1];
+                    next.score() < kth.score()
+                        || (next.score() == kth.score() && next.entry() > kth.entry())
                 }
                 _ => true,
             };

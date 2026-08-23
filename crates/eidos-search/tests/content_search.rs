@@ -508,19 +508,42 @@ fn page_driven_relevance_ranks_by_matching_chunks_with_exact_order() {
 fn page_driven_budget_exhaustion_is_reported_not_silent() {
     let fx = fixture();
     fx.extract_all();
-    let mut opts = lazy_opts();
-    opts.content.max_verify = 1;
-    let r = fx.run_with("content:~line", &opts, None, 50);
-    assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("results are a subset")),
-        "{:?}",
-        r.warnings
-    );
-    assert!(!r.total.exact, "{:?}", r.total);
-    // Whatever was returned is verified.
-    assert!(r.hits.iter().all(|h| !h.snippets.is_empty()));
+    // A budget of 3 is short for big.log's first batch of 8: the object is
+    // accepted on a partial score and the walk must still report a subset.
+    for budget in [1, 3] {
+        let mut opts = lazy_opts();
+        opts.content.max_verify = budget;
+        let r = fx.run_with("content:~line", &opts, None, 50);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("results are a subset")),
+            "budget {budget}: {:?}",
+            r.warnings
+        );
+        assert!(!r.total.exact, "budget {budget}: {:?}", r.total);
+        // Whatever was returned is verified.
+        assert!(r.hits.iter().all(|h| !h.snippets.is_empty()));
+    }
+}
+
+#[test]
+fn page_driven_relevance_ties_follow_entry_order_across_pages() {
+    let fx = fixture();
+    fx.extract_all();
+    // `Zephyr` appears once in each of two Markdown files: equal bounds,
+    // equal verified scores, so the entry-id tie-break decides the page
+    // boundary. Page one of size one must show the same file as the first
+    // row of an exhaustive run, and page two the other.
+    let lazy = lazy_opts();
+    let all = fx.run_with("content:~Zephyr ext:md", &lazy, None, 50);
+    let names: Vec<&str> = all.hits.iter().map(|h| h.name.as_str()).collect();
+    assert_eq!(names.len(), 2);
+    let p1 = fx.run_with("content:~Zephyr ext:md", &lazy, None, 1);
+    assert_eq!(p1.hits[0].name, names[0]);
+    let p2 = fx.run_with("content:~Zephyr ext:md", &lazy, p1.next_cursor.clone(), 1);
+    assert_eq!(p2.hits[0].name, names[1]);
+    assert_eq!(p1.hits[0].score, p2.hits[0].score);
 }
 
 #[test]
