@@ -499,7 +499,10 @@ export const api = {
     request<SourceView>(`/api/sources/${id}/content`, { method: 'POST', body: JSON.stringify(body) }),
   retryJob: (id: number) =>
     request<RetryReport>(`/api/jobs/${id}/retry`, { method: 'POST', body: JSON.stringify({ preview: false }) }),
-  retrySourceContent: (id: number, body: { class?: string; reason_prefix?: string; preview: boolean }) =>
+  retrySourceContent: (
+    id: number,
+    body: { class?: string; reason_prefix?: string; preview: boolean; limit?: number },
+  ) =>
     request<RetryReport>(`/api/sources/${id}/content/retry`, { method: 'POST', body: JSON.stringify(body) }),
 }
 

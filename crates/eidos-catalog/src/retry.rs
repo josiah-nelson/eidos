@@ -47,7 +47,8 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Cap on the jobs one bulk action touches.
+/// Cap on the jobs one bulk action requeues, and on the candidates it
+/// examines to find them.
 pub const MAX_RETRY_BATCH: u32 = 50_000;
 /// Accepted job ids reported back (a bulk retry can accept thousands).
 const MAX_REPORTED_IDS: usize = 100;
@@ -65,6 +66,8 @@ pub struct RetrySelector {
     pub class: Option<FailureClass>,
     /// Match jobs whose `last_error` starts with this text.
     pub reason_prefix: Option<String>,
+    /// Stop after requeueing this many. A confirmation can pass the count
+    /// its preview reported and be sure the action stays within it.
     pub limit: Option<u32>,
     /// Count what would happen without changing anything.
     pub preview: bool,
@@ -188,79 +191,29 @@ impl Catalog {
     /// Requeue the failed work a selector names: failed jobs, and (for the
     /// content stage) objects whose extraction failed for good.
     ///
-    /// Runs in one immediate transaction so the duplicate-active check and
-    /// the requeue cannot interleave with a worker claim. Preview mode
-    /// evaluates exactly the same rules and writes nothing.
+    /// The action runs in one immediate transaction, so the
+    /// duplicate-active check and the requeue cannot interleave with a
+    /// worker claim. A preview applies exactly the same rules, writes
+    /// nothing, and runs on a pooled reader: counting a large backlog must
+    /// not hold the single catalog writer away from the workers.
     pub fn retry_failed_jobs(&self, sel: &RetrySelector) -> Result<RetryReport> {
-        let limit = sel.limit.unwrap_or(MAX_RETRY_BATCH).min(MAX_RETRY_BATCH) as i64;
-        let explicit = sel.is_explicit();
+        let limit = u64::from(sel.limit.unwrap_or(MAX_RETRY_BATCH).min(MAX_RETRY_BATCH));
         let prefix = sel.reason_prefix.as_deref().map(like_prefix);
         let mut report = RetryReport {
             preview: sel.preview,
             ..Default::default()
         };
-        self.with_writer(|conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let now = UnixNanos::now().0;
-            let candidates: Vec<Candidate> = tx
-                .prepare(CANDIDATE_SQL)?
-                .query_map(
-                    params![
-                        sel.job_id.map(|j| j.0),
-                        sel.object_id.map(|o| o.0),
-                        sel.source_id.map(|s| s.0),
-                        sel.stage.map(|s| s.as_str()),
-                        sel.class.map(|c| c.as_str()),
-                        prefix,
-                        explicit as i64,
-                        limit
-                    ],
-                    |r| {
-                        Ok(Candidate {
-                            job_id: r.get(0)?,
-                            state: r.get(1)?,
-                            object_id: r.get(2)?,
-                            object_generation: r.get(3)?,
-                            stage: r.get(4)?,
-                            estimated_cost: r.get(5)?,
-                            attempts: r.get(6)?,
-                            object_deleted: r.get::<_, i64>(7)? != 0,
-                            object_generation_now: r.get(8)?,
-                            source_state: r.get(9)?,
-                            content_enabled: r.get::<_, i64>(10)? != 0,
-                        })
-                    },
-                )?
-                .collect::<rusqlite::Result<_>>()?;
-            for c in candidates {
-                match classify(&tx, &c)? {
-                    Verdict::Accept => {
-                        if !sel.preview {
-                            tx.execute(
-                                "UPDATE jobs SET state = 'queued', scheduled_at = ?2, started_at = NULL, finished_at = NULL,
-                                    worker = NULL, requeue_count = requeue_count + 1, requeued_at = ?2,
-                                    retry_base_attempts = ?3
-                                 WHERE job_id = ?1 AND state = 'failed'",
-                                params![c.job_id, now, c.attempts],
-                            )?;
-                        }
-                        report.accept(Some(JobId(c.job_id)), c.estimated_cost.max(0) as u64);
-                    }
-                    Verdict::Skip(why) => report.skip(why),
-                    Verdict::Reject(why) => report.reject(why),
-                }
-            }
-            let remaining = limit - report.total() as i64;
-            if remaining > 0 && sel.job_id.is_none() && sel.stage.is_none_or(|s| s == JobStage::ContentText) {
-                retry_failed_content(&tx, sel, &prefix, remaining, now, &mut report)?;
-            }
-            if sel.preview {
-                tx.rollback()?;
-            } else {
+        if sel.preview {
+            self.with_reader(|conn| evaluate(conn, sel, &prefix, limit, &mut report))?;
+        } else {
+            self.with_writer(|conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                evaluate(&tx, sel, &prefix, limit, &mut report)?;
                 tx.commit()?;
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
+        }
         Ok(report)
     }
 
@@ -301,6 +254,76 @@ impl Catalog {
     }
 }
 
+/// Classify (and, unless previewing, requeue) everything the selector
+/// names. `conn` is a write transaction for an action and a read-only
+/// connection for a preview; the preview path never reaches a write.
+fn evaluate(
+    conn: &rusqlite::Connection,
+    sel: &RetrySelector,
+    prefix: &Option<String>,
+    limit: u64,
+    report: &mut RetryReport,
+) -> Result<()> {
+    let now = UnixNanos::now().0;
+    let candidates: Vec<Candidate> = conn
+        .prepare(CANDIDATE_SQL)?
+        .query_map(
+            params![
+                sel.job_id.map(|j| j.0),
+                sel.object_id.map(|o| o.0),
+                sel.source_id.map(|s| s.0),
+                sel.stage.map(|s| s.as_str()),
+                sel.class.map(|c| c.as_str()),
+                prefix,
+                sel.is_explicit() as i64,
+                MAX_RETRY_BATCH as i64
+            ],
+            |r| {
+                Ok(Candidate {
+                    job_id: r.get(0)?,
+                    state: r.get(1)?,
+                    object_id: r.get(2)?,
+                    object_generation: r.get(3)?,
+                    stage: r.get(4)?,
+                    estimated_cost: r.get(5)?,
+                    attempts: r.get(6)?,
+                    object_deleted: r.get::<_, i64>(7)? != 0,
+                    object_generation_now: r.get(8)?,
+                    source_state: r.get(9)?,
+                    content_enabled: r.get::<_, i64>(10)? != 0,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    for c in candidates {
+        if report.accepted >= limit {
+            break;
+        }
+        match classify(conn, &c)? {
+            Verdict::Accept => {
+                if !sel.preview {
+                    conn.execute(
+                        "UPDATE jobs SET state = 'queued', scheduled_at = ?2, started_at = NULL, finished_at = NULL,
+                            worker = NULL, requeue_count = requeue_count + 1, requeued_at = ?2, retry_base_attempts = ?3
+                         WHERE job_id = ?1 AND state = 'failed'",
+                        params![c.job_id, now, c.attempts],
+                    )?;
+                }
+                report.accept(Some(JobId(c.job_id)), c.estimated_cost.max(0) as u64);
+            }
+            Verdict::Skip(why) => report.skip(why),
+            Verdict::Reject(why) => report.reject(why),
+        }
+    }
+    if report.accepted < limit
+        && sel.job_id.is_none()
+        && sel.stage.is_none_or(|s| s == JobStage::ContentText)
+    {
+        retry_failed_content(conn, sel, prefix, limit, now, report)?;
+    }
+    Ok(())
+}
+
 /// Objects whose extraction failed for good: the pipeline records a
 /// deterministic, corrupt, or resource-limit failure on the content record
 /// and finishes the job, so nothing in the queue represents them any more.
@@ -322,10 +345,10 @@ const FAILED_CONTENT_SQL: &str = "SELECT o.object_id, o.source_id, o.generation,
      LIMIT ?5";
 
 fn retry_failed_content(
-    tx: &rusqlite::Transaction<'_>,
+    conn: &rusqlite::Connection,
     sel: &RetrySelector,
     prefix: &Option<String>,
-    limit: i64,
+    limit: u64,
     now: i64,
     report: &mut RetryReport,
 ) -> Result<()> {
@@ -337,7 +360,7 @@ fn retry_failed_content(
         source_state: String,
         content_enabled: bool,
     }
-    let rows: Vec<Row> = tx
+    let rows: Vec<Row> = conn
         .prepare(FAILED_CONTENT_SQL)?
         .query_map(
             params![
@@ -345,7 +368,7 @@ fn retry_failed_content(
                 sel.source_id.map(|s| s.0),
                 sel.class.map(|c| c.as_str()),
                 prefix,
-                limit
+                MAX_RETRY_BATCH as i64
             ],
             |r| {
                 Ok(Row {
@@ -360,6 +383,9 @@ fn retry_failed_content(
         )?
         .collect::<rusqlite::Result<_>>()?;
     for row in rows {
+        if report.accepted >= limit {
+            break;
+        }
         if row.source_state == "retired" {
             report.skip("retired");
             continue;
@@ -369,7 +395,7 @@ fn retry_failed_content(
             continue;
         }
         let key = NewJob::object_key(JobStage::ContentText, row.object, row.generation);
-        let existing: Option<(i64, i64)> = tx
+        let existing: Option<(i64, i64)> = conn
             .query_row(
                 "SELECT job_id, attempts FROM jobs WHERE idempotency_key = ?1",
                 params![key],
@@ -381,7 +407,7 @@ fn retry_failed_content(
                 // Revive the finished job in place: its attempt and error
                 // history is the record of what went wrong.
                 Some((job_id, attempts)) => {
-                    tx.execute(
+                    conn.execute(
                         "UPDATE jobs SET state = 'queued', scheduled_at = ?2, started_at = NULL, finished_at = NULL,
                             worker = NULL, requeue_count = requeue_count + 1, requeued_at = ?2, retry_base_attempts = ?3
                          WHERE job_id = ?1",
@@ -389,7 +415,7 @@ fn retry_failed_content(
                     )?;
                 }
                 None => crate::content::enqueue_content_for(
-                    tx,
+                    conn,
                     row.source,
                     row.object,
                     row.generation,
@@ -398,7 +424,7 @@ fn retry_failed_content(
             }
             // The object is a content candidate again; the content record
             // keeps its failure until the re-run overwrites it.
-            crate::content::flip_state(tx, row.object, ContentState::Pending, None)?;
+            crate::content::flip_state(conn, row.object, ContentState::Pending, None)?;
         }
         report.accept(existing.map(|(id, _)| JobId(id)), row.size);
     }
@@ -411,7 +437,7 @@ enum Verdict {
     Reject(&'static str),
 }
 
-fn classify(tx: &rusqlite::Transaction<'_>, c: &Candidate) -> Result<Verdict> {
+fn classify(conn: &rusqlite::Connection, c: &Candidate) -> Result<Verdict> {
     if c.state != "failed" {
         return Ok(Verdict::Reject(match c.state.as_str() {
             "running" => "running",
@@ -436,7 +462,7 @@ fn classify(tx: &rusqlite::Transaction<'_>, c: &Candidate) -> Result<Verdict> {
         if c.stage == JobStage::ContentText.as_str() && !c.content_enabled {
             return Ok(Verdict::Skip("content_disabled"));
         }
-        let active: bool = tx.query_row(
+        let active: bool = conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM jobs WHERE object_id = ?1 AND stage = ?2
                             AND state IN ('queued','running') AND job_id != ?3)",
             params![obj, c.stage, c.job_id],

@@ -509,3 +509,36 @@ fn failed_content_records_are_requeued_although_their_job_finished() {
     assert_eq!(fx.active_jobs(one), 1);
     assert_eq!(fx.active_jobs(two), 1);
 }
+
+#[test]
+fn a_limit_caps_how_many_are_requeued() {
+    let fx = Fx::new();
+    let det = fx.fail("one.txt", FailureClass::Deterministic, "boom");
+    let second = fx.fail("two.txt", FailureClass::Deterministic, "boom");
+    fx.fail("three.txt", FailureClass::Deterministic, "boom");
+    // A confirmation passes the count its preview reported; candidates are
+    // ordered oldest first, so the action stays inside what was shown.
+    let sel = RetrySelector {
+        limit: Some(2),
+        ..RetrySelector::source(fx.source, JobStage::ContentText)
+    };
+    let preview = fx
+        .catalog
+        .retry_failed_jobs(&RetrySelector {
+            preview: true,
+            ..sel.clone()
+        })
+        .unwrap();
+    assert_eq!((preview.accepted, preview.bytes), (2, 300));
+    let r = fx.catalog.retry_failed_jobs(&sel).unwrap();
+    assert_eq!((r.accepted, r.bytes), (2, 300));
+    assert_eq!(fx.state(det), JobState::Queued);
+    assert_eq!(fx.state(second), JobState::Queued);
+    assert_eq!(
+        fx.catalog
+            .failed_work_by_source(JobStage::ContentText)
+            .unwrap()[&fx.source],
+        (1, 300),
+        "the third failure is untouched"
+    );
+}

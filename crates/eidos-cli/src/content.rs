@@ -35,7 +35,8 @@ enum ContentCommand {
         /// Only failures whose error message starts with this text.
         #[arg(long, requires = "source")]
         reason_prefix: Option<String>,
-        /// Cap on jobs touched by one bulk retry.
+        /// Requeue at most this many (pass a preview's count to bound the
+        /// action to what it reported).
         #[arg(long, requires = "source")]
         limit: Option<u32>,
         /// Report what would be retried without changing anything.
