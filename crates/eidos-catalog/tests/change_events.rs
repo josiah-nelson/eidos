@@ -1099,3 +1099,210 @@ fn archive_members_never_reach_the_containing_directory() {
     assert_eq!(fx.extrema(""), (Some(t(90).0), Some(t(10).0)));
     fx.assert_matches_rebuild();
 }
+
+// --- Changes applied while a scan generation is open (native replay) -----
+
+/// Open a reconciliation generation and stream the fixture tree into it
+/// without publishing, exactly as the service's native scan sequence does
+/// before it replays overlapping change-feed records.
+fn open_reconcile(fx: &Fx) -> eidos_catalog::scan::ScanSession {
+    let mut session = fx
+        .catalog
+        .begin_scan(fx.source, eidos_catalog::scan::ScanKind::Reconcile)
+        .unwrap();
+    let lister = eidos_scanner::default_lister();
+    let opts = eidos_scanner::WalkOptions::default();
+    eidos_scanner::walk(&fx.root, lister.as_ref(), &opts, |ev| {
+        session.ingest(ev).unwrap()
+    });
+    // Release the session's batch transaction so replay batches can use the
+    // shared writer (the service does the same before replaying).
+    session.commit().unwrap();
+    session
+}
+
+fn usn_checkpoint(next_usn: i64) -> Checkpoint {
+    Checkpoint {
+        kind: "usn".into(),
+        value: serde_json::json!({"journal_id": 1, "next_usn": next_usn}),
+    }
+}
+
+fn source_of(fx: &Fx) -> eidos_catalog::model::SourceRecord {
+    fx.catalog.get_source(fx.source).unwrap().unwrap()
+}
+
+#[test]
+fn changes_replayed_into_open_generation_survive_publish() {
+    let mut fx = Fx::new();
+    fx.catalog
+        .set_checkpoint(fx.source, &usn_checkpoint(5))
+        .unwrap();
+    let a = fx.key_of("a");
+    let two = fx.key_of("a/b/two.txt");
+    let one_snap = fx.snapshot_of("a/one.txt");
+    let late = fx.fresh_snapshot(ObjectKind::File, 7);
+
+    let session = open_reconcile(&fx);
+    // Overlapping changes: a file created after `a` was listed, a file
+    // deleted after `a/b` was listed, and a file re-observed unchanged.
+    let stats = fx
+        .catalog
+        .apply_changes(
+            fx.source,
+            &[
+                ChangeEvent::Link {
+                    parent: a,
+                    name: "late.txt".into(),
+                    snapshot: late,
+                },
+                ChangeEvent::Delete { object: two },
+                ChangeEvent::Link {
+                    parent: a,
+                    name: "one.txt".into(),
+                    snapshot: one_snap,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    assert_eq!(stats.entries_created, 1);
+    assert_eq!(stats.objects_tombstoned, 1);
+    // The generation is still open: nothing is advertised and the checkpoint
+    // has not moved.
+    let during = source_of(&fx);
+    assert_eq!(during.state, eidos_domain::SourceState::Reconciling);
+    assert_eq!(during.published_generation, Some(1));
+    let (cp, _) = fx.catalog.checkpoint(fx.source).unwrap().unwrap();
+    assert_eq!(cp.value["next_usn"], 5);
+
+    let cp = usn_checkpoint(42);
+    let summary = session
+        .finish_with(&eidos_catalog::scan::PublishOptions {
+            checkpoint: Some(&cp),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(summary.published);
+    assert_eq!(summary.generation, 2);
+    assert_eq!(
+        summary.tombstoned_entries + summary.tombstoned_objects,
+        0,
+        "replayed rows are not tombstoned as unobserved"
+    );
+
+    let after = source_of(&fx);
+    assert_eq!(after.published_generation, Some(2));
+    assert!(matches!(
+        after.state,
+        eidos_domain::SourceState::MetadataComplete | eidos_domain::SourceState::ContentPending
+    ));
+    let (cp, _) = fx.catalog.checkpoint(fx.source).unwrap().unwrap();
+    assert_eq!(
+        cp.value["next_usn"], 42,
+        "checkpoint published with the generation"
+    );
+    assert!(fx
+        .catalog
+        .resolve_relative(fx.source, "a/late.txt")
+        .unwrap()
+        .is_some());
+    assert!(fx
+        .catalog
+        .resolve_relative(fx.source, "a/one.txt")
+        .unwrap()
+        .is_some());
+    assert!(fx
+        .catalog
+        .resolve_relative(fx.source, "a/b/two.txt")
+        .unwrap()
+        .is_none());
+    // Aggregates were rebuilt at publication over the replayed state.
+    let root_agg = fx
+        .catalog
+        .directory_aggregate(after.root_object_id.unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(root_agg.file_count, 2, "one.txt + late.txt");
+    assert_eq!(root_agg.logical_bytes, 107);
+    let a_id = fx
+        .catalog
+        .resolve_relative(fx.source, "a")
+        .unwrap()
+        .unwrap();
+    let a_agg = fx.catalog.directory_aggregate(a_id).unwrap().unwrap();
+    assert_eq!(a_agg.file_count, 2);
+    assert_eq!(a_agg.dir_count, 1);
+}
+
+#[test]
+fn abort_after_replay_preserves_previous_generation_and_checkpoint() {
+    let mut fx = Fx::new();
+    fx.catalog
+        .set_checkpoint(fx.source, &usn_checkpoint(5))
+        .unwrap();
+    let a = fx.key_of("a");
+    let late = fx.fresh_snapshot(ObjectKind::File, 7);
+    let session = open_reconcile(&fx);
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[ChangeEvent::Link {
+                parent: a,
+                name: "late.txt".into(),
+                snapshot: late,
+            }],
+            None,
+        )
+        .unwrap();
+    session.abort("replay failed: journal read failed").unwrap();
+
+    let s = source_of(&fx);
+    assert_eq!(s.published_generation, Some(1));
+    assert_eq!(s.state, eidos_domain::SourceState::Degraded);
+    assert!(s.state_reason.as_deref().unwrap().contains("replay failed"));
+    let (cp, _) = fx.catalog.checkpoint(fx.source).unwrap().unwrap();
+    assert_eq!(cp.value["next_usn"], 5, "checkpoint untouched by the abort");
+    let gens = fx.catalog.list_generations(fx.source, 10).unwrap();
+    let g2 = gens.iter().find(|g| g.generation == 2).unwrap();
+    assert_eq!(g2.state, "aborted");
+    assert!(fx
+        .catalog
+        .resolve_relative(fx.source, "a/b/two.txt")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn crash_during_replay_is_recovered_as_aborted_with_checkpoint_kept() {
+    let mut fx = Fx::new();
+    fx.catalog
+        .set_checkpoint(fx.source, &usn_checkpoint(5))
+        .unwrap();
+    let a = fx.key_of("a");
+    let late = fx.fresh_snapshot(ObjectKind::File, 7);
+    let session = open_reconcile(&fx);
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[ChangeEvent::Link {
+                parent: a,
+                name: "late.txt".into(),
+                snapshot: late,
+            }],
+            None,
+        )
+        .unwrap();
+    // Simulate a crash between replay and publication.
+    drop(session);
+    let path = fx.catalog.path().to_path_buf();
+    drop(fx.catalog);
+    let reopened = Catalog::open(&path).unwrap();
+    let report = reopened.recover().unwrap();
+    assert_eq!(report.aborted_generations, vec![(SourceId(1), 2)]);
+    let s = reopened.get_source(SourceId(1)).unwrap().unwrap();
+    assert_eq!(s.published_generation, Some(1));
+    assert_eq!(s.state, eidos_domain::SourceState::Degraded);
+    let (cp, _) = reopened.checkpoint(SourceId(1)).unwrap().unwrap();
+    assert_eq!(cp.value["next_usn"], 5);
+}
