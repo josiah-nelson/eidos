@@ -591,6 +591,27 @@ impl Catalog {
         })
     }
 
+    /// Object ids of every live ancestor of an object (not including it),
+    /// nearest first. One query, whatever the depth.
+    pub fn ancestor_object_ids(&self, object: ObjectId) -> Result<Vec<ObjectId>> {
+        self.with_reader(|conn| {
+            counted();
+            Ok(conn
+                .prepare_cached(
+                    "WITH RECURSIVE up(object_id) AS (
+                        SELECT parent_id FROM entries WHERE object_id = ?1 AND deleted_at IS NULL
+                        UNION
+                        SELECT e.parent_id FROM entries e JOIN up u ON e.object_id = u.object_id WHERE e.deleted_at IS NULL
+                     ) SELECT object_id FROM up WHERE object_id IS NOT NULL",
+                )?
+                .query_map(params![object.0], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .map(ObjectId)
+                .collect())
+        })
+    }
+
     // ----- projection bookkeeping -------------------------------------------
 
     pub fn projection_position(&self, name: &str) -> Result<i64> {

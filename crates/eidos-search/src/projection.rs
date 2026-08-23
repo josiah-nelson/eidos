@@ -27,6 +27,30 @@ pub struct FollowStats {
     pub elapsed_ms: f64,
 }
 
+/// Subtree roots that lie under another root of the same batch. One
+/// ancestor query per root, and none at all for the common single-root
+/// batch.
+fn nested_roots(
+    catalog: &Catalog,
+    subtrees: &[ObjectId],
+    roots: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>> {
+    let mut nested = HashSet::new();
+    if subtrees.len() < 2 {
+        return Ok(nested);
+    }
+    for root in subtrees {
+        if catalog
+            .ancestor_object_ids(*root)?
+            .iter()
+            .any(|a| roots.contains(a))
+        {
+            nested.insert(*root);
+        }
+    }
+    Ok(nested)
+}
+
 impl CatalogIndex {
     /// Replace every document of a source with the catalog's published
     /// generation. Commits once at the end.
@@ -140,20 +164,19 @@ impl CatalogIndex {
                 affected.push(row.object_id);
             }
         }
-        // Expand subtrees. A root already covered by an earlier root's
-        // descendants needs no walk of its own: its live descendants are a
-        // subset. Its ancestry deletion below still happens, because an
-        // orphaned document from an older generation may name it as an
-        // ancestor without naming the outer root.
-        let mut covered_roots: HashSet<ObjectId> = HashSet::new();
+        // Expand subtrees. A root nested inside another root of the same
+        // batch needs no walk of its own: its live descendants are a subset.
+        // Which roots those are is settled up front, from each root's
+        // ancestors, so the saving does not depend on the order the rows
+        // arrived in. Nested roots are still deleted by ancestry below,
+        // because a document orphaned by an older generation may name one of
+        // them as an ancestor without naming the outer root.
+        let nested = nested_roots(catalog, &subtrees, &subtree_seen)?;
         for root in &subtrees {
-            if covered_roots.contains(root) {
+            if nested.contains(root) {
                 continue;
             }
             for d in catalog.descendant_object_ids(*root)? {
-                if subtree_seen.contains(&d) {
-                    covered_roots.insert(d);
-                }
                 if seen.insert(d) {
                     affected.push(d);
                 }
