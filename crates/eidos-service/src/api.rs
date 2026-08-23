@@ -933,6 +933,8 @@ pub struct ActivityView {
     pub workers: crate::content_workers::ContentWorkersView,
     pub follower: crate::follower::FollowerView,
     pub content_index_documents: u64,
+    /// Rebuild-from-stored-chunks state of the content index.
+    pub content_rebuild: eidos_search::content::RebuildStatus,
     /// Admission-control gauges and totals for expensive API operations.
     pub admission: crate::admission::AdmissionView,
     pub sources: Vec<ActivitySourceView>,
@@ -973,6 +975,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
             workers: st2.content_workers.view(st2.content_index.uncommitted()),
             follower: st2.follower.view(&st2),
             content_index_documents: st2.content_index.num_docs(),
+            content_rebuild: st2.content_index.rebuild_status(),
             admission: st2.admission.view(),
             sources,
             recent_failures: st2.catalog.recent_failed_jobs(20)?,

@@ -112,8 +112,28 @@ retrieved generation get no snippets rather than wrong ones.
   the coordinator commits every 2 s or 20,000 documents and only then
   `mark_content_indexed` flips object states (aggregates + outbox, so the
   catalog index follows). A crash between the two phases leaves `indexing`
-  records that `requeue_unfinished_content` re-queues at startup; an empty
-  content index at startup resets every indexed object to `pending`.
+  records that `requeue_unfinished_content` re-queues at startup.
+- The content index is rebuilt from stored chunks — never by re-reading
+  files — when it is empty at startup while chunks exist (lost or recreated
+  index, schema change) or when a previous rebuild did not finish. The
+  rebuild is *scheduled* synchronously at open (`begin_rebuild`: durable
+  `rebuild.json` marker in the index directory, written via rename, whose
+  presence alone — even torn or unreadable — means "rebuild required";
+  phase `pending`), so the
+  very first search or readiness check already reports content as partial;
+  `start_background` then runs it. The run holds the index writer gate (a
+  reader–writer lock that every `add_chunks`/`delete_*`/`commit` takes on
+  the read side) for its whole duration, content workers claim no jobs and
+  the coordinator commits nothing while the phase is `pending`/`running`,
+  and the phase, progress, and last error are exposed in `GET /api/activity`
+  (`content_rebuild`) and `eidos activity`. Success removes the marker
+  (phase `idle`); failure, an interrupting shutdown, or a crash leave it in
+  place (phase `failed` with the reason, or `pending` after a restart), so
+  the next start rebuilds again and every response in between says why
+  content results are incomplete. Building into a replacement directory and
+  swapping was rejected for now: the live index is empty in the only
+  scenario that triggers a rebuild, and swapping directories under open
+  memory maps is not reliable on Windows.
 - Transient I/O failures retry with the job backoff; binary files and
   deterministic failures are terminal and visible (`state:unsupported`,
   `state:failed`, with the reason in the hit).

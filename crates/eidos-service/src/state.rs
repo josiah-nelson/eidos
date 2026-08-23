@@ -34,6 +34,9 @@ pub struct AppState {
     pub shutdown: Arc<AtomicBool>,
     /// Whether the reconciler may start periodic rescans on its own.
     pub auto_reconcile: bool,
+    /// A content-index rebuild from stored chunks was scheduled at open and
+    /// runs once `start_background` spawns it.
+    pub content_rebuild: bool,
 }
 
 impl AppState {
@@ -61,19 +64,30 @@ impl AppState {
             eidos_search::CatalogIndex::open(config.data_dir.join("index").join("catalog"))?;
         let content_index =
             eidos_search::ContentIndex::open(config.data_dir.join("index").join("content"))?;
-        let mut rebuild_content = false;
-        if content_index.is_fresh() {
-            // A (re)created content index holds nothing. The catalog keeps
-            // every chunk's text, so the index is rebuilt from storage in the
-            // background instead of re-reading the sources.
-            let stats = catalog.content_stats(None)?;
-            if stats.chunks > 0 {
-                tracing::warn!(
-                    chunks = stats.chunks,
-                    "content index is empty; rebuilding it from stored chunks"
-                );
-                rebuild_content = true;
-            }
+        // A (re)created content index holds nothing, and an unfinished
+        // rebuild leaves a partial one. The catalog keeps every chunk's text,
+        // so the index is rebuilt from storage in the background instead of
+        // re-reading the sources. The rebuild is *scheduled* here, before
+        // anything is advertised, so search and readiness report a partial
+        // content index from the first request; `start_background` runs it.
+        let stats = catalog.content_stats(None)?;
+        let rebuild_content = if content_index.is_rebuilding() {
+            tracing::warn!(
+                chunks = stats.chunks,
+                "a previous content index rebuild did not finish; rebuilding again"
+            );
+            true
+        } else if content_index.is_fresh() && stats.chunks > 0 {
+            tracing::warn!(
+                chunks = stats.chunks,
+                "content index is empty; rebuilding it from stored chunks"
+            );
+            true
+        } else {
+            false
+        };
+        if rebuild_content {
+            content_index.begin_rebuild(stats.chunks)?;
         }
         let state = Self {
             admission: Arc::new(crate::admission::Admission::new(config.admission.clone())),
@@ -94,19 +108,8 @@ impl AppState {
             scan_threads: config.scan_threads,
             shutdown: Arc::new(AtomicBool::new(false)),
             auto_reconcile: config.auto_reconcile,
+            content_rebuild: rebuild_content,
         };
-        if rebuild_content {
-            let catalog = state.catalog.clone();
-            let index = state.content_index.clone();
-            std::thread::Builder::new()
-                .name("content-rebuild".into())
-                .spawn(move || {
-                    if let Err(e) = index.rebuild_from_chunks(&catalog) {
-                        tracing::error!(error = %e, "content index rebuild failed");
-                    }
-                })
-                .expect("spawn content rebuild");
-        }
         Ok(state)
     }
 
@@ -132,6 +135,19 @@ impl AppState {
     /// Start change-feed watchers for every published native source and the
     /// periodic reconciler.
     pub fn start_background(self: &Arc<Self>) -> anyhow::Result<()> {
+        if self.content_rebuild {
+            // Runs under the index writer gate: content workers and the
+            // commit coordinator wait until it finishes (or fails).
+            let st = self.clone();
+            std::thread::Builder::new()
+                .name("content-rebuild".into())
+                .spawn(move || {
+                    if let Err(e) = st.content_index.run_rebuild(&st.catalog, &st.shutdown) {
+                        tracing::error!(error = %e, "content index rebuild failed");
+                    }
+                })
+                .expect("spawn content rebuild");
+        }
         for s in self.catalog.list_sources()? {
             if s.published_generation.is_some()
                 && s.kind == eidos_domain::SourceKind::WindowsLocal
