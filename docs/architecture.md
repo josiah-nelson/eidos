@@ -299,7 +299,8 @@ Contains chunk documents:
 3. Resolve directory/source filters.
 4. Retrieve metadata and/or content candidates.
 5. For substring/regex clauses, intersect trigrams then verify stored text.
-6. Group chunks by current object and select diverse snippets.
+6. Group chunks by object, drop candidates whose generation the catalog has
+   superseded, and select diverse snippets from what remains.
 7. Join current paths, aggregates, and source completeness from the catalog.
 8. Return results, cursors, timing, completeness, and explanation.
 

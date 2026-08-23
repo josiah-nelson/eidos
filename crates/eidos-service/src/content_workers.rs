@@ -360,7 +360,11 @@ fn coordinator_loop(state: &AppState) {
         }
         let uncommitted = state.content_index.uncommitted();
         let pending = status.pending_publish.lock().len();
-        if (pending > 0 || uncommitted > 0)
+        // `is_dirty`, not `uncommitted`: a reindex that produced no chunks
+        // (the file turned binary, empty, unreadable, or unsupported) queues
+        // only a deletion, and its old chunks stay searchable until it is
+        // committed.
+        if (pending > 0 || state.content_index.is_dirty())
             && (last_commit.elapsed() >= COMMIT_INTERVAL || uncommitted >= COMMIT_DOCS)
         {
             if let Err(e) = commit_and_publish(state) {
