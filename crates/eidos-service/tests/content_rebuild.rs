@@ -340,8 +340,7 @@ fn shutdown_during_rebuild_leaves_it_pending_for_the_next_start() {
     let st = state.content_index.rebuild_status();
     assert!(st.error.as_deref().unwrap().contains("shutdown"), "{st:?}");
     assert!(content_dir(&e.data).join(REBUILD_MARKER).exists());
-    std::thread::sleep(Duration::from_millis(800));
-    drop(state);
+    stop(state);
 
     let state = open_state(&e.data);
     assert!(state.content_rebuild);
