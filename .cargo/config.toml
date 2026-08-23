@@ -1,0 +1,5 @@
+# The bundled SQLite caps `PRAGMA mmap_size` at 2 GiB unless built with a
+# larger SQLITE_MAX_MMAP_SIZE; the catalog maps the whole file so chunk
+# fetches are memory reads (see docs/adr/0009).
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_MAX_MMAP_SIZE=1099511627776"

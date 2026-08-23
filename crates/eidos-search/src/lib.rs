@@ -10,6 +10,7 @@ pub mod content;
 pub mod exec;
 pub mod pipeline;
 pub mod projection;
+pub mod regex_plan;
 pub mod schema;
 
 pub use content::ContentIndex;

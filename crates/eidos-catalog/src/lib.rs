@@ -154,7 +154,7 @@ fn open_connection(path: &Path) -> Result<Connection> {
         "PRAGMA synchronous = NORMAL;
          PRAGMA temp_store = MEMORY;
          PRAGMA cache_size = -65536;
-         PRAGMA mmap_size = 268435456;
+         PRAGMA mmap_size = 1099511627776;
          PRAGMA foreign_keys = OFF;",
     )?;
     Ok(conn)

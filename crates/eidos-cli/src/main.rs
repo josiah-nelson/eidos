@@ -7,6 +7,11 @@
 //! Search commands (Milestone 3) talk to the running service so the CLI and
 //! web UI share one query contract.
 
+/// Chunk verification allocates tens of kilobytes per fetched chunk across
+/// eight threads; the system allocator serialises those on Windows.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod activity;
 mod admin;
 mod archive;
