@@ -59,11 +59,15 @@ test('excluding several buckets keeps every exclusion', () => {
   assert.equal(applyFacetClick(two, large, 'include', others(large)), 'readme size:>=64k')
 })
 
-test('bounds typed by hand are never rewritten', () => {
+test('only a bucket clause is removed, whoever wrote it', () => {
+  // A bound of your own is left alone, even on the same field.
   assert.equal(
     applyFacetClick('size:>=100 ext:md', medium, 'include', others(medium)),
     'size:>=100 ext:md size:>=4k size:<64k',
   )
+  // One that reads exactly like a bucket is that bucket: nothing tells them
+  // apart, and keeping both would leave no results.
+  assert.equal(applyFacetClick('size:>=4k size:<64k', small, 'include', others(small)), 'size:<4k')
 })
 
 test('a clause added to a disjunction filters every branch', () => {

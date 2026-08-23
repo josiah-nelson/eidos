@@ -11,9 +11,12 @@
  *      forms instead of contradicting them.
  *   2. The buckets of a range facet are disjoint, so intersecting two of
  *      them can only give nothing. Selecting one therefore drops whatever
- *      other bucket of the same facet is in the query. Bounds typed by hand
- *      are left alone: `size:>=100` plus the "< 4 KiB" bucket stays the
- *      intersection of both.
+ *      other bucket of the same facet is in the query. Only those exact
+ *      clauses are touched: `size:>=100` plus the "< 4 KiB" bucket stays
+ *      the intersection of both. Matching is textual, so a hand-written
+ *      bound that reads exactly like a bucket is treated as that bucket —
+ *      there is nothing to tell them apart, and keeping both would leave no
+ *      results.
  */
 
 /**

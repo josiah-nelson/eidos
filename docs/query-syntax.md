@@ -85,8 +85,11 @@ anything:
     already implies.
   - Excluding a bucket removes only its own inclusion; exclusions of
     different buckets are independent and accumulate.
-  - Bounds you typed yourself are never rewritten: `size:>=100` plus the
-    `< 4 KiB` bucket stays the intersection of both.
+  - Only a bucket's own clause is ever removed. Any other bound stays:
+    `size:>=100` plus the `< 4 KiB` bucket is the intersection of both. A
+    clause you typed that reads exactly like a bucket counts as that
+    bucket — nothing distinguishes the two, and keeping both would leave
+    no results.
   - Because AND binds tighter than OR, a query that already contains a
     top-level `OR` is parenthesised first, so the clause filters every
     branch: `a OR b` becomes `(a OR b) size:<4k`.
