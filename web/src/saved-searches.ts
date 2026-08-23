@@ -1,5 +1,7 @@
 export const SAVED_SEARCHES_STORAGE_KEY = 'eidos.saved-searches'
 export const SAVED_SEARCHES_VERSION = 2
+export const MAX_SAVED_SEARCHES = 1000
+export const MAX_SAVED_SEARCH_BYTES = 1_000_000
 export const PAGE_SIZES = [25, 50, 100, 250] as const
 
 type ResultMode = 'files' | 'directories' | 'both'
@@ -94,6 +96,7 @@ export function canonicalSearchUrl(base: string, state: SearchViewState): string
 /** Decode current and legacy browser-local saved-search documents. */
 export function loadSavedSearches(raw: string | null): SavedSearchLoad {
   if (!raw) return { searches: [], discarded: 0 }
+  if (raw.length > MAX_SAVED_SEARCH_BYTES) return { searches: [], discarded: 1 }
   let value: unknown
   try {
     value = JSON.parse(raw)
@@ -108,11 +111,17 @@ export function loadSavedSearches(raw: string | null): SavedSearchLoad {
   }
 
   const searches: SavedSearch[] = []
-  let discarded = 0
-  for (const item of root.searches) {
+  const seenIds = new Set<string>()
+  const candidates = root.searches.slice(0, MAX_SAVED_SEARCHES)
+  let discarded = root.searches.length - candidates.length
+  for (const item of candidates) {
     const decoded = decodeSavedSearch(item, version)
-    if (decoded && !searches.some((saved) => saved.id === decoded.id)) searches.push(decoded)
-    else discarded += 1
+    if (!decoded || seenIds.has(decoded.id)) {
+      discarded += 1
+      continue
+    }
+    seenIds.add(decoded.id)
+    searches.push(decoded)
   }
   return { searches, discarded }
 }
@@ -189,19 +198,31 @@ export function importSavedSearches(
 ): { searches: SavedSearch[]; imported: number; renamed: number; discarded: number } {
   const decoded = loadSavedSearches(raw)
   if (decoded.searches.length === 0) throw new Error('No valid saved searches were found in that file.')
+  const incoming = decoded.searches.slice(0, Math.max(0, MAX_SAVED_SEARCHES - searches.length))
+  if (incoming.length === 0) throw new Error(`At most ${MAX_SAVED_SEARCHES} saved searches are allowed.`)
   const next = [...searches]
+  const knownIds = new Set(searches.map((saved) => saved.id))
+  const knownNames = new Set(searches.map((saved) => nameKey(saved.name)))
   let renamed = 0
-  for (const incoming of decoded.searches) {
-    const name = uniqueName(next, incoming.name)
-    if (name !== incoming.name) renamed += 1
+  for (const saved of incoming) {
+    const name = uniqueNameFrom(knownNames, saved.name)
+    const savedId = knownIds.has(saved.id) ? uniqueIdFrom(knownIds, id) : saved.id
+    if (name !== saved.name) renamed += 1
+    knownIds.add(savedId)
+    knownNames.add(nameKey(name))
     next.push({
-      ...incoming,
-      id: next.some((saved) => saved.id === incoming.id) ? uniqueId(next, id) : incoming.id,
+      ...saved,
+      id: savedId,
       name,
-      state: normalizeState(incoming.state),
+      state: normalizeState(saved.state),
     })
   }
-  return { searches: next, imported: decoded.searches.length, renamed, discarded: decoded.discarded }
+  return {
+    searches: next,
+    imported: incoming.length,
+    renamed,
+    discarded: decoded.discarded + decoded.searches.length - incoming.length,
+  }
 }
 
 export function nameCollision(searches: SavedSearch[], name: string, exceptId?: string): SavedSearch | undefined {
@@ -266,22 +287,34 @@ function cleanName(value: string): string {
 }
 
 function sameName(a: string, b: string): boolean {
-  return a.localeCompare(b, undefined, { sensitivity: 'accent' }) === 0
+  return nameKey(a) === nameKey(b)
 }
 
 function uniqueName(searches: SavedSearch[], desired: string): string {
-  if (!searches.some((saved) => sameName(saved.name, desired))) return desired
+  return uniqueNameFrom(new Set(searches.map((saved) => nameKey(saved.name))), desired)
+}
+
+function uniqueNameFrom(names: Set<string>, desired: string): string {
+  if (!names.has(nameKey(desired))) return desired
   let suffix = 2
-  while (searches.some((saved) => sameName(saved.name, `${desired} (${suffix})`))) suffix += 1
+  while (names.has(nameKey(`${desired} (${suffix})`))) suffix += 1
   return `${desired} (${suffix})`
 }
 
 function uniqueId(searches: SavedSearch[], create: () => string): string {
+  return uniqueIdFrom(new Set(searches.map((saved) => saved.id)), create)
+}
+
+function uniqueIdFrom(ids: Set<string>, create: () => string): string {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const candidate = create()
-    if (candidate && !searches.some((saved) => saved.id === candidate)) return candidate
+    if (candidate && !ids.has(candidate)) return candidate
   }
   throw new Error('Could not create a unique saved-search ID.')
+}
+
+function nameKey(name: string): string {
+  return name.normalize('NFC').toLocaleLowerCase()
 }
 
 function randomId(): string {

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   DEFAULT_SEARCH_VIEW,
+  MAX_SAVED_SEARCH_BYTES,
+  MAX_SAVED_SEARCHES,
   canonicalSearchParams,
   canonicalSearchUrl,
   deleteSavedSearch,
@@ -141,6 +143,7 @@ test('version 1 data migrates missing and renamed fields to current defaults', (
 
 test('malformed documents and rows are isolated instead of breaking the page', () => {
   assert.deepEqual(loadSavedSearches('{nope'), { searches: [], discarded: 1 })
+  assert.deepEqual(loadSavedSearches('x'.repeat(MAX_SAVED_SEARCH_BYTES + 1)), { searches: [], discarded: 1 })
   assert.deepEqual(loadSavedSearches(JSON.stringify({ version: 99, searches: [{}] })), {
     searches: [],
     discarded: 1,
@@ -153,6 +156,25 @@ test('malformed documents and rows are isolated instead of breaking the page', (
   )
   assert.deepEqual(mixed.searches, one())
   assert.equal(mixed.discarded, 2)
+})
+
+test('stored documents and imports are bounded', () => {
+  const base = one()[0]
+  const oversized = Array.from({ length: MAX_SAVED_SEARCHES + 2 }, (_, i) => ({
+    ...base,
+    id: `stored-${i}`,
+    name: `Stored ${i}`,
+  }))
+  const loaded = loadSavedSearches(serializeSavedSearches(oversized))
+  assert.equal(loaded.searches.length, MAX_SAVED_SEARCHES)
+  assert.equal(loaded.discarded, 2)
+
+  const current = oversized.slice(0, MAX_SAVED_SEARCHES - 1)
+  const incoming = oversized.slice(-2).map((saved, i) => ({ ...saved, id: `incoming-${i}` }))
+  const imported = importSavedSearches(current, serializeSavedSearches(incoming))
+  assert.equal(imported.searches.length, MAX_SAVED_SEARCHES)
+  assert.equal(imported.imported, 1)
+  assert.equal(imported.discarded, 1)
 })
 
 test('import preserves existing searches while making names and IDs unique', () => {

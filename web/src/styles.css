@@ -586,10 +586,12 @@ table.grid tr:hover td {
   white-space: nowrap;
 }
 .saved-search-menu .menu-body {
+  --saved-menu-available: max(160px, calc(100vw - 240px));
   left: 0;
   right: auto;
-  min-width: 430px;
-  max-width: min(560px, calc(100vw - 240px));
+  width: min(560px, var(--saved-menu-available));
+  min-width: min(430px, var(--saved-menu-available));
+  max-width: var(--saved-menu-available);
 }
 .saved-search-list {
   list-style: none;
@@ -634,6 +636,7 @@ table.grid tr:hover td {
 }
 .saved-search-buttons {
   display: flex;
+  flex-wrap: wrap;
   gap: 7px;
   font-size: 11.5px;
 }
@@ -715,6 +718,10 @@ table.grid tr:hover td {
   padding: 18px 20px;
   width: 520px;
   max-width: 95vw;
+  color: var(--text);
+}
+dialog.modal::backdrop {
+  background: rgba(0, 0, 0, 0.35);
 }
 .modal .form {
   display: grid;

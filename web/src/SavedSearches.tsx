@@ -1,5 +1,6 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
+  MAX_SAVED_SEARCH_BYTES,
   SAVED_SEARCHES_STORAGE_KEY,
   canonicalSearchUrl,
   deleteSavedSearch,
@@ -32,6 +33,27 @@ export function SavedSearchControls({ state, onRun }: Props) {
   const [dialog, setDialog] = useState<NameDialog | null>(null)
   const [notice, setNotice] = useState(initial.discarded ? 'Ignored invalid saved-search data.' : '')
   const importInput = useRef<HTMLInputElement>(null)
+  const dialogElement = useRef<HTMLDialogElement>(null)
+
+  useEffect(() => {
+    const sync = (event: StorageEvent) => {
+      if (event.key !== SAVED_SEARCHES_STORAGE_KEY) return
+      const loaded = loadSavedSearches(event.newValue)
+      setSearches(loaded.searches)
+      setNotice(loaded.discarded ? 'Another tab saved invalid data; invalid rows were ignored.' : 'Saved searches updated in another tab.')
+    }
+    window.addEventListener('storage', sync)
+    return () => window.removeEventListener('storage', sync)
+  }, [])
+
+  useEffect(() => {
+    if (dialog && dialogElement.current && !dialogElement.current.open) dialogElement.current.showModal()
+  }, [dialog])
+
+  const closeDialog = () => {
+    dialogElement.current?.close()
+    setDialog(null)
+  }
 
   const commit = (next: SavedSearch[], message: string) => {
     setSearches(next)
@@ -46,14 +68,15 @@ export function SavedSearchControls({ state, onRun }: Props) {
   const submitName = () => {
     if (!dialog) return
     try {
+      const latest = loadLocal().searches
       if (dialog.kind === 'save') {
-        const result = upsertSavedSearch(searches, dialog.name, state)
+        const result = upsertSavedSearch(latest, dialog.name, state)
         commit(result.searches, result.replaced ? `Replaced “${result.saved.name}”.` : `Saved “${result.saved.name}”.`)
       } else {
-        const next = renameSavedSearch(searches, dialog.id!, dialog.name)
+        const next = renameSavedSearch(latest, dialog.id!, dialog.name)
         commit(next, `Renamed to “${dialog.name.trim()}”.`)
       }
-      setDialog(null)
+      closeDialog()
     } catch (error) {
       setDialog({ ...dialog, error: (error as Error).message })
     }
@@ -61,7 +84,7 @@ export function SavedSearchControls({ state, onRun }: Props) {
 
   const duplicate = (id: string) => {
     try {
-      const result = duplicateSavedSearch(searches, id)
+      const result = duplicateSavedSearch(loadLocal().searches, id)
       commit(result.searches, `Created “${result.saved.name}”.`)
     } catch (error) {
       setNotice((error as Error).message)
@@ -70,7 +93,7 @@ export function SavedSearchControls({ state, onRun }: Props) {
 
   const remove = (saved: SavedSearch) => {
     if (!window.confirm(`Delete the saved search “${saved.name}”?`)) return
-    commit(deleteSavedSearch(searches, saved.id), `Deleted “${saved.name}”.`)
+    commit(deleteSavedSearch(loadLocal().searches, saved.id), `Deleted “${saved.name}”.`)
   }
 
   const copyLink = async () => {
@@ -96,7 +119,8 @@ export function SavedSearchControls({ state, onRun }: Props) {
   const importFile = async (file?: File) => {
     if (!file) return
     try {
-      const result = importSavedSearches(searches, await file.text())
+      if (file.size > MAX_SAVED_SEARCH_BYTES) throw new Error('Saved-search imports must be 1 MB or smaller.')
+      const result = importSavedSearches(loadLocal().searches, await file.text())
       const detail = [
         `${result.imported} imported`,
         result.renamed ? `${result.renamed} renamed to avoid conflicts` : '',
@@ -180,41 +204,50 @@ export function SavedSearchControls({ state, onRun }: Props) {
         )}
       </div>
       {dialog && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setDialog(null)}>
-          <div className="modal saved-search-dialog" role="dialog" aria-modal="true" aria-labelledby="saved-search-title" onMouseDown={(event) => event.stopPropagation()}>
-            <form
-              className="form"
-              onSubmit={(event) => {
-                event.preventDefault()
-                submitName()
-              }}
-            >
-              <h1 id="saved-search-title">{dialog.kind === 'save' ? 'Save this search' : 'Rename saved search'}</h1>
-              <label>
-                Name
-                <input
-                  type="text"
-                  value={dialog.name}
-                  maxLength={80}
-                  autoFocus
-                  onChange={(event) => setDialog({ ...dialog, name: event.target.value, error: undefined })}
-                />
-              </label>
-              {collision && dialog.kind === 'save' && (
-                <div className="banner warn">Saving will replace “{collision.name}” with the current query and view.</div>
-              )}
-              {dialog.error && <div className="error-text">{dialog.error}</div>}
-              <div className="actions">
-                <button type="button" className="btn" onClick={() => setDialog(null)}>
-                  Cancel
-                </button>
-                <button type="submit" className="btn primary">
-                  {collision && dialog.kind === 'save' ? 'Replace' : dialog.kind === 'save' ? 'Save' : 'Rename'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+        <dialog
+          ref={dialogElement}
+          className="modal saved-search-dialog"
+          aria-labelledby="saved-search-title"
+          onCancel={(event) => {
+            event.preventDefault()
+            closeDialog()
+          }}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeDialog()
+          }}
+        >
+          <form
+            className="form"
+            onSubmit={(event) => {
+              event.preventDefault()
+              submitName()
+            }}
+          >
+            <h1 id="saved-search-title">{dialog.kind === 'save' ? 'Save this search' : 'Rename saved search'}</h1>
+            <label>
+              Name
+              <input
+                type="text"
+                value={dialog.name}
+                maxLength={80}
+                autoFocus
+                onChange={(event) => setDialog({ ...dialog, name: event.target.value, error: undefined })}
+              />
+            </label>
+            {collision && dialog.kind === 'save' && (
+              <div className="banner warn">Saving will replace “{collision.name}” with the current query and view.</div>
+            )}
+            {dialog.error && <div className="error-text">{dialog.error}</div>}
+            <div className="actions">
+              <button type="button" className="btn" onClick={closeDialog}>
+                Cancel
+              </button>
+              <button type="submit" className="btn primary">
+                {collision && dialog.kind === 'save' ? 'Replace' : dialog.kind === 'save' ? 'Save' : 'Rename'}
+              </button>
+            </div>
+          </form>
+        </dialog>
       )}
     </>
   )
