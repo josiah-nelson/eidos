@@ -346,6 +346,8 @@ pub enum QueryError {
     LimitTooLarge { limit: u32, max: u32 },
     #[error("invalid cursor")]
     InvalidCursor,
+    #[error("cursor does not belong to this request: {message}; restart from the first page")]
+    CursorMismatch { message: String },
     #[error("{message}")]
     Other { message: String },
 }

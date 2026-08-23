@@ -1607,15 +1607,84 @@ fn sort_key_cmp(a: &Stored, b: &Stored, sort: Sort) -> std::cmp::Ordering {
     ord.then_with(|| a.entry_id.cmp(&b.entry_id))
 }
 
-fn decode_cursor(c: &Option<String>) -> std::result::Result<usize, QueryError> {
-    match c {
-        None => Ok(0),
-        Some(s) => s
-            .strip_prefix("o:")
-            .and_then(|n| n.parse::<usize>().ok())
-            .ok_or(QueryError::InvalidCursor),
-    }
+/// Extra candidates fetched beyond the page so that documents the catalog
+/// no longer knows (the projection is slightly behind) can be replaced on
+/// the same page instead of shortening it.
+pub const STALE_SLACK: usize = 8;
+
+/// Page cursor: `o:<consumed candidates>;g:<index generation>;q:<query
+/// fingerprint>`. The offset counts every candidate the previous pages
+/// consumed — including stale projection documents that produced no hit —
+/// so a page never re-examines what an earlier page skipped. `g` is the
+/// Tantivy searcher generation the cursor was issued from (a change is
+/// reported as a warning: offsets are not stable across commits); `q`
+/// binds the cursor to the query, mode, sort, and scope it was issued for.
+/// The legacy `o:<offset>` form is still accepted without either check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    offset: usize,
+    generation: Option<u64>,
+    fingerprint: Option<u64>,
 }
+
+fn decode_cursor(c: &Option<String>) -> std::result::Result<Cursor, QueryError> {
+    let s = match c {
+        None => {
+            return Ok(Cursor {
+                offset: 0,
+                generation: None,
+                fingerprint: None,
+            })
+        }
+        Some(s) => s,
+    };
+    let mut cursor = Cursor {
+        offset: 0,
+        generation: None,
+        fingerprint: None,
+    };
+    let mut seen_offset = false;
+    for part in s.split(';') {
+        let (key, value) = part.split_once(':').ok_or(QueryError::InvalidCursor)?;
+        match key {
+            "o" => {
+                cursor.offset = value.parse().map_err(|_| QueryError::InvalidCursor)?;
+                seen_offset = true;
+            }
+            "g" => cursor.generation = Some(value.parse().map_err(|_| QueryError::InvalidCursor)?),
+            "q" => {
+                cursor.fingerprint =
+                    Some(u64::from_str_radix(value, 16).map_err(|_| QueryError::InvalidCursor)?)
+            }
+            _ => return Err(QueryError::InvalidCursor),
+        }
+    }
+    if !seen_offset {
+        return Err(QueryError::InvalidCursor);
+    }
+    Ok(cursor)
+}
+
+fn encode_cursor(offset: usize, generation: u64, fingerprint: u64) -> String {
+    format!("o:{offset};g:{generation};q:{fingerprint:016x}")
+}
+
+/// Stable (process-independent) fingerprint of everything that determines
+/// the candidate order a cursor walks: query, mode, sort, and scope.
+fn query_fingerprint(req: &SearchRequest) -> u64 {
+    let key = serde_json::to_string(&(&req.query, req.mode, req.sort, req.include_retired))
+        .unwrap_or_default();
+    // FNV-1a: small, dependency-free, and identical across builds.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Candidates in page order; each resolves lazily to its stored fields.
+type Candidates<'a> = Box<dyn Iterator<Item = Result<Stored>> + 'a>;
 
 /// Execute a search request without a content index (content clauses are
 /// rejected with an explanation).
@@ -1638,7 +1707,17 @@ pub fn search_with_content(
 ) -> Result<SearchResponse> {
     let t0 = Instant::now();
     req.validate(&opts.limits)?;
-    let offset = decode_cursor(&req.cursor)?;
+    let cursor = decode_cursor(&req.cursor)?;
+    let fingerprint = query_fingerprint(req);
+    if let Some(q) = cursor.fingerprint {
+        if q != fingerprint {
+            return Err(QueryError::CursorMismatch {
+                message: "the cursor was issued for a different query, mode, sort, or scope".into(),
+            }
+            .into());
+        }
+    }
+    let offset = cursor.offset;
     let limit = req.limit.max(1) as usize;
     let f = index.fields();
     let all_sources = catalog.list_sources()?;
@@ -1718,10 +1797,17 @@ pub fn search_with_content(
         !ctx.verifiers.is_empty() || !ctx.fast_verifiers.is_empty() || tight || has_content;
     let t1 = Instant::now();
     let mut warnings = ctx.warnings.clone();
+    let index_generation = searcher.generation().generation_id();
+    if cursor.generation.is_some_and(|g| g != index_generation) {
+        warnings.push(
+            "the index changed since this cursor was issued; page boundaries may have shifted, so a result may repeat or be skipped"
+                .into(),
+        );
+    }
     let mut steps = ctx.steps.clone();
     let mut verify_ms = 0.0;
 
-    let (page, total, total_exact): (Vec<Stored>, u64, bool) = if collect_all {
+    let (page, total, total_exact): (Candidates<'_>, u64, bool) = if collect_all {
         let addrs: HashSet<DocAddress> = searcher.search(&root, &DocSetCollector)?;
         let mut truncated = false;
         let mut list: Vec<DocAddress> = addrs.into_iter().collect();
@@ -1773,7 +1859,7 @@ pub fn search_with_content(
         } else {
             None
         };
-        let want = offset + limit;
+        let want = offset + limit + STALE_SLACK;
 
         // Explain and warn for a page walk; returns (total, exact).
         let report_walk = |steps: &mut Vec<PlanStep>,
@@ -1987,27 +2073,22 @@ pub fn search_with_content(
                         Some(lc),
                         tw.elapsed().as_secs_f64() * 1000.0,
                     );
-                    let page: Vec<Stored> = outcome
-                        .verified
-                        .into_iter()
-                        .skip(offset)
-                        .take(limit)
-                        .collect();
+                    let page: Candidates<'_> =
+                        Box::new(outcome.verified.into_iter().skip(offset).map(Ok));
                     (page, total, exact)
                 } else {
                     let total = verified.len() as u64;
-                    let page: Vec<Stored> = verified.into_iter().skip(offset).take(limit).collect();
+                    let page: Candidates<'_> = Box::new(verified.into_iter().skip(offset).map(Ok));
                     (page, total, !truncated && !content_truncated)
                 }
             } else {
                 verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
                 rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
                 let total = rows.len() as u64;
-                let mut page = Vec::with_capacity(limit);
-                for r in rows.into_iter().skip(offset).take(limit) {
+                let page: Candidates<'_> = Box::new(rows.into_iter().skip(offset).map(|r| {
                     let doc: TantivyDocument = searcher.doc(r.addr)?;
-                    page.push(read_stored(f, &doc, r.score));
-                }
+                    Ok(read_stored(f, &doc, r.score))
+                }));
                 (page, total, !truncated && !content_truncated)
             }
         } else {
@@ -2043,15 +2124,15 @@ pub fn search_with_content(
                 lazy_cx.as_ref(),
                 verify_ms,
             );
-            let mut page = Vec::with_capacity(limit);
-            for r in outcome.verified.into_iter().skip(offset).take(limit) {
-                let doc: TantivyDocument = searcher.doc(r.addr)?;
-                page.push(read_stored(f, &doc, r.score));
-            }
+            let page: Candidates<'_> =
+                Box::new(outcome.verified.into_iter().skip(offset).map(|r| {
+                    let doc: TantivyDocument = searcher.doc(r.addr)?;
+                    Ok(read_stored(f, &doc, r.score))
+                }));
             (page, total, exact)
         }
     } else {
-        let n = (offset + limit).max(1);
+        let n = (offset + limit + STALE_SLACK).max(1);
         let top = TopDocs::with_limit(n);
         let order = if req.sort.descending {
             Order::Desc
@@ -2110,21 +2191,21 @@ pub fn search_with_content(
             verified: None,
             elapsed_ms: None,
         });
-        let mut page = Vec::with_capacity(limit);
-        for (score, a) in addrs.into_iter().skip(offset) {
+        let page: Candidates<'_> = Box::new(addrs.into_iter().skip(offset).map(|(score, a)| {
             let doc: TantivyDocument = searcher.doc(a)?;
-            page.push(read_stored(f, &doc, score));
-        }
+            Ok(read_stored(f, &doc, score))
+        }));
         (page, count as u64, true)
     };
     let retrieve_ms = t1.elapsed().as_secs_f64() * 1000.0 - verify_ms;
     let t2 = Instant::now();
-    let (hits, facets) = build_hits(
+    let (hits, facets, consumed) = build_hits(
         index,
         catalog,
         req,
         &searcher,
         page,
+        limit,
         root.as_ref(),
         &content_sets,
         opts,
@@ -2144,8 +2225,12 @@ pub fn search_with_content(
             c.content_complete = false;
         }
     }
-    let next_cursor = if (offset + hits.len()) < total as usize {
-        Some(format!("o:{}", offset + hits.len()))
+    // Advance by candidates consumed, not hits returned: stale documents
+    // that produced no hit are never re-examined by the next page, and a
+    // page of nothing but stale documents still makes progress.
+    let consumed_total = offset + consumed;
+    let next_cursor = if consumed_total < total as usize {
+        Some(encode_cursor(consumed_total, index_generation, fingerprint))
     } else {
         None
     };
@@ -2178,24 +2263,35 @@ pub fn search_with_content(
     })
 }
 
+/// Join candidates with the catalog in page order until `limit` hits are
+/// assembled or the candidates run out. Returns the hits, facets, and the
+/// number of candidates consumed (stale ones included) so the cursor can
+/// advance past everything this page examined.
 #[allow(clippy::too_many_arguments)]
 fn build_hits(
     index: &CatalogIndex,
     catalog: &Catalog,
     req: &SearchRequest,
     searcher: &Searcher,
-    page: Vec<Stored>,
+    candidates: Candidates<'_>,
+    limit: usize,
     facet_query: &dyn TQuery,
     content_sets: &[ContentSet],
     opts: &ExecOptions,
-) -> Result<(Vec<Hit>, Vec<Facet>)> {
+) -> Result<(Vec<Hit>, Vec<Facet>, usize)> {
     let sources: HashMap<SourceId, eidos_catalog::SourceRecord> = catalog
         .list_sources()?
         .into_iter()
         .map(|s| (s.id, s))
         .collect();
-    let mut hits = Vec::with_capacity(page.len());
-    for s in page {
+    let mut hits = Vec::with_capacity(limit);
+    let mut consumed = 0usize;
+    for s in candidates {
+        if hits.len() >= limit {
+            break;
+        }
+        let s = s?;
+        consumed += 1;
         let obj = match catalog.get_object(s.object_id)? {
             Some(o) if o.deleted_at.is_none() => o,
             _ => continue, // index slightly ahead/behind the catalog
@@ -2280,7 +2376,7 @@ fn build_hits(
     } else {
         facets_for(index, searcher, facet_query, &req.facets, &sources, catalog)?
     };
-    Ok((hits, facets))
+    Ok((hits, facets, consumed))
 }
 
 /// Diverse line-aware snippets for one file: the best-scoring chunks across
