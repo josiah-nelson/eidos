@@ -258,7 +258,10 @@ impl Parser {
                 message: "unexpected ')'".into(),
                 position: pos,
             }),
-            Some(Tok::Word(_, w)) if w == "NOT" || w == "!" => {
+            // `NOT x`, `!x`, and a bare `-` in front of a group: `-(a b)`,
+            // which is also what the renderer emits for a negated
+            // conjunction.
+            Some(Tok::Word(_, w)) if w == "NOT" || w == "!" || w == "-" => {
                 self.pos += 1;
                 Ok(Query::not(self.unary()?))
             }
@@ -570,6 +573,15 @@ impl Parser {
                     parse_time_range(value, self.now).ok_or_else(|| err("invalid time"))?;
                 Query::Time {
                     field: TimeField::Modified,
+                    after,
+                    before,
+                }
+            }
+            "subtree_mtime" | "subtree_modified" | "tree_mtime" => {
+                let (after, before) =
+                    parse_time_range(value, self.now).ok_or_else(|| err("invalid time"))?;
+                Query::Time {
+                    field: TimeField::SubtreeModified,
                     after,
                     before,
                 }

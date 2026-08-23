@@ -21,6 +21,7 @@
 //! state:pending        content state
 //! has:idb              directory containing .idb anywhere beneath; has:cs>3
 //! files:>100  subtree:>1G  subtree_alloc:>1G   directory predicates
+//! subtree_mtime:>=2026-01-01   newest change beneath a directory
 //! attr:hidden          attribute set (readonly hidden system reparse ...)
 //! source:G             configured source name or id
 //! in:o:123             under object id 123
@@ -47,11 +48,18 @@ pub fn render(q: &Query) -> String {
             i += 1;
         }
         if i == 0 {
-            format!("{v}")
-        } else if f.fract() == 0.0 {
+            return format!("{v}");
+        }
+        let unit = if f.fract() == 0.0 {
             format!("{f:.0}{}", U[i])
         } else {
             format!("{f:.1}{}", U[i])
+        };
+        // Only use the unit form when it denotes exactly `v`; a rounded
+        // suffix (`64.0k` for 65535) would not survive a re-parse.
+        match parser::parse_size(&unit) {
+            Some(x) if x == v => unit,
+            _ => format!("{v}"),
         }
     }
     fn go(q: &Query, out: &mut Vec<String>) {
@@ -231,12 +239,13 @@ pub fn render(q: &Query) -> String {
             } => {
                 let key = match field {
                     TimeField::Modified => "mtime",
+                    TimeField::SubtreeModified => "subtree_mtime",
                     TimeField::Created => "ctime",
                     TimeField::Changed => "chtime",
                     TimeField::Accessed => "atime",
                 };
                 let day = |t: eidos_domain::UnixNanos| t.to_rfc3339();
-                out.push(range_text(key, after.map(day), before.map(day)));
+                out.push(time_range_text(key, after.map(day), before.map(day)));
             }
             Query::Attributes { all_of, none_of } => {
                 for bit in 0..32u32 {
@@ -302,6 +311,18 @@ pub fn render(q: &Query) -> String {
     v.join(" ")
 }
 
+/// Time bounds are `[after, before)`, so the upper bound has to render as an
+/// exclusive `<`: `key:<=T` and `key:A..B` both mean "up to and including T"
+/// and would move the boundary when re-parsed.
+fn time_range_text(key: &str, after: Option<String>, before: Option<String>) -> String {
+    match (after, before) {
+        (Some(a), Some(b)) => format!("{key}:>={a} {key}:<{b}"),
+        (Some(a), None) => format!("{key}:>={a}"),
+        (None, Some(b)) => format!("{key}:<{b}"),
+        (None, None) => format!("{key}:*"),
+    }
+}
+
 fn range_text(key: &str, min: Option<String>, max: Option<String>) -> String {
     match (min, max) {
         (Some(a), Some(b)) => format!("{key}:{a}..{b}"),
@@ -357,11 +378,74 @@ mod tests {
             "has:idb has:cs kind:directory",
             "(a OR b) ext:cs",
             "path:G:\\Tools size:>=1M",
+            // Bucket clauses: bounded ranges, their grouped negations, and
+            // the directory-side subtree predicates.
+            "size:>=1M size:<16M",
+            "-(size:>=1M size:<16M)",
+            "mtime:>=2026-08-16 mtime:<2026-08-23",
+            "-(mtime:>=2026-08-16 mtime:<2026-08-23)",
+            "subtree:>=16M subtree:<256M",
+            "subtree_mtime:>=2026-08-16 subtree_mtime:<2026-08-23",
+            "-subtree_mtime:<2025-08-23",
         ] {
             let parsed = parse(q).unwrap();
             let rendered = render(&parsed.query);
             let again = parse(&rendered).unwrap();
             assert_eq!(parsed.query, again.query, "{q} -> {rendered}");
         }
+    }
+
+    #[test]
+    fn negation_of_a_group_negates_the_whole_group() {
+        let q = parse("-(size:>=1M size:<16M)").unwrap().query;
+        let Query::Not { clause } = &q else {
+            panic!("expected a negation, got {q:?}")
+        };
+        assert!(matches!(clause.as_ref(), Query::And { clauses } if clauses.len() == 2));
+        assert_eq!(
+            parse("-(a b)").unwrap().query,
+            parse("NOT (a b)").unwrap().query
+        );
+    }
+
+    #[test]
+    fn sizes_render_exactly() {
+        // A rounded binary suffix would not re-parse to the same byte count.
+        for bytes in [
+            0u64,
+            1,
+            4096,
+            65_535,
+            65_536,
+            1_572_864,
+            16_777_215,
+            1 << 30,
+        ] {
+            let q = Query::Size {
+                field: SizeField::Logical,
+                min: Some(bytes),
+                max: None,
+            };
+            let rendered = render(&q);
+            assert_eq!(parse(&rendered).unwrap().query, q, "{bytes} -> {rendered}");
+        }
+        assert_eq!(
+            render(&Query::Size {
+                field: SizeField::Logical,
+                min: Some(65_535),
+                max: None
+            }),
+            "size:>=65535"
+        );
+    }
+
+    /// `before` is exclusive; rendering it as `<=` would move the boundary.
+    #[test]
+    fn time_upper_bound_renders_exclusively() {
+        let q = parse("mtime:>=2026-08-16 mtime:<2026-08-23").unwrap().query;
+        assert_eq!(
+            render(&q),
+            "mtime:>=2026-08-16T00:00:00.000Z mtime:<2026-08-23T00:00:00.000Z"
+        );
     }
 }
