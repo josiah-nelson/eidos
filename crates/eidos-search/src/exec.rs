@@ -4,9 +4,13 @@
 //! candidates, verify exact/case-sensitive clauses against stored originals,
 //! join current state and completeness from the catalog, and explain.
 
-use crate::content::{self, ContentClause, ContentIndex, ContentOpts, Matcher, VERIFY_THREADS};
+use crate::content::{
+    self, object_score, verify_object, ContentClause, ContentIndex, ContentOpts, Matcher,
+    VERIFY_THREADS,
+};
 use crate::schema::{attr_bit, attr_name, fold, Fields};
 use crate::{CatalogIndex, Result, SearchError, PROJECTION_NAME};
+use eidos_catalog::content::ChunkRow;
 use eidos_catalog::Catalog;
 use eidos_domain::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -54,13 +58,39 @@ pub struct ObjectMatch {
     pub generation: u32,
     /// `(chunk ordinal, score)`
     pub chunks: Vec<(u32, f32)>,
+    /// Chunk rows already fetched while verifying (page-driven path), so
+    /// snippets need not fetch them again.
+    pub rows: Vec<ChunkRow>,
 }
 
 /// Everything one content clause retrieved, keyed by object.
 pub struct ContentSet {
+    /// Verified matches. For a deferred clause this fills up as the page
+    /// walk verifies objects.
     pub by_object: HashMap<ObjectId, ObjectMatch>,
     pub matcher: Matcher,
     pub truncated: bool,
+    /// Unverified candidate chunk ordinals per object (newest generation),
+    /// when verification was deferred to the page walk.
+    pub deferred: Option<HashMap<ObjectId, (u32, Vec<u32>)>>,
+}
+
+impl ContentSet {
+    fn is_deferred(&self) -> bool {
+        self.deferred.is_some()
+    }
+    /// Upper bound on this clause's contribution to an object's score.
+    fn bound(&self, object: ObjectId) -> f32 {
+        if let Some(m) = self.by_object.get(&object) {
+            return m.score;
+        }
+        match &self.deferred {
+            Some(c) => c
+                .get(&object)
+                .map_or(0.0, |(_, ords)| object_score(ords.len())),
+            None => 0.0,
+        }
+    }
 }
 
 /// Stored fields of a hit candidate.
@@ -206,6 +236,95 @@ fn fast_sort_cmp(a: &FastRow, b: &FastRow, sort: Sort) -> std::cmp::Ordering {
         ord.reverse()
     };
     ord.then_with(|| a.entry_id.cmp(&b.entry_id))
+}
+
+/// Rows in folded name/path order across segments: per-segment term
+/// ordinals give the order within a segment; segments are merged by
+/// comparing resolved heads, so only rows that are actually consumed get
+/// their strings resolved.
+struct MergeByString<'a> {
+    streams: Vec<std::vec::IntoIter<FastRow>>,
+    heads: Vec<Option<FastRow>>,
+    cols: &'a HashMap<u32, FastCols>,
+    by_name: bool,
+    desc: bool,
+}
+
+impl<'a> MergeByString<'a> {
+    fn new(
+        rows: Vec<FastRow>,
+        cols: &'a HashMap<u32, FastCols>,
+        by_name: bool,
+        desc: bool,
+    ) -> Self {
+        let mut per_seg: HashMap<u32, Vec<FastRow>> = HashMap::new();
+        for r in rows {
+            per_seg.entry(r.addr.segment_ord).or_default().push(r);
+        }
+        let mut streams: Vec<std::vec::IntoIter<FastRow>> = per_seg
+            .into_values()
+            .map(|mut v| {
+                v.sort_by(|a, b| {
+                    let k = if by_name {
+                        a.name_ord.cmp(&b.name_ord)
+                    } else {
+                        a.path_ord.cmp(&b.path_ord)
+                    };
+                    let k = if desc { k.reverse() } else { k };
+                    k.then(a.entry_id.cmp(&b.entry_id))
+                });
+                v.into_iter()
+            })
+            .collect();
+        let heads = streams
+            .iter_mut()
+            .map(|it| it.next().map(|r| Self::resolved(cols, r)))
+            .collect();
+        Self {
+            streams,
+            heads,
+            cols,
+            by_name,
+            desc,
+        }
+    }
+    fn resolved(cols: &HashMap<u32, FastCols>, mut r: FastRow) -> FastRow {
+        cols.get(&r.addr.segment_ord)
+            .expect("opened")
+            .resolve(&mut r);
+        r
+    }
+}
+
+impl Iterator for MergeByString<'_> {
+    type Item = FastRow;
+    fn next(&mut self) -> Option<FastRow> {
+        let mut best: Option<usize> = None;
+        for (i, h) in self.heads.iter().enumerate() {
+            if let Some(r) = h {
+                let better = match best {
+                    None => true,
+                    Some(j) => {
+                        let o = self.heads[j].as_ref().expect("head");
+                        let k = if self.by_name {
+                            r.name_folded.cmp(&o.name_folded)
+                        } else {
+                            r.path_folded.cmp(&o.path_folded)
+                        };
+                        let k = if self.desc { k.reverse() } else { k };
+                        k.then(r.entry_id.cmp(&o.entry_id)) == std::cmp::Ordering::Less
+                    }
+                };
+                if better {
+                    best = Some(i);
+                }
+            }
+        }
+        let i = best?;
+        let r = self.heads[i].take().expect("head");
+        self.heads[i] = self.streams[i].next().map(|n| Self::resolved(self.cols, n));
+        Some(r)
+    }
 }
 
 /// `AND` of the folded trigrams of every literal (None when no literal has
@@ -873,13 +992,21 @@ fn compile_content(
         ),
     };
     ctx.readable.push(desc);
+    let mut copts = ctx.content_opts;
+    if ctx.neg_depth > 0 {
+        // Page-driven verification filters the final candidate set, which is
+        // only right in positive `AND` context; inside `OR`/`NOT` the clause
+        // must be exact, so verify eagerly under the fetch budget.
+        copts.lazy_min = usize::MAX;
+        copts.max_candidates = copts.max_candidates.min(copts.max_verify);
+    }
     let (ret, matcher) = content::retrieve(
         index,
         ctx.catalog,
         &clause,
         ctx.content_scope.as_deref(),
         &ctx.retired,
-        &ctx.content_opts,
+        &copts,
     )
     .map_err(|e| QueryError::Other {
         message: e.to_string(),
@@ -894,33 +1021,75 @@ fn compile_content(
             "content clause \"{value}\" matched more chunks than the limit; results are a subset — narrow the query"
         ));
     }
+    let verified_mode = matches!(
+        mode,
+        TextMode::Exact | TextMode::Substring | TextMode::Regex
+    );
     let mut by_object: HashMap<ObjectId, ObjectMatch> = HashMap::new();
-    for h in &ret.hits {
-        let e = by_object.entry(h.object_id).or_insert(ObjectMatch {
-            score: 0.0,
-            generation: h.generation,
-            chunks: Vec::new(),
-        });
-        // Newer generation wins if both are somehow present.
-        if h.generation > e.generation {
-            e.generation = h.generation;
-            e.chunks.clear();
-            e.score = 0.0;
+    let mut deferred: Option<HashMap<ObjectId, (u32, Vec<u32>)>> = None;
+    if ret.deferred {
+        // Candidates only: group per object, newest generation wins.
+        let mut cands: HashMap<ObjectId, (u32, Vec<u32>)> = HashMap::new();
+        for h in &ret.hits {
+            let e = cands
+                .entry(h.object_id)
+                .or_insert((h.generation, Vec::new()));
+            if h.generation > e.0 {
+                *e = (h.generation, Vec::new());
+            }
+            if h.generation == e.0 {
+                e.1.push(h.ordinal);
+            }
         }
-        if h.generation == e.generation {
-            e.score = e.score.max(h.score) + h.score * 0.1;
-            e.chunks.push((h.ordinal, h.score));
+        for (_, ords) in cands.values_mut() {
+            ords.sort_unstable();
+        }
+        deferred = Some(cands);
+    } else {
+        for h in &ret.hits {
+            let e = by_object.entry(h.object_id).or_insert(ObjectMatch {
+                score: 0.0,
+                generation: h.generation,
+                chunks: Vec::new(),
+                rows: Vec::new(),
+            });
+            // Newer generation wins if both are somehow present.
+            if h.generation > e.generation {
+                e.generation = h.generation;
+                e.chunks.clear();
+                e.score = 0.0;
+            }
+            if h.generation == e.generation {
+                e.chunks.push((h.ordinal, h.score));
+                e.score = if verified_mode {
+                    // Matching chunks, capped: the same score the page-driven
+                    // path produces, so both paths rank alike.
+                    object_score(e.chunks.len())
+                } else {
+                    e.score.max(h.score) + h.score * 0.1
+                };
+            }
         }
     }
+    let objects = deferred.as_ref().map_or(by_object.len(), |c| c.len());
     ctx.steps.push(PlanStep {
         stage: "content".into(),
-        description: format!("{} → {} file(s)", ret.description, by_object.len()),
+        description: format!(
+            "{} → {} file(s){}",
+            ret.description,
+            objects,
+            if ret.deferred { " (unverified)" } else { "" }
+        ),
         candidates: Some(ret.candidates),
         verified: ret.verified,
         elapsed_ms: Some(ret.elapsed_ms),
     });
-    let terms: Vec<Term> = by_object
-        .keys()
+    let ids: Vec<ObjectId> = match &deferred {
+        Some(c) => c.keys().copied().collect(),
+        None => by_object.keys().copied().collect(),
+    };
+    let terms: Vec<Term> = ids
+        .iter()
         .map(|o| Term::from_field_u64(ctx.f.object_id, o.0 as u64))
         .collect();
     let q: Box<dyn TQuery> = if terms.is_empty() {
@@ -932,6 +1101,7 @@ fn compile_content(
         by_object,
         matcher,
         truncated: ret.truncated,
+        deferred,
     });
     Ok(q)
 }
@@ -1023,6 +1193,272 @@ fn content_score(sets: &[ContentSet], object: ObjectId) -> f32 {
     sets.iter()
         .filter_map(|s| s.by_object.get(&object).map(|m| m.score))
         .sum()
+}
+
+/// Upper bound on `content_score` before deferred clauses are verified.
+fn content_bound(sets: &[ContentSet], object: ObjectId) -> f32 {
+    sets.iter().map(|s| s.bound(object)).sum()
+}
+
+/// `(content set index, object, generation, verdict)` per verified object.
+type Verdicts = Vec<(usize, ObjectId, u32, content::ObjectVerdict)>;
+
+/// Page-driven content verification: verifies objects of deferred clauses
+/// on demand, in batches across threads, under one chunk-fetch budget.
+struct LazyContent<'a> {
+    sets: &'a mut Vec<ContentSet>,
+    catalog: &'a Catalog,
+    budget: std::sync::atomic::AtomicUsize,
+    fetched: usize,
+    rejected: HashSet<ObjectId>,
+    /// The budget ran out: some objects could not be decided.
+    exhausted: bool,
+}
+
+impl<'a> LazyContent<'a> {
+    fn new(sets: &'a mut Vec<ContentSet>, catalog: &'a Catalog, budget: usize) -> Self {
+        Self {
+            sets,
+            catalog,
+            budget: std::sync::atomic::AtomicUsize::new(budget),
+            fetched: 0,
+            rejected: HashSet::new(),
+            exhausted: false,
+        }
+    }
+
+    fn decided(&self, object: ObjectId) -> bool {
+        self.rejected.contains(&object)
+            || self
+                .sets
+                .iter()
+                .all(|s| !s.is_deferred() || s.by_object.contains_key(&object))
+    }
+
+    /// Verify every undecided object in `objects` so that `accepts` can
+    /// answer for each. Work is spread over threads; the budget is shared.
+    fn prepare(&mut self, objects: &[ObjectId]) -> Result<()> {
+        if self.exhausted {
+            return Ok(());
+        }
+        // (set index, object, generation, ordinals)
+        let mut work: Vec<(usize, ObjectId, u32, Vec<u32>)> = Vec::new();
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        for o in objects {
+            if !seen.insert(*o) || self.decided(*o) {
+                continue;
+            }
+            for (i, set) in self.sets.iter().enumerate() {
+                if let Some(c) = &set.deferred {
+                    if !set.by_object.contains_key(o) {
+                        match c.get(o) {
+                            Some((g, ords)) => work.push((i, *o, *g, ords.clone())),
+                            None => {
+                                self.rejected.insert(*o);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if work.is_empty() {
+            return Ok(());
+        }
+        let threads = work.len().clamp(1, VERIFY_THREADS);
+        let per = work.len().div_ceil(threads).max(1);
+        let catalog = self.catalog;
+        let budget = &self.budget;
+        let sets: &Vec<ContentSet> = self.sets;
+        let results: Vec<Result<Verdicts>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = work
+                .chunks(per)
+                .map(|part| {
+                    sc.spawn(move || {
+                        let mut out = Vec::with_capacity(part.len());
+                        for (i, o, g, ords) in part {
+                            let v =
+                                verify_object(catalog, &sets[*i].matcher, *o, *g, ords, budget)?;
+                            out.push((*i, *o, *g, v));
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("content verification thread"))
+                .collect()
+        });
+        for r in results {
+            for (i, o, g, v) in r? {
+                self.fetched += v.fetched;
+                if v.undecided {
+                    self.exhausted = true;
+                    continue;
+                }
+                if v.matched.is_empty() {
+                    self.rejected.insert(o);
+                    continue;
+                }
+                let mut rows = Vec::with_capacity(v.matched.len());
+                let mut chunks = Vec::with_capacity(v.matched.len());
+                for (row, n) in v.matched {
+                    chunks.push((row.ordinal, n as f32));
+                    rows.push(row);
+                }
+                self.sets[i].by_object.insert(
+                    o,
+                    ObjectMatch {
+                        score: object_score(chunks.len()),
+                        generation: g,
+                        chunks,
+                        rows,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every deferred clause matched the object (after `prepare`).
+    fn accepts(&self, object: ObjectId) -> bool {
+        !self.rejected.contains(&object)
+            && self
+                .sets
+                .iter()
+                .all(|s| !s.is_deferred() || s.by_object.contains_key(&object))
+    }
+}
+
+/// A row of the page walk: an entry with its sort keys and object.
+trait WalkRow {
+    fn object(&self) -> ObjectId;
+    fn score(&self) -> f32;
+    fn set_score(&mut self, s: f32);
+    fn entry(&self) -> i64;
+}
+
+impl WalkRow for FastRow {
+    fn object(&self) -> ObjectId {
+        self.object_id
+    }
+    fn score(&self) -> f32 {
+        self.score
+    }
+    fn set_score(&mut self, s: f32) {
+        self.score = s;
+    }
+    fn entry(&self) -> i64 {
+        self.entry_id
+    }
+}
+
+impl WalkRow for Stored {
+    fn object(&self) -> ObjectId {
+        self.object_id
+    }
+    fn score(&self) -> f32 {
+        self.score
+    }
+    fn set_score(&mut self, s: f32) {
+        self.score = s;
+    }
+    fn entry(&self) -> i64 {
+        self.entry_id
+    }
+}
+
+/// Rows verified per batch before the page walk checks whether it may stop.
+const WALK_BATCH: usize = 64;
+
+struct WalkOutcome<T> {
+    verified: Vec<T>,
+    examined: usize,
+    /// The walk reached the end of the candidates: totals are exact.
+    exhausted: bool,
+}
+
+fn by_score_then_entry<T: WalkRow>(a: &T, b: &T) -> std::cmp::Ordering {
+    b.score()
+        .partial_cmp(&a.score())
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.entry().cmp(&b.entry()))
+}
+
+/// Verify candidates in sort order only until `want` survive. `pass` is the
+/// cheap per-row check (fast-field verifiers); `content` verifies deferred
+/// content clauses in batches. With `by_bound` (relevance sort over deferred
+/// content) rows arrive in descending score-bound order and the walk stops
+/// once the next bound cannot beat the `want`-th best verified score, so the
+/// page order is exact; `verified` is then sorted by score.
+fn lazy_walk<T: WalkRow>(
+    rows: impl Iterator<Item = T>,
+    want: usize,
+    mut pass: impl FnMut(&mut T) -> bool,
+    mut content: Option<&mut LazyContent<'_>>,
+    by_bound: bool,
+) -> Result<WalkOutcome<T>> {
+    let mut rows = rows.peekable();
+    let mut verified: Vec<T> = Vec::with_capacity(want);
+    let mut examined = 0usize;
+    let exhausted;
+    loop {
+        if rows.peek().is_none() {
+            exhausted = true;
+            break;
+        }
+        if verified.len() >= want {
+            let stop = match (by_bound, rows.peek()) {
+                (true, Some(next)) => {
+                    verified.sort_by(by_score_then_entry);
+                    next.score() <= verified[want - 1].score()
+                }
+                _ => true,
+            };
+            if stop {
+                exhausted = false;
+                break;
+            }
+        }
+        // Cheap checks on a batch, then one parallel content pass.
+        let mut batch: Vec<T> = Vec::with_capacity(WALK_BATCH);
+        while batch.len() < WALK_BATCH {
+            match rows.next() {
+                Some(mut r) => {
+                    examined += 1;
+                    if pass(&mut r) {
+                        batch.push(r);
+                    }
+                }
+                None => break,
+            }
+        }
+        match content.as_deref_mut() {
+            Some(lc) => {
+                let objects: Vec<ObjectId> = batch.iter().map(|r| r.object()).collect();
+                lc.prepare(&objects)?;
+                for mut r in batch {
+                    if lc.accepts(r.object()) {
+                        r.set_score(content_score(lc.sets, r.object()));
+                        verified.push(r);
+                    }
+                }
+                if lc.exhausted {
+                    exhausted = false;
+                    break;
+                }
+            }
+            None => verified.extend(batch),
+        }
+    }
+    if by_bound {
+        verified.sort_by(by_score_then_entry);
+    }
+    Ok(WalkOutcome {
+        verified,
+        examined,
+        exhausted,
+    })
 }
 
 fn compile_path(
@@ -1270,6 +1706,8 @@ pub fn search_with_content(
     let tight = ctx.tight_dirs && req.mode == ResultMode::Directories;
     let has_content = !ctx.content_sets.is_empty();
     let content_truncated = ctx.content_sets.iter().any(|s| s.truncated);
+    let lazy_content = ctx.content_sets.iter().any(|s| s.is_deferred());
+    let mut content_sets = std::mem::take(&mut ctx.content_sets);
     let collect_all =
         !ctx.verifiers.is_empty() || !ctx.fast_verifiers.is_empty() || tight || has_content;
     let t1 = Instant::now();
@@ -1307,15 +1745,77 @@ pub fn search_with_content(
             .collect();
         drop(list);
         if has_content {
+            // Deferred clauses contribute their upper bound until verified;
+            // the page walk replaces it with the verified score.
             for r in rows.iter_mut() {
-                r.score = content_score(&ctx.content_sets, r.object_id);
+                r.score = content_bound(&content_sets, r.object_id);
             }
         }
         let fast = &ctx.fast_verifiers;
         let need_stored = !ctx.verifiers.is_empty() || tight;
         let sort_by_string = matches!(req.sort.field, SortField::Name | SortField::Path);
-        let lazy =
-            !need_stored && rows.len() > LAZY_VERIFY_MIN && (!fast.is_empty() || sort_by_string);
+        let lazy = !need_stored
+            && (lazy_content
+                || (rows.len() > LAZY_VERIFY_MIN && (!fast.is_empty() || sort_by_string)));
+        let by_bound = lazy_content && req.sort.field == SortField::Relevance && !tight;
+        let mut lazy_cx = if lazy_content {
+            Some(LazyContent::new(
+                &mut content_sets,
+                catalog,
+                opts.content.max_verify,
+            ))
+        } else {
+            None
+        };
+        let want = offset + limit;
+
+        // Explain and warn for a page walk; returns (total, exact).
+        let report_walk = |steps: &mut Vec<PlanStep>,
+                           warnings: &mut Vec<String>,
+                           outcome_len: usize,
+                           examined: usize,
+                           exhausted: bool,
+                           lc: Option<&LazyContent<'_>>,
+                           elapsed_ms: f64|
+         -> (u64, bool) {
+            let mut desc =
+                format!("lazy: {examined} of {candidates} candidates examined in sort order");
+            if !fast.is_empty() {
+                desc.push_str(" on folded fast fields");
+            }
+            if let Some(lc) = lc {
+                desc.push_str(&format!(
+                    "; {} chunks fetched for content verification",
+                    lc.fetched
+                ));
+            }
+            if !exhausted {
+                desc.push_str("; total is an upper bound");
+            }
+            steps.push(PlanStep {
+                stage: "verify".into(),
+                description: desc,
+                candidates: Some(candidates),
+                verified: Some(outcome_len as u64),
+                elapsed_ms: Some(elapsed_ms),
+            });
+            if lc.is_some_and(|lc| lc.exhausted) {
+                warnings.push(format!(
+                    "content verification stopped after {} chunk fetches; results are a subset — narrow the query",
+                    opts.content.max_verify
+                ));
+            } else if !exhausted {
+                warnings.push(format!(
+                    "{candidates} candidates; the total and facet counts are upper bounds — hits shown are verified"
+                ));
+            }
+            let total = if exhausted {
+                outcome_len as u64
+            } else {
+                candidates
+            };
+            (total, exhausted && !truncated && !content_truncated)
+        };
 
         if !lazy {
             // Eager: resolve strings where needed and verify everything.
@@ -1464,9 +1964,35 @@ pub fn search_with_content(
                         sort_key_cmp(a, b, sort)
                     }
                 });
-                let total = verified.len() as u64;
-                let page: Vec<Stored> = verified.into_iter().skip(offset).take(limit).collect();
-                (page, total, !truncated && !content_truncated)
+                if let Some(lc) = lazy_cx.as_mut() {
+                    // Stored verifiers ran eagerly; content is still verified
+                    // only as far as the page needs.
+                    let tw = Instant::now();
+                    let n = verified.len();
+                    let outcome =
+                        lazy_walk(verified.into_iter(), want, |_| true, Some(lc), by_bound)?;
+                    verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
+                    let (total, exact) = report_walk(
+                        &mut steps,
+                        &mut warnings,
+                        outcome.verified.len(),
+                        outcome.examined.min(n),
+                        outcome.exhausted,
+                        Some(lc),
+                        tw.elapsed().as_secs_f64() * 1000.0,
+                    );
+                    let page: Vec<Stored> = outcome
+                        .verified
+                        .into_iter()
+                        .skip(offset)
+                        .take(limit)
+                        .collect();
+                    (page, total, exact)
+                } else {
+                    let total = verified.len() as u64;
+                    let page: Vec<Stored> = verified.into_iter().skip(offset).take(limit).collect();
+                    (page, total, !truncated && !content_truncated)
+                }
             } else {
                 verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
                 rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
@@ -1482,142 +2008,41 @@ pub fn search_with_content(
             // Lazy: order candidates by cheap keys, then resolve and verify
             // in that order only until the page is filled. Every returned hit
             // is verified; the total is an upper bound unless the walk ended.
-            let want = offset + limit;
-            let mut verified: Vec<FastRow> = Vec::with_capacity(want.min(rows.len()));
-            let mut examined = 0usize;
-            let exhausted;
-            if sort_by_string {
-                // Per-segment ordinal order is the folded string order within
-                // a segment; merge segments by comparing resolved heads.
-                let by_name = req.sort.field == SortField::Name;
-                let mut per_seg: HashMap<u32, Vec<FastRow>> = HashMap::new();
-                for r in rows {
-                    per_seg.entry(r.addr.segment_ord).or_default().push(r);
-                }
-                let desc = req.sort.descending;
-                let mut streams: Vec<std::vec::IntoIter<FastRow>> = per_seg
-                    .into_values()
-                    .map(|mut v| {
-                        v.sort_by(|a, b| {
-                            let k = if by_name {
-                                a.name_ord.cmp(&b.name_ord)
-                            } else {
-                                a.path_ord.cmp(&b.path_ord)
-                            };
-                            let k = if desc { k.reverse() } else { k };
-                            k.then(a.entry_id.cmp(&b.entry_id))
-                        });
-                        v.into_iter()
-                    })
-                    .collect();
-                let mut heads: Vec<Option<FastRow>> = streams
-                    .iter_mut()
-                    .map(|it| {
-                        it.next().map(|mut r| {
-                            cols.get(&r.addr.segment_ord)
-                                .expect("opened")
-                                .resolve(&mut r);
-                            r
-                        })
-                    })
-                    .collect();
-                loop {
-                    if verified.len() >= want {
-                        exhausted = heads.iter().all(|h| h.is_none());
-                        break;
-                    }
-                    // Pick the smallest (or largest) head.
-                    let mut best: Option<usize> = None;
-                    for (i, h) in heads.iter().enumerate() {
-                        if let Some(r) = h {
-                            let better = match best {
-                                None => true,
-                                Some(j) => {
-                                    let o = heads[j].as_ref().expect("head");
-                                    let k = if by_name {
-                                        r.name_folded.cmp(&o.name_folded)
-                                    } else {
-                                        r.path_folded.cmp(&o.path_folded)
-                                    };
-                                    let k = if desc { k.reverse() } else { k };
-                                    k.then(r.entry_id.cmp(&o.entry_id)) == std::cmp::Ordering::Less
-                                }
-                            };
-                            if better {
-                                best = Some(i);
-                            }
-                        }
-                    }
-                    let i = match best {
-                        Some(i) => i,
-                        None => {
-                            exhausted = true;
-                            break;
-                        }
-                    };
-                    let mut r = heads[i].take().expect("head");
-                    heads[i] = streams[i].next().map(|mut n| {
-                        cols.get(&n.addr.segment_ord)
-                            .expect("opened")
-                            .resolve(&mut n);
-                        n
-                    });
-                    examined += 1;
-                    let c = cols.get(&r.addr.segment_ord).expect("opened");
-                    if c.passes(&mut r, fast) {
-                        verified.push(r);
-                    }
-                }
+            let cols_ref = &cols;
+            let pass = |r: &mut FastRow| {
+                cols_ref
+                    .get(&r.addr.segment_ord)
+                    .expect("opened")
+                    .passes(r, fast)
+            };
+            let outcome = if sort_by_string {
+                let merged = MergeByString::new(
+                    rows,
+                    cols_ref,
+                    req.sort.field == SortField::Name,
+                    req.sort.descending,
+                );
+                lazy_walk(merged, want, pass, lazy_cx.as_mut(), by_bound)?
             } else {
                 rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
-                let mut it = rows.into_iter();
-                loop {
-                    if verified.len() >= want {
-                        exhausted = it.len() == 0;
-                        break;
-                    }
-                    match it.next() {
-                        Some(mut r) => {
-                            examined += 1;
-                            let c = cols.get(&r.addr.segment_ord).expect("opened");
-                            if c.passes(&mut r, fast) {
-                                verified.push(r);
-                            }
-                        }
-                        None => {
-                            exhausted = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
-            let total = if exhausted {
-                verified.len() as u64
-            } else {
-                candidates
+                lazy_walk(rows.into_iter(), want, pass, lazy_cx.as_mut(), by_bound)?
             };
-            steps.push(PlanStep {
-                stage: "verify".into(),
-                description: format!(
-                    "lazy: {examined} of {candidates} candidates examined in sort order on folded fast fields{}",
-                    if exhausted { "" } else { "; total is an upper bound" }
-                ),
-                candidates: Some(candidates),
-                verified: Some(verified.len() as u64),
-                elapsed_ms: Some(verify_ms),
-            });
-            if !exhausted {
-                warnings.push(format!(
-                    "{candidates} candidates; the total is an upper bound — hits shown are verified"
-                ));
-            }
+            verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
+            let (total, exact) = report_walk(
+                &mut steps,
+                &mut warnings,
+                outcome.verified.len(),
+                outcome.examined,
+                outcome.exhausted,
+                lazy_cx.as_ref(),
+                verify_ms,
+            );
             let mut page = Vec::with_capacity(limit);
-            for r in verified.into_iter().skip(offset).take(limit) {
+            for r in outcome.verified.into_iter().skip(offset).take(limit) {
                 let doc: TantivyDocument = searcher.doc(r.addr)?;
                 page.push(read_stored(f, &doc, r.score));
             }
-            (page, total, exhausted && !truncated && !content_truncated)
+            (page, total, exact)
         }
     } else {
         let n = (offset + limit).max(1);
@@ -1695,7 +2120,7 @@ pub fn search_with_content(
         &searcher,
         page,
         root.as_ref(),
-        &ctx.content_sets,
+        &content_sets,
         opts,
     )?;
     let join_ms = t2.elapsed().as_secs_f64() * 1000.0;
@@ -1810,7 +2235,7 @@ fn build_hits(
                     .as_ref()
                     .and_then(|r| r.reason.clone().or_else(|| r.error.clone())),
             };
-            let snippets = if content_sets.is_empty() {
+            let snippets = if content_sets.is_empty() || !req.snippets {
                 Vec::new()
             } else {
                 snippets_for(catalog, content_sets, s.object_id, obj.generation, opts)?
@@ -1882,13 +2307,36 @@ fn snippets_for(
             .then(a.0.cmp(&b.0))
     });
     ranked.truncate(opts.max_snippets.max(1));
-    let ordinals: Vec<u32> = ranked.iter().map(|r| r.0).collect();
-    let rows = catalog.chunks_for(object, generation, &ordinals)?;
+    // Rows the page walk already fetched need no second trip to the store.
+    let mut by_ordinal: BTreeMap<u32, ChunkRow> = BTreeMap::new();
+    let mut missing: Vec<u32> = Vec::new();
+    for (ord, _) in &ranked {
+        let cached = sets.iter().find_map(|s| {
+            s.by_object
+                .get(&object)
+                .filter(|m| m.generation == generation)
+                .and_then(|m| m.rows.iter().find(|r| r.ordinal == *ord))
+        });
+        match cached {
+            Some(r) => {
+                by_ordinal.insert(*ord, r.clone());
+            }
+            None => missing.push(*ord),
+        }
+    }
+    if !missing.is_empty() {
+        for r in catalog.chunks_for(object, generation, &missing)? {
+            by_ordinal.insert(r.ordinal, r);
+        }
+    }
     let matchers: Vec<&Matcher> = sets.iter().map(|s| &s.matcher).collect();
     let mut out = Vec::new();
-    for row in rows {
-        if let Some(s) = make_snippet(&row, &matchers, opts.snippet_chars) {
-            out.push(s);
+    // Best-scoring chunk first, as ranked.
+    for (ord, _) in &ranked {
+        if let Some(row) = by_ordinal.get(ord) {
+            if let Some(s) = make_snippet(row, &matchers, opts.snippet_chars) {
+                out.push(s);
+            }
         }
     }
     Ok(out)
