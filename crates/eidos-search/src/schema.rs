@@ -5,7 +5,7 @@
 //! `CatalogIndex::open` rebuilds from the catalog.
 
 use eidos_catalog::projection::ProjectionRow;
-use eidos_domain::{FileAttributes, ObjectKind};
+use eidos_domain::FileAttributes;
 use tantivy::schema::{
     Field, IndexRecordOption, NumericOptions, Schema, TextFieldIndexing, TextOptions, FAST,
     INDEXED, STORED, STRING,
@@ -184,7 +184,7 @@ pub fn document(f: &Fields, row: &ProjectionRow) -> TantivyDocument {
     for a in attr_terms(row.attributes) {
         d.add_text(f.attrs, a);
     }
-    let is_dir = row.kind == ObjectKind::Directory;
+    let is_dir = row.kind.is_directory_like();
     d.add_u64(f.file_count, if is_dir { row.file_count } else { 0 });
     d.add_u64(f.dir_count, if is_dir { row.dir_count } else { 0 });
     d.add_u64(

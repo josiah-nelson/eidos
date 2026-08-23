@@ -142,6 +142,13 @@ impl CatalogIndex {
             match row.op.as_str() {
                 "subtree" => {
                     stats.subtree_rebuilds += 1;
+                    // A subtree replacement may use fresh object ids (archive
+                    // generations do), so remove documents from the old tree
+                    // by ancestry before walking the current catalog rows.
+                    self.writer().delete_term(Term::from_field_u64(
+                        self.fields().ancestors,
+                        row.object_id.0 as u64,
+                    ));
                     if seen.insert(row.object_id) {
                         self.reindex_object(catalog, row.object_id, &mut stats)?;
                     }

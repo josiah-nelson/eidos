@@ -204,6 +204,26 @@ fn containers_get_manifests_and_members() {
     assert_eq!(under_src[1].path, "src/lib/mod.rs");
     assert_eq!(under_src[1].size, 9);
 
+    // The manifest is also a real virtual subtree, so ordinary catalog
+    // traversal and the catalog index see the same rows as archive browsing.
+    let virtual_file = fx.object("pkg/tool.zip/src/lib/mod.rs");
+    let object = fx.catalog.get_object(virtual_file).unwrap().unwrap();
+    assert_eq!(object.kind, ObjectKind::VirtualFile);
+    assert_eq!(object.size, 9);
+    let virtual_dir = fx.object("pkg/tool.zip/src/lib");
+    assert_eq!(
+        fx.catalog.get_object(virtual_dir).unwrap().unwrap().kind,
+        ObjectKind::VirtualDirectory
+    );
+    let virtual_hits = fx.run("name:mod.rs");
+    assert_eq!(virtual_hits.hits.len(), 1);
+    assert_eq!(virtual_hits.hits[0].kind, ObjectKind::VirtualFile);
+    assert!(virtual_hits.hits[0]
+        .path
+        .as_deref()
+        .unwrap()
+        .ends_with("tool.zip\\src\\lib\\mod.rs"));
+
     // The container's content state says what happened.
     let r = fx.run("name:tool.zip");
     assert_eq!(r.hits.len(), 1);
@@ -272,13 +292,58 @@ fn reindex_and_requeue_rebuild_manifests() {
     // A content reindex drops manifests with the chunks …
     fx.catalog.reset_content_for_reindex().unwrap();
     assert!(fx.catalog.archive_record(zip).unwrap().is_none());
+    assert!(fx
+        .catalog
+        .resolve_relative(fx.source, "pkg/tool.zip/src/lib/mod.rs")
+        .unwrap()
+        .is_none());
     // … and requeue finds every container again (3 containers; notes.zip is
     // text but carries the extension, so it is queued too and falls back).
     assert_eq!(fx.catalog.requeue_archives(None).unwrap(), 4);
     drain_content_jobs(&fx.catalog, &fx.content, &Limits::default(), "test").unwrap();
     let rec = fx.catalog.archive_record(zip).unwrap().expect("rebuilt");
     assert_eq!(rec.member_count, 5);
+    assert!(fx
+        .catalog
+        .resolve_relative(fx.source, "pkg/tool.zip/src/lib/mod.rs")
+        .unwrap()
+        .is_some());
     assert_eq!(fx.catalog.requeue_archives(None).unwrap(), 0);
+}
+
+#[test]
+fn requeue_backfills_an_existing_manifest_without_virtual_rows() {
+    let fx = fixture();
+    fx.extract_all();
+    let zip = fx.object("pkg/tool.zip");
+    assert!(fx.catalog.archive_record(zip).unwrap().is_some());
+
+    // This is the shape of a catalog upgraded from migration 5: the manifest
+    // is current, but its object/entry projection has never been built.
+    fx.catalog
+        .with_writer(|conn| {
+            let now = UnixNanos::now().0;
+            conn.execute(
+                "UPDATE entries SET deleted_at = ?2 WHERE object_id IN (
+                     SELECT object_id FROM objects WHERE archive_container_id = ?1
+                 )",
+                [zip.0, now],
+            )?;
+            conn.execute(
+                "UPDATE objects SET deleted_at = ?2 WHERE archive_container_id = ?1",
+                [zip.0, now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(fx.catalog.requeue_archives(Some(fx.source)).unwrap(), 1);
+    drain_content_jobs(&fx.catalog, &fx.content, &Limits::default(), "test").unwrap();
+    assert!(fx
+        .catalog
+        .resolve_relative(fx.source, "pkg/tool.zip/src/lib/mod.rs")
+        .unwrap()
+        .is_some());
 }
 
 #[test]
@@ -303,6 +368,14 @@ fn stale_archive_generation_is_not_published() {
     let current = fx.catalog.get_object(zip).unwrap().unwrap();
     assert_eq!(current.generation, original.generation + 1);
     assert_eq!(current.content_state, ContentState::Pending);
+    assert!(fx
+        .catalog
+        .resolve_relative(fx.source, "pkg/tool.zip/src/lib/mod.rs")
+        .unwrap()
+        .is_none());
+    fx.index.sync_sources(&fx.catalog).unwrap();
+    fx.index.reload().unwrap();
+    assert!(fx.run("name:mod.rs").hits.is_empty());
 
     let stale_record = eidos_catalog::archive::ArchiveRecord {
         member_count: 999,
@@ -343,7 +416,7 @@ fn manifest_rows_persist_in_batches_and_published_retries_are_idempotent() {
     content.generation = generation;
     content.state = ContentState::Indexed;
     content.coverage = Coverage::Full;
-    let members: Vec<ArchiveMember> = (0..2_500u32)
+    let mut members: Vec<ArchiveMember> = (0..2_500u32)
         .map(|ordinal| {
             let name = format!("member-{ordinal:04}.txt");
             ArchiveMember {
@@ -364,6 +437,11 @@ fn manifest_rows_persist_in_batches_and_published_retries_are_idempotent() {
             }
         })
         .collect();
+    // ZIPs may contain duplicate paths. Ordinal keeps their identities
+    // distinct even though both browse entries render the same path.
+    members[1].path = members[0].path.clone();
+    members[1].name = members[0].name.clone();
+    members[1].raw_name = members[0].raw_name.clone();
     rec.member_count = members.len() as u64;
     rec.dir_count = 0;
     rec.implicit_dir_count = 0;
@@ -386,6 +464,19 @@ fn manifest_rows_persist_in_batches_and_published_retries_are_idempotent() {
         )
         .unwrap();
     assert_eq!(total, 2_500);
+    let duplicate_entries: i64 = fx
+        .catalog
+        .with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM entries e JOIN objects o ON o.object_id = e.object_id
+                 WHERE o.archive_container_id = ?1 AND e.name = 'member-0000.txt'
+                   AND e.deleted_at IS NULL AND o.deleted_at IS NULL",
+                [zip.0],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(duplicate_entries, 2);
 
     let mut retry = rec.clone();
     let short = &members[..3];

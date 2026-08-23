@@ -70,6 +70,20 @@ budgets and visibility as text extraction.
   record and one page of members, either the children of a virtual
   directory (`parent=`, directories first) or every member under a path
   prefix; `eidos archive show <object>` prints it, marking flagged names.
+- **Archive members materialize as ordinary catalog topology.** Every member
+  has an `objects` row of kind `virtual_file` or `virtual_directory` and an
+  `entries` row beneath the container object. Provenance columns bind its
+  identity to container id, container generation, and member ordinal. Rows
+  are inserted as hidden staging data in the same bounded writer windows as
+  member metadata, then the complete tree replaces the previous generation
+  atomically. Duplicate normalized paths remain separate ordinal identities;
+  descendants attach to the first directory with that path.
+- **One subtree event publishes a virtual-tree replacement.** Index followers
+  delete the former tree by its container ancestor before projecting current
+  descendants, so a manifest does not create one outbox row per member.
+  Full-scan changes, change-feed updates, container deletion, and content-index
+  reset all retire materialized descendants. Existing manifests without
+  virtual rows are selected by `archive requeue` for backfill.
 - The fixture builder (`eidos_archive::fixture`) synthesises archives —
   stored members, ZIP64 end records, arbitrary extra fields — so tests
   exercise truncated tails, bogus directory offsets, bomb-shaped entry
@@ -78,10 +92,9 @@ budgets and visibility as text extraction.
 
 ## Consequences
 
-- Member names are in the catalog but not yet in the search index: the Q-6
-  gate (member names discoverable by `name:`/`path:` clauses, archive
-  declared sizes in directory accounting) is the next change, which
-  projects `archive_members` into the catalog index as virtual entries.
+- Member names and paths participate in ordinary browse and catalog-index
+  search. Directory accounting still needs separate archive declared-size
+  fields so virtual sizes do not inflate physical logical/allocated totals.
 - Archives that are text in disguise cost one extra tail read before the
   text path; archives that are binary in disguise cost the same read before
   the existing sniff.

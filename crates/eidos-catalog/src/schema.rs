@@ -339,6 +339,27 @@ CREATE TABLE archive_members (
 CREATE INDEX archive_members_parent ON archive_members (object_id, generation, parent, name);
 "#,
     ),
+    (
+        "materialized archive members",
+        r#"
+ALTER TABLE objects ADD COLUMN archive_container_id INTEGER;
+ALTER TABLE objects ADD COLUMN archive_generation INTEGER;
+ALTER TABLE objects ADD COLUMN archive_member_ordinal INTEGER;
+
+CREATE UNIQUE INDEX objects_archive_member
+    ON objects (archive_container_id, archive_generation, archive_member_ordinal)
+    WHERE archive_container_id IS NOT NULL;
+CREATE INDEX objects_archive_container
+    ON objects (archive_container_id, archive_generation);
+
+DROP INDEX entries_parent_name;
+CREATE UNIQUE INDEX entries_parent_name
+    ON entries (source_id, parent_id, name)
+    WHERE deleted_at IS NULL AND is_virtual = 0;
+CREATE UNIQUE INDEX entries_virtual_object
+    ON entries (object_id) WHERE is_virtual = 1;
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.
@@ -372,7 +393,7 @@ mod tests {
     fn migrations_apply_once_and_are_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         let first = migrate(&mut conn).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5]);
+        assert_eq!(first, vec![1, 2, 3, 4, 5, 6]);
         let second = migrate(&mut conn).unwrap();
         assert!(second.is_empty());
         let v: i64 = conn

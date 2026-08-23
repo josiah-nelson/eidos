@@ -576,6 +576,24 @@ impl Catalog {
             for o in &objects {
                 flip_state(&tx, ObjectId(*o), ContentState::Pending, None)?;
             }
+            let containers: Vec<(i64, i64, i64)> = tx
+                .prepare(
+                    "SELECT DISTINCT v.archive_container_id, c.source_id, c.generation
+                     FROM objects v JOIN objects c ON c.object_id = v.archive_container_id
+                     WHERE v.archive_container_id IS NOT NULL AND v.deleted_at IS NULL",
+                )?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (container, source, generation) in containers {
+                crate::archive::retire_virtual_tree(&tx, ObjectId(container), UnixNanos::now().0)?;
+                outbox_append_conn(
+                    &tx,
+                    SourceId(source),
+                    ObjectId(container),
+                    "subtree",
+                    generation,
+                )?;
+            }
             tx.execute("DELETE FROM content_records", [])?;
             tx.execute("DELETE FROM chunks", [])?;
             tx.execute("DELETE FROM archive_records", [])?;
