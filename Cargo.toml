@@ -5,6 +5,7 @@ members = [
     "crates/eidos-catalog",
     "crates/eidos-scanner",
     "crates/eidos-content",
+    "crates/eidos-archive",
     "crates/eidos-search",
     "crates/eidos-query",
     "crates/eidos-service",
@@ -21,6 +22,7 @@ repository = "https://github.com/josiah-nelson/eidos"
 [workspace.dependencies]
 eidos-domain = { path = "crates/eidos-domain" }
 eidos-catalog = { path = "crates/eidos-catalog" }
+eidos-archive = { path = "crates/eidos-archive" }
 eidos-scanner = { path = "crates/eidos-scanner" }
 eidos-content = { path = "crates/eidos-content" }
 eidos-search = { path = "crates/eidos-search" }
@@ -39,6 +41,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs", "compression-
 rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 tantivy = "0.26"
 blake3 = "1.8"
+crc32fast = "1.5"
 clap = { version = "4.6", features = ["derive", "env"] }
 regex = "1.13"
 regex-syntax = "0.8"

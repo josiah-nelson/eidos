@@ -1,0 +1,17 @@
+[package]
+name = "eidos-archive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Archive member inventories from container metadata (ZIP central directory), without extraction"
+
+[dependencies]
+eidos-domain = { workspace = true }
+crc32fast = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
