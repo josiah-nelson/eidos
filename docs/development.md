@@ -43,7 +43,10 @@ and skip themselves otherwise.
 The service scans new sources, keeps local NTFS sources live through the USN
 journal, rescans feed-less sources on their reconcile interval, rebuilds the
 search index whenever a source's published generation changes, and follows
-the catalog outbox every 500 ms (`GET /api/index` shows follower state).
+the catalog outbox every 500 ms (`GET /api/index` shows follower state). Each
+successful projection iteration commits and reloads the in-process Tantivy
+reader before recording its catalog position, so API searches see the update
+as soon as the iteration returns.
 
 `serve` flags / environment: `--data-dir` (`EIDOS_DATA_DIR`), `--bind`
 (`EIDOS_BIND`, default loopback — the API has no authentication yet and warns

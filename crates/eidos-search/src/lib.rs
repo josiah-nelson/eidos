@@ -111,7 +111,7 @@ impl CatalogIndex {
         let writer = index.writer_with_num_threads(2, 96 * 1024 * 1024)?;
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
         let mut cursor_key = [0_u8; 32];
         getrandom::fill(&mut cursor_key)
@@ -144,6 +144,19 @@ impl CatalogIndex {
     }
 
     pub fn reload(&self) -> Result<()> {
+        self.reader.reload()?;
+        Ok(())
+    }
+
+    /// Commit queued projection mutations and publish them to this process's
+    /// searchers before returning.
+    ///
+    /// The catalog projection has one in-process writer, so explicit reloads
+    /// give callers a stronger visibility boundary than Tantivy's delayed
+    /// `meta.json` watcher. They also avoid the watcher racing Tantivy's
+    /// atomic `meta.json` replacement on Windows.
+    pub(crate) fn commit_and_reload(&self) -> Result<()> {
+        self.writer().commit()?;
         self.reader.reload()?;
         Ok(())
     }

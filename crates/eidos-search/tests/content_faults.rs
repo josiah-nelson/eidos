@@ -74,7 +74,6 @@ fn fixture() -> Fx {
     .unwrap();
     let index = CatalogIndex::open(dir.path().join("index")).unwrap();
     index.sync_sources(&catalog).unwrap();
-    index.reload().unwrap();
     let content = ContentIndex::open(dir.path().join("content")).unwrap();
     Fx {
         _dir: dir,
@@ -213,7 +212,6 @@ impl Fx {
         )
         .unwrap();
         self.index.follow_once(&self.catalog, 10_000).unwrap();
-        self.index.reload().unwrap();
         n
     }
 

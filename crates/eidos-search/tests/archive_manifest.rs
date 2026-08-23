@@ -84,7 +84,6 @@ fn fixture() -> Fx {
     .unwrap();
     let index = CatalogIndex::open(dir.path().join("index")).unwrap();
     index.sync_sources(&catalog).unwrap();
-    index.reload().unwrap();
     let content = ContentIndex::open(dir.path().join("content")).unwrap();
     Fx {
         _dir: dir,
@@ -103,7 +102,6 @@ impl Fx {
             .unwrap();
         drain_content_jobs(&self.catalog, &self.content, &Limits::default(), "test").unwrap();
         self.index.follow_once(&self.catalog, 10_000).unwrap();
-        self.index.reload().unwrap();
     }
 
     fn object(&self, rel: &str) -> ObjectId {
@@ -374,7 +372,6 @@ fn stale_archive_generation_is_not_published() {
         .unwrap()
         .is_none());
     fx.index.sync_sources(&fx.catalog).unwrap();
-    fx.index.reload().unwrap();
     assert!(fx.run("name:mod.rs").hits.is_empty());
 
     let stale_record = eidos_catalog::archive::ArchiveRecord {

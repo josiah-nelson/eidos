@@ -89,6 +89,15 @@ catalog — idempotent, so a crash between index commit and position update
 only repeats work. The position is recorded in the catalog
 (`projection_state`) after the index commit.
 
+The in-process reader uses Tantivy's manual reload policy. Every projection
+commit reloads that reader synchronously before the rebuild/follower call
+returns, so a successful return is also a visibility boundary for searches.
+This avoids relying on Tantivy's delayed `meta.json` file watcher: on Windows
+that watcher can briefly hold a file while the writer atomically replaces
+index metadata, producing a transient `Access is denied` commit failure. A
+reload failure is returned before catalog projection state or the outbox
+position advances, so the same idempotent work is retried.
+
 Both paths read the catalog in batches of `PROJECTION_BATCH` (1 024) rows.
 A rebuild loads the source's path nodes once — directories, virtual
 directories, and archive containers, which are ordinary files that own
