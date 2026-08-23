@@ -180,6 +180,27 @@ native event
 Checkpoints advance only when enough durable state exists to replay or repair
 all downstream work.
 
+### Directory aggregate invariants
+
+Whatever a full reconciliation would compute is the definition; the
+incremental path must land on the same values, and tests assert that
+equality after every kind of mutation.
+
+- Counts and byte totals are per live entry of the subtree, so a hard-linked
+  file counts once under each directory that links it.
+- `newest_modified`/`oldest_modified` are the extrema of the subtree's
+  **non-directory** entries. A directory's own modification time never
+  contributes; its aggregate row carries its children's extrema instead.
+- Virtual archive members hang off their container object, which owns no
+  aggregate row, so they never reach a physical directory's totals or
+  extrema. The container counts as the one file it is.
+- Counts are a monoid, so incremental changes add signed deltas along the
+  ancestor chain. Extrema are not: when a mutation removes the entry that
+  provided a directory's extremum, that one directory is recomputed from its
+  direct children, and the walk keeps recomputing upward only while an
+  ancestor's extremum is likewise invalidated. Propagation never stops on a
+  swallowed error — a failed ancestor lookup aborts the transaction.
+
 ### Overflow or invalid checkpoint
 
 Mark the source degraded, preserve existing results as stale, reconcile the

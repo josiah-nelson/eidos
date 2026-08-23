@@ -1,12 +1,13 @@
 //! Incremental change application with synthetic events (platform neutral).
 
+use eidos_catalog::archive::ArchiveMember;
 use eidos_catalog::changes::{ChangeEvent, Checkpoint, NativeKey, ObjectSnapshot};
 use eidos_catalog::jobs::NewJob;
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::{Catalog, NewSource};
 use eidos_domain::{
-    ContentState, FailureClass, FileAttributes, IdentityConfidence, JobStage, JobState,
-    NativeIdentity, ObjectKind, Priority, SourceId, SourceKind, UnixNanos,
+    ContentState, Coverage, FailureClass, FileAttributes, IdentityConfidence, JobStage, JobState,
+    NativeIdentity, ObjectId, ObjectKind, Priority, SourceId, SourceKind, UnixNanos,
 };
 use std::sync::Arc;
 
@@ -69,12 +70,7 @@ impl Fx {
     }
 
     fn key_of(&self, rel: &str) -> NativeKey {
-        let id = self
-            .catalog
-            .resolve_relative(self.source, rel)
-            .unwrap()
-            .expect(rel);
-        let o = self.catalog.get_object(id).unwrap().unwrap();
+        let o = self.catalog.get_object(self.id(rel)).unwrap().unwrap();
         NativeKey::from(o.native.expect("native identity"))
     }
 
@@ -151,6 +147,147 @@ impl Fx {
             .unwrap()
             .is_some()
     }
+
+    fn id(&self, rel: &str) -> ObjectId {
+        if rel.is_empty() {
+            self.catalog
+                .get_source(self.source)
+                .unwrap()
+                .unwrap()
+                .root_object_id
+                .unwrap()
+        } else {
+            self.catalog
+                .resolve_relative(self.source, rel)
+                .unwrap()
+                .expect(rel)
+        }
+    }
+
+    /// Subtree `(newest, oldest)` of a directory, in raw nanoseconds.
+    fn extrema(&self, rel: &str) -> (Option<i64>, Option<i64>) {
+        let a = self.agg(rel);
+        (
+            a.newest_modified.map(|t| t.0),
+            a.oldest_modified.map(|t| t.0),
+        )
+    }
+
+    /// Retimestamp a live object through the change feed.
+    fn set_modified(&self, rel: &str, at: UnixNanos) {
+        let mut snap = self.snapshot_of(rel);
+        snap.modified = Some(at);
+        self.catalog
+            .apply_changes(self.source, &[ChangeEvent::Update { snapshot: snap }], None)
+            .unwrap();
+    }
+
+    /// Link a new file with a chosen modification time.
+    fn add_file(&mut self, parent: &str, name: &str, size: u64, at: UnixNanos) {
+        let parent_key = self.key_of(parent);
+        let mut snap = self.fresh_snapshot(ObjectKind::File, size);
+        snap.modified = Some(at);
+        self.catalog
+            .apply_changes(
+                self.source,
+                &[ChangeEvent::Link {
+                    parent: parent_key,
+                    name: name.into(),
+                    snapshot: snap,
+                }],
+                None,
+            )
+            .unwrap();
+    }
+
+    fn unlink(&self, parent: &str, name: &str) {
+        let parent = self.key_of(parent);
+        self.catalog
+            .apply_changes(
+                self.source,
+                &[ChangeEvent::Unlink {
+                    parent,
+                    name: name.into(),
+                }],
+                None,
+            )
+            .unwrap();
+    }
+
+    fn agg_rows(&self) -> Vec<AggRow> {
+        self.catalog
+            .with_reader(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT object_id, file_count, dir_count, logical_bytes, allocated_bytes,
+                            newest_modified, oldest_modified, content_pending, content_indexed,
+                            content_failed, content_excluded
+                     FROM directory_aggregates ORDER BY object_id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok(AggRow {
+                            object: r.get(0)?,
+                            files: r.get(1)?,
+                            dirs: r.get(2)?,
+                            logical: r.get(3)?,
+                            allocated: r.get(4)?,
+                            newest: r.get(5)?,
+                            oldest: r.get(6)?,
+                            pending: r.get(7)?,
+                            indexed: r.get(8)?,
+                            failed: r.get(9)?,
+                            excluded: r.get(10)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap()
+    }
+
+    /// Full reconciliation must reproduce whatever the incremental path left
+    /// behind, extrema included.
+    fn assert_matches_rebuild(&self) {
+        let incremental = self.agg_rows();
+        let root = self.id("");
+        let source = self.source;
+        self.catalog
+            .with_writer(|conn| {
+                let tx = conn.transaction()?;
+                eidos_catalog::aggregates::rebuild_source(
+                    &tx,
+                    source,
+                    root,
+                    1,
+                    &std::collections::HashSet::new(),
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(incremental, self.agg_rows(), "incremental != rebuild");
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AggRow {
+    object: i64,
+    files: i64,
+    dirs: i64,
+    logical: i64,
+    allocated: i64,
+    newest: Option<i64>,
+    oldest: Option<i64>,
+    pending: i64,
+    indexed: i64,
+    failed: i64,
+    excluded: i64,
+}
+
+/// Well-separated synthetic timestamps (seconds apart, far from "now" so a
+/// real filesystem mtime can never collide with one).
+fn t(secs: i64) -> UnixNanos {
+    UnixNanos(1_600_000_000_000_000_000 + secs * 1_000_000_000)
 }
 
 #[test]
@@ -651,4 +788,314 @@ fn job_queue_lifecycle() {
         JobState::Queued
     );
     let _ = ContentState::Pending;
+}
+
+// ---------------------------------------------------------------------------
+// Directory extrema (issue #4): incremental newest/oldest must stay exact.
+// ---------------------------------------------------------------------------
+
+/// The base fixture with synthetic timestamps: `a/one.txt` is the oldest
+/// file at `t(10)` and `a/b/two.txt` the newest at `t(90)`.
+fn stamped() -> Fx {
+    let fx = Fx::new();
+    fx.set_modified("a/one.txt", t(10));
+    fx.set_modified("a/b/two.txt", t(90));
+    fx
+}
+
+#[test]
+fn retimestamping_below_the_current_newest_lowers_it() {
+    let fx = stamped();
+    // Both files were stamped *down* from their real (recent) mtimes, so an
+    // aggregate that can only be raised would still be showing "now".
+    assert_eq!(fx.extrema(""), (Some(t(90).0), Some(t(10).0)));
+    assert_eq!(fx.extrema("a"), (Some(t(90).0), Some(t(10).0)));
+    assert_eq!(fx.extrema("a/b"), (Some(t(90).0), Some(t(90).0)));
+    fx.assert_matches_rebuild();
+}
+
+#[test]
+fn deleting_the_newest_file_lowers_every_ancestor() {
+    let fx = stamped();
+    let two = fx.key_of("a/b/two.txt");
+    fx.catalog
+        .apply_changes(fx.source, &[ChangeEvent::Delete { object: two }], None)
+        .unwrap();
+    assert_eq!(
+        fx.extrema("a/b"),
+        (None, None),
+        "empty subtree has no times"
+    );
+    assert_eq!(fx.extrema("a"), (Some(t(10).0), Some(t(10).0)));
+    assert_eq!(fx.extrema(""), (Some(t(10).0), Some(t(10).0)));
+    fx.assert_matches_rebuild();
+}
+
+#[test]
+fn deleting_the_oldest_file_raises_every_ancestor() {
+    let fx = stamped();
+    let one = fx.key_of("a/one.txt");
+    fx.catalog
+        .apply_changes(fx.source, &[ChangeEvent::Delete { object: one }], None)
+        .unwrap();
+    assert_eq!(fx.extrema("a"), (Some(t(90).0), Some(t(90).0)));
+    assert_eq!(fx.extrema(""), (Some(t(90).0), Some(t(90).0)));
+    fx.assert_matches_rebuild();
+}
+
+#[test]
+fn retimestamping_moves_both_ends() {
+    let mut fx = stamped();
+    fx.add_file("a/b", "three.txt", 50, t(50));
+    assert_eq!(fx.extrema("a/b"), (Some(t(90).0), Some(t(50).0)));
+    assert_eq!(fx.extrema(""), (Some(t(90).0), Some(t(10).0)));
+
+    // The newest file becomes the oldest in its own directory.
+    fx.set_modified("a/b/two.txt", t(20));
+    assert_eq!(fx.extrema("a/b"), (Some(t(50).0), Some(t(20).0)));
+    assert_eq!(fx.extrema("a"), (Some(t(50).0), Some(t(10).0)));
+    assert_eq!(fx.extrema(""), (Some(t(50).0), Some(t(10).0)));
+    fx.assert_matches_rebuild();
+
+    // The oldest file becomes the newest of the whole tree.
+    fx.set_modified("a/one.txt", t(200));
+    assert_eq!(fx.extrema("a/b"), (Some(t(50).0), Some(t(20).0)));
+    assert_eq!(fx.extrema("a"), (Some(t(200).0), Some(t(20).0)));
+    assert_eq!(fx.extrema(""), (Some(t(200).0), Some(t(20).0)));
+    fx.assert_matches_rebuild();
+}
+
+#[test]
+fn deleting_a_nested_directory_recomputes_the_chain() {
+    let mut fx = stamped();
+    let deep = fx.fresh_snapshot(ObjectKind::Directory, 0);
+    let b = fx.key_of("a/b");
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[ChangeEvent::Link {
+                parent: b,
+                name: "deep".into(),
+                snapshot: deep.clone(),
+            }],
+            None,
+        )
+        .unwrap();
+    // A new empty directory contributes no timestamp of its own.
+    assert_eq!(fx.extrema("a/b/deep"), (None, None));
+    assert_eq!(fx.extrema(""), (Some(t(90).0), Some(t(10).0)));
+
+    fx.add_file("a/b/deep", "far.txt", 10, t(400));
+    fx.add_file("a/b/deep", "ancient.txt", 10, t(1));
+    assert_eq!(fx.extrema("a/b/deep"), (Some(t(400).0), Some(t(1).0)));
+    assert_eq!(fx.extrema("a/b"), (Some(t(400).0), Some(t(1).0)));
+    assert_eq!(fx.extrema(""), (Some(t(400).0), Some(t(1).0)));
+    fx.assert_matches_rebuild();
+
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[ChangeEvent::Delete {
+                object: NativeKey::from(deep.native),
+            }],
+            None,
+        )
+        .unwrap();
+    assert!(!fx.exists("a/b/deep/far.txt"));
+    assert_eq!(fx.extrema("a/b"), (Some(t(90).0), Some(t(90).0)));
+    assert_eq!(fx.extrema("a"), (Some(t(90).0), Some(t(10).0)));
+    assert_eq!(fx.extrema(""), (Some(t(90).0), Some(t(10).0)));
+    fx.assert_matches_rebuild();
+}
+
+#[test]
+fn moving_a_subtree_transfers_its_extrema() {
+    let mut fx = stamped();
+    fx.add_file("a/b", "three.txt", 50, t(150));
+    let root_key = fx.key_of("");
+    let c = fx.fresh_snapshot(ObjectKind::Directory, 0);
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[ChangeEvent::Link {
+                parent: root_key,
+                name: "c".into(),
+                snapshot: c.clone(),
+            }],
+            None,
+        )
+        .unwrap();
+    let a = fx.key_of("a");
+    let b_snap = fx.snapshot_of("a/b");
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[
+                ChangeEvent::Unlink {
+                    parent: a,
+                    name: "b".into(),
+                },
+                ChangeEvent::Link {
+                    parent: NativeKey::from(c.native),
+                    name: "b".into(),
+                    snapshot: b_snap,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    assert!(fx.exists("c/b/three.txt"));
+    // `a` keeps only one.txt; `c` inherits the moved subtree's window.
+    assert_eq!(fx.extrema("a"), (Some(t(10).0), Some(t(10).0)));
+    assert_eq!(fx.extrema("c"), (Some(t(150).0), Some(t(90).0)));
+    assert_eq!(fx.extrema("c/b"), (Some(t(150).0), Some(t(90).0)));
+    assert_eq!(fx.extrema(""), (Some(t(150).0), Some(t(10).0)));
+    fx.assert_matches_rebuild();
+}
+
+#[test]
+fn hard_linked_entries_keep_each_parent_exact() {
+    let fx = stamped();
+    let b = fx.key_of("a/b");
+    let snap = fx.snapshot_of("a/one.txt");
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[ChangeEvent::Link {
+                parent: b,
+                name: "one-link.txt".into(),
+                snapshot: snap,
+            }],
+            None,
+        )
+        .unwrap();
+    assert_eq!(fx.extrema("a/b"), (Some(t(90).0), Some(t(10).0)));
+    fx.assert_matches_rebuild();
+
+    // One retimestamp reaches the object through both of its entries.
+    fx.set_modified("a/one.txt", t(300));
+    assert_eq!(fx.extrema("a/b"), (Some(t(300).0), Some(t(90).0)));
+    assert_eq!(fx.extrema("a"), (Some(t(300).0), Some(t(90).0)));
+    assert_eq!(fx.extrema(""), (Some(t(300).0), Some(t(90).0)));
+    fx.assert_matches_rebuild();
+
+    // Dropping one link leaves the other entry's contribution in place.
+    fx.unlink("a/b", "one-link.txt");
+    assert!(fx.exists("a/one.txt"));
+    assert_eq!(fx.extrema("a/b"), (Some(t(90).0), Some(t(90).0)));
+    assert_eq!(fx.extrema("a"), (Some(t(300).0), Some(t(90).0)));
+    assert_eq!(fx.extrema(""), (Some(t(300).0), Some(t(90).0)));
+    fx.assert_matches_rebuild();
+}
+
+fn zip_member(ordinal: u32, name: &str, at: UnixNanos) -> ArchiveMember {
+    ArchiveMember {
+        ordinal,
+        path: name.into(),
+        name: name.into(),
+        parent: String::new(),
+        raw_name: name.into(),
+        is_dir: false,
+        implicit: false,
+        size: 8,
+        compressed: 4,
+        method: 8,
+        crc32: 0,
+        modified: Some(at),
+        encrypted: false,
+        flags: 0,
+    }
+}
+
+#[test]
+fn archive_members_never_reach_the_containing_directory() {
+    let fx = Fx::new();
+    std::fs::write(fx.root.join("a/pack.zip"), b"PK\x05\x06").unwrap();
+    let lister = eidos_scanner::default_lister();
+    run_scan(
+        &fx.catalog,
+        fx.source,
+        lister.as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    fx.set_modified("a/one.txt", t(10));
+    fx.set_modified("a/b/two.txt", t(90));
+    fx.set_modified("a/pack.zip", t(500));
+    assert_eq!(fx.extrema("a"), (Some(t(500).0), Some(t(10).0)));
+
+    // A manifest whose members sit far outside the physical window: they
+    // hang off the container, not off `a`, so neither end may move.
+    let zip = fx.id("a/pack.zip");
+    let generation = fx.catalog.get_object(zip).unwrap().unwrap().generation;
+    let members = vec![
+        zip_member(0, "ancient.txt", t(-9_000)),
+        zip_member(1, "future.txt", t(9_000)),
+    ];
+    let rec = eidos_catalog::archive::ArchiveRecord {
+        object_id: zip,
+        source_id: fx.source,
+        generation,
+        format: "zip".into(),
+        member_count: members.len() as u64,
+        dir_count: 0,
+        implicit_dir_count: 0,
+        suspicious_count: 0,
+        declared_size: 16,
+        compressed_size: 8,
+        claimed_entries: members.len() as u64,
+        zip64: false,
+        truncated: false,
+        comment: None,
+        state: ContentState::Indexed,
+        error: None,
+        reason: None,
+        processed_at: UnixNanos::now(),
+        elapsed_ms: 1.0,
+    };
+    let content = eidos_catalog::content::ContentRecord {
+        object_id: zip,
+        source_id: fx.source,
+        generation,
+        extraction_version: 1,
+        encoding: None,
+        coverage: Coverage::Full,
+        indexed_bytes: 0,
+        total_bytes: 4,
+        chunk_count: 0,
+        line_count: 0,
+        chars: 0,
+        content_id: None,
+        hash_complete: false,
+        state: ContentState::Indexed,
+        failure_class: None,
+        error: None,
+        reason: None,
+        processed_at: UnixNanos::now(),
+        elapsed_ms: 1.0,
+    };
+    assert!(fx
+        .catalog
+        .store_archive(&rec, &members, &content, None)
+        .unwrap());
+    assert!(fx.exists("a/pack.zip/future.txt"));
+    assert_eq!(fx.extrema("a"), (Some(t(500).0), Some(t(10).0)));
+    assert_eq!(fx.extrema(""), (Some(t(500).0), Some(t(10).0)));
+    fx.assert_matches_rebuild();
+
+    // Deleting the container retires the virtual tree and the container's
+    // own timestamp, which was the directory's newest.
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[ChangeEvent::Delete {
+                object: fx.key_of("a/pack.zip"),
+            }],
+            None,
+        )
+        .unwrap();
+    assert!(!fx.exists("a/pack.zip/future.txt"));
+    assert_eq!(fx.extrema("a"), (Some(t(90).0), Some(t(10).0)));
+    assert_eq!(fx.extrema(""), (Some(t(90).0), Some(t(10).0)));
+    fx.assert_matches_rebuild();
 }
