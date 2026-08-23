@@ -325,6 +325,95 @@ fn facets() {
     assert_eq!(sizes.values.iter().map(|v| v.count).sum::<u64>(), 17);
 }
 
+/// Every size and modification-time bucket carries clauses that reproduce
+/// exactly the bucket the user clicked — including the first (open below),
+/// the last (open above), and the exclusions — in both result modes.
+#[test]
+fn range_bucket_clauses_reproduce_their_bucket() {
+    let fx = fixture();
+    for (mode, base) in [
+        (ResultMode::Files, ""),
+        (ResultMode::Directories, ""),
+        // An existing bound on the same field must still combine, not be
+        // silently replaced.
+        (ResultMode::Files, "size:>=100"),
+    ] {
+        let mut req = fx.req(base);
+        req.mode = mode;
+        req.facets = vec![
+            FacetRequest {
+                field: FacetField::SizeBucket,
+                limit: 10,
+            },
+            FacetRequest {
+                field: FacetField::ModifiedBucket,
+                limit: 10,
+            },
+        ];
+        let r = fx.run_req(req);
+        let total = r.total.value;
+        assert!(total > 0, "{mode:?} {base:?} has no results");
+        let mut open_below = 0;
+        let mut open_above = 0;
+        for facet in &r.facets {
+            let mut summed = 0;
+            for v in &facet.values {
+                let range = v.range.as_ref().unwrap_or_else(|| {
+                    panic!("{:?} bucket {} has no clause", facet.field, v.value)
+                });
+                open_below += u32::from(range.from.is_none());
+                open_above += u32::from(range.to.is_none());
+                let mut include = fx.req(&format!("{base} {}", range.clause));
+                include.mode = mode;
+                assert_eq!(
+                    fx.run_req(include).total.value,
+                    v.count,
+                    "{:?} include {} in {mode:?}",
+                    facet.field,
+                    range.clause
+                );
+                let mut exclude = fx.req(&format!("{base} {}", range.exclude));
+                exclude.mode = mode;
+                assert_eq!(
+                    fx.run_req(exclude).total.value,
+                    total - v.count,
+                    "{:?} exclude {} in {mode:?}",
+                    facet.field,
+                    range.exclude
+                );
+                summed += v.count;
+            }
+            assert_eq!(summed, total, "{:?} buckets cover every hit", facet.field);
+        }
+        // Everything in the fixture is small, so the open-below first bucket
+        // is always exercised above; the open-above bucket is whichever
+        // modification-time bucket the run lands in (`facets.rs` unit tests
+        // pin the clause text for both ends).
+        assert_eq!(r.facets.len(), 2);
+        assert!(open_below >= 1, "no open-ended first bucket in {mode:?}");
+        let _ = open_above;
+    }
+}
+
+/// The buckets mix per-file and per-subtree values in `both` mode, so they
+/// are labelled but carry no clause rather than a clause that means
+/// something else.
+#[test]
+fn range_buckets_are_display_only_in_both_mode() {
+    let fx = fixture();
+    let mut req = fx.req("");
+    req.mode = ResultMode::Both;
+    req.facets = vec![FacetRequest {
+        field: FacetField::SizeBucket,
+        limit: 10,
+    }];
+    let r = fx.run_req(req);
+    let sizes = &r.facets[0];
+    assert!(!sizes.values.is_empty());
+    assert!(sizes.values.iter().all(|v| v.range.is_none()));
+    assert!(sizes.values.iter().all(|v| v.label.is_some()));
+}
+
 #[test]
 fn content_clause_is_rejected_truthfully() {
     let fx = fixture();
@@ -654,6 +743,71 @@ fn large_candidate_sets_verify_lazily_in_sort_order() {
     let r = run("name:ite_m", SortField::Name, false, 10, None);
     assert!(r.total.exact);
     assert_eq!(r.total.value, 520);
+}
+
+/// The same subtree twice, a subtree nested inside it, and a descendant
+/// named on its own: one rebuild of `proj` has to cover all four, whichever
+/// order the rows arrive in.
+#[test]
+fn duplicate_and_nested_subtree_rows_are_coalesced() {
+    for outer_first in [true, false] {
+        let fx = fixture();
+        let before = fx.index.num_docs();
+        let object = |rel: &str| {
+            fx.catalog
+                .resolve_relative(fx.source, rel)
+                .unwrap()
+                .unwrap()
+        };
+        let proj = object("proj");
+        let src = object("proj/src");
+        let helpers = object("proj/src/util/Helpers.cs");
+        let now = UnixNanos::now();
+        let row = |seq: i64, object: ObjectId, op: &str| eidos_catalog::jobs::OutboxRow {
+            seq,
+            source_id: fx.source,
+            object_id: object,
+            op: op.into(),
+            generation: 1,
+            created_at: now,
+        };
+        let (first, third) = if outer_first {
+            (proj, src)
+        } else {
+            (src, proj)
+        };
+        let rows = [
+            row(1, first, "subtree"),
+            row(2, helpers, "upsert"),
+            row(3, third, "subtree"),
+            row(4, proj, "subtree"),
+        ];
+        let affected = 1 + fx.catalog.descendant_object_ids(proj).unwrap().len() as u64;
+
+        eidos_catalog::projection::reset_query_count();
+        let stats = fx.index.apply_outbox(&fx.catalog, &rows).unwrap();
+        let queries = eidos_catalog::projection::query_count();
+        fx.index.reload().unwrap();
+
+        assert_eq!(stats.rows, 4);
+        assert_eq!(stats.subtree_rebuilds, 3);
+        // Every affected object is deleted and re-added exactly once...
+        assert_eq!(
+            stats.documents_deleted, affected,
+            "outer_first={outer_first}"
+        );
+        assert_eq!(stats.documents_added, affected, "outer_first={outer_first}");
+        // ...leaving the index with the documents it started with.
+        assert_eq!(fx.index.num_docs(), before);
+        // Two ancestor probes (one per distinct root), one descendant walk,
+        // and the batched reads: the nested root is never walked, and the
+        // arrival order does not change that.
+        assert!(
+            queries <= 12,
+            "{queries} catalog queries to rebuild {affected} objects (outer_first={outer_first})"
+        );
+        assert!(fx.names("name:=Helpers.cs").contains(&"Helpers.cs".into()));
+    }
 }
 
 // --- Cursors: stale projection documents, query binding, index changes ---

@@ -5,10 +5,12 @@
 //! report completeness) lives behind [`state::AppState`] so that v1 can move
 //! the scanner behind a transport without changing the API layer.
 
+pub mod admission;
 pub mod api;
 pub mod content_workers;
 pub mod follower;
 pub mod scanner;
+pub mod source_budget;
 pub mod state;
 #[cfg(windows)]
 pub mod usn_apply;
@@ -33,6 +35,8 @@ pub struct ServiceConfig {
     pub content: bool,
     /// Extraction threads (global; per-source budgets apply on top).
     pub content_workers: usize,
+    /// Bounds and deadlines for expensive HTTP operations.
+    pub admission: admission::AdmissionConfig,
 }
 
 impl Default for ServiceConfig {
@@ -45,6 +49,7 @@ impl Default for ServiceConfig {
             auto_reconcile: true,
             content: true,
             content_workers: 4,
+            admission: admission::AdmissionConfig::default(),
         }
     }
 }

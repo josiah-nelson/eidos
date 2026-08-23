@@ -5,6 +5,7 @@
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::NewSource;
 use eidos_domain::{ContentState, SearchRequest, SourceId, SourceKind};
+use eidos_search::content::object_ids;
 use eidos_search::exec::{search_with_content, ExecOptions};
 use eidos_service::content_workers::spawn_content_workers;
 use eidos_service::state::AppState;
@@ -203,5 +204,84 @@ fn workers_drain_publish_and_survive_restart() {
     }));
     refresh_index(&state);
     assert_eq!(search(&state, "content:newtoken").hits[0].name, "a.txt");
+    state.request_shutdown();
+}
+
+/// A reindex that yields no chunks (the file turned binary) queues only a
+/// Tantivy deletion. Nothing else is running to carry it into the index, so
+/// the coordinator's own commit policy has to notice that the writer is
+/// dirty; otherwise the previous generation's text stays in the index until
+/// some unrelated file happens to be extracted.
+#[test]
+fn deletion_only_reindex_is_committed_by_the_coordinator() {
+    let e = env();
+    let state = open_state(&e.data);
+    let sid: SourceId = state
+        .catalog
+        .add_source(&NewSource {
+            host_id: state.host_id,
+            name: "fixture".into(),
+            kind: SourceKind::WindowsGeneric,
+            root_path: e.root.display().to_string(),
+            aliases: vec![],
+        })
+        .unwrap();
+    run_scan(
+        &state.catalog,
+        sid,
+        state.lister.as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    refresh_index(&state);
+    spawn_content_workers(&state, 2);
+    eidos_service::content_workers::top_up_queue(&state).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            state
+                .catalog
+                .source_completeness(sid)
+                .map(|c| c.content_complete)
+                .unwrap_or(false)
+        }),
+        "content never completed"
+    );
+    refresh_index(&state);
+    let object = search(&state, "name:=a.txt").hits[0].object_id;
+    assert_eq!(search(&state, "content:Zephyr").hits[0].name, "a.txt");
+    assert!(object_ids(&state.content_index).unwrap().contains(&object));
+    let commits_before = state.content_workers.view(0).commits;
+
+    // The text file becomes binary: unsupported, terminal, no replacement.
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(e.root.join("a.txt"), b"\x00\x01\x02binary payload\x00\x00").unwrap();
+    run_scan(
+        &state.catalog,
+        sid,
+        state.lister.as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    refresh_index(&state);
+    eidos_service::content_workers::top_up_queue(&state).unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            !object_ids(&state.content_index).unwrap().contains(&object)
+        }),
+        "the queued deletion was never committed: {:?}",
+        state
+            .content_workers
+            .view(state.content_index.uncommitted())
+    );
+    let view = state.content_workers.view(0);
+    assert!(view.commits > commits_before, "{view:?}");
+    assert!(!state.content_index.is_dirty(), "{view:?}");
+    refresh_index(&state);
+    assert!(search(&state, "content:Zephyr").hits.is_empty());
+    assert_eq!(
+        search(&state, "name:=a.txt").hits[0].content.state,
+        ContentState::Unsupported
+    );
     state.request_shutdown();
 }

@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test": "node --test \"src/*.test.ts\"",
     "preview": "vite preview"
   },
   "dependencies": {

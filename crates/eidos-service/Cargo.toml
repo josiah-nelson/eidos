@@ -25,3 +25,4 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tower = { workspace = true }

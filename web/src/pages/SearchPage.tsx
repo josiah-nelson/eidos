@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Link, useSearchParams } from 'react-router'
-import { api, type FacetField, type Hit, type ResultMode, type SortField } from '../api'
+import { api, type FacetField, type FacetValue, type Hit, type ResultMode, type SortField } from '../api'
 import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
 import { bytes, count, duration, when } from '../format'
+import { applyFacetClick, negate, type FacetForms } from '../query-clause'
 
 const PAGE = 100
 const FILE_FACETS: FacetField[] = ['source', 'extension', 'kind', 'content_state', 'size_bucket', 'modified_bucket']
@@ -72,8 +73,9 @@ export default function SearchPage() {
   )
 
   const submit = () => set({ q: draft })
-  const addClause = (clause: string) => {
-    const next = draft.trim().length ? `${draft.trim()} ${clause}` : clause
+  /** Refine the query with a facet value, including or excluding it. */
+  const click = (value: FacetForms, form: 'include' | 'exclude', siblings: FacetForms[]) => {
+    const next = applyFacetClick(draft, value, form, siblings)
     setDraft(next)
     set({ q: next })
   }
@@ -237,24 +239,44 @@ export default function SearchPage() {
                 <h2 style={{ marginTop: 0 }}>{f.field.replace('_', ' ')}</h2>
                 <ul className="facet-list">
                   {f.values.slice(0, 12).map((v) => {
-                    const clause = facetClause(f.field, v.value, v.label)
+                    const forms = facetForms(f.field, v)
+                    // Range buckets are disjoint, so picking one supersedes another.
+                    const siblings = f.values.flatMap((o) =>
+                      o !== v && o.range ? [o.range] : [],
+                    )
                     return (
                       <li key={v.value}>
-                        {clause ? (
+                        {forms ? (
                           <a
                             href="#"
+                            title={`add  ${forms.clause}`}
                             onClick={(e) => {
                               e.preventDefault()
-                              addClause(clause)
+                              click(forms, 'include', siblings)
                             }}
                           >
                             {v.label ?? v.value ?? '(none)'}
                           </a>
                         ) : (
-                          <span>{v.label ?? v.value}</span>
+                          <span title={v.label}>{v.label ?? v.value}</span>
                         )}
                         <span>{count(v.count)}</span>
-                        <span />
+                        {forms ? (
+                          <a
+                            href="#"
+                            className="facet-exclude"
+                            title={`add  ${forms.exclude}`}
+                            aria-label={`exclude ${v.label ?? v.value}`}
+                            onClick={(e) => {
+                              e.preventDefault()
+                              click(forms, 'exclude', siblings)
+                            }}
+                          >
+                            −
+                          </a>
+                        ) : (
+                          <span />
+                        )}
                       </li>
                     )
                   })}
@@ -267,6 +289,17 @@ export default function SearchPage() {
       )}
     </div>
   )
+}
+
+/**
+ * The clauses that select and exclude one facet value. Range buckets carry
+ * them from the server; term facets get them from the value itself. `null`
+ * when the value cannot be turned into a filter at all.
+ */
+function facetForms(field: FacetField, v: FacetValue): FacetForms | null {
+  if (v.range) return v.range
+  const clause = facetClause(field, v.value, v.label)
+  return clause ? { clause, exclude: negate(clause) } : null
 }
 
 function facetClause(field: FacetField, value: string, label?: string): string | null {

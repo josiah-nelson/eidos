@@ -17,7 +17,7 @@ with a reduced (std-only) lister and no change feeds.
 ## Commands
 
 ```powershell
-# One-shot: format check, clippy (deny warnings), all tests, release build, web lint+build
+# One-shot: format check, clippy (deny warnings), all tests, release build, web lint+test+build
 .\scripts\check.ps1            # -SkipWeb / -SkipRelease to shorten
 
 # Individually
@@ -25,7 +25,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
-cd web; npm ci; npm run lint; npm run build
+cd web; npm ci; npm run lint; npm test; npm run build
 ```
 
 Tests never touch user data: every integration test builds its own fixture
@@ -49,7 +49,48 @@ the catalog outbox every 500 ms (`GET /api/index` shows follower state).
 (`EIDOS_BIND`, default loopback — the API has no authentication yet and warns
 when bound elsewhere), `--web-dir` (`EIDOS_WEB_DIR`, empty for API only),
 `--scan-threads`, `--no-auto-reconcile`, `--no-content` (metadata only),
-`--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4).
+`--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4), plus the
+admission-control flags below.
+
+### Operational limits
+
+Search, browse, archive listing and count endpoints run blocking
+SQLite/Tantivy work. The service admits a bounded number of them at once and
+sheds the rest rather than letting latency grow without bound:
+
+| Flag | Environment | Default | Meaning |
+|---|---|---|---|
+| `--max-concurrent-queries` | `EIDOS_MAX_CONCURRENT_QUERIES` | 4 | Expensive operations running at once |
+| `--query-queue-depth` | `EIDOS_QUERY_QUEUE_DEPTH` | 32 | Requests allowed to wait for a slot |
+| `--query-queue-wait-ms` | `EIDOS_QUERY_QUEUE_WAIT_MS` | 5000 | How long a queued request waits |
+| `--search-timeout-ms` | `EIDOS_SEARCH_TIMEOUT_MS` | 30000 | Response deadline for search |
+| `--operation-timeout-ms` | `EIDOS_OPERATION_TIMEOUT_MS` | 60000 | Response deadline for browse/counts/archive/maintenance |
+| `--max-body-bytes` | `EIDOS_MAX_BODY_BYTES` | 1048576 | Largest accepted JSON request body |
+
+Beyond the queue bound, or after the queue wait, a request is answered
+`503` with `{"kind":"busy"}` and a `Retry-After` header. Past its deadline it
+is answered `504` with `{"kind":"timeout"}`. Health, activity and index
+status never enter the gate, so they stay responsive while queries saturate
+it.
+
+A deadline ends the *response*, not the query: a running SQLite or Tantivy
+call cannot be cancelled mid-call, so the permit is released by the blocking
+task when it finishes, not when the client gives up. The catalog and index
+therefore never see a half-applied operation, and `GET /api/index` (and
+`/api/activity`) report the difference: `admission.in_flight` counts work
+still holding a permit and `admission.detached` counts the part of it whose
+client has already gone — the deadline passed, or the connection went away.
+Both fall back to zero as the abandoned work drains; `rejected_busy` and
+`timed_out` are cumulative.
+
+Defaults assume the loopback default bind: one browser plus a CLI on a
+machine that is also scanning and extracting content. Before binding
+anywhere else, note that the API still has no authentication or per-client
+rate limiting, so these limits protect the process, not the deployment — the
+gate is global, and any client may fill it. A remote-facing deployment needs
+a fronting proxy that terminates TLS, authenticates, and applies per-client
+rate limits, and should raise `--max-concurrent-queries` only as far as the
+disk backing `catalog.db` can serve concurrent readers.
 
 Content extraction runs in the service for every source whose content
 policy is enabled (the default). Turn it off or bound it per source before

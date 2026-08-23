@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub struct AppState {
+    /// Bounded gate in front of expensive HTTP operations.
+    pub admission: Arc<crate::admission::Admission>,
     pub catalog: Arc<Catalog>,
     pub index: Arc<eidos_search::CatalogIndex>,
     pub content_index: Arc<eidos_search::ContentIndex>,
@@ -21,8 +23,6 @@ pub struct AppState {
     /// Global content switch (`--no-content` keeps workers idle).
     pub content_enabled: AtomicBool,
     pub content_worker_count: usize,
-    /// Per-source concurrency budgets, refreshed by the coordinator.
-    pub content_budgets: Mutex<HashMap<SourceId, u32>>,
     pub exec_opts: eidos_search::exec::ExecOptions,
     pub host_id: HostId,
     pub host_name: String,
@@ -76,6 +76,7 @@ impl AppState {
             }
         }
         let state = Self {
+            admission: Arc::new(crate::admission::Admission::new(config.admission.clone())),
             catalog,
             index,
             content_index,
@@ -83,7 +84,6 @@ impl AppState {
             content_workers: Arc::new(crate::content_workers::ContentWorkersStatus::default()),
             content_enabled: AtomicBool::new(config.content),
             content_worker_count: config.content_workers,
-            content_budgets: Mutex::new(HashMap::new()),
             exec_opts: eidos_search::exec::ExecOptions::default(),
             host_id,
             host_name,
@@ -120,6 +120,11 @@ impl AppState {
         Some(p)
     }
 
+    /// Per-source content concurrency budgets and live reservations.
+    pub fn content_budgets(&self) -> &Arc<crate::source_budget::SourceBudgets> {
+        &self.content_workers.budgets
+    }
+
     pub fn watcher_status(&self, id: SourceId) -> Option<Arc<WatcherStatus>> {
         self.watchers.lock().get(&id).cloned()
     }
@@ -144,6 +149,9 @@ impl AppState {
     pub fn request_shutdown(&self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Shed queued expensive work at once: graceful shutdown then waits
+        // only for the operations that already hold a permit.
+        self.admission.close();
         for w in self.watchers.lock().values() {
             w.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
