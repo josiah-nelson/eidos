@@ -26,10 +26,24 @@
 //! candidate is rejected when another job for the same object and stage is
 //! already `queued` or `running`, so two retries (or a retry racing a
 //! restart requeue) can never leave two active jobs for one object.
+//!
+//! A retry covers two families, because a content failure can live in
+//! either place:
+//!
+//! - **failed jobs** (`jobs.state = 'failed'`): a transient failure that
+//!   exhausted its automatic budget, or a stage that reported a terminal
+//!   class through `fail_job`;
+//! - **failed content records**: the extraction pipeline writes a
+//!   deterministic, corrupt, or resource-limit failure onto the content
+//!   record and *finishes* the job, so the queue no longer represents the
+//!   object. Those objects go back to `content_state = 'pending'` and their
+//!   content job is revived (or re-created) — this is the requeue an
+//!   operator needs after fixing an extractor or raising a limit.
 
+use crate::jobs::NewJob;
 use crate::{Catalog, Result};
-use eidos_domain::{FailureClass, JobId, JobStage, ObjectId, SourceId, UnixNanos};
-use rusqlite::params;
+use eidos_domain::{ContentState, FailureClass, JobId, JobStage, ObjectId, SourceId, UnixNanos};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -84,7 +98,8 @@ impl RetrySelector {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryReport {
     pub preview: bool,
-    /// Jobs moved back to `queued` (or that would be).
+    /// Jobs moved back to `queued`, plus failed objects put back to
+    /// `pending` with a content job (or what would be, in a preview).
     pub accepted: u64,
     /// Candidates that are no longer worth running (deleted, retired,
     /// superseded by a newer generation, content disabled).
@@ -92,7 +107,7 @@ pub struct RetryReport {
     /// Candidates that must not be touched now (running, already queued,
     /// already active under another job).
     pub rejected: u64,
-    /// `estimated_cost` (object bytes) of the accepted jobs.
+    /// Bytes of the objects behind the accepted work.
     pub bytes: u64,
     pub skipped_reasons: BTreeMap<String, u64>,
     pub rejected_reasons: BTreeMap<String, u64>,
@@ -101,11 +116,13 @@ pub struct RetryReport {
 }
 
 impl RetryReport {
-    fn accept(&mut self, id: JobId, bytes: u64) {
+    fn accept(&mut self, id: Option<JobId>, bytes: u64) {
         self.accepted += 1;
         self.bytes += bytes;
-        if self.job_ids.len() < MAX_REPORTED_IDS {
-            self.job_ids.push(id);
+        if let Some(id) = id {
+            if self.job_ids.len() < MAX_REPORTED_IDS {
+                self.job_ids.push(id);
+            }
         }
     }
 
@@ -168,7 +185,8 @@ const CANDIDATE_SQL: &str = "SELECT j.job_id, j.state, j.object_id, j.object_gen
      LIMIT ?8";
 
 impl Catalog {
-    /// Requeue the failed jobs a selector names.
+    /// Requeue the failed work a selector names: failed jobs, and (for the
+    /// content stage) objects whose extraction failed for good.
     ///
     /// Runs in one immediate transaction so the duplicate-active check and
     /// the requeue cannot interleave with a worker claim. Preview mode
@@ -226,11 +244,15 @@ impl Catalog {
                                 params![c.job_id, now, c.attempts],
                             )?;
                         }
-                        report.accept(JobId(c.job_id), c.estimated_cost.max(0) as u64);
+                        report.accept(Some(JobId(c.job_id)), c.estimated_cost.max(0) as u64);
                     }
                     Verdict::Skip(why) => report.skip(why),
                     Verdict::Reject(why) => report.reject(why),
                 }
+            }
+            let remaining = limit - report.total() as i64;
+            if remaining > 0 && sel.job_id.is_none() && sel.stage.is_none_or(|s| s == JobStage::ContentText) {
+                retry_failed_content(&tx, sel, &prefix, remaining, now, &mut report)?;
             }
             if sel.preview {
                 tx.rollback()?;
@@ -242,27 +264,145 @@ impl Catalog {
         Ok(report)
     }
 
-    /// Failed jobs per source for one stage: `(count, bytes)`.
-    pub fn failed_jobs_by_source(&self, stage: JobStage) -> Result<BTreeMap<SourceId, (u64, u64)>> {
+    /// Retryable failures per source for one stage: `(count, bytes)` over
+    /// both families a retry covers, so the bulk form can offer itself.
+    pub fn failed_work_by_source(&self, stage: JobStage) -> Result<BTreeMap<SourceId, (u64, u64)>> {
         self.with_reader(|conn| {
-            let mut out = BTreeMap::new();
+            let mut out: BTreeMap<SourceId, (u64, u64)> = BTreeMap::new();
+            let mut add = |r: &rusqlite::Row<'_>| -> rusqlite::Result<()> {
+                let e = out.entry(SourceId(r.get(0)?)).or_default();
+                e.0 += r.get::<_, i64>(1)? as u64;
+                e.1 += r.get::<_, i64>(2)?.max(0) as u64;
+                Ok(())
+            };
             let mut stmt = conn.prepare_cached(
                 "SELECT source_id, COUNT(*), COALESCE(SUM(estimated_cost), 0) FROM jobs
                  WHERE state = 'failed' AND stage = ?1 GROUP BY source_id",
             )?;
-            for row in stmt.query_map(params![stage.as_str()], |r| {
-                Ok((
-                    SourceId(r.get(0)?),
-                    r.get::<_, i64>(1)? as u64,
-                    r.get::<_, i64>(2)? as u64,
-                ))
-            })? {
-                let (sid, n, bytes) = row?;
-                out.insert(sid, (n, bytes));
+            let mut rows = stmt.query(params![stage.as_str()])?;
+            while let Some(r) = rows.next()? {
+                add(r)?;
+            }
+            if stage == JobStage::ContentText {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT o.source_id, COUNT(*), COALESCE(SUM(o.size), 0) FROM objects o
+                     WHERE o.content_state = 'failed' AND o.deleted_at IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.object_id = o.object_id
+                                       AND j.stage = 'content_text' AND j.state IN ('queued','running','failed'))
+                     GROUP BY o.source_id",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    add(r)?;
+                }
             }
             Ok(out)
         })
     }
+}
+
+/// Objects whose extraction failed for good: the pipeline records a
+/// deterministic, corrupt, or resource-limit failure on the content record
+/// and finishes the job, so nothing in the queue represents them any more.
+/// They come back only through this path, which puts the object back to
+/// `pending` and revives (or re-creates) its content job.
+const FAILED_CONTENT_SQL: &str = "SELECT o.object_id, o.source_id, o.generation, o.size, COALESCE(s.state, ''),
+        COALESCE(s.content_enabled, 0)
+     FROM objects o
+     JOIN content_records c ON c.object_id = o.object_id
+     LEFT JOIN sources s ON s.source_id = o.source_id
+     WHERE o.content_state = 'failed' AND o.deleted_at IS NULL AND c.generation = o.generation
+       AND (?1 IS NULL OR o.object_id = ?1)
+       AND (?2 IS NULL OR o.source_id = ?2)
+       AND (?3 IS NULL OR c.failure_class = ?3)
+       AND (?4 IS NULL OR c.error LIKE ?4 ESCAPE '\\')
+       AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.object_id = o.object_id AND j.stage = 'content_text'
+                       AND j.state IN ('queued','running'))
+     ORDER BY o.object_id
+     LIMIT ?5";
+
+fn retry_failed_content(
+    tx: &rusqlite::Transaction<'_>,
+    sel: &RetrySelector,
+    prefix: &Option<String>,
+    limit: i64,
+    now: i64,
+    report: &mut RetryReport,
+) -> Result<()> {
+    struct Row {
+        object: ObjectId,
+        source: SourceId,
+        generation: u32,
+        size: u64,
+        source_state: String,
+        content_enabled: bool,
+    }
+    let rows: Vec<Row> = tx
+        .prepare(FAILED_CONTENT_SQL)?
+        .query_map(
+            params![
+                sel.object_id.map(|o| o.0),
+                sel.source_id.map(|s| s.0),
+                sel.class.map(|c| c.as_str()),
+                prefix,
+                limit
+            ],
+            |r| {
+                Ok(Row {
+                    object: ObjectId(r.get(0)?),
+                    source: SourceId(r.get(1)?),
+                    generation: r.get::<_, i64>(2)? as u32,
+                    size: r.get::<_, i64>(3)?.max(0) as u64,
+                    source_state: r.get(4)?,
+                    content_enabled: r.get::<_, i64>(5)? != 0,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    for row in rows {
+        if row.source_state == "retired" {
+            report.skip("retired");
+            continue;
+        }
+        if !row.content_enabled {
+            report.skip("content_disabled");
+            continue;
+        }
+        let key = NewJob::object_key(JobStage::ContentText, row.object, row.generation);
+        let existing: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT job_id, attempts FROM jobs WHERE idempotency_key = ?1",
+                params![key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if !sel.preview {
+            match existing {
+                // Revive the finished job in place: its attempt and error
+                // history is the record of what went wrong.
+                Some((job_id, attempts)) => {
+                    tx.execute(
+                        "UPDATE jobs SET state = 'queued', scheduled_at = ?2, started_at = NULL, finished_at = NULL,
+                            worker = NULL, requeue_count = requeue_count + 1, requeued_at = ?2, retry_base_attempts = ?3
+                         WHERE job_id = ?1",
+                        params![job_id, now, attempts],
+                    )?;
+                }
+                None => crate::content::enqueue_content_for(
+                    tx,
+                    row.source,
+                    row.object,
+                    row.generation,
+                    row.size,
+                )?,
+            }
+            // The object is a content candidate again; the content record
+            // keeps its failure until the re-run overwrites it.
+            crate::content::flip_state(tx, row.object, ContentState::Pending, None)?;
+        }
+        report.accept(existing.map(|(id, _)| JobId(id)), row.size);
+    }
+    Ok(())
 }
 
 enum Verdict {

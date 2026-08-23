@@ -67,7 +67,11 @@ The same controls are on the Activity and source pages of the web UI and at
 Transient failures (share offline, sharing violation) retry on their own with
 exponential backoff. Deterministic, corrupt, unsupported, and resource-limit
 failures are terminal on purpose: they come back only through an explicit
-operator retry, once the extractor, the limit, or the share is fixed.
+operator retry, once the extractor, the limit, or the share is fixed. A retry
+covers both places a failure can live — a job left `failed` after its
+transient budget ran out, and an object whose extraction failed for good
+(the failure is on the content record and the job finished; the object goes
+back to `pending` with a fresh content job).
 
 ```powershell
 .\target\release\eidos.exe content retry --source share --preview            # how many, how many bytes

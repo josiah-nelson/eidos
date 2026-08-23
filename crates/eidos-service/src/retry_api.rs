@@ -1,9 +1,10 @@
 //! Operator retry endpoints for failed jobs.
 //!
 //! `POST /api/jobs/{id}/retry` requeues one failed job;
-//! `POST /api/sources/{id}/content/retry` requeues a source's failed
-//! `content_text` jobs, optionally filtered by failure class and
-//! `last_error` prefix, and can preview instead of acting. Both answer with
+//! `POST /api/sources/{id}/content/retry` requeues a source's failed content
+//! work — jobs left `failed`, and objects whose extraction failed for good —
+//! optionally filtered by failure class and error prefix, and can preview
+//! instead of acting. Both answer with
 //! the same additive [`eidos_catalog::retry::RetryReport`] shape:
 //! `{ accepted, skipped, rejected, bytes, ... }`.
 

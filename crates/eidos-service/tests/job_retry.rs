@@ -217,6 +217,50 @@ fn retry_endpoints_requeue_a_failed_job_that_workers_then_process() {
     assert_eq!((n(&done, "accepted"), n(&done, "rejected")), (0, 1));
     assert_eq!(state.content_workers.view(0).files_indexed, 1);
 
+    // A deterministic failure lives on the content record with a finished
+    // job. The bulk retry puts the object back to `pending` and the workers
+    // extract it again.
+    let object = job.object_id.expect("content job has an object");
+    let record = state.catalog.content_record(object).unwrap().unwrap();
+    state
+        .catalog
+        .finish_content(
+            &eidos_catalog::content::ContentRecord {
+                state: eidos_domain::ContentState::Failed,
+                coverage: eidos_domain::Coverage::None,
+                failure_class: Some(FailureClass::Deterministic),
+                error: Some("extract: no decoder".into()),
+                ..record
+            },
+            true,
+        )
+        .unwrap();
+    let deterministic = post(
+        &rt,
+        &app,
+        &format!("/api/sources/{}/content/retry", sid.0),
+        r#"{"class":"deterministic"}"#,
+    );
+    assert_eq!(n(&deterministic, "accepted"), 1);
+    assert_eq!(n(&deterministic, "bytes"), TEXT.len() as u64);
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            state.content_workers.view(0).files_indexed >= 2
+        }),
+        "requeued object was never re-extracted: {:?}",
+        state.content_workers.view(0)
+    );
+    assert_eq!(
+        state
+            .catalog
+            .get_job(job.id)
+            .unwrap()
+            .unwrap()
+            .requeue_count,
+        2,
+        "both operator actions are on the record"
+    );
+
     // Unknown ids and unparseable filters are refused, not silently empty.
     assert_eq!(status(&rt, &app, "/api/jobs/9999/retry", "{}"), 404);
     assert_eq!(

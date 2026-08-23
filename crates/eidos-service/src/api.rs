@@ -876,7 +876,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
             .jobs_by_source(eidos_domain::JobStage::ContentText)?;
         let failed_by_source = st2
             .catalog
-            .failed_jobs_by_source(eidos_domain::JobStage::ContentText)?;
+            .failed_work_by_source(eidos_domain::JobStage::ContentText)?;
         let mut sources = Vec::new();
         for s in st2.catalog.list_sources()? {
             let q = by_source.get(&s.id).copied().unwrap_or((0, 0));

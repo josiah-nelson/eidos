@@ -1,11 +1,13 @@
 //! Operator retry controls for failed jobs (`eidos_catalog::retry`).
 
+use eidos_catalog::content::ContentRecord;
 use eidos_catalog::jobs::{NewJob, MAX_TRANSIENT_ATTEMPTS};
 use eidos_catalog::retry::RetrySelector;
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::{Catalog, NewSource};
 use eidos_domain::{
-    FailureClass, JobId, JobStage, JobState, ObjectId, Priority, SourceId, SourceKind, SourceState,
+    ContentState, Coverage, FailureClass, JobId, JobStage, JobState, ObjectId, Priority, SourceId,
+    SourceKind, SourceState, UnixNanos,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -103,6 +105,44 @@ impl Fx {
             .unwrap();
         self.catalog.fail_job(id, class, error).unwrap();
         id
+    }
+
+    /// What the extraction pipeline writes for a terminal failure: the
+    /// failure lands on the content record and the job finishes.
+    fn record_failure(&self, rel: &str, class: FailureClass, error: &str) -> ObjectId {
+        let obj = self.obj(rel);
+        let o = self.catalog.get_object(obj).unwrap().unwrap();
+        self.catalog
+            .finish_content(
+                &ContentRecord {
+                    object_id: obj,
+                    source_id: self.source,
+                    generation: o.generation,
+                    extraction_version: 1,
+                    encoding: None,
+                    coverage: Coverage::None,
+                    indexed_bytes: 0,
+                    total_bytes: o.size,
+                    chunk_count: 0,
+                    line_count: 0,
+                    chars: 0,
+                    content_id: None,
+                    hash_complete: false,
+                    state: ContentState::Failed,
+                    failure_class: Some(class),
+                    error: Some(error.into()),
+                    reason: None,
+                    processed_at: UnixNanos::now(),
+                    elapsed_ms: 1.0,
+                },
+                true,
+            )
+            .unwrap();
+        obj
+    }
+
+    fn content_state(&self, obj: ObjectId) -> ContentState {
+        self.catalog.get_object(obj).unwrap().unwrap().content_state
     }
 
     fn state(&self, id: JobId) -> JobState {
@@ -245,7 +285,7 @@ fn bulk_retry_filters_by_class_and_reason_prefix() {
     assert_eq!(preview.bytes, 600, "100 + 200 + 300");
     assert_eq!(
         fx.catalog
-            .failed_jobs_by_source(JobStage::ContentText)
+            .failed_work_by_source(JobStage::ContentText)
             .unwrap()[&fx.source],
         (3, 600)
     );
@@ -288,7 +328,7 @@ fn bulk_retry_filters_by_class_and_reason_prefix() {
     assert_eq!(fx.state(det), JobState::Queued);
     assert_eq!(
         fx.catalog
-            .failed_jobs_by_source(JobStage::ContentText)
+            .failed_work_by_source(JobStage::ContentText)
             .unwrap()
             .get(&fx.source),
         None
@@ -395,4 +435,77 @@ fn operator_retry_restores_the_transient_backoff_budget() {
         JobState::Queued,
         "the retried job retries automatically again"
     );
+}
+
+#[test]
+fn failed_content_records_are_requeued_although_their_job_finished() {
+    let fx = Fx::new();
+    // A deterministic failure: the pipeline stores it on the content record
+    // and completes the job, so nothing in the queue represents the object.
+    let job = fx.queue("one.txt");
+    fx.catalog.complete_job(job).unwrap();
+    let one = fx.record_failure(
+        "one.txt",
+        FailureClass::Deterministic,
+        "extract: no decoder",
+    );
+    // The same failure for an object whose job row is already gone.
+    let two = fx.record_failure(
+        "two.txt",
+        FailureClass::ResourceLimit,
+        "extract: over 64 MiB",
+    );
+    assert_eq!(fx.content_state(one), ContentState::Failed);
+    assert_eq!(
+        fx.catalog
+            .failed_work_by_source(JobStage::ContentText)
+            .unwrap()[&fx.source],
+        (2, 300),
+        "both are offered to the operator"
+    );
+
+    let all = RetrySelector::source(fx.source, JobStage::ContentText);
+    let preview = fx
+        .catalog
+        .retry_failed_jobs(&RetrySelector {
+            preview: true,
+            ..all.clone()
+        })
+        .unwrap();
+    assert_eq!((preview.accepted, preview.bytes), (2, 300));
+    assert_eq!(
+        fx.content_state(one),
+        ContentState::Failed,
+        "preview acts on nothing"
+    );
+    assert_eq!(fx.state(job), JobState::Done);
+
+    // One class only, then the rest.
+    let r = fx
+        .catalog
+        .retry_failed_jobs(&RetrySelector {
+            class: Some(FailureClass::ResourceLimit),
+            ..all.clone()
+        })
+        .unwrap();
+    assert_eq!((r.accepted, r.bytes), (1, 200));
+    assert_eq!(fx.content_state(two), ContentState::Pending);
+    assert_eq!(fx.active_jobs(two), 1, "a fresh job was created");
+    assert_eq!(fx.content_state(one), ContentState::Failed);
+
+    let r = fx.catalog.retry_failed_jobs(&all).unwrap();
+    assert_eq!((r.accepted, r.bytes), (1, 100));
+    assert_eq!(r.job_ids, vec![job], "the finished job is revived in place");
+    let revived = fx.catalog.get_job(job).unwrap().unwrap();
+    assert_eq!(revived.state, JobState::Queued);
+    assert_eq!(revived.requeue_count, 1);
+    assert_eq!(fx.content_state(one), ContentState::Pending);
+    assert_eq!(fx.active_jobs(one), 1);
+
+    // Requeueing again is a no-op: the objects are pending with an active
+    // job, so neither family has a candidate.
+    let again = fx.catalog.retry_failed_jobs(&all).unwrap();
+    assert_eq!(again.total(), 0);
+    assert_eq!(fx.active_jobs(one), 1);
+    assert_eq!(fx.active_jobs(two), 1);
 }

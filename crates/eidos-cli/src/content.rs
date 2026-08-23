@@ -15,11 +15,13 @@ pub struct ContentArgs {
 
 #[derive(Subcommand, Debug)]
 enum ContentCommand {
-    /// Requeue failed content jobs: one job by id, or a whole source.
+    /// Requeue failed content work: one job by id, or a whole source.
     ///
     /// Transient failures already retry on their own; this is for the
     /// terminal ones (deterministic, corrupt, unsupported, resource_limit)
-    /// after the underlying problem is fixed.
+    /// after the underlying problem is fixed. A source retry also covers
+    /// objects whose extraction failed for good, whose job already
+    /// finished.
     Retry {
         /// Job id (from `eidos activity` or the Activity page).
         job: Option<i64>,
