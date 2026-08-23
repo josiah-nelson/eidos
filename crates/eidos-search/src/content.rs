@@ -26,6 +26,7 @@ use tantivy::tokenizer::{
     LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer,
 };
 use tantivy::{DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use ts_rs::TS;
 
 pub const CONTENT_SCHEMA_VERSION: u32 = 2;
 pub const TRIGRAM_TOKENIZER: &str = "eidos_trigram";
@@ -213,7 +214,7 @@ pub struct ContentIndex {
 /// complete.
 pub const REBUILD_MARKER: &str = "rebuild.json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum RebuildPhase {
     /// No rebuild is pending; the index is complete with respect to stored chunks.
@@ -227,7 +228,8 @@ pub enum RebuildPhase {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, TS)]
+#[ts(optional_fields)]
 pub struct RebuildStatus {
     pub phase: RebuildPhase,
     /// Stored chunks the rebuild has to index (0 when unknown).

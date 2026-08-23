@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use ts_rs::TS;
 
 pub const FOLLOW_INTERVAL: Duration = Duration::from_millis(500);
 pub const FOLLOW_BATCH: u32 = 2000;
@@ -23,7 +24,7 @@ pub struct FollowerStatus {
     pub rebuilding: Mutex<Option<i64>>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, TS)]
 pub struct FollowerView {
     pub iterations: u64,
     pub rebuilds: u64,

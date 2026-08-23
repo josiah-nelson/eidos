@@ -7,11 +7,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use ts_rs::TS;
 
 macro_rules! opaque_i64_id {
     ($(#[$doc:meta])* $name:ident, $prefix:literal) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, TS)]
         pub struct $name(pub i64);
 
         impl Serialize for $name {
@@ -92,7 +93,7 @@ opaque_i64_id!(
 /// On NTFS/ReFS this is the volume serial plus the 128-bit file ID. Other
 /// filesystems may only provide a 64-bit ID or nothing at all, in which case
 /// the scanner synthesises a fallback identity with lower confidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 pub struct NativeIdentity {
     pub volume_serial: u64,
     /// 128-bit file reference. For 64-bit IDs the high half is zero.
@@ -117,7 +118,7 @@ impl NativeIdentity {
 }
 
 /// How much the scanner trusts the native identity to survive renames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityConfidence {
     /// Stable native file ID (NTFS/ReFS 128-bit or 64-bit IDs).
@@ -147,7 +148,8 @@ impl IdentityConfidence {
 }
 
 /// BLAKE3 content hash of the full object bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, TS)]
+#[ts(as = "String")]
 pub struct ContentId(pub [u8; 32]);
 
 impl ContentId {
@@ -201,7 +203,7 @@ impl<'de> Deserialize<'de> for ContentId {
 
 /// Identity of an extracted chunk: object generation, extraction version,
 /// and ordinal within the extraction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 pub struct ChunkId {
     pub object_id: ObjectId,
     pub object_generation: u32,

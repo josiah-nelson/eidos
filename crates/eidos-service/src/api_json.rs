@@ -33,13 +33,19 @@ impl Formatter for StringifyLargeIntegers {
     }
 }
 
+/// Serialize any API-owned JSON using the v2 exact-integer policy. Streaming
+/// responses use this too, so they cannot quietly diverge from `ApiJson`.
+pub(crate) fn to_vec<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, StringifyLargeIntegers);
+    value.serialize(&mut serializer)?;
+    Ok(bytes)
+}
+
 impl<T: Serialize> IntoResponse for ApiJson<T> {
     fn into_response(self) -> Response {
-        let mut bytes = Vec::new();
-        let mut serializer =
-            serde_json::Serializer::with_formatter(&mut bytes, StringifyLargeIntegers);
-        match self.0.serialize(&mut serializer) {
-            Ok(()) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
+        match to_vec(&self.0) {
+            Ok(bytes) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to serialize API response: {error}"),

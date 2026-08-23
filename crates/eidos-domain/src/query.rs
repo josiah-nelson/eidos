@@ -17,9 +17,10 @@ use crate::ids::{HostId, ObjectId, SourceId};
 use crate::state::{ContentState, ObjectKind};
 use crate::time::UnixNanos;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// Query tree.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Query {
     /// Matches every object in scope.
@@ -83,9 +84,19 @@ pub enum Query {
     },
     Size {
         field: SizeField,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            with = "crate::json::option_u64_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[ts(as = "Option<u64>")]
         min: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            with = "crate::json::option_u64_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[ts(as = "Option<u64>")]
         max: Option<u64>,
     },
     Time {
@@ -109,24 +120,50 @@ pub enum Query {
     /// Directory predicate: descendant extension count within the subtree.
     DescendantExtension {
         extension: String,
-        #[serde(default = "one")]
+        #[serde(default = "one", with = "crate::json::u64_string")]
+        #[ts(as = "u64")]
         min_count: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            with = "crate::json::option_u64_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[ts(as = "Option<u64>")]
         max_count: Option<u64>,
     },
     /// Directory predicate: subtree size.
     SubtreeSize {
         field: SizeField,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            with = "crate::json::option_u64_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[ts(as = "Option<u64>")]
         min: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            with = "crate::json::option_u64_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[ts(as = "Option<u64>")]
         max: Option<u64>,
     },
     /// Directory predicate: descendant file count.
     DescendantCount {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            with = "crate::json::option_u64_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[ts(as = "Option<u64>")]
         min: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            with = "crate::json::option_u64_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[ts(as = "Option<u64>")]
         max: Option<u64>,
     },
     /// Archive clause.
@@ -145,7 +182,7 @@ fn one() -> u64 {
     1
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum TextField {
     /// Entry display name.
@@ -156,7 +193,7 @@ pub enum TextField {
     Content,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum TextMode {
     /// Tokenised, case-folded, scored terms (all terms required).
@@ -173,7 +210,7 @@ pub enum TextMode {
     Regex,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum PathMode {
     Exact,
@@ -182,14 +219,14 @@ pub enum PathMode {
     Regex,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum SizeField {
     Logical,
     Allocated,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeField {
     Modified,
@@ -202,7 +239,7 @@ pub enum TimeField {
 }
 
 /// Which object kinds to return as top-level results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultMode {
     #[default]
@@ -211,7 +248,7 @@ pub enum ResultMode {
     Both,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum SortField {
     #[default]
@@ -226,7 +263,7 @@ pub enum SortField {
 }
 
 /// How the total match count is produced for a page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CountPolicy {
     /// Exact on the first page; later pages reuse the first page's total
@@ -239,7 +276,7 @@ pub enum CountPolicy {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, TS)]
 pub struct Sort {
     #[serde(default)]
     pub field: SortField,
@@ -247,7 +284,7 @@ pub struct Sort {
     pub descending: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum FacetField {
     Source,
@@ -259,7 +296,7 @@ pub enum FacetField {
     ModifiedBucket,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct FacetRequest {
     pub field: FacetField,
     #[serde(default = "default_facet_limit")]
@@ -271,7 +308,7 @@ fn default_facet_limit() -> u32 {
 }
 
 /// A complete search request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct SearchRequest {
     pub query: Query,
     #[serde(default)]
@@ -614,6 +651,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(back, Query::text(TextField::Name, TextMode::Ranked, "x"));
+    }
+
+    #[test]
+    fn large_bounds_emit_decimal_strings_and_accept_legacy_numbers() {
+        let exact = 9_007_199_254_740_993_u64;
+        let query = Query::Size {
+            field: SizeField::Logical,
+            min: Some(exact),
+            max: None,
+        };
+        assert_eq!(
+            serde_json::to_value(query).unwrap(),
+            serde_json::json!({"op":"size","field":"logical","min":exact.to_string()})
+        );
+
+        let legacy: Query =
+            serde_json::from_value(serde_json::json!({"op":"descendant_count","min":7,"max":"8"}))
+                .unwrap();
+        assert_eq!(
+            legacy,
+            Query::DescendantCount {
+                min: Some(7),
+                max: Some(8),
+            }
+        );
     }
 
     #[test]

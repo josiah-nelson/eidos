@@ -10,8 +10,9 @@ use eidos_domain::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use ts_rs::TS;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct ArchiveRecord {
     pub object_id: ObjectId,
     pub source_id: SourceId,
@@ -37,7 +38,7 @@ pub struct ArchiveRecord {
     pub elapsed_ms: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ArchiveMember {
     pub ordinal: u32,
     pub path: String,
@@ -57,7 +58,7 @@ pub struct ArchiveMember {
 
 /// Member listing: children of one virtual directory (`parent`) or every
 /// member under a path prefix, paged.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct MemberQuery {
     pub parent: Option<String>,
     pub prefix: Option<String>,
@@ -65,7 +66,7 @@ pub struct MemberQuery {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 pub struct ArchiveStats {
     pub archives: u64,
     pub members: u64,

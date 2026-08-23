@@ -9,18 +9,21 @@ use crate::state::{ContentState, Coverage, FileAttributes, ObjectKind, SourceSta
 use crate::time::UnixNanos;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use ts_rs::TS;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct SearchResponse {
     pub schema_version: u32,
     pub hits: Vec<Hit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub next_cursor: Option<String>,
     pub total: TotalCount,
     pub timing: Timing,
     /// One entry per source in scope, always present.
     pub completeness: Vec<SourceCompleteness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub explanation: Option<Explanation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facets: Vec<Facet>,
@@ -38,7 +41,7 @@ impl SearchResponse {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct TotalCount {
     pub value: u64,
     /// `false` when `value` is a lower bound.
@@ -49,7 +52,7 @@ pub struct TotalCount {
 }
 
 /// Provenance of a [`TotalCount`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum TotalOrigin {
     /// Computed for this request.
@@ -62,7 +65,7 @@ pub enum TotalOrigin {
     Bound,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default, TS)]
 pub struct Timing {
     pub total_ms: f64,
     pub plan_ms: f64,
@@ -71,10 +74,11 @@ pub struct Timing {
     pub join_ms: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct Hit {
     pub object_id: ObjectId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub entry_id: Option<EntryId>,
     pub source_id: SourceId,
     pub host_id: HostId,
@@ -82,47 +86,59 @@ pub struct Hit {
     pub name: String,
     /// Current rendered path. May be `None` for orphaned objects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub parent_id: Option<ObjectId>,
     /// Lowercase extension without dot; empty for none.
     pub extension: String,
     pub size: u64,
     pub allocated_size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub modified: Option<UnixNanos>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub created: Option<UnixNanos>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub changed: Option<UnixNanos>,
     pub attributes: FileAttributes,
     pub hard_link_count: u32,
     pub content: ContentSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub score: Option<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub snippets: Vec<Snippet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub directory: Option<DirectorySummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub archive: Option<ArchiveSummary>,
     /// Source state at response time, duplicated for row-level rendering.
     pub source_state: SourceState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ContentSummary {
     pub state: ContentState,
     pub coverage: Coverage,
     /// Object generation the stored chunks (and any snippets) belong to.
     /// Address the content preview endpoint with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub generation: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub indexed_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub content_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub reason: Option<String>,
 }
 
@@ -149,7 +165,7 @@ impl ContentSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct Snippet {
     pub chunk_ordinal: u32,
     pub byte_start: u64,
@@ -162,15 +178,17 @@ pub struct Snippet {
     pub highlights: Vec<[u32; 2]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct DirectorySummary {
     pub file_count: u64,
     pub directory_count: u64,
     pub logical_bytes: u64,
     pub allocated_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub newest_modified: Option<UnixNanos>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub oldest_modified: Option<UnixNanos>,
     /// Sparse descendant extension counts (top entries only).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -179,16 +197,17 @@ pub struct DirectorySummary {
     pub complete: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct ArchiveSummary {
     pub container_id: ObjectId,
     pub depth: u32,
     pub member_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub compressed_size: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct SourceCompleteness {
     pub source_id: SourceId,
     pub name: String,
@@ -205,16 +224,19 @@ pub struct SourceCompleteness {
     #[serde(default)]
     pub listing_errors: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub last_scan_completed: Option<UnixNanos>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub checkpoint_age_ms: Option<u64>,
     pub freshness: Freshness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub note: Option<String>,
 }
 
 /// Strength of the freshness guarantee for a source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum Freshness {
     /// Native change feed (USN) active and checkpoint valid.
@@ -225,25 +247,28 @@ pub enum Freshness {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct Explanation {
     pub readable: String,
     pub steps: Vec<PlanStep>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct PlanStep {
     pub stage: String,
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub candidates: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub verified: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub elapsed_ms: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct Facet {
     pub field: FacetField,
     pub values: Vec<FacetValue>,
@@ -251,16 +276,18 @@ pub struct Facet {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct FacetValue {
     pub value: String,
     pub count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub label: Option<String>,
     /// Bounds and ready-made clauses for range buckets (size, modification
     /// time). Absent for term facets and whenever the result mode has no
     /// clause that reproduces the bucket exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub range: Option<FacetRange>,
 }
 
@@ -273,11 +300,13 @@ pub struct FacetValue {
 /// `exclude` verbatim and never re-derive boundaries; both are written so
 /// that parsing them yields exactly this bucket in the result mode the
 /// response was produced for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct FacetRange {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub from: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub to: Option<i64>,
     /// Query text selecting exactly this bucket, e.g. `size:>=1M size:<16M`.
     pub clause: String,

@@ -5,6 +5,7 @@
 //! renaming or removing one requires a migration.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 macro_rules! str_enum {
     (
@@ -12,7 +13,7 @@ macro_rules! str_enum {
         pub enum $name:ident { $( $(#[$vmeta:meta])* $variant:ident => $s:literal ),+ $(,)? }
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
         #[serde(rename_all = "snake_case")]
         pub enum $name { $( $(#[$vmeta])* $variant ),+ }
 
@@ -225,7 +226,7 @@ str_enum! {
 }
 
 /// Priority classes from ARCHITECTURE.md section 8. Lower is more urgent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     CatalogCritical = 1,
@@ -276,8 +277,9 @@ impl FailureClass {
 
 /// Windows file attribute bits preserved in the catalog (subset of
 /// `FILE_ATTRIBUTE_*`). Stored as a raw `u32`; helpers decode common flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, TS)]
 #[serde(transparent)]
+#[ts(as = "u32")]
 pub struct FileAttributes(pub u32);
 
 impl FileAttributes {

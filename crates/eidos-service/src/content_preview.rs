@@ -31,6 +31,7 @@ use eidos_catalog::content::ChunkRow;
 use eidos_domain::{ContentState, Coverage, ObjectId};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use ts_rs::TS;
 
 /// Neighbouring chunks per side. Requests above this are clamped, not
 /// rejected: the response reports what it actually contains.
@@ -40,7 +41,8 @@ pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 /// Lines of text per response.
 pub const MAX_RESPONSE_LINES: usize = 4_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(optional_fields = nullable)]
 pub struct PreviewQuery {
     /// Content generation the caller believes it is reading (from a search
     /// hit's `content.generation`). Omit to read whatever is current.
@@ -55,7 +57,8 @@ pub struct PreviewQuery {
     after: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(rename = "PreviewChunk")]
 pub struct ChunkView {
     pub ordinal: u32,
     /// Byte range in the decoded source `[byte_start, byte_end)`.
@@ -73,14 +76,15 @@ pub struct ChunkView {
     pub sanitized: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
 pub struct PreviewLimits {
     pub max_neighbors: u32,
     pub max_bytes: usize,
     pub max_lines: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(rename = "ContentPreview")]
 pub struct PreviewView {
     pub object_id: ObjectId,
     /// Current rendered path, for labelling only.

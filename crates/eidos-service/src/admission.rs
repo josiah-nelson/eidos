@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use ts_rs::TS;
 
 /// Tunables for the expensive-operation gate.
 #[derive(Debug, Clone)]
@@ -408,7 +409,7 @@ impl Admission {
 }
 
 /// Additive admission block reported by `GET /api/index` and `/api/activity`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, TS)]
 pub struct AdmissionView {
     /// Expensive operations admitted concurrently.
     pub limit: usize,

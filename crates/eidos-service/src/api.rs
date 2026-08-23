@@ -21,6 +21,7 @@ use eidos_catalog::{
 use eidos_domain::{ObjectId, SourceCompleteness, SourceId, SourceKind};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use ts_rs::TS;
 
 pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router {
     let api = Router::new()
@@ -87,6 +88,12 @@ pub struct ApiError {
     retry_after_s: Option<u64>,
     /// Extra machine-readable fields merged into the error body.
     details: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct ApiErrorBody {
+    error: String,
+    kind: String,
 }
 
 impl ApiError {
@@ -163,9 +170,15 @@ impl From<eidos_catalog::CatalogError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let mut body = serde_json::Map::new();
-        body.insert("error".into(), serde_json::Value::String(self.message));
-        body.insert("kind".into(), serde_json::Value::String(self.kind.into()));
+        let base = ApiErrorBody {
+            error: self.message,
+            kind: self.kind.into(),
+        };
+        let serde_json::Value::Object(mut body) =
+            serde_json::to_value(base).expect("API error body is serializable")
+        else {
+            unreachable!("API error body is an object")
+        };
         if let Some(serde_json::Value::Object(extra)) = self.details {
             body.extend(extra);
         }
@@ -181,8 +194,8 @@ pub(crate) type ApiResult<T> = Result<ApiJson<T>, ApiError>;
 
 // ----- health --------------------------------------------------------------
 
-#[derive(Serialize)]
-struct Health {
+#[derive(Serialize, TS)]
+pub(crate) struct Health {
     version: &'static str,
     schema_version: u32,
     host: String,
@@ -216,7 +229,8 @@ async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
 
 // ----- sources -------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
+#[ts(optional_fields)]
 pub struct SourceView {
     pub source: SourceRecord,
     pub counts: SourceCounts,
@@ -267,8 +281,9 @@ async fn list_sources(State(st): State<Arc<AppState>>) -> ApiResult<Vec<SourceVi
     Ok(ApiJson(views))
 }
 
-#[derive(Deserialize)]
-struct AddSourceBody {
+#[derive(Deserialize, TS)]
+#[ts(optional_fields = nullable)]
+pub(crate) struct AddSourceBody {
     name: String,
     root_path: String,
     #[serde(default)]
@@ -328,8 +343,8 @@ async fn add_source(
     Ok((StatusCode::CREATED, ApiJson(source_view(&st, s)?)))
 }
 
-#[derive(Serialize)]
-struct SourceDetail {
+#[derive(Serialize, TS)]
+pub(crate) struct SourceDetail {
     #[serde(flatten)]
     view: SourceView,
     generations: Vec<ScanGenerationRecord>,
@@ -337,8 +352,8 @@ struct SourceDetail {
     exclusions: Vec<ExclusionRow>,
 }
 
-#[derive(Serialize)]
-struct ExclusionRow {
+#[derive(Serialize, TS)]
+pub(crate) struct ExclusionRow {
     stage: String,
     reason: String,
     count: u64,
@@ -415,8 +430,8 @@ async fn cancel_scan(
     Ok(ApiJson(p.view()))
 }
 
-#[derive(Deserialize)]
-struct ErrorsQuery {
+#[derive(Deserialize, TS)]
+pub(crate) struct ErrorsQuery {
     #[serde(default)]
     include_resolved: bool,
     #[serde(default = "default_limit")]
@@ -466,8 +481,8 @@ async fn source_generations(
 
 // ----- objects -------------------------------------------------------------
 
-#[derive(Serialize)]
-struct ObjectDetail {
+#[derive(Serialize, TS)]
+pub(crate) struct ObjectDetail {
     object: ObjectRecord,
     path: Option<String>,
     entries: Vec<EntryRecord>,
@@ -513,8 +528,8 @@ async fn get_object(
     Ok(ApiJson(detail))
 }
 
-#[derive(Deserialize)]
-struct ChildrenQuery {
+#[derive(Deserialize, TS)]
+pub(crate) struct ChildrenQuery {
     #[serde(default)]
     sort: ChildSort,
     #[serde(default)]
@@ -534,8 +549,8 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Serialize)]
-struct ChildrenView {
+#[derive(Serialize, TS)]
+pub(crate) struct ChildrenView {
     #[serde(flatten)]
     result: ChildrenResult,
     path: Option<String>,
@@ -588,8 +603,8 @@ async fn children(
     Ok(ApiJson(view))
 }
 
-#[derive(Deserialize)]
-struct ArchiveQuery {
+#[derive(Deserialize, TS)]
+pub(crate) struct ArchiveQuery {
     /// List the children of this virtual directory (`""` for the root).
     parent: Option<String>,
     /// List every member whose path starts with this prefix.
@@ -603,7 +618,7 @@ fn default_member_limit() -> u32 {
     200
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct ArchiveView {
     pub object_id: ObjectId,
     pub path: Option<String>,
@@ -649,7 +664,7 @@ async fn archive(
     Ok(ApiJson(view))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct RequeueView {
     pub queued: u64,
 }
@@ -673,8 +688,8 @@ async fn requeue_archives(
     Ok(ApiJson(RequeueView { queued }))
 }
 
-#[derive(Deserialize)]
-struct LimitQuery {
+#[derive(Deserialize, TS)]
+pub(crate) struct LimitQuery {
     #[serde(default = "default_ext_limit")]
     limit: u32,
 }
@@ -696,15 +711,15 @@ async fn extensions(
     Ok(ApiJson(counts))
 }
 
-#[derive(Deserialize)]
-struct ResolveQuery {
+#[derive(Deserialize, TS)]
+pub(crate) struct ResolveQuery {
     source: i64,
     #[serde(default)]
     path: String,
 }
 
-#[derive(Serialize)]
-struct ResolveView {
+#[derive(Serialize, TS)]
+pub(crate) struct ResolveView {
     object_id: ObjectId,
     path: Option<String>,
 }
@@ -713,7 +728,8 @@ struct ResolveView {
 
 /// Body of `POST /api/search`. Either `q` (syntax) or `query` (AST) must be
 /// present; when both are given the AST wins.
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(optional_fields = nullable)]
 pub(crate) struct SearchBody {
     #[serde(default)]
     pub(crate) q: Option<String>,
@@ -742,15 +758,15 @@ fn default_search_limit() -> u32 {
     50
 }
 
-#[derive(Serialize)]
-struct SearchView {
+#[derive(Serialize, TS)]
+pub(crate) struct SearchView {
     #[serde(flatten)]
     response: eidos_domain::SearchResponse,
     /// The compiled AST (editable interpretation).
     query: eidos_domain::Query,
     /// Readable rendering of the AST in query syntax.
     rendered: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notes: Vec<String>,
 }
 
@@ -833,8 +849,8 @@ async fn search(
     run_search(st, body).await
 }
 
-#[derive(Deserialize)]
-struct SearchGetQuery {
+#[derive(Deserialize, TS)]
+pub(crate) struct SearchGetQuery {
     #[serde(default)]
     q: String,
     #[serde(default)]
@@ -893,14 +909,14 @@ async fn search_get(
     .await
 }
 
-#[derive(Deserialize)]
-struct ParseQuery {
+#[derive(Deserialize, TS)]
+pub(crate) struct ParseQuery {
     #[serde(default)]
     q: String,
 }
 
-#[derive(Serialize)]
-struct ParseView {
+#[derive(Serialize, TS)]
+pub(crate) struct ParseView {
     query: eidos_domain::Query,
     rendered: String,
     notes: Vec<String>,
@@ -919,8 +935,9 @@ async fn search_parse(Query(q): Query<ParseQuery>) -> ApiResult<ParseView> {
     }))
 }
 
-#[derive(Deserialize)]
-struct ContentPolicyBody {
+#[derive(Deserialize, TS)]
+#[ts(optional_fields = nullable)]
+pub(crate) struct ContentPolicyBody {
     #[serde(default)]
     enabled: Option<bool>,
     #[serde(default)]
@@ -951,7 +968,7 @@ async fn set_content_policy(
     Ok(ApiJson(source_view(&st, s)?))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct ActivitySourceView {
     pub source_id: SourceId,
     pub name: String,
@@ -971,7 +988,7 @@ pub struct ActivitySourceView {
     pub content_bytes_indexed: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct ActivityView {
     pub content_enabled: bool,
     pub jobs: eidos_catalog::jobs::JobCounts,
@@ -1039,16 +1056,16 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
     Ok(ApiJson(view))
 }
 
-#[derive(Serialize)]
-struct IndexStatus {
+#[derive(Serialize, TS)]
+pub(crate) struct IndexStatus {
     follower: crate::follower::FollowerView,
     /// Admission-control gauges and totals for expensive API operations.
     admission: crate::admission::AdmissionView,
     sources: Vec<IndexSourceState>,
 }
 
-#[derive(Serialize)]
-struct IndexSourceState {
+#[derive(Serialize, TS)]
+pub(crate) struct IndexSourceState {
     source_id: SourceId,
     name: String,
     published_generation: Option<i64>,

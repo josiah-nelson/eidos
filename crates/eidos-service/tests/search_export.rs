@@ -252,7 +252,7 @@ async fn walks_every_page_without_duplicates_and_marks_truncation() {
     assert_eq!(lines.len(), 502, "header + 500 rows + summary");
     let summary: serde_json::Value = serde_json::from_str(lines[501]).unwrap();
     assert_eq!(summary["type"], "summary");
-    assert_eq!(summary["rows_exported"], 500);
+    assert_eq!(summary["rows_exported"], "500");
     assert_eq!(summary["truncated"], true);
     assert!(summary["error"].is_null());
 
@@ -285,15 +285,15 @@ async fn envelope_carries_completeness_of_stale_and_partial_sources() {
     let (status, _, body) = get(&app, "/api/search/export?format=json&q=ext:txt").await;
     assert_eq!(status, StatusCode::OK);
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(doc["schema"], "eidos-export/1");
+    assert_eq!(doc["schema"], "eidos-export/2");
     let c = &doc["completeness"][0];
     assert_eq!(c["state"], "stale");
     assert_eq!(c["metadata_complete"], false);
     assert_eq!(c["content_complete"], false);
-    assert_eq!(c["content_pending"], 2);
+    assert_eq!(c["content_pending"], "2");
     assert_eq!(c["freshness"], "unknown");
     assert_eq!(c["note"], "feed lost");
-    assert_eq!(doc["rows_exported"], 2);
+    assert_eq!(doc["rows_exported"], "2");
     assert_eq!(doc["truncated"], false);
 }
 
@@ -315,11 +315,13 @@ async fn json_and_ndjson_share_one_versioned_row_schema() {
     assert!(header(&headers, "content-disposition")
         .is_some_and(|d| d.starts_with("attachment; filename=\"eidos-export-")));
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(doc["schema"], "eidos-export/1");
+    assert_eq!(doc["schema"], "eidos-export/2");
     assert!(doc["query"]["rendered"].as_str().unwrap().contains("txt"));
     assert_eq!(doc["query"]["mode"], "files");
     assert!(doc["query"]["ast"].is_object());
     assert!(doc["exported_at"].as_str().unwrap().ends_with('Z'));
+    assert!(doc["total"]["value"].is_string());
+    assert!(doc["max_rows"].is_string());
     assert!(doc["warnings"].is_array());
     let rows = doc["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
@@ -333,6 +335,9 @@ async fn json_and_ndjson_share_one_versioned_row_schema() {
     keys.sort_unstable();
     expected.sort_unstable();
     assert_eq!(keys, expected, "JSON rows carry exactly the CSV columns");
+    assert!(rows[0]["object_id"].is_string());
+    assert!(rows[0]["size"].is_string());
+    assert!(rows[0]["allocated_size"].is_string());
     // Absent values stay in the row as explicit nulls (see the unit test in
     // `export.rs`); present ones keep their type.
     assert!(rows[0]["score"].is_number() || rows[0]["score"].is_null());
@@ -343,7 +348,7 @@ async fn json_and_ndjson_share_one_versioned_row_schema() {
     let lines: Vec<&str> = nd.lines().collect();
     assert_eq!(lines.len(), 4);
     let head: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(head["schema"], "eidos-export/1");
+    assert_eq!(head["schema"], "eidos-export/2");
     assert_eq!(head["type"], "header");
     assert!(head["completeness"].is_array());
     let row: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -357,7 +362,9 @@ async fn json_and_ndjson_share_one_versioned_row_schema() {
                 .method("POST")
                 .uri("/api/search/export")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"q":"ext:txt","format":"ndjson","limit":1}"#))
+                .body(Body::from(
+                    r#"{"q":"ext:txt","format":"ndjson","limit":"1"}"#,
+                ))
                 .unwrap(),
         )
         .await

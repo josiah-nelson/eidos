@@ -250,21 +250,22 @@ that, because paths have to round-trip.
 
 ### JSON and NDJSON envelope
 
-Both carry `"schema": "eidos-export/1"`. `format=json` is one document:
+Both carry `"schema": "eidos-export/2"`. `format=json` is one document. All
+64-bit integer fields are exact decimal strings, matching the HTTP API:
 
 ```json
 {
-  "schema": "eidos-export/1",
+  "schema": "eidos-export/2",
   "query": { "q": "ext:md", "rendered": "ext:md", "mode": "files",
              "sort": { "field": "name", "descending": false },
              "include_retired": false, "ast": { } },
   "exported_at": "2026-08-23T01:02:03.123456789Z",
-  "total": { "value": 1200, "exact": true },
-  "max_rows": 100000,
+  "total": { "value": "1200", "exact": true },
+  "max_rows": "100000",
   "completeness": [ ],
   "warnings": [ ],
   "rows": [ ],
-  "rows_exported": 1200,
+  "rows_exported": "1200",
   "truncated": false,
   "error": null
 }

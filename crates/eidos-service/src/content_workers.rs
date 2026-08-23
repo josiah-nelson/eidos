@@ -23,6 +23,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use ts_rs::TS;
 
 pub const COMMIT_INTERVAL: Duration = Duration::from_secs(2);
 pub const COMMIT_DOCS: u64 = 20_000;
@@ -32,7 +33,7 @@ pub const QUEUE_LOW_WATER: u64 = 2_000;
 pub const ENQUEUE_BATCH: u32 = 10_000;
 const IDLE_SLEEP: Duration = Duration::from_millis(500);
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, TS)]
 pub struct WorkerCurrent {
     pub worker: String,
     pub source_id: SourceId,
@@ -67,7 +68,7 @@ pub struct ContentWorkersStatus {
     pub started: Mutex<Option<Instant>>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, TS)]
 pub struct ContentWorkersView {
     pub workers: usize,
     pub current: Vec<WorkerCurrent>,

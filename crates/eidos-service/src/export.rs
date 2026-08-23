@@ -24,9 +24,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use ts_rs::TS;
 
 /// Version tag carried by every JSON/NDJSON export envelope.
-pub const EXPORT_SCHEMA: &str = "eidos-export/1";
+pub const EXPORT_SCHEMA: &str = "eidos-export/2";
 
 /// Stable column order of the CSV export; also the field order of a row in
 /// the JSON and NDJSON exports.
@@ -90,7 +91,7 @@ pub struct ExportStats {
 
 // ----- request -------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
     #[default]
@@ -130,7 +131,7 @@ fn de_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
 pub struct ExportGetQuery {
     #[serde(default)]
     q: String,
@@ -155,7 +156,8 @@ pub struct ExportGetQuery {
 /// POST body: the search body's query fields plus the export options. `limit`
 /// is the row cap of the whole export, not a page size, and `cursor` has no
 /// meaning here — the export always walks from the first row.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(optional_fields = nullable)]
 pub struct ExportBody {
     #[serde(default)]
     q: Option<String>,
@@ -168,6 +170,8 @@ pub struct ExportBody {
     #[serde(default)]
     format: ExportFormat,
     #[serde(default)]
+    #[ts(as = "Option<u64>")]
+    #[serde(with = "eidos_domain::json::option_u64_string")]
     limit: Option<u64>,
     #[serde(default)]
     bom: bool,
@@ -184,8 +188,8 @@ struct Plan {
     meta: QueryMeta,
 }
 
-#[derive(Debug, Serialize)]
-struct QueryMeta {
+#[derive(Debug, Clone, Serialize, TS)]
+pub(crate) struct QueryMeta {
     /// The submitted query text, when the request used `q`.
     q: Option<String>,
     /// The compiled AST rendered back into query syntax.
@@ -194,6 +198,56 @@ struct QueryMeta {
     sort: eidos_domain::Sort,
     include_retired: bool,
     ast: eidos_domain::Query,
+}
+
+/// Fields shared by the JSON document and the first NDJSON record.
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct ExportHeader {
+    schema: &'static str,
+    query: QueryMeta,
+    exported_at: String,
+    total: eidos_domain::TotalCount,
+    max_rows: u64,
+    completeness: Vec<eidos_domain::SourceCompleteness>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct ExportSummary {
+    rows_exported: u64,
+    truncated: bool,
+    error: Option<String>,
+}
+
+/// Complete `format=json` wire contract. The writer streams its three parts
+/// independently, but flattening keeps the generated type identical to the
+/// single object consumers receive.
+#[derive(Debug, Serialize, TS)]
+pub struct ExportDocument {
+    #[serde(flatten)]
+    header: ExportHeader,
+    rows: Vec<ExportRow>,
+    #[serde(flatten)]
+    summary: ExportSummary,
+}
+
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct ExportNdjsonHeader {
+    #[serde(rename = "type")]
+    #[ts(type = "\"header\"")]
+    record_type: &'static str,
+    #[serde(flatten)]
+    header: ExportHeader,
+}
+
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct ExportNdjsonSummary {
+    schema: &'static str,
+    #[serde(rename = "type")]
+    #[ts(type = "\"summary\"")]
+    record_type: &'static str,
+    #[serde(flatten)]
+    summary: ExportSummary,
 }
 
 fn plan(
@@ -497,7 +551,7 @@ async fn produce(
 /// One exported result. Unlike [`eidos_domain::Hit`], absent values are
 /// serialised as explicit `null` rather than omitted, so consumers can tell
 /// "unknown" from "not requested".
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
 pub struct ExportRow {
     pub object_id: i64,
     pub entry_id: Option<i64>,
@@ -596,7 +650,9 @@ fn write_csv_row(out: &mut Vec<u8>, r: &ExportRow) {
 // ----- envelopes -----------------------------------------------------------
 
 fn json_of<T: Serialize>(v: &T) -> String {
-    serde_json::to_string(v).unwrap_or_else(|_| "null".into())
+    crate::api_json::to_vec(v)
+        .map(|bytes| String::from_utf8(bytes).expect("JSON serialization must produce UTF-8"))
+        .unwrap_or_else(|_| "null".into())
 }
 
 fn write_header(out: &mut Vec<u8>, p: &Plan, first: &SearchResponse) {
@@ -606,18 +662,23 @@ fn write_header(out: &mut Vec<u8>, p: &Plan, first: &SearchResponse) {
         return;
     }
     let ndjson = p.format == ExportFormat::Ndjson;
-    let mut head = serde_json::json!({
-        "schema": EXPORT_SCHEMA,
-        "query": p.meta,
-        "exported_at": UnixNanos::now().to_rfc3339_nanos(),
-        "total": first.total,
-        "max_rows": p.max_rows,
-        "completeness": first.completeness,
-        "warnings": first.warnings,
-    });
+    let head = ExportHeader {
+        schema: EXPORT_SCHEMA,
+        query: p.meta.clone(),
+        exported_at: UnixNanos::now().to_rfc3339_nanos(),
+        total: first.total,
+        max_rows: p.max_rows,
+        completeness: first.completeness.clone(),
+        warnings: first.warnings.clone(),
+    };
     if ndjson {
-        head["type"] = "header".into();
-        out.extend_from_slice(json_of(&head).as_bytes());
+        out.extend_from_slice(
+            json_of(&ExportNdjsonHeader {
+                record_type: "header",
+                header: head,
+            })
+            .as_bytes(),
+        );
         out.push(b'\n');
     } else {
         // Leave the envelope object open so `rows` can stream into it.
@@ -656,20 +717,25 @@ fn write_footer(
     if format == ExportFormat::Csv {
         return;
     }
-    let mut tail = serde_json::json!({
-        "rows_exported": rows,
-        "truncated": truncated,
-        "error": error,
-    });
+    let tail = ExportSummary {
+        rows_exported: rows,
+        truncated,
+        error: error.map(str::to_owned),
+    };
     if format == ExportFormat::Json {
         // Close `rows`, then merge the summary into the still-open envelope.
         let s = json_of(&tail);
         out.extend_from_slice(b"],");
         out.extend_from_slice(s.strip_prefix('{').unwrap_or(&s).as_bytes());
     } else {
-        tail["schema"] = EXPORT_SCHEMA.into();
-        tail["type"] = "summary".into();
-        out.extend_from_slice(json_of(&tail).as_bytes());
+        out.extend_from_slice(
+            json_of(&ExportNdjsonSummary {
+                schema: EXPORT_SCHEMA,
+                record_type: "summary",
+                summary: tail,
+            })
+            .as_bytes(),
+        );
     }
     out.push(b'\n');
 }

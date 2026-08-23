@@ -23,6 +23,7 @@ use crate::Result;
 use eidos_domain::{ContentState, ObjectId, ObjectKind, SourceId, UnixNanos};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
+use ts_rs::TS;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acc {
@@ -106,7 +107,7 @@ impl Acc {
     }
 }
 
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, TS)]
 pub struct AggStats {
     pub directories: u64,
     pub extension_rows: u64,
