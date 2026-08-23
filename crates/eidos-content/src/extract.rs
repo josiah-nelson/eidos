@@ -30,6 +30,41 @@ impl Default for Limits {
     }
 }
 
+/// Why a chunk sink rejected a chunk.
+///
+/// A sink failure is the caller's storage failing (a database write, an
+/// index write), never a property of the file being read, so the sink says
+/// how it should be classified and the extractor passes that verdict
+/// through unchanged instead of treating it as a decode failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SinkFailure {
+    pub class: FailureClass,
+    /// Operator-visible reason, including the underlying error chain.
+    pub message: String,
+}
+
+impl SinkFailure {
+    /// A sink failure worth retrying (storage contention, a full disk, an
+    /// index writer error).
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            class: FailureClass::Transient,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SinkFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SinkFailure {}
+
+/// What a chunk sink returns.
+pub type SinkResult = std::result::Result<(), SinkFailure>;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
     pub state: ContentState,
@@ -44,6 +79,10 @@ pub struct Outcome {
     pub content_id: Option<ContentId>,
     pub hash_complete: bool,
     pub failure: Option<(FailureClass, String)>,
+    /// The failure came from the sink, not from opening, reading, or
+    /// decoding the file: the class in `failure` is the sink's own and the
+    /// caller owns the recovery.
+    pub sink_failed: bool,
     /// Human-readable reason for `unsupported`/`excluded` outcomes.
     pub reason: Option<String>,
     pub elapsed_ms: f64,
@@ -77,11 +116,7 @@ fn classify_io(e: &std::io::Error) -> FailureClass {
 
 /// Extract literal text from `path`, delivering chunks to `sink` as they are
 /// produced. Memory use is bounded by `limits.read_bytes` plus one chunk.
-pub fn extract(
-    path: &Path,
-    limits: &Limits,
-    sink: &mut dyn FnMut(Chunk) -> Result<(), String>,
-) -> Outcome {
+pub fn extract(path: &Path, limits: &Limits, sink: &mut dyn FnMut(Chunk) -> SinkResult) -> Outcome {
     let started = Instant::now();
     let mut out = Outcome {
         state: ContentState::Failed,
@@ -95,6 +130,7 @@ pub fn extract(
         content_id: None,
         hash_complete: false,
         failure: None,
+        sink_failed: false,
         reason: None,
         elapsed_ms: 0.0,
     };
@@ -143,9 +179,7 @@ pub fn extract(
 
     chunker.push(&buf[bom_len.min(head_len)..head_len], &mut chunks);
     if let Err(e) = deliver(&mut chunks, sink, &mut out) {
-        out.failure = Some((FailureClass::Deterministic, e));
-        out.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        return out;
+        return sink_failed(out, e, started);
     }
 
     loop {
@@ -169,16 +203,12 @@ pub fn extract(
         consumed += n as u64;
         chunker.push(&buf[..n], &mut chunks);
         if let Err(e) = deliver(&mut chunks, sink, &mut out) {
-            out.failure = Some((FailureClass::Deterministic, e));
-            out.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-            return out;
+            return sink_failed(out, e, started);
         }
     }
     chunker.finish(&mut chunks);
     if let Err(e) = deliver(&mut chunks, sink, &mut out) {
-        out.failure = Some((FailureClass::Deterministic, e));
-        out.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        return out;
+        return sink_failed(out, e, started);
     }
     out.indexed_bytes = consumed;
     out.line_count = chunker.lines_total;
@@ -202,11 +232,21 @@ pub fn extract(
     out
 }
 
+/// Record a sink failure verbatim: the sink's class survives, and
+/// `sink_failed` tells the caller the file itself was fine.
+fn sink_failed(mut out: Outcome, e: SinkFailure, started: Instant) -> Outcome {
+    out.state = ContentState::Failed;
+    out.sink_failed = true;
+    out.failure = Some((e.class, e.message));
+    out.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    out
+}
+
 fn deliver(
     chunks: &mut Vec<Chunk>,
-    sink: &mut dyn FnMut(Chunk) -> Result<(), String>,
+    sink: &mut dyn FnMut(Chunk) -> SinkResult,
     out: &mut Outcome,
-) -> Result<(), String> {
+) -> SinkResult {
     for c in chunks.drain(..) {
         out.chunk_count += 1;
         sink(c)?;
@@ -327,12 +367,49 @@ mod tests {
     }
 
     #[test]
-    fn sink_error_fails_deterministically() {
+    fn sink_failure_keeps_the_sinks_own_class() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.txt");
         std::fs::write(&p, "hello\n").unwrap();
-        let o = extract(&p, &Limits::default(), &mut |_| Err("boom".into()));
+        let o = extract(&p, &Limits::default(), &mut |_| {
+            Err(SinkFailure::transient("catalog write failed: disk full"))
+        });
         assert_eq!(o.state, ContentState::Failed);
-        assert_eq!(o.failure.unwrap().0, FailureClass::Deterministic);
+        assert!(o.sink_failed, "the file was fine; the sink was not");
+        let (class, message) = o.failure.unwrap();
+        assert_eq!(class, FailureClass::Transient, "never reclassified");
+        assert_eq!(message, "catalog write failed: disk full");
+    }
+
+    #[test]
+    fn sink_failure_mid_file_stops_and_reports_the_chunks_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.log");
+        std::fs::write(&p, "line with QzEndpoint\n".repeat(40_000)).unwrap();
+        let mut seen = 0u32;
+        let o = extract(&p, &Limits::default(), &mut |_| {
+            seen += 1;
+            if seen > 3 {
+                Err(SinkFailure {
+                    class: FailureClass::ResourceLimit,
+                    message: "index write failed".into(),
+                })
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(o.state, ContentState::Failed);
+        assert!(o.sink_failed);
+        assert_eq!(o.chunk_count, 4, "stopped at the rejected chunk");
+        assert_eq!(o.failure.unwrap().0, FailureClass::ResourceLimit);
+        assert_eq!(o.coverage, Coverage::None);
+        assert!(o.content_id.is_none(), "no hash for an incomplete read");
+    }
+
+    #[test]
+    fn file_failures_are_not_sink_failures() {
+        let (o, _) = collect(Path::new("Z:\\definitely\\missing.txt"), &Limits::default());
+        assert!(o.failure.is_some());
+        assert!(!o.sink_failed);
     }
 }

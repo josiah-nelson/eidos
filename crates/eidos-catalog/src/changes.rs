@@ -5,6 +5,13 @@
 //! batch is one transaction: catalog rows, aggregate deltas, outbox rows for
 //! derived indexes, and the feed checkpoint all commit together, so a crash
 //! can never leave the checkpoint ahead of the durable state.
+//!
+//! While a scan generation is open for the source (the native scan sequence
+//! replays the records that overlapped enumeration *before* publishing),
+//! rows touched by a batch are stamped with the open generation so that the
+//! publish step does not tombstone them as "not re-observed"; the publish
+//! step rebuilds every aggregate, so the incremental deltas applied here are
+//! only an interim approximation during that window.
 
 use crate::aggregates::{apply_delta, AggDelta};
 use crate::jobs::outbox_append_conn;
@@ -140,13 +147,7 @@ impl Catalog {
     }
 
     pub fn clear_checkpoint(&self, source_id: SourceId) -> Result<()> {
-        self.with_writer(|conn| {
-            conn.execute(
-                "UPDATE sources SET checkpoint_kind = NULL, checkpoint_json = NULL, checkpoint_at = NULL, updated_at = ?2 WHERE source_id = ?1",
-                params![source_id.0, UnixNanos::now().0],
-            )?;
-            Ok(())
-        })
+        self.with_writer(|conn| clear_checkpoint_conn(conn, source_id))
     }
 
     pub fn checkpoint(&self, source_id: SourceId) -> Result<Option<(Checkpoint, UnixNanos)>> {
@@ -205,11 +206,23 @@ impl Catalog {
     }
 }
 
-fn set_checkpoint_conn(conn: &Connection, source_id: SourceId, cp: &Checkpoint) -> Result<()> {
+pub(crate) fn set_checkpoint_conn(
+    conn: &Connection,
+    source_id: SourceId,
+    cp: &Checkpoint,
+) -> Result<()> {
     let now = UnixNanos::now().0;
     conn.execute(
         "UPDATE sources SET checkpoint_kind = ?2, checkpoint_json = ?3, checkpoint_at = ?4, updated_at = ?4 WHERE source_id = ?1",
         params![source_id.0, cp.kind, cp.value.to_string(), now],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn clear_checkpoint_conn(conn: &Connection, source_id: SourceId) -> Result<()> {
+    conn.execute(
+        "UPDATE sources SET checkpoint_kind = NULL, checkpoint_json = NULL, checkpoint_at = NULL, updated_at = ?2 WHERE source_id = ?1",
+        params![source_id.0, UnixNanos::now().0],
     )?;
     Ok(())
 }
@@ -233,6 +246,9 @@ struct Applier<'a> {
     tx: &'a Transaction<'a>,
     source_id: SourceId,
     root: ObjectId,
+    /// Generation stamped on rows this batch creates or re-observes: the
+    /// open scan generation when one exists, otherwise the published one.
+    stamp: i64,
     policy: PolicyEngine,
     stats: ApplyStats,
     touched: HashSet<ObjectId>,
@@ -246,10 +262,19 @@ impl<'a> Applier<'a> {
         let root = src
             .root_object_id
             .ok_or_else(|| CatalogError::InvalidState("source has never been scanned".into()))?;
+        let open: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM scan_generations WHERE source_id = ?1 AND state = 'open'",
+                params![source_id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let stamp = open.unwrap_or(src.published_generation.unwrap_or(0));
         Ok(Self {
             tx,
             source_id,
             root,
+            stamp,
             policy: PolicyEngine::new(),
             stats: ApplyStats::default(),
             touched: HashSet::new(),
@@ -431,7 +456,8 @@ impl<'a> Applier<'a> {
                 self.tx
                     .prepare_cached(
                         "UPDATE objects SET size = ?2, allocated = ?3, attributes = ?4, created = ?5, modified = ?6, changed = ?7,
-                            accessed = ?8, reparse_tag = ?9, generation = ?10, content_state = ?11, link_count = ?12 WHERE object_id = ?1",
+                            accessed = ?8, reparse_tag = ?9, generation = ?10, content_state = ?11, link_count = ?12,
+                            last_seen_generation = MAX(last_seen_generation, ?13) WHERE object_id = ?1",
                     )?
                     .execute(params![
                         ex.id.0,
@@ -446,6 +472,7 @@ impl<'a> Applier<'a> {
                         generation,
                         state.as_str(),
                         snap.link_count.max(1) as i64,
+                        self.stamp,
                     ])?;
                 if content_changed {
                     let (entries, objects) =
@@ -480,10 +507,18 @@ impl<'a> Applier<'a> {
                         &ext,
                         ex.size as u64,
                         ex.allocated as u64,
+                        ex.modified.map(UnixNanos),
                         old_state,
                         -1,
                     );
-                    let add = AggDelta::for_file(&ext, snap.size, snap.allocated, state, 1);
+                    let add = AggDelta::for_file(
+                        &ext,
+                        snap.size,
+                        snap.allocated,
+                        snap.modified,
+                        state,
+                        1,
+                    );
                     d.file_count += add.file_count;
                     d.logical += add.logical;
                     d.allocated += add.allocated;
@@ -492,7 +527,7 @@ impl<'a> Applier<'a> {
                     d.failed += add.failed;
                     d.excluded += add.excluded;
                     d.ext.extend(add.ext);
-                    d.touch_modified = snap.modified;
+                    d.added = add.added;
                     Some(d)
                 } else {
                     None
@@ -506,9 +541,7 @@ impl<'a> Applier<'a> {
                 "INSERT INTO objects (source_id, kind, native_volume_serial, native_id_high, native_id_low, identity_confidence,
                     generation, size, allocated, attributes, created, modified, changed, accessed, reparse_tag, link_count,
                     content_state, first_seen_generation, last_seen_generation)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    (SELECT COALESCE(published_generation, 0) FROM sources WHERE source_id = ?1),
-                    (SELECT COALESCE(published_generation, 0) FROM sources WHERE source_id = ?1))",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
             )?
             .execute(params![
                 self.source_id.0,
@@ -527,6 +560,7 @@ impl<'a> Applier<'a> {
                 snap.reparse_tag as i64,
                 snap.link_count.max(1) as i64,
                 new_state.as_str(),
+                self.stamp,
             ])?;
         let id = ObjectId(self.tx.last_insert_rowid());
         self.record_policy(id, decision)?;
@@ -535,8 +569,8 @@ impl<'a> Applier<'a> {
         if snap.kind == ObjectKind::Directory {
             self.tx.execute(
                 "INSERT OR IGNORE INTO directory_aggregates (object_id, source_id, generation, complete)
-                 VALUES (?1, ?2, (SELECT COALESCE(published_generation, 0) FROM sources WHERE source_id = ?2), 1)",
-                params![id.0, self.source_id.0],
+                 VALUES (?1, ?2, ?3, 1)",
+                params![id.0, self.source_id.0, self.stamp],
             )?;
         }
         let content_candidate = snap.kind == ObjectKind::File && new_state == ContentState::Pending;
@@ -586,8 +620,13 @@ impl<'a> Applier<'a> {
             String::new()
         };
         match self.find_entry(parent, name)? {
-            Some((_, existing_obj)) if existing_obj == obj => {
-                // Entry unchanged; propagate any state delta to all parents.
+            Some((entry_id, existing_obj)) if existing_obj == obj => {
+                // Entry unchanged (re-observed by the feed); propagate any
+                // state delta to all parents.
+                self.tx.execute(
+                    "UPDATE entries SET last_seen_generation = MAX(last_seen_generation, ?2) WHERE entry_id = ?1",
+                    params![entry_id, self.stamp],
+                )?;
                 if let Some(d) = state_delta {
                     for p in self.parents_of(obj)? {
                         apply_delta(self.tx, p, &d)?;
@@ -609,11 +648,17 @@ impl<'a> Applier<'a> {
         self.tx
             .prepare_cached(
                 "INSERT INTO entries (source_id, parent_id, object_id, name, name_folded, extension, first_seen_generation, last_seen_generation)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
-                    (SELECT COALESCE(published_generation, 0) FROM sources WHERE source_id = ?1),
-                    (SELECT COALESCE(published_generation, 0) FROM sources WHERE source_id = ?1))",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
             )?
-            .execute(params![self.source_id.0, parent.0, obj.0, name, crate::policy::fold(name), ext])?;
+            .execute(params![
+                self.source_id.0,
+                parent.0,
+                obj.0,
+                name,
+                crate::policy::fold(name),
+                ext,
+                self.stamp
+            ])?;
         self.stats.entries_created += 1;
         // Aggregate contribution of this new entry on the parent chain.
         let delta = if snap.kind == ObjectKind::Directory {
@@ -636,9 +681,7 @@ impl<'a> Applier<'a> {
                     .map(|e| ContentState::parse(&e.content_state).unwrap_or(ContentState::Pending))
                     .unwrap_or(ContentState::Pending)
             };
-            let mut d = AggDelta::for_file(&ext, snap.size, snap.allocated, st, 1);
-            d.touch_modified = snap.modified;
-            d
+            AggDelta::for_file(&ext, snap.size, snap.allocated, snap.modified, st, 1)
         };
         apply_delta(self.tx, parent, &delta)?;
         if !created && snap.kind == ObjectKind::Directory {
@@ -698,6 +741,7 @@ impl<'a> Applier<'a> {
                 &extension_of(&name),
                 ex.size as u64,
                 ex.allocated as u64,
+                ex.modified.map(UnixNanos),
                 st,
                 -1,
             )

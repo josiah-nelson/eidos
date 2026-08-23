@@ -5,10 +5,23 @@
 //! transaction. `apply_delta` propagates a change through the ancestor chain
 //! for incremental updates; subtree moves subtract at the old parent chain
 //! and add at the new one instead of recomputing descendants.
+//!
+//! Both definitions of `newest_modified`/`oldest_modified` must agree: they
+//! are the extrema of `objects.modified` over the **non-directory** live
+//! entries of the subtree. A directory's own `modified` never contributes
+//! (its aggregate row carries its children's extrema instead), and virtual
+//! archive members are not part of any physical directory's subtree because
+//! they hang off the container object, which has no aggregate row.
+//!
+//! Counters are monoids, so `apply_delta` can add signed values blindly.
+//! Extrema are not: removing the entry that provided a directory's extremum
+//! makes the stored value unknown, so `apply_delta` recomputes that one
+//! directory from its direct children (one query) and keeps walking up only
+//! while an ancestor's extremum is likewise invalidated.
 
 use crate::Result;
 use eidos_domain::{ContentState, ObjectId, ObjectKind, SourceId, UnixNanos};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +246,25 @@ pub fn rebuild_source(
     Ok(stats)
 }
 
+/// Modification-time extrema of whatever is entering or leaving a subtree.
+/// `None` means "contributes no timestamp" (an empty subtree, or a file
+/// whose `modified` is unknown), which never invalidates anything.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Extrema {
+    pub newest: Option<i64>,
+    pub oldest: Option<i64>,
+}
+
+impl Extrema {
+    /// The extrema of a single timestamp.
+    fn point(at: Option<i64>) -> Self {
+        Extrema {
+            newest: at,
+            oldest: at,
+        }
+    }
+}
+
 /// Signed change to propagate up from a directory.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AggDelta {
@@ -246,17 +278,35 @@ pub struct AggDelta {
     pub excluded: i64,
     /// `(extension, count delta, bytes delta)`
     pub ext: Vec<(String, i64, i64)>,
-    /// Newest modified candidate (only raises `newest_modified`).
-    pub touch_modified: Option<UnixNanos>,
+    /// Timestamps this change adds to the subtree.
+    pub added: Extrema,
+    /// Timestamps this change removes from the subtree. When one of them is
+    /// the directory's current extremum, that extremum is recomputed.
+    pub removed: Extrema,
 }
 
 impl AggDelta {
-    pub fn for_file(ext: &str, size: u64, alloc: u64, state: ContentState, sign: i64) -> Self {
+    pub fn for_file(
+        ext: &str,
+        size: u64,
+        alloc: u64,
+        modified: Option<UnixNanos>,
+        state: ContentState,
+        sign: i64,
+    ) -> Self {
+        let stamp = Extrema::point(modified.map(|t| t.0));
+        let (added, removed) = if sign >= 0 {
+            (stamp, Extrema::default())
+        } else {
+            (Extrema::default(), stamp)
+        };
         let mut d = AggDelta {
             file_count: sign,
             logical: sign * size as i64,
             allocated: sign * alloc as i64,
             ext: vec![(ext.to_string(), sign, sign * size as i64)],
+            added,
+            removed,
             ..Default::default()
         };
         match state {
@@ -284,14 +334,16 @@ impl AggDelta {
                 .iter()
                 .map(|(e, c, b)| (e.clone(), -c, -b))
                 .collect(),
-            touch_modified: None,
+            added: self.removed,
+            removed: self.added,
         }
     }
 
     /// Build the delta that represents an entire subtree (for moves).
     pub fn from_subtree(conn: &Connection, dir: ObjectId) -> Result<Self> {
         let row = conn.query_row(
-            "SELECT file_count, dir_count, logical_bytes, allocated_bytes, content_pending, content_indexed, content_failed, content_excluded
+            "SELECT file_count, dir_count, logical_bytes, allocated_bytes, content_pending, content_indexed, content_failed, content_excluded,
+                    newest_modified, oldest_modified
              FROM directory_aggregates WHERE object_id = ?1",
             params![dir.0],
             |r| {
@@ -305,7 +357,11 @@ impl AggDelta {
                     failed: r.get(6)?,
                     excluded: r.get(7)?,
                     ext: Vec::new(),
-                    touch_modified: None,
+                    added: Extrema {
+                        newest: r.get(8)?,
+                        oldest: r.get(9)?,
+                    },
+                    removed: Extrema::default(),
                 })
             },
         )?;
@@ -319,6 +375,96 @@ impl AggDelta {
     }
 }
 
+/// Extrema of a directory's direct children, using the same definition as
+/// `rebuild_source`: child directories contribute their aggregate extrema,
+/// everything else (files, reparse points, archive containers) contributes
+/// its own `modified`.
+const CHILD_EXTREMA_SQL: &str = "SELECT
+        MAX(CASE WHEN o.kind = 'directory' THEN a.newest_modified ELSE o.modified END),
+        MIN(CASE WHEN o.kind = 'directory' THEN a.oldest_modified ELSE o.modified END)
+     FROM entries e
+     JOIN objects o ON o.object_id = e.object_id
+     LEFT JOIN directory_aggregates a ON a.object_id = e.object_id
+     WHERE e.parent_id = ?1 AND e.deleted_at IS NULL AND o.deleted_at IS NULL";
+
+/// The directory's newest value after `removed` left and `added` arrived, or
+/// `None` when the removal took the current maximum away and nothing added
+/// replaces it — the caller must then recompute from the direct children.
+fn next_newest(cur: Option<i64>, removed: Option<i64>, added: Option<i64>) -> Option<Option<i64>> {
+    if let Some(r) = removed {
+        let replaced = matches!(added, Some(a) if a >= r);
+        if !replaced && !matches!(cur, Some(c) if c > r) {
+            return None;
+        }
+    }
+    Some(match (cur, added) {
+        (Some(c), Some(a)) => Some(c.max(a)),
+        (c, None) => c,
+        (None, a) => a,
+    })
+}
+
+/// Mirror of [`next_newest`] for the minimum.
+fn next_oldest(cur: Option<i64>, removed: Option<i64>, added: Option<i64>) -> Option<Option<i64>> {
+    if let Some(r) = removed {
+        let replaced = matches!(added, Some(a) if a <= r);
+        if !replaced && !matches!(cur, Some(c) if c < r) {
+            return None;
+        }
+    }
+    Some(match (cur, added) {
+        (Some(c), Some(a)) => Some(c.min(a)),
+        (c, None) => c,
+        (None, a) => a,
+    })
+}
+
+/// Move one directory's stored extrema to what `added`/`removed` imply,
+/// recomputing from its direct children when a removal invalidated them.
+/// Returns `(before, after)`: the change the parent now sees in this
+/// directory, which is inert when the two are equal.
+fn step_extrema(
+    conn: &Connection,
+    dir: ObjectId,
+    added: Extrema,
+    removed: Extrema,
+) -> Result<(Extrema, Extrema)> {
+    let cur = conn
+        .prepare_cached(
+            "SELECT newest_modified, oldest_modified FROM directory_aggregates WHERE object_id = ?1",
+        )?
+        .query_row(params![dir.0], |r| {
+            Ok(Extrema {
+                newest: r.get(0)?,
+                oldest: r.get(1)?,
+            })
+        })
+        .optional()?
+        .unwrap_or_default();
+    let newest = next_newest(cur.newest, removed.newest, added.newest);
+    let oldest = next_oldest(cur.oldest, removed.oldest, added.oldest);
+    let next = match (newest, oldest) {
+        (Some(newest), Some(oldest)) => Extrema { newest, oldest },
+        // One extremum lost its provider: both are cheap to re-derive from
+        // the children we would have to visit anyway.
+        _ => conn
+            .prepare_cached(CHILD_EXTREMA_SQL)?
+            .query_row(params![dir.0], |r| {
+                Ok(Extrema {
+                    newest: r.get(0)?,
+                    oldest: r.get(1)?,
+                })
+            })?,
+    };
+    if next != cur {
+        conn.prepare_cached(
+            "UPDATE directory_aggregates SET newest_modified = ?2, oldest_modified = ?3 WHERE object_id = ?1",
+        )?
+        .execute(params![dir.0, next.newest, next.oldest])?;
+    }
+    Ok((cur, next))
+}
+
 /// Apply `delta` to `dir` and every ancestor up to the source root. Must run
 /// inside a transaction. Returns the number of directories touched.
 pub fn apply_delta(conn: &Connection, dir: ObjectId, delta: &AggDelta) -> Result<u32> {
@@ -327,8 +473,7 @@ pub fn apply_delta(conn: &Connection, dir: ObjectId, delta: &AggDelta) -> Result
             file_count = file_count + ?2, dir_count = dir_count + ?3,
             logical_bytes = logical_bytes + ?4, allocated_bytes = allocated_bytes + ?5,
             content_pending = content_pending + ?6, content_indexed = content_indexed + ?7,
-            content_failed = content_failed + ?8, content_excluded = content_excluded + ?9,
-            newest_modified = CASE WHEN ?10 IS NOT NULL AND (newest_modified IS NULL OR ?10 > newest_modified) THEN ?10 ELSE newest_modified END
+            content_failed = content_failed + ?8, content_excluded = content_excluded + ?9
          WHERE object_id = ?1",
     )?;
     let mut upd_ext = conn.prepare_cached(
@@ -343,6 +488,8 @@ pub fn apply_delta(conn: &Connection, dir: ObjectId, delta: &AggDelta) -> Result
     let mut current = Some(dir);
     let mut touched = 0u32;
     let mut guard = 0;
+    let mut added = delta.added;
+    let mut removed = delta.removed;
     while let Some(d) = current {
         guard += 1;
         if guard > 1024 {
@@ -360,7 +507,6 @@ pub fn apply_delta(conn: &Connection, dir: ObjectId, delta: &AggDelta) -> Result
             delta.indexed,
             delta.failed,
             delta.excluded,
-            delta.touch_modified.map(|t| t.0),
         ])?;
         if n > 0 {
             touched += 1;
@@ -370,10 +516,20 @@ pub fn apply_delta(conn: &Connection, dir: ObjectId, delta: &AggDelta) -> Result
                     del_ext.execute(params![d.0, ext])?;
                 }
             }
+            if added != removed {
+                // The parent sees this directory swap its old extrema for
+                // its new ones; equal values stop the walk short.
+                (removed, added) = step_extrema(conn, d, added, removed)?;
+            }
+        } else {
+            // No aggregate row: not a tracked directory (an archive
+            // container's virtual subtree, say), so nothing above it changes.
+            added = Extrema::default();
+            removed = Extrema::default();
         }
         current = parent_of
             .query_row(params![d.0], |r| r.get::<_, Option<i64>>(0))
-            .ok()
+            .optional()?
             .flatten()
             .map(ObjectId);
     }

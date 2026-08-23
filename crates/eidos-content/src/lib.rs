@@ -9,7 +9,7 @@ pub mod extract;
 pub mod sniff;
 
 pub use chunk::{Chunk, Chunker, ChunkerConfig};
-pub use extract::{extract, Limits, Outcome};
+pub use extract::{extract, Limits, Outcome, SinkFailure, SinkResult};
 pub use sniff::{sniff, Encoding, Sniff};
 
 /// Bump when chunking or decoding semantics change so stored chunks are

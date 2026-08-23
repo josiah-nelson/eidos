@@ -8,6 +8,7 @@
 
 pub mod content;
 pub mod exec;
+pub mod facets;
 pub mod pipeline;
 pub mod projection;
 pub mod regex_plan;

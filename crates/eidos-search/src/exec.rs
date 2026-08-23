@@ -8,6 +8,7 @@ use crate::content::{
     self, object_score, verify_objects, verify_threads, ContentClause, ContentIndex, ContentOpts,
     Matcher, VerifyJob,
 };
+use crate::facets::RangeBucket;
 use crate::regex_plan::TrigramPlan;
 use crate::schema::{attr_bit, attr_name, fold, Fields};
 use crate::{CatalogIndex, Result, SearchError, PROJECTION_NAME};
@@ -604,6 +605,7 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
             let fld = match field {
                 TimeField::Modified => f.modified,
                 TimeField::Created => f.created,
+                TimeField::SubtreeModified => f.newest_modified,
                 TimeField::Changed | TimeField::Accessed => {
                     return Err(QueryError::Other {
                         message: format!("{field:?} time is not indexed"),
@@ -615,7 +617,13 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
                 after.map_or("-∞".to_string(), |t| t.to_rfc3339()),
                 before.map_or("∞".to_string(), |t| t.to_rfc3339())
             ));
-            i64_range(fld, after.map(|t| t.0), before.map(|t| t.0))
+            let range = i64_range(fld, after.map(|t| t.0), before.map(|t| t.0));
+            if *field == TimeField::SubtreeModified {
+                // A directory predicate, like `subtree:` and `files:`.
+                all_of(vec![term_text(f.kind, "directory"), range])
+            } else {
+                range
+            }
         }
         Query::Attributes { all_of: a, none_of: n } => {
             let mut clauses: Vec<(Occur, Box<dyn TQuery>)> = vec![(Occur::Must, Box::new(AllQuery))];
@@ -1060,19 +1068,36 @@ fn compile_content(
             }
         }
     }
+    let stale = drop_stale_generations(ctx.catalog, &mut by_object, &mut deferred)?;
     let objects = deferred.as_ref().map_or(by_object.len(), |c| c.len());
     ctx.steps.push(PlanStep {
         stage: "content".into(),
         description: format!(
-            "{} → {} file(s){}",
+            "{} → {} file(s){}{}",
             ret.description,
             objects,
-            if ret.deferred { " (unverified)" } else { "" }
+            if ret.deferred { " (unverified)" } else { "" },
+            if stale > 0 {
+                format!("; {stale} of an older generation dropped")
+            } else {
+                String::new()
+            }
         ),
         candidates: Some(ret.candidates),
         verified: ret.verified,
         elapsed_ms: Some(ret.elapsed_ms),
     });
+    if stale > 0 && ret.truncated {
+        // Candidates are cut before their generation is known, so a chunk of
+        // a superseded generation can occupy the budget that the same file's
+        // current chunk would have used. The result is a subset either way
+        // (the truncation warning above says so); name the second cause.
+        ctx.warnings.push(format!(
+            "content clause \"{value}\": {stale} file(s) matched only on a superseded generation. \
+             The candidate list was truncated, so a current-generation match of theirs may have \
+             been cut with it — narrow the query"
+        ));
+    }
     let ids: Vec<ObjectId> = match &deferred {
         Some(c) => c.keys().copied().collect(),
         None => by_object.keys().copied().collect(),
@@ -1093,6 +1118,45 @@ fn compile_content(
         deferred,
     });
     Ok(q)
+}
+
+/// Drop content matches whose generation is not the object's current one,
+/// returning how many objects were removed.
+///
+/// The content index is committed asynchronously (ADR-0005): a queued
+/// deletion of an object's old chunk documents becomes visible only at the
+/// next commit, and between a file changing and its re-extraction the index
+/// legitimately still holds the previous generation. Such a document
+/// describes text the file no longer contains, so it must not compose into a
+/// file hit at all — filtering here (before the object set reaches the
+/// catalog-index query) also keeps stale objects out of totals and facets,
+/// and covers both the eager and the page-driven path of ADR-0008, whose
+/// candidates are grouped per generation as well.
+fn drop_stale_generations(
+    catalog: &Catalog,
+    by_object: &mut HashMap<ObjectId, ObjectMatch>,
+    deferred: &mut Option<HashMap<ObjectId, (u32, Vec<u32>)>>,
+) -> std::result::Result<usize, QueryError> {
+    let ids: Vec<ObjectId> = match deferred {
+        Some(c) => c.keys().copied().collect(),
+        None => by_object.keys().copied().collect(),
+    };
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let current = catalog
+        .object_generations(&ids)
+        .map_err(|e| QueryError::Other {
+            message: e.to_string(),
+        })?;
+    let before = ids.len();
+    match deferred {
+        // An object gone from the catalog (`None`) is stale too.
+        Some(c) => c.retain(|o, (g, _)| current.get(o) == Some(g)),
+        None => by_object.retain(|o, m| current.get(o) == Some(&m.generation)),
+    }
+    let after = deferred.as_ref().map_or(by_object.len(), |c| c.len());
+    Ok(before - after)
 }
 
 /// Source scope visible before compilation: `source:` clauses that are
@@ -2435,7 +2499,15 @@ fn build_hits(
     let facets = if req.facets.is_empty() {
         Vec::new()
     } else {
-        facets_for(index, searcher, facet_query, &req.facets, &sources, catalog)?
+        facets_for(
+            index,
+            searcher,
+            facet_query,
+            &req.facets,
+            req.mode,
+            &sources,
+            catalog,
+        )?
     };
     Ok((hits, facets, consumed))
 }
@@ -2569,19 +2641,23 @@ fn make_snippet(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn facets_for(
     index: &CatalogIndex,
     searcher: &Searcher,
     query: &dyn TQuery,
     requests: &[FacetRequest],
+    mode: ResultMode,
     sources: &HashMap<SourceId, eidos_catalog::SourceRecord>,
     catalog: &Catalog,
 ) -> Result<Vec<Facet>> {
     use tantivy::aggregation::agg_req::Aggregations;
     use tantivy::aggregation::AggregationCollector;
     let _ = index;
-    let now = UnixNanos::now().0;
-    let day = 86_400_000_000_000i64;
+    let now = UnixNanos::now();
+    // Bucket tables for the range facets, kept so the response can be built
+    // from the same boundaries the aggregation was asked for.
+    let mut tables: HashMap<FacetField, Vec<RangeBucket>> = HashMap::new();
     let mut spec = serde_json::Map::new();
     for r in requests {
         let size = r.limit.clamp(1, 500);
@@ -2600,16 +2676,16 @@ fn facets_for(
                 serde_json::json!({"terms": {"field": "parent_id", "size": size}})
             }
             FacetField::SizeBucket => {
-                serde_json::json!({"range": {"field": "subtree_logical", "ranges": [
-                {"to": 4096.0}, {"from": 4096.0, "to": 65536.0}, {"from": 65536.0, "to": 1048576.0},
-                {"from": 1048576.0, "to": 16777216.0}, {"from": 16777216.0, "to": 268435456.0},
-                {"from": 268435456.0, "to": 1073741824.0}, {"from": 1073741824.0}]}})
+                let buckets = crate::facets::size_buckets(mode);
+                let spec = range_spec("subtree_logical", &buckets);
+                tables.insert(r.field, buckets);
+                spec
             }
             FacetField::ModifiedBucket => {
-                serde_json::json!({"range": {"field": "newest_modified", "ranges": [
-                {"from": (now - day) as f64}, {"from": (now - 7 * day) as f64, "to": (now - day) as f64},
-                {"from": (now - 30 * day) as f64, "to": (now - 7 * day) as f64},
-                {"from": (now - 365 * day) as f64, "to": (now - 30 * day) as f64}, {"to": (now - 365 * day) as f64}]}})
+                let buckets = crate::facets::time_buckets(now, mode);
+                let spec = range_spec("newest_modified", &buckets);
+                tables.insert(r.field, buckets);
+                spec
             }
         };
         spec.insert(format!("{:?}", r.field).to_lowercase(), v);
@@ -2639,6 +2715,38 @@ fn facets_for(
             .unwrap_or(0)
             > 0;
         let mut values = Vec::new();
+        // Range facets are emitted from the bucket table, in its display
+        // order, so every value carries the boundaries and clauses the
+        // aggregation was built from.
+        if let Some(table) = tables.remove(&r.field) {
+            for bucket in table {
+                let Some(b) = buckets.iter().find(|b| {
+                    bound_eq(b.get("from"), bucket.from) && bound_eq(b.get("to"), bucket.to)
+                }) else {
+                    continue;
+                };
+                let count = b.get("doc_count").and_then(|c| c.as_u64()).unwrap_or(0);
+                if count == 0 {
+                    continue;
+                }
+                values.push(FacetValue {
+                    value: b
+                        .get("key")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    count,
+                    label: Some(bucket.label),
+                    range: bucket.range,
+                });
+            }
+            out.push(Facet {
+                field: r.field,
+                values,
+                truncated,
+            });
+            continue;
+        }
         for b in buckets {
             let count = b.get("doc_count").and_then(|c| c.as_u64()).unwrap_or(0);
             if count == 0 {
@@ -2668,14 +2776,6 @@ fn facets_for(
                         catalog.render_path(ObjectId(id)).ok().flatten(),
                     )
                 }
-                FacetField::SizeBucket | FacetField::ModifiedBucket => {
-                    let from = b.get("from").and_then(|v| v.as_f64());
-                    let to = b.get("to").and_then(|v| v.as_f64());
-                    (
-                        raw_key.as_str().unwrap_or("").to_string(),
-                        Some(bucket_label(r.field, from, to, now)),
-                    )
-                }
                 _ => {
                     let s = raw_key.as_str().unwrap_or("").to_string();
                     let label = if s.is_empty() {
@@ -2690,6 +2790,7 @@ fn facets_for(
                 value: value_s,
                 count,
                 label,
+                range: None,
             });
         }
         out.push(Facet {
@@ -2701,38 +2802,32 @@ fn facets_for(
     Ok(out)
 }
 
-fn bucket_label(field: FacetField, from: Option<f64>, to: Option<f64>, now: i64) -> String {
-    match field {
-        FacetField::SizeBucket => {
-            let h = |v: f64| -> String {
-                let b = v as u64;
-                if b >= 1 << 30 {
-                    format!("{}G", b >> 30)
-                } else if b >= 1 << 20 {
-                    format!("{}M", b >> 20)
-                } else if b >= 1 << 10 {
-                    format!("{}K", b >> 10)
-                } else {
-                    format!("{b}")
-                }
-            };
-            match (from, to) {
-                (None, Some(t)) => format!("< {}", h(t)),
-                (Some(f), Some(t)) => format!("{} – {}", h(f), h(t)),
-                (Some(f), None) => format!("≥ {}", h(f)),
-                _ => "all".into(),
+/// The aggregation request for one bucket table.
+fn range_spec(field: &str, buckets: &[RangeBucket]) -> serde_json::Value {
+    let ranges: Vec<serde_json::Value> = buckets
+        .iter()
+        .map(|b| {
+            let mut m = serde_json::Map::new();
+            if let Some(f) = b.from {
+                m.insert("from".into(), (f as f64).into());
             }
-        }
-        FacetField::ModifiedBucket => {
-            let days = |v: f64| ((now as f64 - v) / 86_400_000_000_000.0).round() as i64;
-            match (from, to) {
-                (Some(f), None) => format!("last {} day(s)", days(f)),
-                (Some(f), Some(t)) => format!("{}–{} days ago", days(t), days(f)),
-                (None, Some(t)) => format!("older than {} days", days(t)),
-                _ => "all".into(),
+            if let Some(t) = b.to {
+                m.insert("to".into(), (t as f64).into());
             }
-        }
-        _ => String::new(),
+            serde_json::Value::Object(m)
+        })
+        .collect();
+    serde_json::json!({"range": {"field": field, "ranges": ranges}})
+}
+
+/// Match a returned bucket boundary against the table it was built from.
+/// Boundaries are whole bytes or UTC-midnight nanoseconds, both exactly
+/// representable as `f64`, so the comparison is exact.
+fn bound_eq(returned: Option<&serde_json::Value>, want: Option<i64>) -> bool {
+    match (returned.and_then(|v| v.as_f64()), want) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b as f64,
+        _ => false,
     }
 }
 

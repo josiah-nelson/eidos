@@ -234,6 +234,32 @@ pub struct FacetValue {
     pub count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Bounds and ready-made clauses for range buckets (size, modification
+    /// time). Absent for term facets and whenever the result mode has no
+    /// clause that reproduces the bucket exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<FacetRange>,
+}
+
+/// The exact boundaries of one range facet bucket plus the query text that
+/// selects or excludes it.
+///
+/// The interval is half-open — `from` is inclusive, `to` is exclusive — and
+/// either end may be open. Sizes are bytes; times are Unix nanoseconds, and
+/// the clauses spell the boundaries as UTC dates. Clients append `clause` or
+/// `exclude` verbatim and never re-derive boundaries; both are written so
+/// that parsing them yields exactly this bucket in the result mode the
+/// response was produced for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FacetRange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<i64>,
+    /// Query text selecting exactly this bucket, e.g. `size:>=1M size:<16M`.
+    pub clause: String,
+    /// Query text excluding exactly this bucket, e.g. `-(size:>=1M size:<16M)`.
+    pub exclude: String,
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ pub mod api;
 pub mod content_workers;
 pub mod follower;
 pub mod scanner;
+pub mod source_budget;
 pub mod state;
 #[cfg(windows)]
 pub mod usn_apply;

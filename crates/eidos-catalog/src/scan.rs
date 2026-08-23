@@ -7,11 +7,16 @@
 //! - `finish` tombstones entries that were not re-observed *under
 //!   directories that were successfully listed*, cascades deletions,
 //!   rebuilds aggregates, and flips `published_generation` — all in one
-//!   transaction.
+//!   transaction. [`PublishOptions`] lets the caller commit the change-feed
+//!   checkpoint in that same transaction and publish in a `degraded` state,
+//!   so a native scan's "replay overlapping changes → publish → checkpoint"
+//!   sequence has no window in which the generation looks complete while the
+//!   replayed state is not durable.
 //! - `abort` (or crash recovery) never publishes; the previous generation
 //!   remains the published truth and the source becomes `degraded`.
 
 use crate::aggregates;
+use crate::changes::{clear_checkpoint_conn, set_checkpoint_conn, Checkpoint};
 use crate::model::SourceRecord;
 use crate::policy::{ContentDecision, PolicyCtx, PolicyEngine};
 use crate::{Catalog, CatalogError, RecoveryReport, Result};
@@ -64,6 +69,22 @@ pub struct ScanSummary {
     pub elapsed_ms: f64,
     pub published: bool,
     pub final_state: SourceState,
+}
+
+/// How a generation is published (see [`ScanSession::finish_with`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PublishOptions<'a> {
+    /// Change-feed checkpoint to store in the publish transaction: the feed
+    /// position up to which overlapping changes have been applied to this
+    /// generation.
+    pub checkpoint: Option<&'a Checkpoint>,
+    /// Drop any stored checkpoint in the publish transaction (the feed can
+    /// no longer continue from it; a watcher will reconcile again).
+    pub clear_checkpoint: bool,
+    /// Publish the generation but leave the source `degraded` with this
+    /// reason (e.g. the feed wrapped during enumeration, so some overlapping
+    /// changes may be missing until the next reconciliation).
+    pub degraded: Option<&'a str>,
 }
 
 pub struct ScanSession {
@@ -514,7 +535,14 @@ impl ScanSession {
     ///
     /// A generation whose *root* could not be listed is never published: it
     /// would otherwise look like a complete, empty source.
-    pub fn finish(mut self) -> Result<ScanSummary> {
+    pub fn finish(self) -> Result<ScanSummary> {
+        self.finish_with(&PublishOptions::default())
+    }
+
+    /// [`finish`](Self::finish) with an explicit publication policy: the
+    /// checkpoint (if any) and the source state flip commit atomically with
+    /// the generation.
+    pub fn finish_with(mut self, opts: &PublishOptions<'_>) -> Result<ScanSummary> {
         self.commit()?;
         if self.unlisted.contains(&self.root) {
             // An unreachable root (not found / transient network failure)
@@ -604,7 +632,9 @@ impl ScanSession {
             params![sid],
             |r| r.get(0),
         )?;
-        let final_state = if pending > 0 {
+        let final_state = if opts.degraded.is_some() {
+            SourceState::Degraded
+        } else if pending > 0 {
             SourceState::ContentPending
         } else {
             SourceState::MetadataComplete
@@ -622,19 +652,27 @@ impl ScanSession {
                 (tomb_entries + tomb_objects) as i64
             ],
         )?;
-        let reason = if self.stats.errors > 0 {
-            Some(format!(
+        let mut reasons: Vec<String> = Vec::new();
+        if let Some(d) = opts.degraded {
+            reasons.push(d.to_string());
+        }
+        if self.stats.errors > 0 {
+            reasons.push(format!(
                 "{} directories could not be listed; their previous contents were preserved",
                 self.stats.errors
-            ))
-        } else {
-            None
-        };
+            ));
+        }
+        let reason = (!reasons.is_empty()).then(|| reasons.join("; "));
         self.conn.execute(
             "UPDATE sources SET published_generation = ?2, state = ?3, state_reason = ?4, last_scan_completed_at = ?5, updated_at = ?5
              WHERE source_id = ?1",
             params![sid, gen, final_state.as_str(), reason, now],
         )?;
+        if let Some(cp) = opts.checkpoint {
+            set_checkpoint_conn(&self.conn, self.source.id, cp)?;
+        } else if opts.clear_checkpoint {
+            clear_checkpoint_conn(&self.conn, self.source.id)?;
+        }
         self.conn.execute_batch("COMMIT")?;
         self.in_tx = false;
         self.stats.commits += 1;

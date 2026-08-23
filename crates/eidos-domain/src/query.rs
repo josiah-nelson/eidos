@@ -196,6 +196,9 @@ pub enum TimeField {
     Created,
     Changed,
     Accessed,
+    /// Newest modification time anywhere beneath a directory. Like the other
+    /// subtree predicates it only matches directories.
+    SubtreeModified,
 }
 
 /// Which object kinds to return as top-level results.
