@@ -2135,11 +2135,8 @@ pub fn search_with_content(
         &in_scope.iter().map(|s| s.id).collect::<Vec<_>>(),
         &mut warnings,
     )?;
-    if content_index.is_some_and(|c| c.is_rebuilding()) {
-        warnings.push(
-            "the content index is being rebuilt from stored chunks; content results are partial until it finishes"
-                .into(),
-        );
+    if let Some(reason) = content_index.and_then(|c| c.content_incomplete_reason()) {
+        warnings.push(reason);
         for c in completeness.iter_mut() {
             c.content_complete = false;
         }

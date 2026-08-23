@@ -198,7 +198,10 @@ fn worker_loop(state: &AppState, name: &str) {
         if state.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        if !state.content_enabled.load(Ordering::Relaxed) {
+        if !state.content_enabled.load(Ordering::Relaxed) || state.content_index.is_rebuilding() {
+            // Nothing is claimed while the index is being rebuilt: the
+            // rebuild owns the writer, and a claimed job would only sit on
+            // the gate holding its source budget.
             std::thread::sleep(IDLE_SLEEP);
             continue;
         }
@@ -326,7 +329,10 @@ fn coordinator_loop(state: &AppState) {
         }
         let uncommitted = state.content_index.uncommitted();
         let pending = status.pending_publish.lock().len();
-        if (pending > 0 || uncommitted > 0)
+        // A rebuild owns the writer; commits resume when it is done.
+        let rebuilding = state.content_index.is_rebuilding();
+        if !rebuilding
+            && (pending > 0 || uncommitted > 0)
             && (last_commit.elapsed() >= COMMIT_INTERVAL || uncommitted >= COMMIT_DOCS)
         {
             if let Err(e) = commit_and_publish(state) {
