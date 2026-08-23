@@ -32,17 +32,37 @@ miss the 30-second gate.
 next_usn, volume_root}`. The native scan sequence is:
 
 1. `FSCTL_QUERY_USN_JOURNAL` → pending checkpoint `(journal_id, next_usn)`.
-2. Full enumeration + publish (Milestone 1 path, `kind = reconcile` when a
-   generation already exists).
-3. Replay records from the pending USN to the present, applying each batch
-   with its own checkpoint.
-4. Store the checkpoint; start/continue the watcher.
+2. Full enumeration into an open generation (Milestone 1 path,
+   `kind = reconcile` when a generation already exists). The source stays
+   `enumerating`/`reconciling`.
+3. Replay records from the pending USN to the present **into the open
+   generation** (`Catalog::apply_changes` stamps rows it creates or
+   re-observes with the open generation so the publish step does not
+   tombstone them as unobserved; no checkpoint is stored yet).
+4. Publish the generation and store the checkpoint **in one transaction**
+   (`ScanSession::finish_with`); start/continue the watcher.
 
-The checkpoint is written **in the same SQLite transaction** as the catalog
-rows, aggregate deltas, and outbox rows it covers (`Catalog::apply_changes`).
-A crash cannot leave the checkpoint ahead of durable state. Derived indexes
-(Milestone 3) consume the outbox, so "enough durable state exists to replay
-downstream work" holds without coupling the feed to index commits.
+The source is therefore never advertised as complete while overlapping
+changes are still pending, and a checkpoint is never durable without the
+publication it belongs to. Failure windows:
+
+- the journal wraps during enumeration → the enumerated generation is
+  published `degraded` ("another reconciliation is required") with the
+  checkpoint cleared, so the watcher reconciles again;
+- the feed cannot be read, or a batch cannot be applied → the generation is
+  aborted; the previous published generation and its checkpoint (if any)
+  stay in force and the source is `degraded` with the reason. A watcher
+  that has to re-establish a checkpoint waits 30 s after a failed
+  reconciliation before starting another;
+- a crash during replay → crash recovery aborts the open generation exactly
+  as for any interrupted scan.
+
+For live batches the checkpoint is written **in the same SQLite
+transaction** as the catalog rows, aggregate deltas, and outbox rows it
+covers (`Catalog::apply_changes`). A crash cannot leave the checkpoint ahead
+of durable state. Derived indexes (Milestone 3) consume the outbox, so
+"enough durable state exists to replay downstream work" holds without
+coupling the feed to index commits.
 
 ### Event normalisation
 
