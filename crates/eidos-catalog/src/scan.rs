@@ -556,6 +556,7 @@ impl ScanSession {
         // 1. Entries not re-observed under directories we listed this generation.
         let mut tomb_entries = self.conn.execute(
             "UPDATE entries SET deleted_at = ?3 WHERE source_id = ?1 AND deleted_at IS NULL AND last_seen_generation < ?2
+               AND is_virtual = 0
                AND parent_id IN (SELECT object_id FROM objects WHERE source_id = ?1 AND listed_generation = ?2)",
             params![sid, gen, now],
         )? as u64;

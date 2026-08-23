@@ -145,6 +145,10 @@ pub struct DirectorySummary {
     pub directory_count: u64,
     pub logical_bytes: u64,
     pub allocated_bytes: u64,
+    /// Kept separate from physical apparent bytes.
+    pub archive_declared_bytes: u64,
+    /// Kept separate from physical allocated bytes.
+    pub archive_compressed_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newest_modified: Option<UnixNanos>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

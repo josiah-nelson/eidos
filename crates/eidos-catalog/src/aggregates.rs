@@ -17,6 +17,8 @@ pub struct Acc {
     pub dir_count: u64,
     pub logical: u64,
     pub allocated: u64,
+    pub archive_declared: u64,
+    pub archive_compressed: u64,
     pub newest: Option<i64>,
     pub oldest: Option<i64>,
     pub pending: u64,
@@ -36,6 +38,8 @@ impl Default for Acc {
             dir_count: 0,
             logical: 0,
             allocated: 0,
+            archive_declared: 0,
+            archive_compressed: 0,
             newest: None,
             oldest: None,
             pending: 0,
@@ -69,11 +73,26 @@ impl Acc {
         e.1 += size;
     }
 
-    fn merge_child(&mut self, child: &Acc) {
+    fn add_virtual_file(&mut self, ext: &str, declared: u64, compressed: u64, mtime: Option<i64>) {
+        self.file_count += 1;
+        self.archive_declared += declared;
+        self.archive_compressed += compressed;
+        if let Some(m) = mtime {
+            self.newest = Some(self.newest.map_or(m, |n| n.max(m)));
+            self.oldest = Some(self.oldest.map_or(m, |o| o.min(m)));
+        }
+        // Counts participate in `has:` uniformly, but physical extension
+        // bytes remain physical; declared archive bytes have their own field.
+        self.ext.entry(ext.to_string()).or_insert((0, 0)).0 += 1;
+    }
+
+    fn merge_contents(&mut self, child: &Acc) {
         self.file_count += child.file_count;
-        self.dir_count += child.dir_count + 1;
+        self.dir_count += child.dir_count;
         self.logical += child.logical;
         self.allocated += child.allocated;
+        self.archive_declared += child.archive_declared;
+        self.archive_compressed += child.archive_compressed;
         if let Some(m) = child.newest {
             self.newest = Some(self.newest.map_or(m, |n| n.max(m)));
         }
@@ -90,6 +109,11 @@ impl Acc {
             e.0 += c;
             e.1 += b;
         }
+    }
+
+    fn merge_child(&mut self, child: &Acc) {
+        self.merge_contents(child);
+        self.dir_count += 1;
     }
 }
 
@@ -114,7 +138,8 @@ pub fn rebuild_source(
         let mut stmt = conn.prepare_cached(
             "SELECT e.parent_id, e.object_id, e.extension, o.kind, o.size, o.allocated, o.modified, o.content_state
              FROM entries e JOIN objects o ON o.object_id = e.object_id
-             WHERE e.source_id = ?1 AND e.deleted_at IS NULL AND o.deleted_at IS NULL AND e.parent_id IS NOT NULL",
+             WHERE e.source_id = ?1 AND e.deleted_at IS NULL AND o.deleted_at IS NULL
+               AND e.is_virtual = 0 AND e.parent_id IS NOT NULL",
         )?;
         let mut rows = stmt.query(params![source_id.0])?;
         while let Some(r) = rows.next()? {
@@ -162,8 +187,9 @@ pub fn rebuild_source(
 
     let mut ins_agg = conn.prepare_cached(
         "INSERT INTO directory_aggregates (object_id, source_id, file_count, dir_count, logical_bytes, allocated_bytes,
-            newest_modified, oldest_modified, content_pending, content_indexed, content_failed, content_excluded, generation, complete)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            archive_declared_bytes, archive_compressed_bytes, newest_modified, oldest_modified,
+            content_pending, content_indexed, content_failed, content_excluded, generation, complete)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
     )?;
     let mut ins_ext = conn.prepare_cached(
         "INSERT INTO directory_extension_counts (object_id, extension, count, bytes) VALUES (?1, ?2, ?3, ?4)",
@@ -180,26 +206,7 @@ pub fn rebuild_source(
         if let Some(o) = own.remove(dir) {
             // Own files were accumulated separately from children merges.
             let mut merged = o;
-            merged.dir_count += a.dir_count;
-            merged.file_count += a.file_count;
-            merged.logical += a.logical;
-            merged.allocated += a.allocated;
-            merged.pending += a.pending;
-            merged.indexed += a.indexed;
-            merged.failed += a.failed;
-            merged.excluded += a.excluded;
-            merged.complete &= a.complete;
-            if let Some(m) = a.newest {
-                merged.newest = Some(merged.newest.map_or(m, |n| n.max(m)));
-            }
-            if let Some(m) = a.oldest {
-                merged.oldest = Some(merged.oldest.map_or(m, |o| o.min(m)));
-            }
-            for (k, (c, b)) in a.ext.drain() {
-                let e = merged.ext.entry(k).or_insert((0, 0));
-                e.0 += c;
-                e.1 += b;
-            }
+            merged.merge_contents(&a);
             a = merged;
         }
         if unlisted.contains(dir) {
@@ -212,6 +219,8 @@ pub fn rebuild_source(
             a.dir_count as i64,
             a.logical as i64,
             a.allocated as i64,
+            a.archive_declared as i64,
+            a.archive_compressed as i64,
             a.newest,
             a.oldest,
             a.pending as i64,
@@ -230,6 +239,35 @@ pub fn rebuild_source(
             acc.entry(*p).or_default().merge_child(&a);
         }
     }
+    drop(ins_agg);
+    drop(ins_ext);
+
+    // Virtual trees hang beneath file objects, so reduce each archive
+    // separately and add its counts/declared bytes to every physical link of
+    // the container. Physical logical/allocated bytes remain untouched.
+    let containers: Vec<ObjectId> = conn
+        .prepare_cached(
+            "SELECT DISTINCT archive_container_id FROM objects
+             WHERE source_id = ?1 AND archive_container_id IS NOT NULL AND deleted_at IS NULL",
+        )?
+        .query_map(params![source_id.0], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(ObjectId)
+        .collect();
+    for container in containers {
+        let archive = rebuild_archive(conn, source_id, container, generation)?;
+        apply_to_parents(conn, container, &archive.delta)?;
+        stats.directories += archive.directories;
+        stats.extension_rows += archive.extension_rows;
+        conn.execute(
+            "UPDATE archive_records SET aggregate_generation = generation
+             WHERE object_id = ?1 AND generation = (
+                 SELECT generation FROM objects WHERE object_id = ?1
+             )",
+            params![container.0],
+        )?;
+    }
     Ok(stats)
 }
 
@@ -240,6 +278,8 @@ pub struct AggDelta {
     pub dir_count: i64,
     pub logical: i64,
     pub allocated: i64,
+    pub archive_declared: i64,
+    pub archive_compressed: i64,
     pub pending: i64,
     pub indexed: i64,
     pub failed: i64,
@@ -275,6 +315,8 @@ impl AggDelta {
             dir_count: -self.dir_count,
             logical: -self.logical,
             allocated: -self.allocated,
+            archive_declared: -self.archive_declared,
+            archive_compressed: -self.archive_compressed,
             pending: -self.pending,
             indexed: -self.indexed,
             failed: -self.failed,
@@ -291,7 +333,9 @@ impl AggDelta {
     /// Build the delta that represents an entire subtree (for moves).
     pub fn from_subtree(conn: &Connection, dir: ObjectId) -> Result<Self> {
         let row = conn.query_row(
-            "SELECT file_count, dir_count, logical_bytes, allocated_bytes, content_pending, content_indexed, content_failed, content_excluded
+            "SELECT file_count, dir_count, logical_bytes, allocated_bytes,
+                    archive_declared_bytes, archive_compressed_bytes,
+                    content_pending, content_indexed, content_failed, content_excluded
              FROM directory_aggregates WHERE object_id = ?1",
             params![dir.0],
             |r| {
@@ -300,10 +344,12 @@ impl AggDelta {
                     dir_count: r.get::<_, i64>(1)? + 1,
                     logical: r.get(2)?,
                     allocated: r.get(3)?,
-                    pending: r.get(4)?,
-                    indexed: r.get(5)?,
-                    failed: r.get(6)?,
-                    excluded: r.get(7)?,
+                    archive_declared: r.get(4)?,
+                    archive_compressed: r.get(5)?,
+                    pending: r.get(6)?,
+                    indexed: r.get(7)?,
+                    failed: r.get(8)?,
+                    excluded: r.get(9)?,
                     ext: Vec::new(),
                     touch_modified: None,
                 })
@@ -319,6 +365,197 @@ impl AggDelta {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct ArchiveAggStats {
+    pub delta: AggDelta,
+    pub directories: u64,
+    pub extension_rows: u64,
+}
+
+/// Current contribution of one live virtual tree to each physical directory
+/// containing the archive. This is cheap enough to subtract before replacing
+/// or retiring a manifest generation.
+pub fn archive_delta(conn: &Connection, container: ObjectId) -> Result<AggDelta> {
+    let (files, dirs, declared, compressed): (i64, i64, i64, i64) = conn.query_row(
+        "SELECT
+             COALESCE(SUM(o.kind = 'virtual_file'), 0),
+             COALESCE(SUM(o.kind = 'virtual_directory'), 0),
+             COALESCE(SUM(CASE WHEN o.kind = 'virtual_file' THEN o.size ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN o.kind = 'virtual_file' THEN am.compressed ELSE 0 END), 0)
+         FROM objects o
+         LEFT JOIN archive_members am
+           ON am.object_id = o.archive_container_id
+          AND am.generation = o.archive_generation
+          AND am.ordinal = o.archive_member_ordinal
+         WHERE o.archive_container_id = ?1 AND o.deleted_at IS NULL",
+        params![container.0],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let ext = conn
+        .prepare_cached(
+            "SELECT e.extension, COUNT(*) FROM entries e
+             JOIN objects o ON o.object_id = e.object_id
+             WHERE o.archive_container_id = ?1 AND o.kind = 'virtual_file'
+               AND o.deleted_at IS NULL AND e.deleted_at IS NULL
+             GROUP BY e.extension",
+        )?
+        .query_map(params![container.0], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, 0))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(AggDelta {
+        file_count: files,
+        dir_count: dirs,
+        archive_declared: declared,
+        archive_compressed: compressed,
+        ext,
+        ..Default::default()
+    })
+}
+
+/// Apply one archive contribution once for every live physical entry of its
+/// container (hard links count once per entry, matching ordinary file sizes).
+pub fn apply_to_parents(conn: &Connection, container: ObjectId, delta: &AggDelta) -> Result<u32> {
+    let parents = conn
+        .prepare_cached(
+            "SELECT parent_id FROM entries
+             WHERE object_id = ?1 AND is_virtual = 0 AND deleted_at IS NULL
+               AND parent_id IS NOT NULL",
+        )?
+        .query_map(params![container.0], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut touched = 0;
+    for parent in parents {
+        touched += apply_delta(conn, ObjectId(parent), delta)?;
+    }
+    Ok(touched)
+}
+
+/// Rebuild aggregate rows inside one archive and return the whole virtual
+/// tree's contribution. The container itself is a transparent topology edge:
+/// it remains a physical file while its members reduce into its parent dirs.
+pub fn rebuild_archive(
+    conn: &Connection,
+    source_id: SourceId,
+    container: ObjectId,
+    generation: i64,
+) -> Result<ArchiveAggStats> {
+    let mut children: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    let mut parents: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let mut own: HashMap<ObjectId, Acc> = HashMap::new();
+    let mut dirs = HashSet::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT e.parent_id, o.object_id, e.extension, o.kind, o.size, o.modified,
+                    COALESCE(am.compressed, 0)
+             FROM objects o JOIN entries e ON e.object_id = o.object_id
+             LEFT JOIN archive_members am
+               ON am.object_id = o.archive_container_id
+              AND am.generation = o.archive_generation
+              AND am.ordinal = o.archive_member_ordinal
+             WHERE o.archive_container_id = ?1 AND o.deleted_at IS NULL
+               AND e.deleted_at IS NULL",
+        )?;
+        let mut rows = stmt.query(params![container.0])?;
+        while let Some(r) = rows.next()? {
+            let parent = ObjectId(r.get::<_, i64>(0)?);
+            let object = ObjectId(r.get::<_, i64>(1)?);
+            let ext: String = r.get(2)?;
+            let kind: String = r.get(3)?;
+            if kind == ObjectKind::VirtualDirectory.as_str() {
+                dirs.insert(object);
+                parents.insert(object, parent);
+                children.entry(parent).or_default().push(object);
+            } else {
+                own.entry(parent).or_default().add_virtual_file(
+                    &ext,
+                    r.get::<_, i64>(4)? as u64,
+                    r.get::<_, i64>(6)? as u64,
+                    r.get(5)?,
+                );
+            }
+        }
+    }
+
+    let mut order = Vec::with_capacity(dirs.len());
+    let mut queue: Vec<ObjectId> = dirs
+        .iter()
+        .filter(|d| parents.get(d).is_none_or(|p| !dirs.contains(p)))
+        .copied()
+        .collect();
+    let mut i = 0;
+    while i < queue.len() {
+        let dir = queue[i];
+        order.push(dir);
+        if let Some(kids) = children.get(&dir) {
+            queue.extend(kids);
+        }
+        i += 1;
+    }
+    if order.len() != dirs.len() {
+        return Err(crate::CatalogError::InvalidState(format!(
+            "archive {container} virtual directory graph is cyclic"
+        )));
+    }
+
+    let mut acc: HashMap<ObjectId, Acc> = HashMap::new();
+    let mut total = own.remove(&container).unwrap_or_default();
+    let mut stats = ArchiveAggStats::default();
+    let mut ins_agg = conn.prepare_cached(
+        "INSERT OR REPLACE INTO directory_aggregates (object_id, source_id, file_count,
+             dir_count, logical_bytes, allocated_bytes, archive_declared_bytes,
+             archive_compressed_bytes, newest_modified, oldest_modified, content_pending,
+             content_indexed, content_failed, content_excluded, generation, complete)
+         VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, ?6, ?7, ?8, 0, 0, 0, 0, ?9, 1)",
+    )?;
+    let mut ins_ext = conn.prepare_cached(
+        "INSERT OR REPLACE INTO directory_extension_counts (object_id, extension, count, bytes)
+         VALUES (?1, ?2, ?3, 0)",
+    )?;
+    for dir in order.into_iter().rev() {
+        let mut a = own.remove(&dir).unwrap_or_default();
+        if let Some(descendants) = acc.remove(&dir) {
+            a.merge_contents(&descendants);
+        }
+        ins_agg.execute(params![
+            dir.0,
+            source_id.0,
+            a.file_count as i64,
+            a.dir_count as i64,
+            a.archive_declared as i64,
+            a.archive_compressed as i64,
+            a.newest,
+            a.oldest,
+            generation,
+        ])?;
+        stats.directories += 1;
+        for (ext, (count, _)) in &a.ext {
+            ins_ext.execute(params![dir.0, ext, *count as i64])?;
+            stats.extension_rows += 1;
+        }
+        match parents.get(&dir).copied() {
+            Some(parent) if dirs.contains(&parent) => {
+                acc.entry(parent).or_default().merge_child(&a);
+            }
+            _ => total.merge_child(&a),
+        }
+    }
+    stats.delta = AggDelta {
+        file_count: total.file_count as i64,
+        dir_count: total.dir_count as i64,
+        archive_declared: total.archive_declared as i64,
+        archive_compressed: total.archive_compressed as i64,
+        ext: total
+            .ext
+            .into_iter()
+            .map(|(ext, (count, _))| (ext, count as i64, 0))
+            .collect(),
+        touch_modified: total.newest.map(UnixNanos),
+        ..Default::default()
+    };
+    Ok(stats)
+}
+
 /// Apply `delta` to `dir` and every ancestor up to the source root. Must run
 /// inside a transaction. Returns the number of directories touched.
 pub fn apply_delta(conn: &Connection, dir: ObjectId, delta: &AggDelta) -> Result<u32> {
@@ -326,9 +563,11 @@ pub fn apply_delta(conn: &Connection, dir: ObjectId, delta: &AggDelta) -> Result
         "UPDATE directory_aggregates SET
             file_count = file_count + ?2, dir_count = dir_count + ?3,
             logical_bytes = logical_bytes + ?4, allocated_bytes = allocated_bytes + ?5,
-            content_pending = content_pending + ?6, content_indexed = content_indexed + ?7,
-            content_failed = content_failed + ?8, content_excluded = content_excluded + ?9,
-            newest_modified = CASE WHEN ?10 IS NOT NULL AND (newest_modified IS NULL OR ?10 > newest_modified) THEN ?10 ELSE newest_modified END
+            archive_declared_bytes = archive_declared_bytes + ?6,
+            archive_compressed_bytes = archive_compressed_bytes + ?7,
+            content_pending = content_pending + ?8, content_indexed = content_indexed + ?9,
+            content_failed = content_failed + ?10, content_excluded = content_excluded + ?11,
+            newest_modified = CASE WHEN ?12 IS NOT NULL AND (newest_modified IS NULL OR ?12 > newest_modified) THEN ?12 ELSE newest_modified END
          WHERE object_id = ?1",
     )?;
     let mut upd_ext = conn.prepare_cached(
@@ -356,6 +595,8 @@ pub fn apply_delta(conn: &Connection, dir: ObjectId, delta: &AggDelta) -> Result
             delta.dir_count,
             delta.logical,
             delta.allocated,
+            delta.archive_declared,
+            delta.archive_compressed,
             delta.pending,
             delta.indexed,
             delta.failed,

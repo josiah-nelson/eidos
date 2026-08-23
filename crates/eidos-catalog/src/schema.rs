@@ -360,6 +360,14 @@ CREATE UNIQUE INDEX entries_virtual_object
     ON entries (object_id) WHERE is_virtual = 1;
 "#,
     ),
+    (
+        "separate archive size aggregates",
+        r#"
+ALTER TABLE directory_aggregates ADD COLUMN archive_declared_bytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE directory_aggregates ADD COLUMN archive_compressed_bytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE archive_records ADD COLUMN aggregate_generation INTEGER;
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.
@@ -393,7 +401,7 @@ mod tests {
     fn migrations_apply_once_and_are_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         let first = migrate(&mut conn).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7]);
         let second = migrate(&mut conn).unwrap();
         assert!(second.is_empty());
         let v: i64 = conn

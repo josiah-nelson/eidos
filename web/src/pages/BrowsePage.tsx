@@ -54,9 +54,17 @@ export default function BrowsePage() {
       rows.map((r) => ({
         id: r.object.id,
         label: r.entry.name,
-        value: r.object.kind === 'directory' ? (r.aggregate?.logical_bytes ?? 0) : r.object.size,
-        isDir: r.object.kind === 'directory',
-        detail: r.object.kind === 'directory' ? `${count(r.aggregate?.file_count)} files` : undefined,
+        value:
+          r.object.kind === 'virtual_directory'
+            ? (r.aggregate?.archive_declared_bytes ?? 0)
+            : r.object.kind === 'directory'
+              ? (r.aggregate?.logical_bytes ?? 0)
+              : r.object.size,
+        isDir: r.object.kind === 'directory' || r.object.kind === 'virtual_directory',
+        detail:
+          r.object.kind === 'directory' || r.object.kind === 'virtual_directory'
+            ? `${count(r.aggregate?.file_count)} files`
+            : undefined,
       })),
     [rows],
   )
@@ -93,6 +101,13 @@ export default function BrowsePage() {
                 · subtree {count(object.data.aggregate.file_count)} files, {count(object.data.aggregate.dir_count)}{' '}
                 dirs · apparent {bytes(object.data.aggregate.logical_bytes)} · allocated{' '}
                 {bytes(object.data.aggregate.allocated_bytes)}
+                {object.data.aggregate.archive_declared_bytes > 0 && (
+                  <>
+                    {' '}
+                    · archive declared {bytes(object.data.aggregate.archive_declared_bytes)} · compressed{' '}
+                    {bytes(object.data.aggregate.archive_compressed_bytes)}
+                  </>
+                )}
                 {!object.data.aggregate.complete && (
                   <>
                     {' '}
@@ -279,7 +294,7 @@ function ChildrenTable({
       <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
         {items.map((vi) => {
           const r = rows[vi.index]
-          const isDir = r.object.kind === 'directory'
+          const isDir = r.object.kind === 'directory' || r.object.kind === 'virtual_directory'
           const agg = r.aggregate
           return (
             <div
@@ -298,7 +313,15 @@ function ChildrenTable({
                 )}
                 {!isDir && r.object.link_count > 1 && <span className="badge info">{r.object.link_count} links</span>}
               </div>
-              <div className="col num">{bytes(isDir ? agg?.logical_bytes : r.object.size)}</div>
+              <div className="col num">
+                {bytes(
+                  r.object.kind === 'virtual_directory'
+                    ? agg?.archive_declared_bytes
+                    : isDir
+                      ? agg?.logical_bytes
+                      : r.object.size,
+                )}
+              </div>
               <div className="col num">{bytes(isDir ? agg?.allocated_bytes : r.object.allocated)}</div>
               <div className="col num muted">{isDir ? count(agg?.file_count) : ''}</div>
               <div className="col num muted">{isDir ? count(agg?.dir_count) : ''}</div>

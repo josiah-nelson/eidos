@@ -116,7 +116,8 @@ fn archive_generation_is_current(conn: &Connection, rec: &ArchiveRecord) -> Resu
 fn archive_generation_is_published(conn: &Connection, rec: &ArchiveRecord) -> Result<bool> {
     Ok(conn
         .query_row(
-            "SELECT (member_count + implicit_dir_count) = (
+            "SELECT COALESCE(aggregate_generation = generation, 0)
+               AND (member_count + implicit_dir_count) = (
                  SELECT COUNT(*) FROM objects v
                  WHERE v.archive_container_id = archive_records.object_id
                    AND v.archive_generation = archive_records.generation
@@ -187,6 +188,19 @@ pub(crate) fn retire_virtual_tree(
     container: ObjectId,
     now: i64,
 ) -> Result<(u64, u64)> {
+    let accounted = conn
+        .query_row(
+            "SELECT COALESCE(aggregate_generation = generation, 0) FROM archive_records
+             WHERE object_id = ?1",
+            params![container.0],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if accounted {
+        let delta = crate::aggregates::archive_delta(conn, container)?.negate();
+        crate::aggregates::apply_to_parents(conn, container, &delta)?;
+    }
     let entries = conn.execute(
         "UPDATE entries SET deleted_at = ?2
          WHERE is_virtual = 1 AND deleted_at IS NULL AND object_id IN (
@@ -211,6 +225,10 @@ pub(crate) fn retire_virtual_tree(
          WHERE archive_container_id = ?1 AND deleted_at IS NULL",
         params![container.0, now],
     )? as u64;
+    conn.execute(
+        "UPDATE archive_records SET aggregate_generation = NULL WHERE object_id = ?1",
+        params![container.0],
+    )?;
     Ok((entries, objects))
 }
 
@@ -232,6 +250,14 @@ fn publish_virtual_tree(conn: &Connection, rec: &ArchiveRecord) -> Result<()> {
          )",
         params![rec.object_id.0, rec.generation as i64],
     )?;
+    let source_generation: i64 = conn.query_row(
+        "SELECT COALESCE(published_generation, 0) FROM sources WHERE source_id = ?1",
+        params![rec.source_id.0],
+        |r| r.get(0),
+    )?;
+    let archive =
+        crate::aggregates::rebuild_archive(conn, rec.source_id, rec.object_id, source_generation)?;
+    crate::aggregates::apply_to_parents(conn, rec.object_id, &archive.delta)?;
     outbox_append_conn(
         conn,
         rec.source_id,
@@ -255,15 +281,16 @@ fn upsert_archive_record(tx: &rusqlite::Connection, rec: &ArchiveRecord) -> Resu
     tx.execute(
         "INSERT INTO archive_records (object_id, source_id, generation, format, member_count, dir_count,
             implicit_dir_count, suspicious_count, declared_size, compressed_size, claimed_entries, zip64,
-            truncated, comment, state, error, reason, processed_at, elapsed_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            truncated, comment, state, error, reason, processed_at, elapsed_ms, aggregate_generation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?3)
          ON CONFLICT(object_id) DO UPDATE SET source_id = excluded.source_id, generation = excluded.generation,
             format = excluded.format, member_count = excluded.member_count, dir_count = excluded.dir_count,
             implicit_dir_count = excluded.implicit_dir_count, suspicious_count = excluded.suspicious_count,
             declared_size = excluded.declared_size, compressed_size = excluded.compressed_size,
             claimed_entries = excluded.claimed_entries, zip64 = excluded.zip64, truncated = excluded.truncated,
             comment = excluded.comment, state = excluded.state, error = excluded.error, reason = excluded.reason,
-            processed_at = excluded.processed_at, elapsed_ms = excluded.elapsed_ms",
+            processed_at = excluded.processed_at, elapsed_ms = excluded.elapsed_ms,
+            aggregate_generation = excluded.aggregate_generation",
         params![
             rec.object_id.0,
             rec.source_id.0,
@@ -960,12 +987,15 @@ impl Catalog {
                                OR EXISTS (
                                    SELECT 1 FROM archive_records a
                                    WHERE a.object_id = o.object_id AND a.generation = o.generation
-                                     AND a.member_count + a.implicit_dir_count > 0
-                                     AND NOT EXISTS (
-                                         SELECT 1 FROM objects v
-                                         WHERE v.archive_container_id = o.object_id
-                                           AND v.archive_generation = o.generation
-                                           AND v.deleted_at IS NULL
+                                     AND (
+                                         a.aggregate_generation IS NULL
+                                         OR a.aggregate_generation != a.generation
+                                         OR (a.member_count + a.implicit_dir_count > 0 AND NOT EXISTS (
+                                             SELECT 1 FROM objects v
+                                             WHERE v.archive_container_id = o.object_id
+                                               AND v.archive_generation = o.generation
+                                               AND v.deleted_at IS NULL
+                                         ))
                                      )
                                )
                            )
