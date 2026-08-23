@@ -16,9 +16,17 @@ export type AggStats = { directories: ApiInt, extension_rows: ApiInt, unreachabl
 
 export type ApiErrorBody = { error: string, kind: string, };
 
+export type ArchiveMember = { ordinal: number, path: string, name: string, parent: string, raw_name: string, is_dir: boolean, implicit: boolean, size: ApiInt, compressed: ApiInt, method: number, crc32: number, modified: UnixNanos | null, encrypted: boolean, flags: number, };
+
+export type ArchiveQuery = { parent: string | null, prefix: string | null, offset: number, limit: number, };
+
+export type ArchiveRecord = { object_id: ObjectId, source_id: SourceId, generation: number, format: string, member_count: ApiInt, dir_count: ApiInt, implicit_dir_count: ApiInt, suspicious_count: ApiInt, declared_size: ApiInt, compressed_size: ApiInt, claimed_entries: ApiInt, zip64: boolean, truncated: boolean, comment: string | null, state: ContentState, error: string | null, reason: string | null, processed_at: UnixNanos, elapsed_ms: number, };
+
 export type ArchiveStats = { archives: ApiInt, members: ApiInt, declared_size: ApiInt, truncated: ApiInt, failed: ApiInt, };
 
 export type ArchiveSummary = { container_id: ObjectId, depth: number, member_path: string, compressed_size?: ApiInt, };
+
+export type ArchiveView = { object_id: ObjectId, path: string | null, record: ArchiveRecord, members: Array<ArchiveMember>, total: ApiInt, query: MemberQuery, };
 
 export type ChildRow = { entry: EntryRecord, object: ObjectRecord, aggregate: DirectoryAggregate | null, };
 
@@ -59,6 +67,14 @@ export type ErrorsQuery = { include_resolved: boolean, limit: number, };
 export type ExclusionRow = { stage: string, reason: string, count: ApiInt, bytes: ApiInt, };
 
 export type Explanation = { readable: string, steps: Array<PlanStep>, };
+
+export type ExportBody = { q?: string | null, query?: Query | null, mode: ResultMode, sort: Sort, format: ExportFormat, limit?: ApiInt | null, bom: boolean, include_retired: boolean, };
+
+export type ExportFormat = "csv" | "json" | "ndjson";
+
+export type ExportGetQuery = { q: string, format: ExportFormat, mode: ResultMode | null, sort: SortField | null, desc: boolean, limit: ApiInt | null, bom: boolean, include_retired: boolean, };
+
+export type ExportRow = { object_id: ApiInt, entry_id: ApiInt | null, source: string, kind: string, name: string, path: string | null, extension: string, size: ApiInt, allocated_size: ApiInt, modified: string | null, created: string | null, content_state: string, hard_link_count: number, score: number | null, };
 
 export type Facet = { field: FacetField, values: Array<FacetValue>, truncated: boolean, };
 
@@ -104,6 +120,8 @@ export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in
 
 export type LimitQuery = { limit: number, };
 
+export type MemberQuery = { parent: string | null, prefix: string | null, offset: number, limit: number, };
+
 export type NativeIdentity = { volume_serial: ApiInt, file_id_high: ApiInt, file_id_low: ApiInt, confidence: IdentityConfidence, };
 
 export type ObjectDetail = { object: ObjectRecord, path: string | null, entries: Array<EntryRecord>, aggregate: DirectoryAggregate | null, policy: Array<PolicyDecision>, source: SourceCompleteness, };
@@ -134,9 +152,13 @@ export type Priority = "catalog_critical" | "metadata_projection" | "small_text"
 
 export type Query = { "op": "all" } | { "op": "and", clauses: Array<Query>, } | { "op": "or", clauses: Array<Query>, } | { "op": "not", clause: Query, } | { "op": "text", field: TextField, mode: TextMode, value: string, case_sensitive: boolean, slop: number, } | { "op": "host", ids: Array<HostId>, } | { "op": "source", ids: Array<SourceId>, names?: Array<string>, } | { "op": "object", ids: Array<ObjectId>, } | { "op": "path", mode: PathMode, value: string, case_sensitive: boolean, } | { "op": "descendant_of", directory: ObjectId, max_depth?: number | null, } | { "op": "extension", values: Array<string>, } | { "op": "kind", values: Array<ObjectKind>, } | { "op": "size", field: SizeField, min?: ApiInt | null, max?: ApiInt | null, } | { "op": "time", field: TimeField, after?: UnixNanos | null, before?: UnixNanos | null, } | { "op": "attributes", all_of: number, none_of: number, } | { "op": "content_state", states: Array<ContentState>, } | { "op": "descendant_extension", extension: string, min_count: ApiInt, max_count?: ApiInt | null, } | { "op": "subtree_size", field: SizeField, min?: ApiInt | null, max?: ApiInt | null, } | { "op": "descendant_count", min?: ApiInt | null, max?: ApiInt | null, } | { "op": "archive", in_archive?: boolean | null, container?: ObjectId | null, max_depth?: number | null, };
 
+export type QueryMeta = { q: string | null, rendered: string, mode: ResultMode, sort: Sort, include_retired: boolean, ast: Query, };
+
 export type RebuildPhase = "idle" | "pending" | "running" | "failed";
 
 export type RebuildStatus = { phase: RebuildPhase, chunks: ApiInt, docs: ApiInt, elapsed_ms: ApiInt, error?: string, };
+
+export type RequeueView = { queued: ApiInt, };
 
 export type ResolveQuery = { source: ApiInt, path: string, };
 
@@ -157,6 +179,8 @@ export type ScanStats = { dirs_listed: ApiInt, entries_seen: ApiInt, errors: Api
 export type ScanSummary = { source_id: SourceId, generation: ApiInt, stats: ScanStats, tombstoned_entries: ApiInt, tombstoned_objects: ApiInt, aggregates: AggStats, elapsed_ms: number, published: boolean, final_state: SourceState, };
 
 export type SearchBody = { q?: string | null, query?: Query | null, mode: ResultMode, sort: Sort, limit: number, cursor?: string | null, explain: boolean, facets: Array<FacetRequest>, include_retired: boolean, count: CountPolicy, };
+
+export type SearchGetQuery = { q: string, mode: ResultMode | null, sort: SortField | null, desc: boolean, limit: number, cursor: string | null, explain: boolean, facets: string, count: CountPolicy, };
 
 export type SearchView = { query: Query, rendered: string, notes?: Array<string>, schema_version: number, hits: Array<Hit>, next_cursor?: string, total: TotalCount, timing: Timing, completeness: Array<SourceCompleteness>, explanation?: Explanation, facets?: Array<Facet>, warnings?: Array<string>, };
 

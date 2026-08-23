@@ -90,11 +90,15 @@ fn typescript_contract() -> String {
     types.add::<crate::api::ObjectDetail>();
     types.add::<crate::api::ChildrenQuery>();
     types.add::<crate::api::ChildrenView>();
+    types.add::<crate::api::ArchiveQuery>();
+    types.add::<crate::api::ArchiveView>();
+    types.add::<crate::api::RequeueView>();
     types.add::<crate::api::LimitQuery>();
     types.add::<crate::api::ResolveQuery>();
     types.add::<crate::api::ResolveView>();
     types.add::<crate::api::SearchBody>();
     types.add::<crate::api::SearchView>();
+    types.add::<crate::api::SearchGetQuery>();
     types.add::<crate::api::ParseQuery>();
     types.add::<crate::api::ParseView>();
     types.add::<crate::api::ContentPolicyBody>();
@@ -104,6 +108,10 @@ fn typescript_contract() -> String {
     types.add::<crate::content_preview::PreviewView>();
     types.add::<crate::retry_api::RetryBody>();
     types.add::<eidos_catalog::retry::RetryReport>();
+    types.add::<crate::export::ExportGetQuery>();
+    types.add::<crate::export::ExportBody>();
+    types.add::<crate::export::QueryMeta>();
+    types.add::<crate::export::ExportRow>();
 
     types.finish()
 }

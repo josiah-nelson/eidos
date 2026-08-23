@@ -603,8 +603,8 @@ async fn children(
     Ok(ApiJson(view))
 }
 
-#[derive(Deserialize)]
-struct ArchiveQuery {
+#[derive(Deserialize, TS)]
+pub(crate) struct ArchiveQuery {
     /// List the children of this virtual directory (`""` for the root).
     parent: Option<String>,
     /// List every member whose path starts with this prefix.
@@ -618,7 +618,7 @@ fn default_member_limit() -> u32 {
     200
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct ArchiveView {
     pub object_id: ObjectId,
     pub path: Option<String>,
@@ -664,7 +664,7 @@ async fn archive(
     Ok(ApiJson(view))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct RequeueView {
     pub queued: u64,
 }
@@ -849,8 +849,8 @@ async fn search(
     run_search(st, body).await
 }
 
-#[derive(Deserialize)]
-struct SearchGetQuery {
+#[derive(Deserialize, TS)]
+pub(crate) struct SearchGetQuery {
     #[serde(default)]
     q: String,
     #[serde(default)]

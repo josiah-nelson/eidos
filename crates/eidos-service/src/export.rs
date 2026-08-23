@@ -24,9 +24,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use ts_rs::TS;
 
 /// Version tag carried by every JSON/NDJSON export envelope.
-pub const EXPORT_SCHEMA: &str = "eidos-export/1";
+pub const EXPORT_SCHEMA: &str = "eidos-export/2";
 
 /// Stable column order of the CSV export; also the field order of a row in
 /// the JSON and NDJSON exports.
@@ -90,7 +91,7 @@ pub struct ExportStats {
 
 // ----- request -------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
     #[default]
@@ -130,7 +131,7 @@ fn de_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
 pub struct ExportGetQuery {
     #[serde(default)]
     q: String,
@@ -155,7 +156,8 @@ pub struct ExportGetQuery {
 /// POST body: the search body's query fields plus the export options. `limit`
 /// is the row cap of the whole export, not a page size, and `cursor` has no
 /// meaning here — the export always walks from the first row.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(optional_fields = nullable)]
 pub struct ExportBody {
     #[serde(default)]
     q: Option<String>,
@@ -168,6 +170,8 @@ pub struct ExportBody {
     #[serde(default)]
     format: ExportFormat,
     #[serde(default)]
+    #[ts(as = "Option<u64>")]
+    #[serde(with = "eidos_domain::json::option_u64_string")]
     limit: Option<u64>,
     #[serde(default)]
     bom: bool,
@@ -184,8 +188,8 @@ struct Plan {
     meta: QueryMeta,
 }
 
-#[derive(Debug, Serialize)]
-struct QueryMeta {
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct QueryMeta {
     /// The submitted query text, when the request used `q`.
     q: Option<String>,
     /// The compiled AST rendered back into query syntax.
@@ -497,7 +501,7 @@ async fn produce(
 /// One exported result. Unlike [`eidos_domain::Hit`], absent values are
 /// serialised as explicit `null` rather than omitted, so consumers can tell
 /// "unknown" from "not requested".
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
 pub struct ExportRow {
     pub object_id: i64,
     pub entry_id: Option<i64>,
@@ -596,7 +600,9 @@ fn write_csv_row(out: &mut Vec<u8>, r: &ExportRow) {
 // ----- envelopes -----------------------------------------------------------
 
 fn json_of<T: Serialize>(v: &T) -> String {
-    serde_json::to_string(v).unwrap_or_else(|_| "null".into())
+    crate::api_json::to_vec(v)
+        .map(|bytes| String::from_utf8(bytes).expect("JSON serialization must produce UTF-8"))
+        .unwrap_or_else(|_| "null".into())
 }
 
 fn write_header(out: &mut Vec<u8>, p: &Plan, first: &SearchResponse) {
