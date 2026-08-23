@@ -318,7 +318,7 @@ function HitTable({
       <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
         {items.map((vi) => {
           const h = hits[vi.index]
-          const isDir = h.kind === 'directory'
+          const isDir = h.kind === 'directory' || h.kind === 'virtual_directory'
           const parent = h.path ? h.path.slice(0, Math.max(0, h.path.lastIndexOf('\\'))) : ''
           const snippets = h.snippets ?? []
           return (
@@ -346,7 +346,15 @@ function HitTable({
               <div className="col mono muted" title={h.path}>
                 {parent}
               </div>
-              <div className="col num">{bytes(isDir ? h.directory?.logical_bytes : h.size)}</div>
+              <div className="col num">
+                {bytes(
+                  h.kind === 'virtual_directory'
+                    ? h.directory?.archive_declared_bytes
+                    : isDir
+                      ? h.directory?.logical_bytes
+                      : h.size,
+                )}
+              </div>
               <div className="col num muted">{isDir ? count(h.directory?.file_count) : ''}</div>
               <div className="col muted">{when(isDir ? h.directory?.newest_modified : h.modified)}</div>
               <div className="col">

@@ -480,8 +480,10 @@ pub(crate) fn light_counts_conn(conn: &Connection, src: &SourceRecord) -> Result
     if let Some(root) = src.root_object_id {
         if let Some(row) = conn
             .query_row(
-                "SELECT file_count, dir_count, logical_bytes, allocated_bytes, content_pending, content_indexed,
-                        content_failed, content_excluded FROM directory_aggregates WHERE object_id = ?1",
+                "SELECT file_count, dir_count, logical_bytes, allocated_bytes,
+                        archive_declared_bytes, archive_compressed_bytes, content_pending,
+                        content_indexed, content_failed, content_excluded
+                 FROM directory_aggregates WHERE object_id = ?1",
                 params![root.0],
                 |r| {
                     Ok((
@@ -493,6 +495,8 @@ pub(crate) fn light_counts_conn(conn: &Connection, src: &SourceRecord) -> Result
                         r.get::<_, i64>(5)?,
                         r.get::<_, i64>(6)?,
                         r.get::<_, i64>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, i64>(9)?,
                     ))
                 },
             )
@@ -502,10 +506,12 @@ pub(crate) fn light_counts_conn(conn: &Connection, src: &SourceRecord) -> Result
             c.directories = row.1 as u64;
             c.logical_bytes = row.2 as u64;
             c.allocated_bytes = row.3 as u64;
-            c.content_pending = row.4.max(0) as u64;
-            c.content_indexed = row.5.max(0) as u64;
-            c.content_failed = row.6.max(0) as u64;
-            c.content_excluded = row.7.max(0) as u64;
+            c.archive_declared_bytes = row.4 as u64;
+            c.archive_compressed_bytes = row.5 as u64;
+            c.content_pending = row.6.max(0) as u64;
+            c.content_indexed = row.7.max(0) as u64;
+            c.content_failed = row.8.max(0) as u64;
+            c.content_excluded = row.9.max(0) as u64;
         }
     }
     Ok(c)
@@ -547,9 +553,11 @@ pub(crate) fn source_counts_conn(conn: &Connection, id: SourceId) -> Result<Sour
         .optional()?
         .flatten()
     {
-        if let Some((f, d, lb, ab)) = conn
+        if let Some((f, d, lb, ab, declared, compressed)) = conn
             .query_row(
-                "SELECT file_count, dir_count, logical_bytes, allocated_bytes FROM directory_aggregates WHERE object_id = ?1",
+                "SELECT file_count, dir_count, logical_bytes, allocated_bytes,
+                        archive_declared_bytes, archive_compressed_bytes
+                 FROM directory_aggregates WHERE object_id = ?1",
                 params![root],
                 |r| {
                     Ok((
@@ -557,6 +565,8 @@ pub(crate) fn source_counts_conn(conn: &Connection, id: SourceId) -> Result<Sour
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
                     ))
                 },
             )
@@ -566,6 +576,8 @@ pub(crate) fn source_counts_conn(conn: &Connection, id: SourceId) -> Result<Sour
             c.directories = d as u64;
             c.logical_bytes = lb as u64;
             c.allocated_bytes = ab as u64;
+            c.archive_declared_bytes = declared as u64;
+            c.archive_compressed_bytes = compressed as u64;
         }
     }
     c.open_errors = conn.query_row(

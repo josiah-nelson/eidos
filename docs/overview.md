@@ -193,10 +193,11 @@ or nothing was indexed.
 
 ### 7.7 Archives
 
-Archive members are virtual entries linked to their container. v0.5 indexes
-ZIP central-directory names, topology, and declared sizes without extracting
-content. v1 adds recursive ZIP/RAR/7z/tar with limits on depth, member count,
-expanded bytes, compression ratio, time, and memory.
+Archive members are virtual `objects`/`entries` rows linked to their container.
+v0.5 indexes ZIP central-directory names, topology, and declared sizes without
+extracting content. Physical and archive declared/compressed aggregate bytes
+remain separate. v1 adds recursive ZIP/RAR/7z/tar with limits on depth, member
+count, expanded bytes, compression ratio, time, and memory.
 
 ### 7.8 Search
 

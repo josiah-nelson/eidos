@@ -55,6 +55,8 @@ export interface SourceCounts {
   files: number
   logical_bytes: number
   allocated_bytes: number
+  archive_declared_bytes: number
+  archive_compressed_bytes: number
   content_pending: number
   content_indexed: number
   content_failed: number
@@ -158,6 +160,8 @@ export interface DirectoryAggregate {
   dir_count: number
   logical_bytes: number
   allocated_bytes: number
+  archive_declared_bytes: number
+  archive_compressed_bytes: number
   newest_modified: number | null
   oldest_modified: number | null
   content_pending: number
@@ -322,6 +326,8 @@ export interface DirectorySummary {
   directory_count: number
   logical_bytes: number
   allocated_bytes: number
+  archive_declared_bytes: number
+  archive_compressed_bytes: number
   newest_modified?: number
   oldest_modified?: number
   extension_counts?: Record<string, number>

@@ -224,6 +224,10 @@ pub struct DirectoryAggregate {
     pub dir_count: u64,
     pub logical_bytes: u64,
     pub allocated_bytes: u64,
+    /// Declared expanded bytes of virtual archive files in the subtree.
+    pub archive_declared_bytes: u64,
+    /// Compressed bytes recorded for virtual archive files in the subtree.
+    pub archive_compressed_bytes: u64,
     pub newest_modified: Option<UnixNanos>,
     pub oldest_modified: Option<UnixNanos>,
     pub content_pending: u64,
@@ -234,7 +238,8 @@ pub struct DirectoryAggregate {
     pub complete: bool,
 }
 
-pub(crate) const AGG_COLUMNS: &str = "a.object_id, a.file_count, a.dir_count, a.logical_bytes, a.allocated_bytes, a.newest_modified, \
+pub(crate) const AGG_COLUMNS: &str = "a.object_id, a.file_count, a.dir_count, a.logical_bytes, a.allocated_bytes, \
+     a.archive_declared_bytes, a.archive_compressed_bytes, a.newest_modified, \
      a.oldest_modified, a.content_pending, a.content_indexed, a.content_failed, a.content_excluded, \
      a.generation, a.complete";
 
@@ -246,14 +251,16 @@ impl DirectoryAggregate {
             dir_count: r.get::<_, i64>(base + 2)? as u64,
             logical_bytes: r.get::<_, i64>(base + 3)? as u64,
             allocated_bytes: r.get::<_, i64>(base + 4)? as u64,
-            newest_modified: r.get::<_, Option<i64>>(base + 5)?.map(UnixNanos),
-            oldest_modified: r.get::<_, Option<i64>>(base + 6)?.map(UnixNanos),
-            content_pending: r.get::<_, i64>(base + 7)? as u64,
-            content_indexed: r.get::<_, i64>(base + 8)? as u64,
-            content_failed: r.get::<_, i64>(base + 9)? as u64,
-            content_excluded: r.get::<_, i64>(base + 10)? as u64,
-            generation: r.get(base + 11)?,
-            complete: r.get::<_, i64>(base + 12)? != 0,
+            archive_declared_bytes: r.get::<_, i64>(base + 5)? as u64,
+            archive_compressed_bytes: r.get::<_, i64>(base + 6)? as u64,
+            newest_modified: r.get::<_, Option<i64>>(base + 7)?.map(UnixNanos),
+            oldest_modified: r.get::<_, Option<i64>>(base + 8)?.map(UnixNanos),
+            content_pending: r.get::<_, i64>(base + 9)? as u64,
+            content_indexed: r.get::<_, i64>(base + 10)? as u64,
+            content_failed: r.get::<_, i64>(base + 11)? as u64,
+            content_excluded: r.get::<_, i64>(base + 12)? as u64,
+            generation: r.get(base + 13)?,
+            complete: r.get::<_, i64>(base + 14)? != 0,
         })
     }
 
@@ -323,6 +330,8 @@ pub struct SourceCounts {
     pub files: u64,
     pub logical_bytes: u64,
     pub allocated_bytes: u64,
+    pub archive_declared_bytes: u64,
+    pub archive_compressed_bytes: u64,
     pub content_pending: u64,
     pub content_indexed: u64,
     pub content_failed: u64,

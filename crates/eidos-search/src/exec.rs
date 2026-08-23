@@ -645,7 +645,13 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
             let ext = fold(extension.trim_start_matches('.'));
             ctx.readable.push(format!("directory containing ≥{min_count} .{ext} files anywhere beneath"));
             ctx.tight_dirs = true;
-            let base = all_of(vec![term_text(f.kind, "directory"), term_text(f.desc_ext, &ext)]);
+            let base = all_of(vec![
+                any_of(vec![
+                    term_text(f.kind, "directory"),
+                    term_text(f.kind, "virtual_directory"),
+                ]),
+                term_text(f.desc_ext, &ext),
+            ]);
             if *min_count > 1 || max_count.is_some() {
                 needs_positive(ctx, "a `has:` clause with a count")?;
                 let (min, max, ext) = (*min_count, *max_count, ext.clone());
@@ -665,11 +671,21 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
                 SizeField::Logical => f.subtree_logical,
                 SizeField::Allocated => f.subtree_allocated,
             };
-            all_of(vec![term_text(f.kind, "directory"), u64_range(fld, *min, *max)])
+            all_of(vec![
+                any_of(vec![
+                    term_text(f.kind, "directory"),
+                    term_text(f.kind, "virtual_directory"),
+                ]),
+                u64_range(fld, *min, *max),
+            ])
         }
-        Query::DescendantCount { min, max } => {
-            all_of(vec![term_text(f.kind, "directory"), u64_range(f.file_count, *min, *max)])
-        }
+        Query::DescendantCount { min, max } => all_of(vec![
+            any_of(vec![
+                term_text(f.kind, "directory"),
+                term_text(f.kind, "virtual_directory"),
+            ]),
+            u64_range(f.file_count, *min, *max),
+        ]),
         Query::Archive { .. } => {
             return Err(QueryError::Other {
                 message: "archive clauses are not available until the ZIP manifest index exists (Milestone 5)".into(),
@@ -2214,6 +2230,8 @@ fn build_hits(
                     directory_count: a.dir_count,
                     logical_bytes: a.logical_bytes,
                     allocated_bytes: a.allocated_bytes,
+                    archive_declared_bytes: a.archive_declared_bytes,
+                    archive_compressed_bytes: a.archive_compressed_bytes,
                     newest_modified: a.newest_modified,
                     oldest_modified: a.oldest_modified,
                     extension_counts: ext,

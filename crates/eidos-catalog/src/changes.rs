@@ -641,6 +641,10 @@ impl<'a> Applier<'a> {
             d
         };
         apply_delta(self.tx, parent, &delta)?;
+        if snap.kind == ObjectKind::File {
+            let archive = crate::aggregates::archive_delta(self.tx, obj)?;
+            apply_delta(self.tx, parent, &archive)?;
+        }
         if !created && snap.kind == ObjectKind::Directory {
             // Moved/renamed directory: every descendant's path changed.
             self.outbox(obj, "subtree", 0)?;
@@ -703,6 +707,10 @@ impl<'a> Applier<'a> {
             )
         };
         apply_delta(self.tx, parent, &delta)?;
+        if ex.kind == ObjectKind::File.as_str() {
+            let archive = crate::aggregates::archive_delta(self.tx, obj)?.negate();
+            apply_delta(self.tx, parent, &archive)?;
+        }
         self.touched.insert(obj);
         self.tx.execute(
             "UPDATE objects SET link_count = MAX(1, (SELECT COUNT(*) FROM entries e WHERE e.object_id = ?1 AND e.deleted_at IS NULL)) WHERE object_id = ?1 AND kind = 'file'",
@@ -785,6 +793,14 @@ impl<'a> Applier<'a> {
             Some(k) => k,
             None => return Ok(()),
         };
+        if kind == ObjectKind::File.as_str() {
+            let (entries, objects) = crate::archive::retire_virtual_tree(self.tx, id, self.now)?;
+            self.stats.entries_tombstoned += entries;
+            self.stats.objects_tombstoned += objects;
+            if objects > 0 {
+                self.outbox(id, "subtree", 0)?;
+            }
+        }
         let mut victims = vec![id];
         // Files normally have no descendants, but archive containers own a
         // virtual subtree and must cascade just like physical directories.

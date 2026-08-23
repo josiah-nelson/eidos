@@ -114,8 +114,13 @@ impl Fx {
     }
 
     fn run(&self, q: &str) -> SearchResponse {
+        self.run_mode(q, ResultMode::Files)
+    }
+
+    fn run_mode(&self, q: &str, mode: ResultMode) -> SearchResponse {
         let parsed = parse(q).unwrap();
-        let r = SearchRequest::new(parsed.query);
+        let mut r = SearchRequest::new(parsed.query);
+        r.mode = mode;
         search_with_content(
             &self.index,
             Some(&self.content),
@@ -147,6 +152,18 @@ fn containers_get_manifests_and_members() {
         })
         .unwrap();
     assert_eq!(priority, Priority::ArchiveManifest as i64);
+    let source_root = fx
+        .catalog
+        .get_source(fx.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let before = fx
+        .catalog
+        .directory_aggregate(source_root)
+        .unwrap()
+        .unwrap();
     fx.extract_all();
 
     let rec = fx.catalog.archive_record(zip).unwrap().expect("manifest");
@@ -278,6 +295,64 @@ fn containers_get_manifests_and_members() {
     let stats = fx.catalog.archive_stats(None).unwrap();
     assert_eq!((stats.archives, stats.members, stats.failed), (3, 6, 1));
     assert_eq!(stats.declared_size, 1017, "tool.zip 1015 + Plugin.VSIX 2");
+
+    let after = fx
+        .catalog
+        .directory_aggregate(source_root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.logical_bytes, before.logical_bytes);
+    assert_eq!(after.allocated_bytes, before.allocated_bytes);
+    assert_eq!(after.file_count, before.file_count + 5);
+    assert_eq!(after.dir_count, before.dir_count + 3);
+    assert_eq!(after.archive_declared_bytes, 1017);
+    assert_eq!(after.archive_compressed_bytes, 1017);
+    let lib_aggregate = fx
+        .catalog
+        .directory_aggregate(virtual_dir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(lib_aggregate.logical_bytes, 0);
+    assert_eq!(lib_aggregate.allocated_bytes, 0);
+    assert_eq!(lib_aggregate.archive_declared_bytes, 9);
+    assert_eq!(lib_aggregate.archive_compressed_bytes, 9);
+    assert!(fx
+        .catalog
+        .extension_counts(virtual_dir, 10)
+        .unwrap()
+        .iter()
+        .any(|e| e.extension == "rs" && e.count == 1));
+    let has_rs = fx.run_mode("has:rs", ResultMode::Directories);
+    assert!(has_rs.hits.iter().any(|h| h.object_id == virtual_dir));
+    for query in ["files:=1", "count:=1", "subtree:=0"] {
+        let response = fx.run_mode(query, ResultMode::Directories);
+        assert!(
+            response.hits.iter().any(|h| h.object_id == virtual_dir),
+            "{query} omitted the virtual directory"
+        );
+    }
+
+    // A normal reconciliation observes no virtual rows from the filesystem,
+    // but must preserve their identities and rebuild the same accounting.
+    run_scan(
+        &fx.catalog,
+        fx.source,
+        eidos_scanner::default_lister().as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        fx.object("pkg/tool.zip/src/lib/mod.rs"),
+        virtual_file,
+        "unchanged reconciliation preserves virtual identity"
+    );
+    let reconciled = fx
+        .catalog
+        .directory_aggregate(source_root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconciled.logical_bytes, before.logical_bytes);
+    assert_eq!(reconciled.archive_declared_bytes, 1017);
 }
 
 #[test]
@@ -297,6 +372,21 @@ fn reindex_and_requeue_rebuild_manifests() {
         .resolve_relative(fx.source, "pkg/tool.zip/src/lib/mod.rs")
         .unwrap()
         .is_none());
+    let source_root = fx
+        .catalog
+        .get_source(fx.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    assert_eq!(
+        fx.catalog
+            .directory_aggregate(source_root)
+            .unwrap()
+            .unwrap()
+            .archive_declared_bytes,
+        0
+    );
     // … and requeue finds every container again (3 containers; notes.zip is
     // text but carries the extension, so it is queued too and falls back).
     assert_eq!(fx.catalog.requeue_archives(None).unwrap(), 4);
@@ -308,6 +398,14 @@ fn reindex_and_requeue_rebuild_manifests() {
         .resolve_relative(fx.source, "pkg/tool.zip/src/lib/mod.rs")
         .unwrap()
         .is_some());
+    assert_eq!(
+        fx.catalog
+            .directory_aggregate(source_root)
+            .unwrap()
+            .unwrap()
+            .archive_declared_bytes,
+        1017
+    );
     assert_eq!(fx.catalog.requeue_archives(None).unwrap(), 0);
 }
 
@@ -333,9 +431,21 @@ fn requeue_backfills_an_existing_manifest_without_virtual_rows() {
                 "UPDATE objects SET deleted_at = ?2 WHERE archive_container_id = ?1",
                 [zip.0, now],
             )?;
+            conn.execute(
+                "UPDATE archive_records SET aggregate_generation = NULL WHERE object_id = ?1",
+                [zip.0],
+            )?;
             Ok(())
         })
         .unwrap();
+
+    run_scan(
+        &fx.catalog,
+        fx.source,
+        eidos_scanner::default_lister().as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
 
     assert_eq!(fx.catalog.requeue_archives(Some(fx.source)).unwrap(), 1);
     drain_content_jobs(&fx.catalog, &fx.content, &Limits::default(), "test").unwrap();
@@ -368,6 +478,22 @@ fn stale_archive_generation_is_not_published() {
     let current = fx.catalog.get_object(zip).unwrap().unwrap();
     assert_eq!(current.generation, original.generation + 1);
     assert_eq!(current.content_state, ContentState::Pending);
+    let source_root = fx
+        .catalog
+        .get_source(fx.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    assert_eq!(
+        fx.catalog
+            .directory_aggregate(source_root)
+            .unwrap()
+            .unwrap()
+            .archive_declared_bytes,
+        2,
+        "changed tool.zip no longer contributes; unchanged Plugin.VSIX still does"
+    );
     assert!(fx
         .catalog
         .resolve_relative(fx.source, "pkg/tool.zip/src/lib/mod.rs")

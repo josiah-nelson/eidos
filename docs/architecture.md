@@ -138,7 +138,6 @@ Minimum logical tables:
 - `directory_extension_counts`
 - `content_records`
 - `chunks`
-- `virtual_entries`
 - `jobs`
 - `outbox`
 - `policy_decisions`
@@ -385,4 +384,3 @@ machine-readable results suitable for regression comparison.
 - Migration and derived-index rebuild tests
 
 No test may mutate the measured user corpus.
-

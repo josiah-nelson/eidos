@@ -84,6 +84,13 @@ budgets and visibility as text extraction.
   Full-scan changes, change-feed updates, container deletion, and content-index
   reset all retire materialized descendants. Existing manifests without
   virtual rows are selected by `archive requeue` for backfill.
+- **Archive expansion never masquerades as physical storage.** Virtual files
+  and directories participate in subtree and extension counts, but their
+  sizes reduce into dedicated `archive_declared_bytes` and
+  `archive_compressed_bytes` aggregate fields. Physical `logical_bytes` and
+  `allocated_bytes` count the container once and do not include expanded
+  members. Incremental publication, hard-link changes, reset, and full
+  reconciliation maintain the same split.
 - The fixture builder (`eidos_archive::fixture`) synthesises archives —
   stored members, ZIP64 end records, arbitrary extra fields — so tests
   exercise truncated tails, bogus directory offsets, bomb-shaped entry
@@ -93,8 +100,8 @@ budgets and visibility as text extraction.
 ## Consequences
 
 - Member names and paths participate in ordinary browse and catalog-index
-  search. Directory accounting still needs separate archive declared-size
-  fields so virtual sizes do not inflate physical logical/allocated totals.
+  search; `has:` sees virtual descendant extensions. Browse and search expose
+  archive declared/compressed totals separately from physical size.
 - Archives that are text in disguise cost one extra tail read before the
   text path; archives that are binary in disguise cost the same read before
   the existing sniff.
