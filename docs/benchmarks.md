@@ -224,6 +224,26 @@ Reading:
   produce false candidates at that granularity. Finer-grained trigram
   documents (blocks within a chunk) are the lever; deferred (ADR-0009).
 
+## Pagination (`eidos bench search --family paging`, 2026-08-23)
+
+Cursor walks of ten 50-row pages over the full catalog index (4.19 M
+documents), release build, warm cache, 5 iterations; `paging-first` is page
+1, `paging-next` pages 2–10. `--count` selects the total-count policy.
+
+| Query (sort) | Matches | page 1 p95 | pages 2–10 p95 |
+|---|---:|---:|---:|
+| `size:>0` (size desc), `count=exact` | 3,517,587 | 136–140 ms | 134 ms |
+| `size:>0` (size desc), `count=auto` | 3,517,587 | 137 ms | 137 ms |
+| `size:>0` (size desc), `count=none` | — (bound) | 140 ms | 138 ms |
+| `ext:dll` (modified desc), `count=exact` | 217,270 | 17–18 ms | 14 ms |
+| `ext:dll` (modified desc), `count=auto` | 217,270 | 18 ms | 14 ms |
+
+Finding: on the top-k (non-verified) path the exact count rides the same
+pass the sorted collector already makes over every match, so skipping it on
+later pages (`auto`) or altogether (`none`) changes nothing measurable. The
+cost of a deep page is the top-k pass itself — proportional to the match
+count, not to the page — which is what a search-after cursor would remove.
+
 ## Gates status (v0.5)
 
 | Gate | Target | Measured |
