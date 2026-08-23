@@ -6,12 +6,15 @@
 
 use eidos_catalog::scan::{run_scan, RunScanOptions, ScanKind};
 use eidos_catalog::{Catalog, ChildSort, ChildrenPage, NewSource};
-use eidos_domain::{ContentState, ObjectKind, SourceId, SourceKind, SourceState};
+use eidos_domain::{ContentState, FileAttributes, ObjectKind, SourceId, SourceKind, SourceState};
 use eidos_scanner::{
-    default_lister, DirectoryLister, RawEntry, ScanError, ScanErrorKind, VolumeInfo,
+    default_lister, DirEvent, DirToken, DirectoryLister, RawEntry, ScanError, ScanErrorKind,
+    VolumeInfo,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -401,7 +404,9 @@ fn interrupted_enumeration_never_publishes() {
     );
     session.ingest(first.unwrap()).unwrap();
     session.commit().unwrap();
-    drop(session);
+    // A real process crash skips Drop; leak the handle to leave the durable
+    // generation open for startup recovery.
+    std::mem::forget(session);
 
     let src = f.catalog.get_source(f.source).unwrap().unwrap();
     assert_eq!(src.published_generation, None);
@@ -430,6 +435,166 @@ fn interrupted_enumeration_never_publishes() {
             .published_generation,
         Some(2)
     );
+}
+
+#[test]
+fn dropping_a_scan_aborts_it_immediately() {
+    let f = fixture();
+    let session = f.catalog.begin_scan(f.source, ScanKind::Full).unwrap();
+
+    drop(session);
+
+    assert_eq!(f.catalog.open_scan_generation(f.source).unwrap(), None);
+    let source = f.catalog.get_source(f.source).unwrap().unwrap();
+    assert_eq!(source.published_generation, None);
+    assert_eq!(source.state, SourceState::New);
+    let generations = f.catalog.list_generations(f.source, 10).unwrap();
+    assert_eq!(generations[0].state, "aborted");
+    assert!(generations[0]
+        .note
+        .as_deref()
+        .unwrap_or_default()
+        .contains("dropped before publication"));
+}
+
+#[test]
+fn ingest_error_rolls_back_and_aborts_on_drop() {
+    let f = fixture();
+    let mut session = f.catalog.begin_scan(f.source, ScanKind::Full).unwrap();
+    let invalid = DirEvent {
+        token: DirToken(99),
+        parent: Some(DirToken(0)),
+        path: f.root.join("missing-parent-token"),
+        depth: 1,
+        result: Ok(vec![]),
+        child_tokens: vec![],
+    };
+
+    let error = session.ingest(invalid).unwrap_err();
+    assert!(error.to_string().contains("delivered before its parent"));
+    drop(session);
+
+    assert_eq!(f.catalog.open_scan_generation(f.source).unwrap(), None);
+    let source = f.catalog.get_source(f.source).unwrap().unwrap();
+    assert_eq!(source.published_generation, None);
+    assert_eq!(source.state, SourceState::New);
+    let generation = &f.catalog.list_generations(f.source, 1).unwrap()[0];
+    assert_eq!(generation.state, "aborted");
+    assert!(generation
+        .note
+        .as_deref()
+        .unwrap_or_default()
+        .contains("dropped before publication"));
+    assert_eq!(
+        f.catalog.source_counts(f.source).unwrap().objects,
+        1,
+        "the source root is durable, but the failed batch was rolled back"
+    );
+}
+
+#[test]
+fn cancelled_walk_aborts_without_publishing() {
+    let f = fixture();
+    let cancel = Arc::new(AtomicBool::new(true));
+    let options = RunScanOptions {
+        walk: eidos_scanner::WalkOptions {
+            cancel: Some(cancel),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let error = run_scan(&f.catalog, f.source, default_lister().as_ref(), &options).unwrap_err();
+
+    assert!(error.to_string().contains("scan cancelled"));
+    let source = f.catalog.get_source(f.source).unwrap().unwrap();
+    assert_eq!(source.published_generation, None);
+    assert_eq!(source.state, SourceState::New);
+    let generation = &f.catalog.list_generations(f.source, 1).unwrap()[0];
+    assert_eq!(generation.state, "aborted");
+    assert!(generation
+        .note
+        .as_deref()
+        .unwrap_or_default()
+        .contains("walk cancelled"));
+}
+
+#[test]
+fn wide_scan_yields_to_catalog_writers() {
+    const FILES: usize = 4_000;
+
+    let f = fixture();
+    let entries = (0..FILES)
+        .map(|i| RawEntry {
+            name: format!("wide-{i:05}.txt"),
+            name_lossy: false,
+            kind: ObjectKind::File,
+            attributes: FileAttributes::default(),
+            size: i as u64,
+            allocated: Some(i as u64),
+            created: None,
+            modified: None,
+            changed: None,
+            accessed: None,
+            native_id: None,
+            reparse_tag: 0,
+        })
+        .collect();
+    let event = DirEvent {
+        token: DirToken(0),
+        parent: None,
+        path: f.root.clone(),
+        depth: 0,
+        result: Ok(entries),
+        child_tokens: vec![],
+    };
+    let mut session = f.catalog.begin_scan(f.source, ScanKind::Full).unwrap();
+    session.set_batching(256, Duration::from_millis(25));
+    let acquisitions_before = f.catalog.writer_stats().acquisitions;
+    let finished = Arc::new(AtomicBool::new(false));
+    let scan_finished = finished.clone();
+
+    let scan = std::thread::spawn(move || {
+        session.ingest(event).unwrap();
+        let summary = session.finish().unwrap();
+        scan_finished.store(true, Ordering::Release);
+        summary
+    });
+
+    let acquisition_deadline = Instant::now() + Duration::from_secs(5);
+    while f.catalog.writer_stats().acquisitions == acquisitions_before {
+        assert!(
+            Instant::now() < acquisition_deadline,
+            "scan did not acquire the writer gate"
+        );
+        std::thread::yield_now();
+    }
+
+    let mut writes = 0;
+    let mut slowest_write = Duration::ZERO;
+    while !finished.load(Ordering::Acquire) {
+        let started = Instant::now();
+        f.catalog
+            .set_source_kind(f.source, SourceKind::WindowsGeneric)
+            .unwrap();
+        slowest_write = slowest_write.max(started.elapsed());
+        writes += 1;
+    }
+    let summary = scan.join().unwrap();
+
+    assert!(summary.published);
+    assert_eq!(summary.stats.entries_seen, FILES as u64);
+    assert!(
+        writes >= 3,
+        "only {writes} writes completed during the scan"
+    );
+    assert!(
+        slowest_write < Duration::from_secs(5),
+        "catalog writer stalled for {slowest_write:?}"
+    );
+    let writer_stats = f.catalog.writer_stats();
+    assert!(writer_stats.acquisitions >= writes + 2);
+    assert!(writer_stats.max_wait_ms > 0.0);
 }
 
 #[test]

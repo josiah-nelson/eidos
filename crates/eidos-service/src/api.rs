@@ -1008,6 +1008,8 @@ pub struct ActivityView {
     pub content_rebuild: eidos_search::content::RebuildStatus,
     /// Admission-control gauges and totals for expensive API operations.
     pub admission: crate::admission::AdmissionView,
+    /// Process-wide catalog writer wait time, including scan batch handoffs.
+    pub catalog_writer: eidos_catalog::CatalogWriterStats,
     pub sources: Vec<ActivitySourceView>,
     pub recent_failures: Vec<eidos_catalog::jobs::JobRecord>,
 }
@@ -1055,6 +1057,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
             content_index_documents: st2.content_index.num_docs(),
             content_rebuild: st2.content_index.rebuild_status(),
             admission: st2.admission.view(),
+            catalog_writer: st2.catalog.writer_stats(),
             sources,
             recent_failures: st2.catalog.recent_failed_jobs(20)?,
         })

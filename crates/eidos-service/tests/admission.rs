@@ -553,6 +553,23 @@ async fn activity_and_index_report_admission_counters() {
         ] {
             assert!(a.get(field).is_some(), "{uri} missing admission.{field}");
         }
+        if uri == "/api/activity" {
+            let writer = &res.body["catalog_writer"];
+            for field in [
+                "acquisitions",
+                "contended_acquisitions",
+                "waiting",
+                "total_wait_ms",
+                "max_wait_ms",
+                "total_hold_ms",
+                "max_hold_ms",
+            ] {
+                assert!(
+                    writer.get(field).is_some(),
+                    "{uri} missing catalog_writer.{field}"
+                );
+            }
+        }
     }
 }
 

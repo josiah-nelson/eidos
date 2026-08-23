@@ -71,6 +71,19 @@ fn print_activity(v: &serde_json::Value) {
         n(w, "uncommitted_documents"),
         n(v, "content_index_documents"),
     );
+    println!(
+        "catalog writer: {} turns  {} contended  {} waiting  {:.1} ms total wait  {:.1} ms max wait",
+        n(v, "catalog_writer.acquisitions"),
+        n(v, "catalog_writer.contended_acquisitions"),
+        n(v, "catalog_writer.waiting"),
+        g(v, "catalog_writer.total_wait_ms").as_f64().unwrap_or(0.0),
+        g(v, "catalog_writer.max_wait_ms").as_f64().unwrap_or(0.0),
+    );
+    println!(
+        "catalog writer hold: {:.1} ms total  {:.1} ms max",
+        g(v, "catalog_writer.total_hold_ms").as_f64().unwrap_or(0.0),
+        g(v, "catalog_writer.max_hold_ms").as_f64().unwrap_or(0.0),
+    );
     if let Some(e) = w["last_error"].as_str() {
         println!("last error: {e}");
     }

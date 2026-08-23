@@ -19,7 +19,7 @@ use crate::aggregates;
 use crate::changes::{clear_checkpoint_conn, set_checkpoint_conn, Checkpoint};
 use crate::model::SourceRecord;
 use crate::policy::{ContentDecision, PolicyCtx, PolicyEngine};
-use crate::{Catalog, CatalogError, RecoveryReport, Result};
+use crate::{Catalog, CatalogError, RecoveryReport, Result, WriterCoordination, WriterPermit};
 use eidos_domain::{
     extension_of, ContentState, IdentityConfidence, ObjectId, ObjectKind, PolicyStage, SourceId,
     SourceState, UnixNanos,
@@ -27,6 +27,7 @@ use eidos_domain::{
 use eidos_scanner::{DirEvent, RawEntry};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 use ts_rs::TS;
 
@@ -90,6 +91,8 @@ pub struct PublishOptions<'a> {
 
 pub struct ScanSession {
     conn: Connection,
+    writer_coordination: Arc<WriterCoordination>,
+    writer_permit: Option<WriterPermit>,
     source: SourceRecord,
     generation: i64,
     root: ObjectId,
@@ -104,6 +107,7 @@ pub struct ScanSession {
     root_error: Option<eidos_scanner::ScanErrorKind>,
     batch_rows: usize,
     batch_interval: std::time::Duration,
+    generation_closed: bool,
 }
 
 impl Catalog {
@@ -187,6 +191,8 @@ impl Catalog {
         let conn = self.open_writer()?;
         Ok(ScanSession {
             conn,
+            writer_coordination: self.writer_coordination.clone(),
+            writer_permit: None,
             source,
             generation,
             root,
@@ -201,6 +207,7 @@ impl Catalog {
             root_error: None,
             batch_rows: 4000,
             batch_interval: std::time::Duration::from_millis(500),
+            generation_closed: false,
         })
     }
 }
@@ -237,9 +244,27 @@ impl ScanSession {
 
     fn ensure_tx(&mut self) -> Result<()> {
         if !self.in_tx {
-            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            let permit = self.writer_coordination.acquire();
+            if let Err(error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
+                drop(permit);
+                return Err(error.into());
+            }
+            self.writer_permit = Some(permit);
             self.in_tx = true;
         }
+        Ok(())
+    }
+
+    fn release_writer(&mut self) {
+        drop(self.writer_permit.take());
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        if self.in_tx {
+            self.conn.execute_batch("ROLLBACK")?;
+            self.in_tx = false;
+        }
+        self.release_writer();
         Ok(())
     }
 
@@ -249,6 +274,7 @@ impl ScanSession {
             self.conn.execute_batch("COMMIT")?;
             self.in_tx = false;
             self.stats.commits += 1;
+            self.release_writer();
         }
         self.pending_rows = 0;
         self.last_commit = Instant::now();
@@ -261,6 +287,11 @@ impl ScanSession {
             self.commit()?;
         }
         Ok(())
+    }
+
+    fn account_row(&mut self) -> Result<()> {
+        self.pending_rows += 1;
+        self.maybe_commit()
     }
 
     /// Ingest one walker event.
@@ -306,7 +337,7 @@ impl ScanSession {
                     "UPDATE objects SET last_seen_generation = ?2 WHERE object_id = ?1",
                     params![dir.0, self.generation],
                 )?;
-                self.pending_rows += 1;
+                self.account_row()?;
             }
             Ok(entries) => {
                 self.stats.dirs_listed += 1;
@@ -315,8 +346,10 @@ impl ScanSession {
                     "UPDATE objects SET listed_generation = ?2, last_seen_generation = ?2 WHERE object_id = ?1",
                     params![dir.0, self.generation],
                 )?;
+                self.account_row()?;
                 let mut child_tokens = ev.child_tokens.iter().peekable();
                 for (i, e) in entries.iter().enumerate() {
+                    self.ensure_tx()?;
                     let obj = self.upsert_object(dir, e, &ctx)?;
                     self.upsert_entry(dir, e, obj)?;
                     if let Some((idx, tok)) = child_tokens.peek() {
@@ -326,11 +359,14 @@ impl ScanSession {
                             child_tokens.next();
                         }
                     }
+                    // Check the row and time bounds between every entry, not
+                    // only after the whole directory. One very wide directory
+                    // therefore cannot monopolize the writer.
+                    self.account_row()?;
                 }
-                self.pending_rows += entries.len() + 1;
             }
         }
-        self.maybe_commit()
+        Ok(())
     }
 
     fn upsert_object(
@@ -561,6 +597,24 @@ impl ScanSession {
     /// checkpoint (if any) and the source state flip commit atomically with
     /// the generation.
     pub fn finish_with(mut self, opts: &PublishOptions<'_>) -> Result<ScanSummary> {
+        let result = self.finish_inner(opts);
+        if let Err(error) = &result {
+            if !self.generation_closed {
+                let reason = format!("scan publication failed: {error}");
+                if let Err(abort_error) = self.abort_open(&reason, None) {
+                    tracing::error!(
+                        source = self.source.id.0,
+                        generation = self.generation,
+                        error = %abort_error,
+                        "failed to abort generation after publication error"
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    fn finish_inner(&mut self, opts: &PublishOptions<'_>) -> Result<ScanSummary> {
         self.commit()?;
         if self.unlisted.contains(&self.root) {
             // An unreachable root (not found / transient network failure)
@@ -587,7 +641,7 @@ impl ScanSession {
             } else {
                 None
             };
-            abort_generation(&self.conn, sid, gen, reason, override_state)?;
+            self.abort_open(reason, override_state)?;
             return Err(CatalogError::InvalidState(format!(
                 "source {sid} generation {gen}: {reason}"
             )));
@@ -596,8 +650,7 @@ impl ScanSession {
         let gen = self.generation;
         let sid = self.source.id.0;
         let root = self.root;
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        self.in_tx = true;
+        self.ensure_tx()?;
 
         // 1. Entries not re-observed under directories we listed this generation.
         let mut tomb_entries = self.conn.execute(
@@ -694,6 +747,8 @@ impl ScanSession {
         self.conn.execute_batch("COMMIT")?;
         self.in_tx = false;
         self.stats.commits += 1;
+        self.release_writer();
+        self.generation_closed = true;
         tracing::info!(
             source = sid,
             generation = gen,
@@ -719,11 +774,60 @@ impl ScanSession {
 
     /// Abandon this generation without publishing.
     pub fn abort(mut self, reason: &str) -> Result<()> {
+        self.abort_open(reason, None)
+    }
+
+    fn abort_open(&mut self, reason: &str, override_state: Option<SourceState>) -> Result<()> {
+        self.rollback()?;
+        let permit = self.writer_coordination.acquire();
+        let result = abort_generation(
+            &self.conn,
+            self.source.id,
+            self.generation,
+            reason,
+            override_state,
+        );
+        drop(permit);
+        if result.is_ok() {
+            self.generation_closed = true;
+        }
+        result
+    }
+}
+
+impl Drop for ScanSession {
+    fn drop(&mut self) {
         if self.in_tx {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            if let Err(error) = self.conn.execute_batch("ROLLBACK") {
+                tracing::error!(
+                    source = self.source.id.0,
+                    generation = self.generation,
+                    error = %error,
+                    "failed to roll back abandoned scan transaction"
+                );
+            }
             self.in_tx = false;
         }
-        abort_generation(&self.conn, self.source.id, self.generation, reason, None)
+        self.release_writer();
+        if !self.generation_closed {
+            let permit = self.writer_coordination.acquire();
+            let result = abort_generation(
+                &self.conn,
+                self.source.id,
+                self.generation,
+                "scan session dropped before publication",
+                None,
+            );
+            drop(permit);
+            if let Err(error) = result {
+                tracing::error!(
+                    source = self.source.id.0,
+                    generation = self.generation,
+                    error = %error,
+                    "failed to abort abandoned scan generation"
+                );
+            }
+        }
     }
 }
 

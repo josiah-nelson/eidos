@@ -166,6 +166,24 @@ source and Activity views show `reconciliation_deferred.reason` and its
 priority over content work because restoring its checkpoint closes a live
 catalog-consistency gap; it still never overlaps another scan generation.
 
+Catalog writers also share a fair in-process gate. Enumeration commits after
+at most 4,000 observed rows or 500 ms, checking those bounds between individual
+entries even when one directory contains thousands of children. A waiting
+content or catalog update therefore gets the next transaction turn instead of
+depending on SQLite's busy timeout. The final tombstone, aggregate, source-state
+and checkpoint publication remains one atomic transaction so readers cannot
+observe a half-published generation. Cancelling, returning an error, or dropping
+a scan session rolls its current batch back and marks the open generation
+aborted; startup recovery covers the separate case where the process itself
+ended before cleanup could run.
+
+`GET /api/activity`, `eidos activity`, and the Activity page report current
+waiters, total and contended acquisitions, and cumulative/max wait and hold
+times. A rising maximum hold identifies a long transaction; a rising total
+wait with stable maximum hold identifies sustained contention. SQLite's
+five-second busy timeout is only a fallback for an unexpected writer outside
+the coordinating process.
+
 Transient failures (share offline, sharing violation) retry on their own with
 exponential backoff. Deterministic, corrupt, unsupported, and resource-limit
 failures are terminal on purpose: they come back only through an explicit
