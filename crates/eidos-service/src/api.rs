@@ -4,6 +4,7 @@
 //! carries completeness. Errors are JSON `{ "error": ..., "kind": ... }`.
 
 use crate::admission::{AdmissionError, Expensive};
+use crate::export;
 use crate::scanner::{start_scan, ScanProgressView, StartScanError};
 use crate::state::AppState;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -39,6 +40,10 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
         .route("/sources/{id}/archives", post(requeue_archives))
         .route("/resolve", get(resolve))
         .route("/search", post(search).get(search_get))
+        .route(
+            "/search/export",
+            get(export::export_get).post(export::export_post),
+        )
         .route("/search/parse", get(search_parse))
         .route("/index", get(index_status))
         // Every API body is a small JSON document; nothing here streams
@@ -69,9 +74,9 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
 
 #[derive(Debug)]
 pub struct ApiError {
-    status: StatusCode,
-    kind: &'static str,
-    message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) kind: &'static str,
+    pub(crate) message: String,
     /// Emitted as `Retry-After` (seconds) when load is shed.
     retry_after_s: Option<u64>,
 }
@@ -88,7 +93,7 @@ impl ApiError {
     fn not_found(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", msg)
     }
-    fn bad_request(msg: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", msg)
     }
     fn conflict(msg: impl Into<String>) -> Self {
@@ -158,6 +163,8 @@ struct Health {
     catalog_path: String,
     sources: usize,
     running_scans: usize,
+    /// Hard cap on rows a single `/api/search/export` may emit.
+    export_max_rows: u64,
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
@@ -176,6 +183,7 @@ async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
         catalog_path: st.catalog.path().display().to_string(),
         sources: sources.len(),
         running_scans: running,
+        export_max_rows: st.export.max_rows,
     }))
 }
 
@@ -679,25 +687,25 @@ struct ResolveView {
 /// Body of `POST /api/search`. Either `q` (syntax) or `query` (AST) must be
 /// present; when both are given the AST wins.
 #[derive(Deserialize)]
-struct SearchBody {
+pub(crate) struct SearchBody {
     #[serde(default)]
-    q: Option<String>,
+    pub(crate) q: Option<String>,
     #[serde(default)]
-    query: Option<eidos_domain::Query>,
+    pub(crate) query: Option<eidos_domain::Query>,
     #[serde(default)]
-    mode: eidos_domain::ResultMode,
+    pub(crate) mode: eidos_domain::ResultMode,
     #[serde(default)]
-    sort: eidos_domain::Sort,
+    pub(crate) sort: eidos_domain::Sort,
     #[serde(default = "default_search_limit")]
-    limit: u32,
+    pub(crate) limit: u32,
     #[serde(default)]
-    cursor: Option<String>,
+    pub(crate) cursor: Option<String>,
     #[serde(default)]
-    explain: bool,
+    pub(crate) explain: bool,
     #[serde(default)]
-    facets: Vec<eidos_domain::FacetRequest>,
+    pub(crate) facets: Vec<eidos_domain::FacetRequest>,
     #[serde(default)]
-    include_retired: bool,
+    pub(crate) include_retired: bool,
 }
 
 fn default_search_limit() -> u32 {
@@ -716,7 +724,9 @@ struct SearchView {
     notes: Vec<String>,
 }
 
-fn build_request(body: SearchBody) -> Result<(eidos_domain::SearchRequest, Vec<String>), ApiError> {
+pub(crate) fn build_request(
+    body: SearchBody,
+) -> Result<(eidos_domain::SearchRequest, Vec<String>), ApiError> {
     let (query, notes) = match (body.query, body.q) {
         (Some(q), _) => (q, Vec::new()),
         (None, Some(text)) => {
@@ -771,7 +781,7 @@ async fn run_search(st: Arc<AppState>, body: SearchBody) -> ApiResult<SearchView
     }))
 }
 
-fn search_error(e: eidos_search::SearchError) -> ApiError {
+pub(crate) fn search_error(e: eidos_search::SearchError) -> ApiError {
     match e {
         eidos_search::SearchError::Query(q) => {
             ApiError::new(StatusCode::BAD_REQUEST, "query", q.to_string())

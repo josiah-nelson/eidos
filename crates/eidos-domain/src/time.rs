@@ -65,6 +65,15 @@ impl UnixNanos {
         format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
     }
 
+    /// Render as RFC 3339 UTC with the full nanosecond field (9 fractional
+    /// digits). Exports use this so no precision is lost or rounded away.
+    pub fn to_rfc3339_nanos(self) -> String {
+        let secs = self.as_secs();
+        let nanos = self.0.rem_euclid(1_000_000_000);
+        let (y, m, d, hh, mm, ss) = civil_from_unix(secs);
+        format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{nanos:09}Z")
+    }
+
     /// Parse an RFC 3339 timestamp (UTC `Z` or numeric offset) or a bare date.
     pub fn parse(s: &str) -> Option<Self> {
         parse_rfc3339(s)
@@ -204,6 +213,19 @@ mod tests {
         assert_eq!(
             UnixNanos(1_700_000_000_000_000_000).to_rfc3339(),
             "2023-11-14T22:13:20.000Z"
+        );
+    }
+
+    #[test]
+    fn nanos_render_keeps_every_digit() {
+        assert_eq!(
+            UnixNanos(1_700_000_000_123_456_789).to_rfc3339_nanos(),
+            "2023-11-14T22:13:20.123456789Z"
+        );
+        // Pre-epoch instants borrow from the second, as `to_rfc3339` does.
+        assert_eq!(
+            UnixNanos(-1).to_rfc3339_nanos(),
+            "1969-12-31T23:59:59.999999999Z"
         );
     }
 

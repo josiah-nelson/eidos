@@ -8,6 +8,7 @@
 pub mod admission;
 pub mod api;
 pub mod content_workers;
+pub mod export;
 pub mod follower;
 pub mod scanner;
 pub mod source_budget;
@@ -37,6 +38,8 @@ pub struct ServiceConfig {
     pub content_workers: usize,
     /// Bounds and deadlines for expensive HTTP operations.
     pub admission: admission::AdmissionConfig,
+    /// Bounds on `/api/search/export`.
+    pub export: export::ExportLimits,
 }
 
 impl Default for ServiceConfig {
@@ -50,6 +53,7 @@ impl Default for ServiceConfig {
             content: true,
             content_workers: 4,
             admission: admission::AdmissionConfig::default(),
+            export: export::ExportLimits::default(),
         }
     }
 }

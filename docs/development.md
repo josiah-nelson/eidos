@@ -49,7 +49,10 @@ the catalog outbox every 500 ms (`GET /api/index` shows follower state).
 (`EIDOS_BIND`, default loopback — the API has no authentication yet and warns
 when bound elsewhere), `--web-dir` (`EIDOS_WEB_DIR`, empty for API only),
 `--scan-threads`, `--no-auto-reconcile`, `--no-content` (metadata only),
-`--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4), plus the
+`--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4),
+`--export-page-size N` (`EIDOS_EXPORT_PAGE_SIZE`, default 500) and
+`--export-max-rows N` (`EIDOS_EXPORT_MAX_ROWS`, default 100000) — see
+[Exporting results](query-syntax.md#exporting-results) — plus the
 admission-control flags below.
 
 ### Operational limits
@@ -71,7 +74,9 @@ Beyond the queue bound, or after the queue wait, a request is answered
 `503` with `{"kind":"busy"}` and a `Retry-After` header. Past its deadline it
 is answered `504` with `{"kind":"timeout"}`. Health, activity and index
 status never enter the gate, so they stay responsive while queries saturate
-it.
+it. An export takes a permit per page rather than one for its whole stream,
+so a long export interleaves with interactive queries instead of holding a
+slot for minutes.
 
 A deadline ends the *response*, not the query: a running SQLite or Tantivy
 call cannot be cancelled mid-call, so the permit is released by the blocking
@@ -112,6 +117,17 @@ Searching through the running service:
 .\target\release\eidos.exe search --mode directories "has:idb has:cs" --explain
 .\target\release\eidos.exe search --json "ext:dmp" | ConvertFrom-Json
 ```
+
+Exporting a whole result set (streamed from the service, never buffered):
+
+```powershell
+.\target\release\eidos.exe search "ext:dmp" --export csv --out dumps.csv
+.\target\release\eidos.exe search "ext:md mtime:>=30d" --export ndjson | Select-Object -First 5
+```
+
+`--out -` (or omitting `--out`) writes to stdout, `--export-limit N` lowers the
+row cap, and `--bom` prefixes a UTF-8 BOM for Excel. The command prints the
+match count and the cap on stderr, marking `(TRUNCATED)` when the cap bites.
 
 `EIDOS_URL` overrides the service address. Query syntax:
 [query-syntax.md](query-syntax.md).

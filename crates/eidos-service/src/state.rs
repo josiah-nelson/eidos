@@ -24,6 +24,9 @@ pub struct AppState {
     pub content_enabled: AtomicBool,
     pub content_worker_count: usize,
     pub exec_opts: eidos_search::exec::ExecOptions,
+    /// Bounds and counters for `/api/search/export`.
+    pub export: crate::export::ExportLimits,
+    pub export_stats: Arc<crate::export::ExportStats>,
     pub host_id: HostId,
     pub host_name: String,
     pub lister: Arc<dyn DirectoryLister>,
@@ -85,6 +88,8 @@ impl AppState {
             content_enabled: AtomicBool::new(config.content),
             content_worker_count: config.content_workers,
             exec_opts: eidos_search::exec::ExecOptions::default(),
+            export: config.export,
+            export_stats: Arc::new(crate::export::ExportStats::default()),
             host_id,
             host_name,
             lister: Arc::from(eidos_scanner::default_lister()),

@@ -654,6 +654,8 @@ dependencies = [
  "eidos-query",
  "eidos-scanner",
  "eidos-search",
+ "futures-core",
+ "http-body-util",
  "parking_lot",
  "serde",
  "serde_json",

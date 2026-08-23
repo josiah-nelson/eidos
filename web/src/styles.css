@@ -698,3 +698,35 @@ input[type='number'].small { width: 64px; }
 }
 .snippets .line { color: var(--fg-2, #8b949e); margin-right: 8px; }
 .snippets mark { background: rgba(210, 153, 34, 0.35); color: inherit; border-radius: 2px; }
+
+/* Export dropdown on the search toolbar. */
+.menu {
+  position: relative;
+}
+.menu > summary {
+  list-style: none;
+  cursor: pointer;
+}
+.menu > summary::-webkit-details-marker {
+  display: none;
+}
+.menu-body {
+  position: absolute;
+  right: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 240px;
+  padding: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgb(0 0 0 / 18%);
+}
+.menu-body a {
+  text-decoration: none;
+}
+.menu-body a:hover {
+  text-decoration: underline;
+}
