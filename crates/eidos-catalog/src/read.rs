@@ -158,6 +158,36 @@ impl Catalog {
         self.with_reader(|conn| get_object_conn(conn, id))
     }
 
+    /// Current generation of each live object in `objects`.
+    ///
+    /// Ids that are unknown or tombstoned are absent from the map, so a
+    /// caller validating a derived artefact (an index document, a stored
+    /// chunk) against the catalog can treat "absent" as "not current".
+    pub fn object_generations(
+        &self,
+        objects: &[ObjectId],
+    ) -> Result<std::collections::HashMap<ObjectId, u32>> {
+        let mut out = std::collections::HashMap::with_capacity(objects.len());
+        if objects.is_empty() {
+            return Ok(out);
+        }
+        self.with_reader(|conn| {
+            for batch in objects.chunks(500) {
+                let vars = vec!["?"; batch.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT object_id, generation FROM objects
+                     WHERE deleted_at IS NULL AND object_id IN ({vars})"
+                ))?;
+                let mut rows = stmt.query(rusqlite::params_from_iter(batch.iter().map(|o| o.0)))?;
+                while let Some(r) = rows.next()? {
+                    out.insert(ObjectId(r.get::<_, i64>(0)?), r.get::<_, i64>(1)? as u32);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Render the current path of an object by following parent links.
     pub fn render_path(&self, id: ObjectId) -> Result<Option<String>> {
         self.with_reader(|conn| render_path_conn(conn, id))

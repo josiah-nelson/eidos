@@ -1060,14 +1060,20 @@ fn compile_content(
             }
         }
     }
+    let stale = drop_stale_generations(ctx.catalog, &mut by_object, &mut deferred)?;
     let objects = deferred.as_ref().map_or(by_object.len(), |c| c.len());
     ctx.steps.push(PlanStep {
         stage: "content".into(),
         description: format!(
-            "{} → {} file(s){}",
+            "{} → {} file(s){}{}",
             ret.description,
             objects,
-            if ret.deferred { " (unverified)" } else { "" }
+            if ret.deferred { " (unverified)" } else { "" },
+            if stale > 0 {
+                format!("; {stale} of an older generation dropped")
+            } else {
+                String::new()
+            }
         ),
         candidates: Some(ret.candidates),
         verified: ret.verified,
@@ -1093,6 +1099,45 @@ fn compile_content(
         deferred,
     });
     Ok(q)
+}
+
+/// Drop content matches whose generation is not the object's current one,
+/// returning how many objects were removed.
+///
+/// The content index is committed asynchronously (ADR-0005): a queued
+/// deletion of an object's old chunk documents becomes visible only at the
+/// next commit, and between a file changing and its re-extraction the index
+/// legitimately still holds the previous generation. Such a document
+/// describes text the file no longer contains, so it must not compose into a
+/// file hit at all — filtering here (before the object set reaches the
+/// catalog-index query) also keeps stale objects out of totals and facets,
+/// and covers both the eager and the page-driven path of ADR-0008, whose
+/// candidates are grouped per generation as well.
+fn drop_stale_generations(
+    catalog: &Catalog,
+    by_object: &mut HashMap<ObjectId, ObjectMatch>,
+    deferred: &mut Option<HashMap<ObjectId, (u32, Vec<u32>)>>,
+) -> std::result::Result<usize, QueryError> {
+    let ids: Vec<ObjectId> = match deferred {
+        Some(c) => c.keys().copied().collect(),
+        None => by_object.keys().copied().collect(),
+    };
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let current = catalog
+        .object_generations(&ids)
+        .map_err(|e| QueryError::Other {
+            message: e.to_string(),
+        })?;
+    let before = ids.len();
+    match deferred {
+        // An object gone from the catalog (`None`) is stale too.
+        Some(c) => c.retain(|o, (g, _)| current.get(o) == Some(g)),
+        None => by_object.retain(|o, m| current.get(o) == Some(&m.generation)),
+    }
+    let after = deferred.as_ref().map_or(by_object.len(), |c| c.len());
+    Ok(before - after)
 }
 
 /// Source scope visible before compilation: `source:` clauses that are
