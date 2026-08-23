@@ -21,6 +21,13 @@ function Step($name, $cmd) {
 
 Step "cargo fmt --check"  { cargo fmt --check }
 Step "cargo clippy"       { cargo clippy --all-targets -- -D warnings }
+Step "generated API contract" {
+    $contract = Join-Path $root "web/src/generated/api.ts"
+    $before = if (Test-Path -LiteralPath $contract) { (Get-FileHash -LiteralPath $contract).Hash } else { "" }
+    cargo test -p eidos-service export_api_contract --lib
+    $after = (Get-FileHash -LiteralPath $contract).Hash
+    if ($before -ne $after) { throw "generated API contract was stale; commit $contract" }
+}
 Step "cargo test"         { cargo test }
 if (-not $SkipRelease) {
     Step "cargo build --release" { cargo build --release }

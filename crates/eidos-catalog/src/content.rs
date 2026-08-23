@@ -16,6 +16,7 @@ use eidos_domain::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use ts_rs::TS;
 
 pub const ZSTD_LEVEL: i32 = 1;
 
@@ -91,7 +92,7 @@ pub struct ChunkRow {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 pub struct ContentStats {
     /// state -> (files, indexed bytes, chunks)
     pub by_state: BTreeMap<String, (u64, u64, u64)>,

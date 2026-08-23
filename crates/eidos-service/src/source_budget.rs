@@ -18,6 +18,7 @@ use eidos_domain::SourceId;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use ts_rs::TS;
 
 /// Budget *reported* for a source whose policy has not been read yet
 /// (matches the `sources.content_concurrency` column default). It is a
@@ -67,7 +68,7 @@ impl Drop for SourceReservation {
 }
 
 /// Diagnostic view of one source's budget and live reservations.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, TS)]
 pub struct SourceConcurrencyView {
     pub source_id: SourceId,
     pub budget: u32,

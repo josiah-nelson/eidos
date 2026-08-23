@@ -6,9 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use ts_rs::TS;
 
 /// Nanoseconds since the Unix epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, TS)]
 pub struct UnixNanos(pub i64);
 
 impl Serialize for UnixNanos {

@@ -6,8 +6,9 @@ use eidos_domain::{
 };
 use rusqlite::Row;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct NewSource {
     pub host_id: HostId,
     pub name: String,
@@ -17,7 +18,7 @@ pub struct NewSource {
     pub aliases: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct SourceRecord {
     pub id: SourceId,
     pub host_id: HostId,
@@ -100,7 +101,7 @@ pub(crate) fn parse_enum<T: EnumFallback>(s: String) -> T {
     s.parse().unwrap_or(T::FALLBACK)
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct ObjectRecord {
     pub id: ObjectId,
     pub source_id: SourceId,
@@ -182,7 +183,7 @@ impl ObjectRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct EntryRecord {
     pub id: eidos_domain::EntryId,
     pub source_id: SourceId,
@@ -217,7 +218,7 @@ impl EntryRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct DirectoryAggregate {
     pub object_id: ObjectId,
     pub file_count: u64,
@@ -268,14 +269,14 @@ impl DirectoryAggregate {
 }
 
 /// One child of a directory as returned by browse APIs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct ChildRow {
     pub entry: EntryRecord,
     pub object: ObjectRecord,
     pub aggregate: Option<DirectoryAggregate>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ChildSort {
     #[default]
@@ -286,7 +287,7 @@ pub enum ChildSort {
     Kind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ChildrenPage {
     pub sort: ChildSort,
     pub descending: bool,
@@ -308,14 +309,14 @@ impl Default for ChildrenPage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct ChildrenResult {
     pub rows: Vec<ChildRow>,
     pub total: u64,
     pub offset: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 pub struct SourceCounts {
     pub objects: u64,
     pub entries: u64,
@@ -331,7 +332,8 @@ pub struct SourceCounts {
     pub open_errors: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(rename = "ScanGeneration")]
 pub struct ScanGenerationRecord {
     pub source_id: SourceId,
     pub generation: i64,
@@ -366,7 +368,7 @@ impl ScanGenerationRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct ErrorRecord {
     pub id: i64,
     pub source_id: SourceId,
@@ -381,7 +383,8 @@ pub struct ErrorRecord {
     pub resolved_at: Option<UnixNanos>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(rename = "PolicyDecision")]
 pub struct PolicyDecisionRecord {
     pub object_id: ObjectId,
     pub stage: String,
@@ -392,7 +395,7 @@ pub struct PolicyDecisionRecord {
     pub user_override: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ExtensionCount {
     pub extension: String,
     pub count: u64,

@@ -47,6 +47,28 @@ retains IDs as strings, formats counts through `BigInt`, and only converts to
 `number` at display-only boundaries such as dates, durations, and chart
 geometry. Identity and ordering never depend on that lossy conversion.
 
+### Generated TypeScript contract
+
+Rust request/response structs, enums, completeness/progress records, and the
+base error body are the source of truth for the web contract. `ts-rs` walks
+the endpoint roots in `eidos-service::api_contract` and writes their complete
+dependency graph to `web/src/generated/api.ts`. Regenerate it with:
+
+```powershell
+cargo test -p eidos-service export_api_contract --lib
+```
+
+The generated file is checked in but must never be edited by hand. Both CI
+and `scripts/check.ps1` rerun the export and fail if it changes. Rust-owned
+types are imported from that file; view state and other UI-only types stay in
+`web/src/api.ts`.
+
+Adding an optional response field or enum variant is compatible within a
+schema version. Removing or renaming a field/variant, changing its meaning,
+or changing a wire representation requires a public schema-version bump and
+a migration note. Cursors remain opaque strings: clients may store and return
+them but must not parse or synthesize them.
+
 ## Running the service
 
 ```powershell

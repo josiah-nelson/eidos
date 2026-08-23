@@ -28,6 +28,7 @@ use eidos_scanner::{DirEvent, RawEntry};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+use ts_rs::TS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanKind {
@@ -44,7 +45,7 @@ impl ScanKind {
     }
 }
 
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, TS)]
 pub struct ScanStats {
     pub dirs_listed: u64,
     pub entries_seen: u64,
@@ -58,7 +59,7 @@ pub struct ScanStats {
     pub commits: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, TS)]
 pub struct ScanSummary {
     pub source_id: SourceId,
     pub generation: i64,

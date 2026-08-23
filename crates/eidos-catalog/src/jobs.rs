@@ -13,6 +13,7 @@ use eidos_domain::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use ts_rs::TS;
 
 pub const MAX_TRANSIENT_ATTEMPTS: u32 = 6;
 
@@ -37,7 +38,7 @@ impl NewJob {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct JobRecord {
     pub id: JobId,
     pub source_id: SourceId,
@@ -143,7 +144,7 @@ pub fn enqueue_conn(conn: &Connection, job: &NewJob) -> Result<Option<JobId>> {
     Ok(Some(JobId(conn.last_insert_rowid())))
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
 pub struct JobCounts {
     /// `stage -> state -> count`
     pub by_stage: BTreeMap<String, BTreeMap<String, u64>>,

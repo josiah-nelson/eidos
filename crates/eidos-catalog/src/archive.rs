@@ -10,6 +10,7 @@ use eidos_domain::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use ts_rs::TS;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArchiveRecord {
@@ -65,7 +66,7 @@ pub struct MemberQuery {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 pub struct ArchiveStats {
     pub archives: u64,
     pub members: u64,

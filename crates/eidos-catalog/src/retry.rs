@@ -46,6 +46,7 @@ use eidos_domain::{ContentState, FailureClass, JobId, JobStage, ObjectId, Source
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use ts_rs::TS;
 
 /// Cap on the jobs one bulk action requeues, and on the candidates it
 /// examines to find them.
@@ -106,7 +107,7 @@ impl RetrySelector {
 }
 
 /// What a retry did (or, in preview mode, would do).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct RetryReport {
     pub preview: bool,
     /// When this evaluation ran; pass it back as `as_of` so later failures do

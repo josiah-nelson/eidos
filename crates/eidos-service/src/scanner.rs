@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use ts_rs::TS;
 
 #[derive(Debug)]
 pub struct ScanProgress {
@@ -24,7 +25,8 @@ pub struct ScanProgress {
     pub result: Mutex<Option<Result<ScanSummary, String>>>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(optional_fields, rename = "ScanProgress")]
 pub struct ScanProgressView {
     pub source_id: SourceId,
     pub running: bool,

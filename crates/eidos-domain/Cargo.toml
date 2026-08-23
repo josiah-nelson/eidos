@@ -10,3 +10,4 @@ description = "Shared identity, state, query AST, and result contracts for the f
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+ts-rs = { workspace = true }

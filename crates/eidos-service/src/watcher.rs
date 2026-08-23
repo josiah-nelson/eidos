@@ -23,13 +23,14 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use ts_rs::TS;
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub const DEFAULT_RECONCILE_INTERVAL_S: i64 = 6 * 3600;
 /// Minimum pause before a watcher retries a reconciliation that failed.
 pub const RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum WatcherState {
     Starting,
@@ -53,7 +54,7 @@ pub struct WatcherStatus {
     last_apply_ms: AtomicU64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, TS)]
 pub struct WatcherView {
     pub state: WatcherState,
     pub live: bool,

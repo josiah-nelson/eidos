@@ -18,6 +18,7 @@ use eidos_catalog::retry::{RetryReport, RetrySelector};
 use eidos_domain::{FailureClass, JobId, JobStage, SourceId, UnixNanos};
 use serde::Deserialize;
 use std::sync::Arc;
+use ts_rs::TS;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -25,7 +26,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/sources/{id}/content/retry", post(retry_source_content))
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, TS)]
+#[ts(optional_fields = nullable)]
 pub struct RetryBody {
     /// Only jobs that failed with this class (`deterministic`, `corrupt`, …).
     #[serde(default)]

@@ -21,6 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test -p eidos-service export_api_contract --lib
+      - run: git diff --exit-code -- web/src/generated/api.ts
       - run: cargo test
 
   web:
