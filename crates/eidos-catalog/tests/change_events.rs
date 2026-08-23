@@ -369,6 +369,14 @@ fn stale_feed_batch_cannot_restore_a_replaced_checkpoint() {
 
     let stale = usn_checkpoint(4);
     let next = usn_checkpoint(6);
+    assert!(!fx
+        .catalog
+        .advance_feed_checkpoint(fx.source, &stale, &next)
+        .unwrap());
+    assert_eq!(
+        fx.catalog.checkpoint(fx.source).unwrap().unwrap().0,
+        current
+    );
     let outcome = fx
         .catalog
         .apply_feed_changes(

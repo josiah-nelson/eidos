@@ -149,28 +149,32 @@ impl Catalog {
     ) -> Result<Option<ApplyStats>> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let current: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT checkpoint_kind, checkpoint_json FROM sources WHERE source_id = ?1 AND checkpoint_kind IS NOT NULL AND checkpoint_json IS NOT NULL",
-                    params![source_id.0],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let current = current
-                .map(|(kind, value)| {
-                    Ok::<_, CatalogError>(Checkpoint {
-                        kind,
-                        value: serde_json::from_str(&value)?,
-                    })
-                })
-                .transpose()?;
-            if current.as_ref() != Some(expected) {
+            if checkpoint_conn(&tx, source_id)?.as_ref() != Some(expected) {
                 return Ok(None);
             }
             let stats = apply_events_conn(&tx, source_id, events)?;
             set_checkpoint_conn(&tx, source_id, next)?;
             tx.commit()?;
             Ok(Some(stats))
+        })
+    }
+
+    /// Advance a feed checkpoint without events, provided the watcher still
+    /// owns the checkpoint it read from.
+    pub fn advance_feed_checkpoint(
+        &self,
+        source_id: SourceId,
+        expected: &Checkpoint,
+        next: &Checkpoint,
+    ) -> Result<bool> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if checkpoint_conn(&tx, source_id)?.as_ref() != Some(expected) {
+                return Ok(false);
+            }
+            set_checkpoint_conn(&tx, source_id, next)?;
+            tx.commit()?;
+            Ok(true)
         })
     }
 
@@ -249,6 +253,24 @@ fn apply_events_conn(
     }
     applier.finish()?;
     Ok(applier.stats)
+}
+
+fn checkpoint_conn(conn: &Connection, source_id: SourceId) -> Result<Option<Checkpoint>> {
+    let current: Option<(String, String)> = conn
+        .query_row(
+            "SELECT checkpoint_kind, checkpoint_json FROM sources WHERE source_id = ?1 AND checkpoint_kind IS NOT NULL AND checkpoint_json IS NOT NULL",
+            params![source_id.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    current
+        .map(|(kind, value)| {
+            Ok(Checkpoint {
+                kind,
+                value: serde_json::from_str(&value)?,
+            })
+        })
+        .transpose()
 }
 
 pub(crate) fn set_checkpoint_conn(

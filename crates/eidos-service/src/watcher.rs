@@ -292,15 +292,32 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 io_failures = 0;
                 if records.is_empty() {
                     if next_usn != cp.next_usn {
-                        let _ = state.catalog.set_checkpoint(
+                        let next_cp = UsnCheckpoint {
+                            next_usn,
+                            ..cp.clone()
+                        };
+                        match state.catalog.advance_feed_checkpoint(
                             source_id,
-                            &UsnCheckpoint {
-                                next_usn,
-                                ..cp.clone()
+                            &cp.to_checkpoint(),
+                            &next_cp.to_checkpoint(),
+                        ) {
+                            Ok(true) => {
+                                status.last_usn.store(next_usn, Ordering::Relaxed);
                             }
-                            .to_checkpoint(),
-                        );
-                        status.last_usn.store(next_usn, Ordering::Relaxed);
+                            Ok(false) => {
+                                tracing::debug!(
+                                    source = source_id.0,
+                                    "checkpoint changed while an empty feed batch was in flight"
+                                );
+                                vol = None;
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "watcher: checkpoint advance failed");
+                                std::thread::sleep(Duration::from_secs(2));
+                                continue;
+                            }
+                        }
                     }
                     status.set(WatcherState::Live, None);
                     std::thread::sleep(POLL_INTERVAL);
