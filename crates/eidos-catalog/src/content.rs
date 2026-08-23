@@ -105,7 +105,10 @@ fn decompress(blob: &[u8], chars_hint: u32) -> String {
 fn decompress_with(dec: &mut zstd::bulk::Decompressor<'_>, blob: &[u8], chars_hint: u32) -> String {
     let cap = (chars_hint as usize).saturating_mul(4).max(64);
     match dec.decompress(blob, cap.max(blob.len() * 8)) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        },
         Err(_) => String::from_utf8_lossy(blob).into_owned(),
     }
 }

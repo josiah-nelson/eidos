@@ -183,6 +183,47 @@ filled; one query may fetch at most 20,000 chunks.
 - Ranked, phrase, and exact-token content queries are unaffected (p95
   27 ms and 30 ms in this run).
 
+## Regex plans and the mapped chunk store (ADR-0009)
+
+Same catalog and method the next day. Regex candidates now come from a
+trigram plan that expands alternations and optional pieces; the catalog is
+memory-mapped in full (SQLite built with a raised `SQLITE_MAX_MMAP_SIZE`);
+page-driven verification batches fetches across objects and uses up to 16
+threads. Full `eidos bench search` run, 30 iterations.
+
+| Family | Queries | ADR-0008 p95 | **p95** | p50 | p99 |
+|---|---|---:|---:|---:|---:|
+| metadata | as above | 91 ms | **79 ms** | 12 ms | 85 ms |
+| directory | as above | 26 ms | **23 ms** | 21 ms | 31 ms |
+| name | as above | 49 ms | **32 ms** | 13 ms | 36 ms |
+| regex (selective) | as above | 43 ms | **39 ms** | | |
+| regex (no literal) | IPv4 shape (flagged dictionary walk) | 1,103 ms | 975 ms | | |
+| content (ranked/phrase) | as above | 55 ms | **19 ms** | 10 ms | 19 ms |
+| content exact token | `content:=Exception` | 30 ms | **19 ms** | | |
+| content substring | `content:~localhost:` | 123 ms | **56 ms** | | |
+| content regex | `content:/timed? ?out after \d+/` (5, exact), `content:/[A-Z][a-z]+Exception: /c ext:log` (350+) | 532 / 78 ms | **174 / 60 ms** | 127 ms | 174 ms |
+| content regex (extra) | `content:/(error\|warn)ing: \w+/ ext:log` (61) | 194 ms | **54 ms** | | |
+| content regex (extra) | `content:/connection (refused\|reset)/` (1,519+) | 1,049 ms | 309 ms | 265 ms | 309 ms |
+
+Reading:
+
+- `/timed? ?out after \d+/` plans as four alternatives (`"time out after "
+  | "timed out after " | "timedout after " | "timeout after "`, 20
+  trigrams) and collects 2,351 candidate chunks over 713 files instead of
+  tens of thousands; all are examined because only five files match, and
+  the total is exact again.
+- The fetch cost behind every verified clause dropped from ≈150 µs to
+  ≈50–60 µs wall per chunk (`bench chunks --query`, 8–16 threads): the
+  candidate chunks of real queries are scattered over a 9 GB file and are
+  often ≈84 KB of text (long-line logs), which the 256 MB mapping limit
+  served through read calls that did not scale across connections. Every
+  content family benefits, not only regexes.
+- `connection (refused|reset)` plans well but 15.9 k chunks contain all of
+  its trigrams while 52 of 1,280 examined files contain the phrase: trigram
+  documents are whole chunks of up to 256 KiB, so common-word literals
+  produce false candidates at that granularity. Finer-grained trigram
+  documents (blocks within a chunk) are the lever; deferred (ADR-0009).
+
 ## Gates status (v0.5)
 
 | Gate | Target | Measured |
@@ -193,5 +234,5 @@ filled; one query may fetch at most 20,000 chunks.
 | selective name/path regex p95 | < 250 ms | 43 ms on 4.15 M entries (literal-free shapes walk the dictionary: 1.1 s, flagged) |
 | multi-GB files with bounded memory | required | 2.14 GiB at 8.6 MiB peak working set |
 | candidate content indexed | 30 min | ≈ 17 min for 28.8 GiB |
-| ordinary content query p95 | < 150 ms | 55 ms (ranked/phrase), 39 ms (exact token) |
-| selective content regex/substring p95 | < 250 ms | 78–123 ms after ADR-0008 (a regex with only weak literals stays fetch-budget bound at ≈530 ms and is reported as a subset) |
+| ordinary content query p95 | < 150 ms | 19 ms (ranked/phrase), 19 ms (exact token) after ADR-0009 |
+| selective content regex/substring p95 | < 250 ms | 56–174 ms after ADR-0009 (content-regex family p95 155 ms; a selective literal with many false trigram candidates — `connection (refused\|reset)` — is 309 ms, see below) |

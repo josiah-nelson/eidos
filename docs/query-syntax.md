@@ -49,9 +49,12 @@ are request parameters, not syntax. Directory predicates (`has:`, `files:`,
   used; case-sensitive modes are verified against the stored original text.
 - Regexes are unanchored unless you write `^`/`$`. Substring, glob, and
   regex clauses on names and paths find candidates through folded trigrams
-  of their literal parts and verify them; patterns without any literal of
-  three or more characters walk the folded dictionary instead and are
-  flagged as broad. `*.ext` is an extension filter.
+  and verify them. A regex is planned as a boolean combination of the
+  strings every match must contain — alternations and optional pieces
+  expand (`colou?r` → `color | colour`, `(error|warn)ing` → `erroring |
+  warning`), and the explanation shows the plan. Patterns without any
+  required string of three or more characters walk the folded dictionary
+  instead and are flagged as broad. `*.ext` is an extension filter.
 - Inside `OR` and `-`/`NOT`, substring/glob/regex clauses run as exact
   dictionary automata (correct, slower on large catalogs), and clauses that
   need verification — case-sensitive modes (`=`, `~`, `/re/c`), `in:` with a
@@ -70,8 +73,10 @@ are request parameters, not syntax. Directory predicates (`has:`, `files:`,
   hit the response says so and `total.exact` is false — narrow the query
   with metadata filters. Phrases do not match across chunk boundaries
   (chunks are ≈16 KB, split on line ends).
-- Regexes with no required literal of three or more characters (for example
-  `/\d+/`) scan every chunk in scope; they are allowed but flagged.
+- Content regexes use the same trigram plan to pick candidate chunks and
+  are then verified against the stored text. Regexes with no required
+  string of three or more characters (for example `/\d+/`) scan every
+  chunk in scope; they are allowed but flagged.
 - Broad name/path substring, glob, and regex clauses (more than 2,000
   candidates) verify results lazily in sort order: the hits you see are all
   verified, but the reported total is an upper bound (`exact: false`,

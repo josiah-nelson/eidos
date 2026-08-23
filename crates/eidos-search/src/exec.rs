@@ -5,9 +5,10 @@
 //! join current state and completeness from the catalog, and explain.
 
 use crate::content::{
-    self, object_score, verify_object, ContentClause, ContentIndex, ContentOpts, Matcher,
-    VERIFY_THREADS,
+    self, object_score, verify_objects, verify_threads, ContentClause, ContentIndex, ContentOpts,
+    Matcher, VerifyJob,
 };
+use crate::regex_plan::TrigramPlan;
 use crate::schema::{attr_bit, attr_name, fold, Fields};
 use crate::{CatalogIndex, Result, SearchError, PROJECTION_NAME};
 use eidos_catalog::content::ChunkRow;
@@ -330,18 +331,7 @@ impl Iterator for MergeByString<'_> {
 /// `AND` of the folded trigrams of every literal (None when no literal has
 /// three characters).
 fn trigram_query(field: tantivy::schema::Field, literals: &[String]) -> Option<Box<dyn TQuery>> {
-    let mut tris: Vec<String> = Vec::new();
-    for l in literals {
-        for t in content::trigrams(l) {
-            if !tris.contains(&t) {
-                tris.push(t);
-            }
-        }
-    }
-    if tris.is_empty() {
-        return None;
-    }
-    Some(all_of(tris.iter().map(|t| term_text(field, t)).collect()))
+    TrigramPlan::all_literals(literals.iter().map(String::as_str)).query(&|t| term_text(field, t))
 }
 
 /// Literal runs of a glob (between `*` / `?`).
@@ -852,10 +842,10 @@ fn compile_text(
                     .push(Box::new(move |s, _| re.is_match(&stored_of(s))));
             }
             let is_name = field == TextField::Name;
-            let literals = content::required_literals(value);
+            let plan = TrigramPlan::for_regex(value);
             let positive = ctx.neg_depth == 0;
             let candidates = if positive {
-                trigram_query(tri_field, &literals)
+                plan.query(&|t| term_text(tri_field, t))
             } else {
                 None
             };
@@ -867,8 +857,7 @@ fn compile_text(
                     ctx.steps.push(PlanStep {
                         stage: "candidates".into(),
                         description: format!(
-                            "trigrams of required literals [{}] on {label}; candidates verified on the folded {label} fast field",
-                            literals.join(", ")
+                            "trigram plan {plan} on {label}; candidates verified on the folded {label} fast field"
                         ),
                         candidates: None,
                         verified: None,
@@ -1264,7 +1253,7 @@ impl<'a> LazyContent<'a> {
         if work.is_empty() {
             return Ok(());
         }
-        let threads = work.len().clamp(1, VERIFY_THREADS);
+        let threads = work.len().clamp(1, verify_threads());
         let per = work.len().div_ceil(threads).max(1);
         let catalog = self.catalog;
         let budget = &self.budget;
@@ -1274,13 +1263,21 @@ impl<'a> LazyContent<'a> {
                 .chunks(per)
                 .map(|part| {
                     sc.spawn(move || {
-                        let mut out = Vec::with_capacity(part.len());
-                        for (i, o, g, ords) in part {
-                            let v =
-                                verify_object(catalog, &sets[*i].matcher, *o, *g, ords, budget)?;
-                            out.push((*i, *o, *g, v));
-                        }
-                        Ok(out)
+                        let jobs: Vec<VerifyJob<'_>> = part
+                            .iter()
+                            .map(|(i, o, g, ords)| VerifyJob {
+                                matcher: &sets[*i].matcher,
+                                object: *o,
+                                generation: *g,
+                                ordinals: ords,
+                            })
+                            .collect();
+                        let verdicts = verify_objects(catalog, &jobs, budget)?;
+                        Ok(part
+                            .iter()
+                            .zip(verdicts)
+                            .map(|((i, o, g, _), v)| (*i, *o, *g, v))
+                            .collect())
                     })
                 })
                 .collect();
@@ -1829,7 +1826,7 @@ pub fn search_with_content(
         if !lazy {
             // Eager: resolve strings where needed and verify everything.
             if !fast.is_empty() || sort_by_string {
-                let threads = (rows.len() / 2_000).clamp(1, VERIFY_THREADS);
+                let threads = (rows.len() / 2_000).clamp(1, verify_threads());
                 let per = rows.len().div_ceil(threads).max(1);
                 let cols_ref = &cols;
                 let mut parts: Vec<Vec<FastRow>> = Vec::new();
@@ -1870,7 +1867,7 @@ pub fn search_with_content(
                 }
             }
             if need_stored {
-                let threads = (rows.len() / 500).clamp(1, VERIFY_THREADS);
+                let threads = (rows.len() / 500).clamp(1, verify_threads());
                 let per = rows.len().div_ceil(threads).max(1);
                 let searcher_ref = &searcher;
                 let parts: Vec<Result<Vec<Stored>>> = std::thread::scope(|sc| {
