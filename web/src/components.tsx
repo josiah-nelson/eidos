@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type ContentState, type SourceCompleteness, type SourceState } from './api'
-import { ago, count, humanState } from './format'
+import { api, type ApiRouteId, type ContentState, type SourceCompleteness, type SourceState } from './api'
+import { ago, count, humanState, integerNumber } from './format'
 
 export function StateBadge({ state }: { state: SourceState }) {
   const cls =
@@ -79,19 +79,19 @@ export function CompletenessBanner({ c }: { c: SourceCompleteness }) {
       </div>
     )
   }
-  if (c.listing_errors > 0) {
+  if (integerNumber(c.listing_errors) > 0) {
     return (
       <div className="banner warn">
         <span className="badge warn">complete with exceptions</span>
         <span>
           <strong>{c.name}</strong>: {count(c.listing_errors)} directories could not be listed in the published
           generation; their previous contents were preserved and their totals are marked incomplete.
-          {c.content_pending > 0 ? ` ${count(c.content_pending)} files await content indexing.` : ''}
+          {integerNumber(c.content_pending) > 0 ? ` ${count(c.content_pending)} files await content indexing.` : ''}
         </span>
       </div>
     )
   }
-  if (c.content_pending > 0) {
+  if (integerNumber(c.content_pending) > 0) {
     return (
       <div className="banner">
         <span className="badge ok">metadata complete</span>
@@ -118,7 +118,7 @@ export function ContentPolicyControl({
   enabled,
   concurrency,
 }: {
-  sourceId: number
+  sourceId: ApiRouteId
   enabled: boolean
   concurrency: number
 }) {

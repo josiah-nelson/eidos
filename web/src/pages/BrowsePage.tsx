@@ -2,10 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
-import { api, type ChildRow, type ChildSort } from '../api'
+import { api, type ApiInt, type ApiRouteId, type ChildRow, type ChildSort } from '../api'
 import { CompletenessBanner, ContentBadge, ErrorBox, Spinner } from '../components'
 import { ContentPreviewPanel } from '../ContentPreview'
-import { attrFlags, bytes, count, when } from '../format'
+import { attrFlags, bytes, count, integerNumber, when } from '../format'
 import { Treemap, type TreemapItem } from '../Treemap'
 
 const PAGE = 500
@@ -26,17 +26,17 @@ export default function BrowsePage() {
     }
   }, [objectId, sources.data, navigate])
 
-  const oid = Number(objectId)
-  const enabled = Number.isFinite(oid) && oid > 0
+  const oid = objectId ?? ''
+  const enabled = /^[1-9]\d*$/.test(oid)
 
   const children = useInfiniteQuery({
     queryKey: ['children', oid, sort, desc, hidden],
     queryFn: ({ pageParam }) => api.children(oid, { sort, desc, offset: pageParam, limit: PAGE, hidden }),
-    initialPageParam: 0,
     getNextPageParam: (last) => {
-      const next = last.offset + last.rows.length
-      return next < last.total ? next : undefined
+      const next = BigInt(last.offset) + BigInt(last.rows.length)
+      return next < BigInt(last.total) ? next.toString() : undefined
     },
+    initialPageParam: '0',
     enabled,
   })
   const extensions = useQuery({
@@ -48,18 +48,22 @@ export default function BrowsePage() {
 
   const rows = useMemo(() => children.data?.pages.flatMap((p) => p.rows) ?? [], [children.data])
   const first = children.data?.pages[0]
-  const total = first?.total ?? 0
+  const total = first?.total ?? '0'
   const [showMap, setShowMap] = useState(true)
-  const [preview, setPreview] = useState<{ objectId: number; name: string } | null>(null)
+  const [preview, setPreview] = useState<{ objectId: ApiInt; name: string } | null>(null)
   const treemapItems: TreemapItem[] = useMemo(
     () =>
-      rows.map((r) => ({
-        id: r.object.id,
-        label: r.entry.name,
-        value: r.object.kind === 'directory' ? (r.aggregate?.logical_bytes ?? 0) : r.object.size,
-        isDir: r.object.kind === 'directory',
-        detail: r.object.kind === 'directory' ? `${count(r.aggregate?.file_count)} files` : undefined,
-      })),
+      rows.map((r) => {
+        const exactValue = r.object.kind === 'directory' ? (r.aggregate?.logical_bytes ?? '0') : r.object.size
+        return {
+          id: r.object.id,
+          label: r.entry.name,
+          value: integerNumber(exactValue),
+          exactValue,
+          isDir: r.object.kind === 'directory',
+          detail: r.object.kind === 'directory' ? `${count(r.aggregate?.file_count)} files` : undefined,
+        }
+      }),
     [rows],
   )
   const treemapTotal = useMemo(() => treemapItems.reduce((s, i) => s + i.value, 0), [treemapItems])
@@ -129,7 +133,7 @@ export default function BrowsePage() {
         {showMap && treemapItems.length > 0 && (
           <div style={{ marginBottom: 8 }}>
             <Treemap items={treemapItems} total={treemapTotal} />
-            {rows.length < total && (
+            {BigInt(rows.length) < BigInt(total) && (
               <div className="muted" style={{ fontSize: 11.5, marginTop: 2 }}>
                 treemap shows the {count(rows.length)} loaded of {count(total)} entries
               </div>
@@ -164,13 +168,13 @@ export default function BrowsePage() {
           {extensions.data && extensions.data.length > 0 && (
             <ul className="facet-list">
               {extensions.data.map((x) => {
-                const max = extensions.data[0].count
+                const max = integerNumber(extensions.data[0].count)
                 return (
                   <li key={x.extension}>
                     <span className="mono">{x.extension === '' ? '(no extension)' : `.${x.extension}`}</span>
                     <span>{count(x.count)}</span>
                     <span className="muted">{bytes(x.bytes)}</span>
-                    <div className="bar" style={{ width: `${Math.max(2, (100 * x.count) / max)}%` }} />
+                    <div className="bar" style={{ width: `${Math.max(2, (100 * integerNumber(x.count)) / max)}%` }} />
                   </li>
                 )
               })}
@@ -211,7 +215,7 @@ export default function BrowsePage() {
   )
 }
 
-function Breadcrumbs({ path, objectId }: { path: string | null; objectId: number }) {
+function Breadcrumbs({ path, objectId }: { path: string | null; objectId: ApiRouteId }) {
   // Crumbs are rendered from the current path string; navigation to
   // ancestors uses the parent link chain (cheap and always correct).
   const parts = path ? path.split('\\').filter((p) => p.length > 0) : []
@@ -241,7 +245,7 @@ function ChildrenTable({
   onPreview,
 }: {
   rows: ChildRow[]
-  total: number
+  total: ApiInt
   sort: ChildSort
   desc: boolean
   onSort: (f: ChildSort) => void
@@ -249,7 +253,7 @@ function ChildrenTable({
   fetching: boolean
   hasMore: boolean
   fetchMore: () => void
-  onPreview: (objectId: number, name: string) => void
+  onPreview: (objectId: ApiInt, name: string) => void
 }) {
   const parentRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({

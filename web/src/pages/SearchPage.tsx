@@ -5,6 +5,7 @@ import { Link, useSearchParams } from 'react-router'
 import {
   api,
   exportUrl,
+  type ApiInt,
   type ExportFormat,
   type FacetField,
   type FacetValue,
@@ -22,7 +23,7 @@ import { PAGE_SIZES, canonicalSearchParams, readSearchView } from '../saved-sear
 
 /** What a "show context" click opens: stored text around one chunk. */
 export interface PreviewTarget {
-  objectId: number
+  objectId: ApiInt
   name: string
   ordinal: number
   generation?: number
@@ -492,7 +493,7 @@ function HitTable({
                 {isDir ? (
                   <span className="muted">
                     {Object.entries(h.directory?.extension_counts ?? {})
-                      .sort((a, b) => b[1] - a[1])
+                      .sort((a, b) => (BigInt(a[1]) === BigInt(b[1]) ? 0 : BigInt(a[1]) < BigInt(b[1]) ? 1 : -1))
                       .slice(0, 5)
                       .map(([e, n]) => `${e || '∅'} ${n}`)
                       .join(' · ')}
@@ -520,7 +521,7 @@ function HitTable({
                 <div className="snippets">
                   {snippets.map((s) => (
                     <div key={s.chunk_ordinal + ':' + s.line_start}>
-                      <span className="line">L{s.line_start + 1}</span>
+                      <span className="line">L{BigInt(s.line_start) + 1n}</span>
                       <Highlighted text={s.text} ranges={s.highlights} />{' '}
                       <button
                         className="linkish"

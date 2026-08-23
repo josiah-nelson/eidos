@@ -6,17 +6,18 @@ import { bytes, count, duration, humanState, when } from '../format'
 
 export default function SourceDetailPage() {
   const { id } = useParams()
-  const sid = Number(id)
+  const sid = id ?? ''
+  const enabled = /^[1-9]\d*$/.test(sid)
   const detail = useQuery({
     queryKey: ['source', sid],
     queryFn: () => api.source(sid),
     refetchInterval: (q) => (q.state.data?.scan?.running ? 1000 : 5000),
-    enabled: Number.isFinite(sid),
+    enabled,
   })
   const errors = useQuery({
     queryKey: ['source-errors', sid],
     queryFn: () => api.sourceErrors(sid, false),
-    enabled: Number.isFinite(sid),
+    enabled,
   })
 
   if (detail.isPending) return <Spinner />
@@ -149,7 +150,7 @@ export default function SourceDetailPage() {
                 </span>
               </td>
               <td>{when(g.started_at)}</td>
-              <td>{g.finished_at ? duration((g.finished_at - g.started_at) / 1e6) : '—'}</td>
+              <td>{g.finished_at ? duration((BigInt(g.finished_at) - BigInt(g.started_at)) / 1_000_000n) : '—'}</td>
               <td className="num">{count(g.dirs_listed)}</td>
               <td className="num">{count(g.entries_seen)}</td>
               <td className="num">{count(g.errors)}</td>

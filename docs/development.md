@@ -32,6 +32,21 @@ Tests never touch user data: every integration test builds its own fixture
 under a `tempfile::tempdir()`. USN-journal tests need an elevated session
 and skip themselves otherwise.
 
+### HTTP integer contract
+
+Public schema version 2 represents every Rust `i64`/`u64` in ordinary JSON
+API responses as a decimal string. This includes opaque IDs, byte/count
+fields, generations, and Unix-nanosecond timestamps. Rust `u32`/`i32`,
+floating-point values, and `usize` bounds remain JSON numbers. Error details
+stored through `serde_json::Value` also stringify integer values because the
+original Rust width is no longer available at serialization time.
+
+Request decoders accept both the decimal-string form and legacy JSON numbers
+for opaque IDs and timestamps. New clients must emit strings. The web UI
+retains IDs as strings, formats counts through `BigInt`, and only converts to
+`number` at display-only boundaries such as dates, durations, and chart
+geometry. Identity and ordering never depend on that lossy conversion.
+
 ## Running the service
 
 ```powershell

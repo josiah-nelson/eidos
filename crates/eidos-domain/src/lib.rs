@@ -8,6 +8,7 @@ pub mod archive;
 pub mod bench;
 pub mod classify;
 pub mod ids;
+pub mod json;
 pub mod query;
 pub mod result;
 pub mod state;
@@ -21,4 +22,4 @@ pub use state::*;
 pub use time::*;
 
 /// Version of the public query/result schema. Bump on incompatible changes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;

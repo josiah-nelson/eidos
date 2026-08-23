@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ApiError, api, type PreviewChunk, type PreviewWindow } from './api'
+import { ApiError, api, type ApiRouteId, type PreviewChunk, type PreviewWindow } from './api'
 import { ContentBadge, ErrorBox, Spinner } from './components'
 import { bytes, count } from './format'
 import { stepWindow } from './preview-window'
@@ -20,7 +20,7 @@ export function ContentPreviewPanel({
   ordinal,
   onClose,
 }: {
-  objectId: number
+  objectId: ApiRouteId
   name: string
   /** Generation the caller believes it read (from a hit's content summary). */
   generation?: number

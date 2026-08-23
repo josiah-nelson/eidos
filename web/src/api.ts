@@ -2,6 +2,10 @@
 
 import type { PreviewWindow } from './preview-window'
 
+/** Decimal JSON string emitted for every Rust `i64`/`u64`. */
+export type ApiInt = string
+export type ApiRouteId = ApiInt | number
+
 export type SourceState =
   | 'new'
   | 'enumerating'
@@ -29,8 +33,8 @@ export type ObjectKind = 'file' | 'directory' | 'reparse' | 'virtual_file' | 'vi
 export interface SourceRecord {
   content_enabled: boolean
   content_concurrency: number
-  id: number
-  host_id: number
+  id: ApiInt
+  host_id: ApiInt
   name: string
   kind: 'windows_local' | 'windows_generic' | 'smb'
   root_path: string
@@ -38,80 +42,82 @@ export interface SourceRecord {
   state: SourceState
   state_reason: string | null
   policy_version: number
-  root_object_id: number | null
-  published_generation: number | null
-  volume_id: number | null
+  root_object_id: ApiInt | null
+  published_generation: ApiInt | null
+  volume_id: ApiInt | null
   preserve_offline: boolean
+  reconcile_interval_s: ApiInt | null
   checkpoint_kind: string | null
-  checkpoint_at: number | null
-  last_scan_started_at: number | null
-  last_scan_completed_at: number | null
-  created_at: number
-  updated_at: number
+  checkpoint_at: ApiInt | null
+  last_scan_started_at: ApiInt | null
+  last_scan_completed_at: ApiInt | null
+  created_at: ApiInt
+  updated_at: ApiInt
 }
 
 export interface SourceCounts {
-  objects: number
-  entries: number
-  directories: number
-  files: number
-  logical_bytes: number
-  allocated_bytes: number
-  content_pending: number
-  content_indexed: number
-  content_failed: number
-  content_excluded: number
-  content_unsupported: number
-  open_errors: number
+  objects: ApiInt
+  entries: ApiInt
+  directories: ApiInt
+  files: ApiInt
+  logical_bytes: ApiInt
+  allocated_bytes: ApiInt
+  content_pending: ApiInt
+  content_indexed: ApiInt
+  content_failed: ApiInt
+  content_excluded: ApiInt
+  content_unsupported: ApiInt
+  open_errors: ApiInt
 }
 
 export interface SourceCompleteness {
-  source_id: number
+  source_id: ApiInt
   name: string
   state: SourceState
   metadata_complete: boolean
   content_complete: boolean
-  content_pending: number
-  content_failed: number
-  listing_errors: number
-  last_scan_completed?: number
-  checkpoint_age_ms?: number
+  content_pending: ApiInt
+  content_failed: ApiInt
+  listing_errors: ApiInt
+  last_scan_completed?: ApiInt
+  checkpoint_age_ms?: ApiInt
   freshness: 'live' | 'periodic' | 'unknown'
   note?: string
 }
 
 export interface ScanStats {
-  dirs_listed: number
-  entries_seen: number
-  errors: number
-  objects_created: number
-  objects_updated: number
-  content_changed: number
-  entries_created: number
-  entries_replaced: number
-  hard_links: number
-  commits: number
+  dirs_listed: ApiInt
+  entries_seen: ApiInt
+  errors: ApiInt
+  objects_created: ApiInt
+  objects_updated: ApiInt
+  content_changed: ApiInt
+  entries_created: ApiInt
+  entries_replaced: ApiInt
+  hard_links: ApiInt
+  commits: ApiInt
 }
 
 export interface ScanSummary {
-  source_id: number
-  generation: number
+  source_id: ApiInt
+  generation: ApiInt
   stats: ScanStats
-  tombstoned_entries: number
-  tombstoned_objects: number
-  aggregates: { directories: number; extension_rows: number; unreachable_directories: number }
+  tombstoned_entries: ApiInt
+  tombstoned_objects: ApiInt
+  aggregates: { directories: ApiInt; extension_rows: ApiInt; unreachable_directories: ApiInt }
   elapsed_ms: number
   published: boolean
   final_state: SourceState
 }
 
 export interface ScanProgress {
-  source_id: number
+  source_id: ApiInt
   running: boolean
-  elapsed_ms: number
-  dirs: number
-  entries: number
-  errors: number
+  phase: string
+  elapsed_ms: ApiInt
+  dirs: ApiInt
+  entries: ApiInt
+  errors: ApiInt
   entries_per_sec: number
   summary?: ScanSummary
   error?: string
@@ -121,14 +127,14 @@ export interface WatcherView {
   state: 'starting' | 'live' | 'reconciling' | 'stopped'
   live: boolean
   detail: string | null
-  batches: number
-  events: number
-  records: number
-  reconciles: number
-  last_usn: number
-  last_batch_ms_ago: number | null
-  last_apply_ms: number
-  uptime_s: number
+  batches: ApiInt
+  events: ApiInt
+  records: ApiInt
+  reconciles: ApiInt
+  last_usn: ApiInt
+  last_batch_ms_ago: ApiInt | null
+  last_apply_ms: ApiInt
+  uptime_s: ApiInt
 }
 
 export interface SourceView {
@@ -140,41 +146,41 @@ export interface SourceView {
 }
 
 export interface ScanGeneration {
-  source_id: number
-  generation: number
+  source_id: ApiInt
+  generation: ApiInt
   kind: string
   state: string
-  started_at: number
-  finished_at: number | null
-  published_at: number | null
-  dirs_listed: number
-  entries_seen: number
-  errors: number
-  tombstoned: number
+  started_at: ApiInt
+  finished_at: ApiInt | null
+  published_at: ApiInt | null
+  dirs_listed: ApiInt
+  entries_seen: ApiInt
+  errors: ApiInt
+  tombstoned: ApiInt
   note: string | null
 }
 
 export interface DirectoryAggregate {
-  object_id: number
-  file_count: number
-  dir_count: number
-  logical_bytes: number
-  allocated_bytes: number
-  newest_modified: number | null
-  oldest_modified: number | null
-  content_pending: number
-  content_indexed: number
-  content_failed: number
-  content_excluded: number
-  generation: number
+  object_id: ApiInt
+  file_count: ApiInt
+  dir_count: ApiInt
+  logical_bytes: ApiInt
+  allocated_bytes: ApiInt
+  newest_modified: ApiInt | null
+  oldest_modified: ApiInt | null
+  content_pending: ApiInt
+  content_indexed: ApiInt
+  content_failed: ApiInt
+  content_excluded: ApiInt
+  generation: ApiInt
   complete: boolean
 }
 
 export interface ExclusionRow {
   stage: string
   reason: string
-  count: number
-  bytes: number
+  count: ApiInt
+  bytes: ApiInt
 }
 
 export interface SourceDetail extends SourceView {
@@ -184,44 +190,44 @@ export interface SourceDetail extends SourceView {
 }
 
 export interface ObjectRecord {
-  id: number
-  source_id: number
+  id: ApiInt
+  source_id: ApiInt
   kind: ObjectKind
   native: {
-    volume_serial: number
-    file_id_high: number
-    file_id_low: number
+    volume_serial: ApiInt
+    file_id_high: ApiInt
+    file_id_low: ApiInt
     confidence: string
   } | null
   identity_confidence: string
   generation: number
-  size: number
-  allocated: number
+  size: ApiInt
+  allocated: ApiInt
   attributes: number
-  created: number | null
-  modified: number | null
-  changed: number | null
-  accessed: number | null
+  created: ApiInt | null
+  modified: ApiInt | null
+  changed: ApiInt | null
+  accessed: ApiInt | null
   reparse_tag: number
   link_count: number
   content_state: ContentState
   content_id: string | null
-  first_seen_generation: number
-  last_seen_generation: number
-  deleted_at: number | null
+  first_seen_generation: ApiInt
+  last_seen_generation: ApiInt
+  deleted_at: ApiInt | null
 }
 
 export interface EntryRecord {
-  id: number
-  source_id: number
-  parent_id: number | null
-  object_id: number
+  id: ApiInt
+  source_id: ApiInt
+  parent_id: ApiInt | null
+  object_id: ApiInt
   name: string
   extension: string
   is_virtual: boolean
-  first_seen_generation: number
-  last_seen_generation: number
-  deleted_at: number | null
+  first_seen_generation: ApiInt
+  last_seen_generation: ApiInt
+  deleted_at: ApiInt | null
 }
 
 export interface ChildRow {
@@ -232,15 +238,15 @@ export interface ChildRow {
 
 export interface ChildrenView {
   rows: ChildRow[]
-  total: number
-  offset: number
+  total: ApiInt
+  offset: ApiInt
   path: string | null
-  parent_id: number | null
+  parent_id: ApiInt | null
   source: SourceCompleteness
 }
 
 export interface PolicyDecision {
-  object_id: number
+  object_id: ApiInt
   stage: string
   included: boolean
   reason: string
@@ -260,33 +266,33 @@ export interface ObjectDetail {
 
 export interface ExtensionCount {
   extension: string
-  count: number
-  bytes: number
+  count: ApiInt
+  bytes: ApiInt
 }
 
 export interface ErrorRecord {
-  id: number
-  source_id: number
-  object_id: number | null
-  generation: number | null
+  id: ApiInt
+  source_id: ApiInt
+  object_id: ApiInt | null
+  generation: ApiInt | null
   stage: string
   kind: string
-  code: number
+  code: ApiInt
   path: string
   message: string
-  occurred_at: number
-  resolved_at: number | null
+  occurred_at: ApiInt
+  resolved_at: ApiInt | null
 }
 
 export interface Health {
   version: string
   schema_version: number
   host: string
-  uptime_s: number
+  uptime_s: ApiInt
   catalog_path: string
   sources: number
   running_scans: number
-  export_max_rows: number
+  export_max_rows: ApiInt
 }
 
 // ----- search --------------------------------------------------------------
@@ -312,47 +318,47 @@ export type FacetField =
 
 export interface Snippet {
   chunk_ordinal: number
-  byte_start: number
-  byte_end: number
-  line_start: number
-  line_end: number
+  byte_start: ApiInt
+  byte_end: ApiInt
+  line_start: ApiInt
+  line_end: ApiInt
   text: string
   highlights: [number, number][]
 }
 
 export interface DirectorySummary {
-  file_count: number
-  directory_count: number
-  logical_bytes: number
-  allocated_bytes: number
-  newest_modified?: number
-  oldest_modified?: number
-  extension_counts?: Record<string, number>
+  file_count: ApiInt
+  directory_count: ApiInt
+  logical_bytes: ApiInt
+  allocated_bytes: ApiInt
+  newest_modified?: ApiInt
+  oldest_modified?: ApiInt
+  extension_counts?: Record<string, ApiInt>
   complete: boolean
 }
 
 export interface Hit {
-  object_id: number
-  entry_id?: number
-  source_id: number
-  host_id: number
+  object_id: ApiInt
+  entry_id?: ApiInt
+  source_id: ApiInt
+  host_id: ApiInt
   kind: ObjectKind
   name: string
   path?: string
-  parent_id?: number
+  parent_id?: ApiInt
   extension: string
-  size: number
-  allocated_size: number
-  modified?: number
-  created?: number
-  changed?: number
+  size: ApiInt
+  allocated_size: ApiInt
+  modified?: ApiInt
+  created?: ApiInt
+  changed?: ApiInt
   attributes: number
   hard_link_count: number
   content: {
     state: ContentState
     coverage: string
     generation?: number
-    indexed_bytes?: number
+    indexed_bytes?: ApiInt
     content_id?: string
     reason?: string
   }
@@ -370,15 +376,15 @@ export interface Hit {
  * nanoseconds, which exceed the precision of a JavaScript number.
  */
 export interface FacetRange {
-  from?: number
-  to?: number
+  from?: ApiInt
+  to?: ApiInt
   clause: string
   exclude: string
 }
 
 export interface FacetValue {
   value: string
-  count: number
+  count: ApiInt
   label?: string
   /** Present for range buckets the current result mode can express. */
   range?: FacetRange
@@ -393,8 +399,8 @@ export interface Facet {
 export interface PlanStep {
   stage: string
   description: string
-  candidates?: number
-  verified?: number
+  candidates?: ApiInt
+  verified?: ApiInt
   elapsed_ms?: number
 }
 
@@ -402,7 +408,7 @@ export interface SearchResponse {
   schema_version: number
   hits: Hit[]
   next_cursor?: string
-  total: { value: number; exact: boolean; origin?: 'counted' | 'cursor' | 'bound' }
+  total: { value: ApiInt; exact: boolean; origin?: 'counted' | 'cursor' | 'bound' }
   timing: { total_ms: number; plan_ms: number; retrieve_ms: number; verify_ms: number; join_ms: number }
   completeness: SourceCompleteness[]
   explanation?: { readable: string; steps: PlanStep[] }
@@ -439,24 +445,24 @@ export function exportUrl(
 
 export interface IndexStatus {
   follower: {
-    iterations: number
-    rebuilds: number
-    rows_applied: number
-    documents_added: number
-    last_seq: number
-    last_rebuild_ms: number
+    iterations: ApiInt
+    rebuilds: ApiInt
+    rows_applied: ApiInt
+    documents_added: ApiInt
+    last_seq: ApiInt
+    last_rebuild_ms: ApiInt
     last_error: string | null
-    last_activity_ms_ago: number | null
-    rebuilding_source: number | null
-    index_documents: number
-    outbox_pending: number
+    last_activity_ms_ago: ApiInt | null
+    rebuilding_source: ApiInt | null
+    index_documents: ApiInt
+    outbox_pending: ApiInt
   }
   sources: {
-    source_id: number
+    source_id: ApiInt
     name: string
-    published_generation: number | null
-    indexed_generation: number | null
-    documents: number
+    published_generation: ApiInt | null
+    indexed_generation: ApiInt | null
+    documents: ApiInt
     in_sync: boolean
   }[]
 }
@@ -465,10 +471,10 @@ export interface IndexStatus {
 
 export interface PreviewChunk {
   ordinal: number
-  byte_start: number
-  byte_end: number
-  line_start: number
-  line_end: number
+  byte_start: ApiInt
+  byte_end: ApiInt
+  line_start: ApiInt
+  line_end: ApiInt
   chars: number
   text: string
   truncated: boolean
@@ -480,17 +486,17 @@ export interface PreviewChunk {
  * the file on disk: the service reads it out of the catalog.
  */
 export interface ContentPreview {
-  object_id: number
+  object_id: ApiInt
   path: string | null
   generation: number
   object_generation: number
   stale: boolean
   state: ContentState
   coverage: string
-  indexed_bytes: number
-  total_bytes: number
+  indexed_bytes: ApiInt
+  total_bytes: ApiInt
   chunk_count: number
-  line_count: number
+  line_count: ApiInt
   encoding: string | null
   reason: string | null
   requested_ordinal: number
@@ -540,20 +546,20 @@ export type ChildSort = 'name' | 'size' | 'allocated_size' | 'modified' | 'kind'
 export const api = {
   health: () => request<Health>('/api/health'),
   sources: () => request<SourceView[]>('/api/sources'),
-  source: (id: number) => request<SourceDetail>(`/api/sources/${id}`),
+  source: (id: ApiRouteId) => request<SourceDetail>(`/api/sources/${id}`),
   addSource: (body: { name: string; root_path: string; scan: boolean }) =>
     request<SourceView>('/api/sources', { method: 'POST', body: JSON.stringify(body) }),
-  scanSource: (id: number) => request<ScanProgress>(`/api/sources/${id}/scan`, { method: 'POST' }),
-  cancelScan: (id: number) => request<ScanProgress>(`/api/sources/${id}/scan/cancel`, { method: 'POST' }),
-  sourceErrors: (id: number, includeResolved = false) =>
+  scanSource: (id: ApiRouteId) => request<ScanProgress>(`/api/sources/${id}/scan`, { method: 'POST' }),
+  cancelScan: (id: ApiRouteId) => request<ScanProgress>(`/api/sources/${id}/scan/cancel`, { method: 'POST' }),
+  sourceErrors: (id: ApiRouteId, includeResolved = false) =>
     request<ErrorRecord[]>(`/api/sources/${id}/errors?include_resolved=${includeResolved}&limit=500`),
-  object: (id: number) => request<ObjectDetail>(`/api/objects/${id}`),
-  children: (id: number, q: { sort: ChildSort; desc: boolean; offset: number; limit: number; hidden: boolean }) =>
+  object: (id: ApiRouteId) => request<ObjectDetail>(`/api/objects/${id}`),
+  children: (id: ApiRouteId, q: { sort: ChildSort; desc: boolean; offset: ApiInt | number; limit: number; hidden: boolean }) =>
     request<ChildrenView>(
       `/api/objects/${id}/children?sort=${q.sort}&desc=${q.desc}&offset=${q.offset}&limit=${q.limit}&hidden=${q.hidden}`,
     ),
-  extensions: (id: number, limit = 30) => request<ExtensionCount[]>(`/api/objects/${id}/extensions?limit=${limit}`),
-  contentPreview: (id: number, w: PreviewWindow) => {
+  extensions: (id: ApiRouteId, limit = 30) => request<ExtensionCount[]>(`/api/objects/${id}/extensions?limit=${limit}`),
+  contentPreview: (id: ApiRouteId, w: PreviewWindow) => {
     const p = new URLSearchParams({
       ordinal: String(w.ordinal),
       before: String(w.before),
@@ -562,8 +568,8 @@ export const api = {
     if (w.generation != null) p.set('generation', String(w.generation))
     return request<ContentPreview>(`/api/objects/${id}/content?${p.toString()}`)
   },
-  resolve: (source: number, path: string) =>
-    request<{ object_id: number; path: string | null }>(
+  resolve: (source: ApiRouteId, path: string) =>
+    request<{ object_id: ApiInt; path: string | null }>(
       `/api/resolve?source=${source}&path=${encodeURIComponent(path)}`,
     ),
   search: (p: SearchParams) =>
@@ -585,18 +591,18 @@ export const api = {
     ),
   indexStatus: () => request<IndexStatus>('/api/index'),
   activity: () => request<ActivityView>('/api/activity'),
-  setContentPolicy: (id: number, body: { enabled?: boolean; concurrency?: number }) =>
+  setContentPolicy: (id: ApiRouteId, body: { enabled?: boolean; concurrency?: number }) =>
     request<SourceView>(`/api/sources/${id}/content`, { method: 'POST', body: JSON.stringify(body) }),
-  retryJob: (id: number) =>
+  retryJob: (id: ApiRouteId) =>
     request<RetryReport>(`/api/jobs/${id}/retry`, { method: 'POST', body: JSON.stringify({ preview: false }) }),
   retrySourceContent: (
-    id: number,
+    id: ApiRouteId,
     body: {
       class?: string
       reason_prefix?: string
       preview: boolean
       limit?: number
-      as_of?: number
+      as_of?: ApiInt
       confirmation?: string
     },
   ) =>
@@ -606,82 +612,82 @@ export const api = {
 // Result of a retry action (`preview: true` counts without acting).
 export interface RetryReport {
   preview: boolean
-  as_of: number
+  as_of: ApiInt
   confirmation: string | null
-  accepted: number
-  skipped: number
-  rejected: number
-  bytes: number
-  skipped_reasons: Record<string, number>
-  rejected_reasons: Record<string, number>
-  job_ids: number[]
+  accepted: ApiInt
+  skipped: ApiInt
+  rejected: ApiInt
+  bytes: ApiInt
+  skipped_reasons: Record<string, ApiInt>
+  rejected_reasons: Record<string, ApiInt>
+  job_ids: ApiInt[]
 }
 
 export interface WorkerCurrent {
   worker: string
-  source_id: number
-  object_id: number
+  source_id: ApiInt
+  object_id: ApiInt
   path: string
-  size: number
-  started_ms_ago: number
+  size: ApiInt
+  started_ms_ago: ApiInt
 }
 
 export interface ContentWorkersView {
   workers: number
   current: WorkerCurrent[]
-  files_indexed: number
-  files_unsupported: number
-  files_failed: number
-  files_skipped: number
-  files_retried: number
-  bytes_read: number
-  chunks_written: number
-  commits: number
-  published: number
-  enqueued: number
-  pending_publish: number
-  uncommitted_documents: number
-  last_commit_ms: number
+  files_indexed: ApiInt
+  files_unsupported: ApiInt
+  files_failed: ApiInt
+  files_skipped: ApiInt
+  files_retried: ApiInt
+  bytes_read: ApiInt
+  chunks_written: ApiInt
+  commits: ApiInt
+  published: ApiInt
+  enqueued: ApiInt
+  pending_publish: ApiInt
+  uncommitted_documents: ApiInt
+  last_commit_ms: ApiInt
   last_error?: string | null
   throughput_bytes_per_s: number
-  uptime_s: number
+  uptime_s: ApiInt
 }
 
 export interface JobCounts {
-  by_stage: Record<string, Record<string, number>>
-  queued: number
-  running: number
-  failed: number
-  oldest_queued_age_ms?: number | null
+  by_stage: Record<string, Record<string, ApiInt>>
+  queued: ApiInt
+  running: ApiInt
+  failed: ApiInt
+  oldest_queued_age_ms?: ApiInt | null
 }
 
 export interface ContentStats {
-  by_state: Record<string, [number, number, number]>
-  total_records: number
-  indexed_bytes: number
-  chunks: number
+  by_state: Record<string, [ApiInt, ApiInt, ApiInt]>
+  total_records: ApiInt
+  indexed_bytes: ApiInt
+  chunks: ApiInt
 }
 
 export interface ActivitySourceView {
-  source_id: number
+  source_id: ApiInt
   name: string
   state: SourceState
   content_enabled: boolean
   content_concurrency: number
   content_reserved: number
   content_peak_reserved: number
-  jobs_queued: number
-  jobs_running: number
-  jobs_failed: number
-  jobs_failed_bytes: number
-  content_states: Record<string, number>
-  content_bytes_indexed: number
+  jobs_queued: ApiInt
+  jobs_running: ApiInt
+  jobs_failed: ApiInt
+  jobs_failed_bytes: ApiInt
+  content_states: Record<string, ApiInt>
+  content_bytes_indexed: ApiInt
 }
 
 export interface JobRecord {
-  id: number
-  source_id: number
-  object_id?: number | null
+  id: ApiInt
+  source_id: ApiInt
+  object_id?: ApiInt | null
   object_generation: number
   stage: string
   priority: number
@@ -689,9 +695,9 @@ export interface JobRecord {
   attempts: number
   last_error?: string | null
   failure_class?: string | null
-  finished_at?: number | null
+  finished_at?: ApiInt | null
   requeue_count: number
-  requeued_at?: number | null
+  requeued_at?: ApiInt | null
 }
 
 export interface ActivityView {
@@ -700,7 +706,7 @@ export interface ActivityView {
   content: ContentStats
   workers: ContentWorkersView
   follower: IndexStatus['follower']
-  content_index_documents: number
+  content_index_documents: ApiInt
   sources: ActivitySourceView[]
   recent_failures: JobRecord[]
 }

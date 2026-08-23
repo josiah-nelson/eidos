@@ -1,9 +1,17 @@
 const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
+export type IntegerLike = string | number | bigint
 
-export function bytes(n: number | null | undefined, digits = 1): string {
+/** Deliberately lossy conversion for visual scales and elapsed-time display. */
+export function integerNumber(n: IntegerLike): number {
+  return Number(n)
+}
+
+export function bytes(n: IntegerLike | null | undefined, digits = 1): string {
   if (n == null) return '—'
-  if (n < 1024) return `${n} B`
-  let v = n
+  const exact = typeof n === 'number' ? null : BigInt(n)
+  if (exact !== null && exact < 1024n) return `${exact} B`
+  let v = integerNumber(n)
+  if (v < 1024) return `${v} B`
   let i = 0
   while (v >= 1024 && i < UNITS.length - 1) {
     v /= 1024
@@ -12,15 +20,15 @@ export function bytes(n: number | null | undefined, digits = 1): string {
   return `${v.toFixed(digits)} ${UNITS[i]}`
 }
 
-export function count(n: number | null | undefined): string {
+export function count(n: IntegerLike | null | undefined): string {
   if (n == null) return '—'
-  return n.toLocaleString()
+  return (typeof n === 'number' ? n : BigInt(n)).toLocaleString()
 }
 
 /** Unix nanoseconds -> local date-time string. */
-export function when(nanos: number | null | undefined): string {
+export function when(nanos: IntegerLike | null | undefined): string {
   if (nanos == null) return '—'
-  const d = new Date(nanos / 1e6)
+  const d = new Date(typeof nanos === 'number' ? nanos / 1e6 : Number(BigInt(nanos) / 1_000_000n))
   if (Number.isNaN(d.getTime())) return '—'
   return d.toLocaleString(undefined, {
     year: 'numeric',
@@ -31,9 +39,10 @@ export function when(nanos: number | null | undefined): string {
   })
 }
 
-export function ago(nanos: number | null | undefined): string {
+export function ago(nanos: IntegerLike | null | undefined): string {
   if (nanos == null) return 'never'
-  const ms = Date.now() - nanos / 1e6
+  const timestamp = typeof nanos === 'number' ? nanos / 1e6 : Number(BigInt(nanos) / 1_000_000n)
+  const ms = Date.now() - timestamp
   if (ms < 0) return 'just now'
   const s = Math.floor(ms / 1000)
   if (s < 60) return `${s}s ago`
@@ -44,7 +53,8 @@ export function ago(nanos: number | null | undefined): string {
   return `${Math.floor(h / 24)}d ago`
 }
 
-export function duration(ms: number): string {
+export function duration(value: IntegerLike): string {
+  const ms = integerNumber(value)
   if (ms < 1000) return `${Math.round(ms)} ms`
   const s = ms / 1000
   if (s < 60) return `${s.toFixed(1)} s`
