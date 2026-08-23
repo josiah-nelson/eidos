@@ -19,8 +19,10 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Budget assumed for a source whose policy has not been loaded yet
-/// (matches the `sources.content_concurrency` column default).
+/// Budget *reported* for a source whose policy has not been read yet
+/// (matches the `sources.content_concurrency` column default). It is a
+/// display value only: an unknown source admits no work at all, so a
+/// failed policy load can never oversubscribe a slow volume.
 pub const DEFAULT_BUDGET: u32 = 2;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -75,8 +77,9 @@ pub struct SourceConcurrencyView {
 
 impl SourceBudgets {
     /// Replace the known budgets (the coordinator refreshes these from
-    /// source policy every enqueue interval). Live reservations survive;
-    /// a source missing from `budgets` falls back to [`DEFAULT_BUDGET`].
+    /// source policy every enqueue interval, and startup does it once
+    /// before the pool starts). Live reservations survive; a source missing
+    /// from `budgets` becomes unknown again and admits nothing.
     pub fn set_all(&self, budgets: &HashMap<SourceId, u32>) {
         let mut slots = self.slots.lock();
         for (id, slot) in slots.iter_mut() {
@@ -111,12 +114,17 @@ impl SourceBudgets {
     }
 
     /// Take one unit of `id`'s budget, or `None` when it is exhausted.
-    /// A budget of zero never admits work.
+    ///
+    /// A source whose policy has not been read yet admits nothing, so a
+    /// catalog read that fails at startup makes workers idle rather than
+    /// fall back to a budget larger than the source is configured for. The
+    /// next successful refresh unblocks them. A budget of zero likewise
+    /// never admits work.
     pub fn try_reserve(self: &Arc<Self>, id: SourceId) -> Option<SourceReservation> {
         {
             let mut slots = self.slots.lock();
             let slot = slots.entry(id).or_default();
-            if slot.reserved >= slot.budget() {
+            if slot.budget.is_none() || slot.reserved >= slot.budget() {
                 return None;
             }
             slot.reserved += 1;
@@ -133,16 +141,6 @@ impl SourceBudgets {
         if let Some(slot) = slots.get_mut(&id) {
             slot.reserved = slot.reserved.saturating_sub(1);
         }
-    }
-
-    /// Sources with no free capacity right now.
-    pub fn saturated(&self) -> Vec<SourceId> {
-        self.slots
-            .lock()
-            .iter()
-            .filter(|(_, s)| s.reserved >= s.budget())
-            .map(|(id, _)| *id)
-            .collect()
     }
 
     /// Diagnostics for `GET /api/activity`, ordered by source id.
@@ -177,10 +175,8 @@ mod tests {
         let r2 = b.try_reserve(A).expect("second unit");
         assert!(b.try_reserve(A).is_none(), "budget of two is exhausted");
         assert_eq!(b.reserved(A), 2);
-        assert_eq!(b.saturated(), vec![A]);
         drop(r1);
         assert_eq!(b.reserved(A), 1);
-        assert!(b.saturated().is_empty());
         assert!(b.try_reserve(A).is_some());
         drop(r2);
         assert_eq!(b.peak_reserved(A), 2, "high-water mark is kept");
@@ -201,9 +197,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_sources_use_the_default_budget_and_refresh_keeps_reservations() {
+    fn a_source_admits_nothing_until_its_policy_is_known() {
         let b = Arc::new(SourceBudgets::default());
-        assert_eq!(b.budget(A), DEFAULT_BUDGET);
+        assert_eq!(b.budget(A), DEFAULT_BUDGET, "reported for display");
+        assert!(
+            b.try_reserve(A).is_none(),
+            "an unread policy must not fall back to the default budget"
+        );
+        b.set_all(&HashMap::from([(A, 1)]));
+        assert!(b.try_reserve(A).is_some(), "unblocked by the refresh");
+    }
+
+    #[test]
+    fn a_refresh_keeps_live_reservations() {
+        let b = Arc::new(SourceBudgets::default());
+        b.set(A, 2);
         let held = b.try_reserve(A).expect("unit");
         b.set_all(&HashMap::from([(A, 1), (SourceId(2), 4)]));
         assert_eq!(b.budget(A), 1);
@@ -211,9 +219,10 @@ mod tests {
         assert!(b.try_reserve(A).is_none(), "now over the lowered budget");
         drop(held);
         assert!(b.try_reserve(A).is_some());
-        // A source dropped from the refresh falls back to the default.
+        // A source dropped from the refresh is unknown again, not default.
         b.set_all(&HashMap::new());
         assert_eq!(b.budget(SourceId(2)), DEFAULT_BUDGET);
+        assert!(b.try_reserve(SourceId(2)).is_none());
     }
 
     #[test]
@@ -221,6 +230,6 @@ mod tests {
         let b = Arc::new(SourceBudgets::default());
         b.set(A, 0);
         assert!(b.try_reserve(A).is_none());
-        assert_eq!(b.saturated(), vec![A]);
+        assert_eq!(b.budget(A), 0);
     }
 }

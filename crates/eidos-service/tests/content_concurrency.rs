@@ -254,6 +254,40 @@ fn startup_loads_budgets_before_any_worker_claims() {
     e.state.request_shutdown();
 }
 
+/// If the startup policy load fails the pool still starts, but it must not
+/// fall back to the default budget: a source whose policy has never been
+/// read admits nothing until a refresh gets through.
+#[test]
+fn an_unread_policy_admits_no_work_until_a_refresh_lands() {
+    let e = env();
+    let sid = add_source(&e.state, "unknown");
+    e.state.catalog.set_content_policy(sid, true, 1).unwrap();
+    queue_jobs(&e.state, sid, 40);
+
+    // Budgets never loaded (as after a failed startup refresh).
+    assert!(
+        reserve_and_claim(&e.state, "content-0", 4)
+            .unwrap()
+            .is_none(),
+        "an unread policy must not admit work at the default budget"
+    );
+    assert_eq!(e.state.content_budgets().reserved(sid), 0);
+
+    // The coordinator's next refresh unblocks the pool at the real budget.
+    eidos_service::content_workers::refresh_budgets(&e.state).unwrap();
+    let (held, jobs) = reserve_and_claim(&e.state, "content-0", 4)
+        .unwrap()
+        .expect("claim once the policy is known");
+    assert_eq!(jobs.len(), 4);
+    assert!(
+        reserve_and_claim(&e.state, "content-1", 4)
+            .unwrap()
+            .is_none(),
+        "still bounded by the loaded budget of one"
+    );
+    drop(held);
+}
+
 /// Nothing stays reserved when a claim finds no work, when the caller drops
 /// the batch after an error, or when a worker unwinds mid-batch.
 #[test]

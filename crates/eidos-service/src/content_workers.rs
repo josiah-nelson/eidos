@@ -178,9 +178,14 @@ pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
     }
     // Install persisted budgets *before* the first worker can claim, or a
     // source configured below the default would be oversubscribed for the
-    // few seconds until the coordinator's first refresh.
+    // few seconds until the coordinator's first refresh. If this fails the
+    // pool still starts, but every source stays unknown and admits nothing
+    // until the coordinator gets the policy through.
     if let Err(e) = refresh_budgets(state) {
-        tracing::error!(error = %e, "loading content concurrency budgets failed");
+        tracing::error!(
+            error = %e,
+            "loading content concurrency budgets failed; workers idle until policy loads"
+        );
     }
     for i in 0..workers {
         let st = state.clone();

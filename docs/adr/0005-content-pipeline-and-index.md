@@ -101,7 +101,10 @@ retrieved generation get no snippets rather than wrong ones.
   oversubscribe a source and the unit comes back on an empty claim, an
   error, cancellation, shutdown, or a panic. A source with no free capacity
   is skipped and the next eligible source is claimed instead, so a
-  saturated HDD or share never starves the rest of the pool. Live
+  saturated HDD or share never starves the rest of the pool. Budgets are
+  loaded before the pool starts, and a source whose policy has never been
+  read admits nothing rather than falling back to the default, so a failed
+  policy load makes workers idle instead of overrunning a slow volume. Live
   reservations and their high-water marks are reported by `GET
   /api/activity` (`workers.concurrency`, and `content_reserved` per source).
 - Publication is two-phase: the worker writes chunks and the content record
