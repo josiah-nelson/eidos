@@ -480,10 +480,18 @@ impl<'a> Applier<'a> {
                         &ext,
                         ex.size as u64,
                         ex.allocated as u64,
+                        ex.modified.map(UnixNanos),
                         old_state,
                         -1,
                     );
-                    let add = AggDelta::for_file(&ext, snap.size, snap.allocated, state, 1);
+                    let add = AggDelta::for_file(
+                        &ext,
+                        snap.size,
+                        snap.allocated,
+                        snap.modified,
+                        state,
+                        1,
+                    );
                     d.file_count += add.file_count;
                     d.logical += add.logical;
                     d.allocated += add.allocated;
@@ -492,7 +500,7 @@ impl<'a> Applier<'a> {
                     d.failed += add.failed;
                     d.excluded += add.excluded;
                     d.ext.extend(add.ext);
-                    d.touch_modified = snap.modified;
+                    d.added = add.added;
                     Some(d)
                 } else {
                     None
@@ -636,9 +644,7 @@ impl<'a> Applier<'a> {
                     .map(|e| ContentState::parse(&e.content_state).unwrap_or(ContentState::Pending))
                     .unwrap_or(ContentState::Pending)
             };
-            let mut d = AggDelta::for_file(&ext, snap.size, snap.allocated, st, 1);
-            d.touch_modified = snap.modified;
-            d
+            AggDelta::for_file(&ext, snap.size, snap.allocated, snap.modified, st, 1)
         };
         apply_delta(self.tx, parent, &delta)?;
         if !created && snap.kind == ObjectKind::Directory {
@@ -698,6 +704,7 @@ impl<'a> Applier<'a> {
                 &extension_of(&name),
                 ex.size as u64,
                 ex.allocated as u64,
+                ex.modified.map(UnixNanos),
                 st,
                 -1,
             )

@@ -192,37 +192,69 @@ impl Catalog {
         exclude_sources: &[SourceId],
         limit: u32,
     ) -> Result<Vec<JobRecord>> {
+        let mut admit = |source: SourceId| (!exclude_sources.contains(&source)).then_some(());
+        Ok(self
+            .claim_jobs_admitted(stages, worker, limit, &mut admit)?
+            .map(|(_, jobs)| jobs)
+            .unwrap_or_default())
+    }
+
+    /// Like [`Catalog::claim_jobs`], but the source is admitted by `admit`
+    /// from inside the claiming transaction, before a single job is marked
+    /// `running`.
+    ///
+    /// This is how per-source concurrency is enforced: `admit` reserves
+    /// capacity and returns a guard, so the check and the claim are one
+    /// atomic step and two workers cannot both act on the same free slot.
+    /// A source `admit` rejects is skipped and the next eligible source is
+    /// offered instead, so a saturated source never starves the others.
+    /// Returns `None` when no source has due work it will admit; on any
+    /// error the guard is dropped before returning, releasing its capacity.
+    pub fn claim_jobs_admitted<T>(
+        &self,
+        stages: &[JobStage],
+        worker: &str,
+        limit: u32,
+        admit: &mut dyn FnMut(SourceId) -> Option<T>,
+    ) -> Result<Option<(T, Vec<JobRecord>)>> {
         if stages.is_empty() || limit == 0 {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let stage_list = stages
             .iter()
             .map(|s| format!("'{}'", s.as_str()))
             .collect::<Vec<_>>()
             .join(",");
-        let exclude = if exclude_sources.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " AND source_id NOT IN ({})",
-                exclude_sources
-                    .iter()
-                    .map(|s| s.0.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        };
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let now = UnixNanos::now().0;
-            let sql = format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued' AND stage IN ({stage_list}) AND scheduled_at <= ?1{exclude}
-                 ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT 1"
-            );
-            let first = tx.query_row(&sql, params![now], job_from_row).optional()?;
-            let first = match first {
-                Some(j) => j,
-                None => return Ok(Vec::new()),
+            let mut rejected: Vec<SourceId> = Vec::new();
+            let (permit, first) = loop {
+                let exclude = if rejected.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " AND source_id NOT IN ({})",
+                        rejected
+                            .iter()
+                            .map(|s| s.0.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                };
+                let sql = format!(
+                    "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued' AND stage IN ({stage_list}) AND scheduled_at <= ?1{exclude}
+                     ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT 1"
+                );
+                let first = match tx.query_row(&sql, params![now], job_from_row).optional()? {
+                    Some(j) => j,
+                    None => return Ok(None),
+                };
+                match admit(first.source_id) {
+                    Some(permit) => break (permit, first),
+                    // No capacity on that source right now: look past it.
+                    None => rejected.push(first.source_id),
+                }
             };
             let mut jobs = vec![first];
             if limit > 1 {
@@ -249,16 +281,18 @@ impl Catalog {
                 }
             }
             tx.commit()?;
-            Ok(jobs
-                .into_iter()
-                .map(|job| JobRecord {
-                    state: JobState::Running,
-                    attempts: job.attempts + 1,
-                    started_at: Some(UnixNanos(now)),
-                    worker: Some(worker.to_string()),
-                    ..job
-                })
-                .collect())
+            Ok(Some((
+                permit,
+                jobs.into_iter()
+                    .map(|job| JobRecord {
+                        state: JobState::Running,
+                        attempts: job.attempts + 1,
+                        started_at: Some(UnixNanos(now)),
+                        worker: Some(worker.to_string()),
+                        ..job
+                    })
+                    .collect(),
+            )))
         })
     }
 

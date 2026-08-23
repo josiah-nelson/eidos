@@ -2,16 +2,18 @@
 //! diagnostic with ranked + exact content and a time bound), Q-2 (exact
 //! case-sensitive identifier with line-aware snippets), regex with required
 //! literals, phrase/ranked retrieval, binary rejection, completeness before
-//! and after extraction, and re-extraction after a file changes.
+//! and after extraction, re-extraction after a file changes, deletion-only
+//! reindexing (a text file that turns binary, empty, or unreadable), and the
+//! rejection of candidates from a superseded generation.
 
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::{Catalog, NewSource};
-use eidos_content::Limits;
+use eidos_content::{Chunk, Limits};
 use eidos_domain::*;
 use eidos_query::parse;
-use eidos_search::content::ContentOpts;
+use eidos_search::content::{object_ids, ContentOpts};
 use eidos_search::exec::{search_with_content, ExecOptions};
-use eidos_search::pipeline::drain_content_jobs;
+use eidos_search::pipeline::{drain_content_jobs, process_object, ProcessResult};
 use eidos_search::{CatalogIndex, ContentIndex};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -138,6 +140,63 @@ impl Fx {
         self.index.follow_once(&self.catalog, 10_000).unwrap();
         self.index.reload().unwrap();
         published
+    }
+
+    /// Extract everything pending under the service's commit policy
+    /// (`content_workers::coordinator_loop`): the index is committed only
+    /// when there is something to publish or the writer reports itself
+    /// dirty. `drain_content_jobs` commits unconditionally, which would hide
+    /// a queued deletion that never marked the writer dirty. Returns
+    /// `(published, dirty)`.
+    fn extract_like_coordinator(&self) -> (u64, bool) {
+        self.catalog
+            .enqueue_pending_content(self.source, 10_000)
+            .unwrap();
+        let mut pending: Vec<ObjectId> = Vec::new();
+        while let Some(job) = self
+            .catalog
+            .claim_job(&[JobStage::ContentText], "test")
+            .unwrap()
+        {
+            let object = match job.object_id {
+                Some(o) => o,
+                None => {
+                    self.catalog.complete_job(job.id).unwrap();
+                    continue;
+                }
+            };
+            let r = process_object(
+                &self.catalog,
+                &self.content,
+                object,
+                job.object_generation,
+                &Limits::default(),
+                Some(job.id),
+            )
+            .unwrap();
+            match r {
+                ProcessResult::Indexed(_) => pending.push(object),
+                ProcessResult::Done(_) => {}
+                ProcessResult::Skipped(_) => self.catalog.complete_job(job.id).unwrap(),
+                ProcessResult::Disabled => self.catalog.delete_job(job.id).unwrap(),
+                ProcessResult::Retry { class, error } => {
+                    self.catalog.fail_job(job.id, class, &error).unwrap();
+                }
+            }
+        }
+        let dirty = self.content.is_dirty();
+        let mut published = 0;
+        if !pending.is_empty() || dirty {
+            self.content.commit().unwrap();
+            published = self.catalog.mark_content_indexed(&pending).unwrap();
+        }
+        self.index.follow_once(&self.catalog, 10_000).unwrap();
+        self.index.reload().unwrap();
+        (published, dirty)
+    }
+
+    fn object_of(&self, name: &str) -> ObjectId {
+        self.run(&format!("name:={name}")).hits[0].object_id
     }
 
     fn run(&self, q: &str) -> SearchResponse {
@@ -589,4 +648,227 @@ fn page_driven_verification_stays_eager_inside_not_and_or() {
         );
     }
     assert_eq!(fx.names("ext:md -content:~build"), vec!["readme.md"]);
+}
+
+// ----- deletion-only reindexing --------------------------------------------
+
+const BINARY_BODY: &[u8] =
+    b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00binary payload\x00\x00";
+
+/// Rewrite `logs/notes.txt` (indexed as text by `extract_all`) and rescan so
+/// the object reaches a new generation with `content_state = pending`.
+fn change_notes(fx: &Fx, body: &[u8]) -> ObjectId {
+    let obj = fx.object_of("notes.txt");
+    assert_eq!(fx.names("content:lowercase"), vec!["notes.txt"]);
+    assert!(object_ids(&fx.content).unwrap().contains(&obj));
+    // Distinct mtime as well as size, so the rescan cannot miss the change.
+    std::thread::sleep(Duration::from_millis(20));
+    write(&fx.root.join("logs/notes.txt"), body);
+    set_age(&fx.root.join("logs/notes.txt"), 0);
+    fx.rescan();
+    obj
+}
+
+/// The old text is gone from the index itself, and no snippet-less hit is
+/// left behind on any retrieval path.
+fn assert_old_text_gone(fx: &Fx, obj: ObjectId) {
+    assert!(
+        !object_ids(&fx.content).unwrap().contains(&obj),
+        "the queued deletion was never committed: chunk documents remain"
+    );
+    for q in [
+        "content:lowercase",
+        "content:~lowercase",
+        "content:=lowercase",
+        r"content:/lowerc\w+/",
+    ] {
+        for opts in [ExecOptions::default(), lazy_opts()] {
+            let r = fx.run_with(q, &opts, None, 50);
+            assert!(r.hits.is_empty(), "{q}: {:?}", sorted_names(&r));
+            assert_eq!(r.total.value, 0, "{q}");
+        }
+    }
+}
+
+#[test]
+fn text_that_becomes_binary_commits_its_deletion() {
+    let fx = fixture();
+    fx.extract_all();
+    let obj = change_notes(&fx, BINARY_BODY);
+
+    let (published, dirty) = fx.extract_like_coordinator();
+    assert_eq!(published, 0, "an unsupported file publishes no chunks");
+    assert!(dirty, "the queued deletion must mark the writer dirty");
+    assert_old_text_gone(&fx, obj);
+
+    let r = fx.run("name:=notes.txt");
+    assert_eq!(r.hits[0].content.state, ContentState::Unsupported);
+    assert!(r.hits[0]
+        .content
+        .reason
+        .as_deref()
+        .is_some_and(|s| s.contains("binary")));
+    assert!(r.completeness[0].content_complete);
+}
+
+#[test]
+fn text_that_becomes_empty_commits_its_deletion() {
+    let fx = fixture();
+    fx.extract_all();
+    let obj = change_notes(&fx, b"");
+
+    let (published, dirty) = fx.extract_like_coordinator();
+    assert_eq!(published, 1, "an empty file is indexed, with no chunks");
+    assert!(dirty);
+    assert_old_text_gone(&fx, obj);
+
+    let rec = fx.catalog.content_record(obj).unwrap().unwrap();
+    assert_eq!(rec.chunk_count, 0);
+    assert_eq!(rec.state, ContentState::Indexed);
+    let r = fx.run("name:=notes.txt");
+    assert_eq!(r.hits[0].content.state, ContentState::Indexed);
+    assert!(r.hits[0].snippets.is_empty());
+}
+
+#[test]
+fn missing_file_after_a_change_commits_its_deletion() {
+    let fx = fixture();
+    fx.extract_all();
+    let obj = change_notes(&fx, b"rewritten notes with a brandnew token\n");
+    // The file disappears between the scan and the extraction: a
+    // deterministic failure, so the job is terminal and nothing replaces the
+    // chunks it just queued for deletion.
+    std::fs::remove_file(fx.root.join("logs/notes.txt")).unwrap();
+
+    let (published, dirty) = fx.extract_like_coordinator();
+    assert_eq!(published, 0);
+    assert!(dirty);
+    assert_old_text_gone(&fx, obj);
+    assert!(fx.names("content:brandnew").is_empty());
+
+    let rec = fx.catalog.content_record(obj).unwrap().unwrap();
+    assert_eq!(rec.state, ContentState::Failed);
+    assert_eq!(rec.coverage, Coverage::None);
+    assert_eq!(
+        fx.run("name:=notes.txt").hits[0].content.state,
+        ContentState::Failed
+    );
+}
+
+/// Put `logs/notes.txt` into the state where both its generations are in the
+/// content index: the new one is published without the old documents being
+/// dropped — the window a queued-but-uncommitted deletion leaves open, and
+/// the state a crash between the index commit and publication can persist.
+/// Returns `(object, old generation, new generation)`.
+fn coexisting_generations(fx: &Fx) -> (ObjectId, u32, u32) {
+    let text = "rewritten notes with a brandnew token\n";
+    let obj = change_notes(fx, text.as_bytes());
+    let old_gen = fx.catalog.content_record(obj).unwrap().unwrap().generation;
+    let new_gen = fx.catalog.get_object(obj).unwrap().unwrap().generation;
+    assert_eq!(new_gen, old_gen + 1);
+    let chunk = Chunk {
+        ordinal: 0,
+        byte_start: 0,
+        byte_end: text.len() as u64,
+        line_start: 0,
+        line_end: 0,
+        text: text.to_string(),
+        split_line: false,
+    };
+    fx.catalog
+        .write_chunks(obj, new_gen, std::slice::from_ref(&chunk))
+        .unwrap();
+    fx.content
+        .add_chunks(obj, fx.source, new_gen, std::slice::from_ref(&chunk))
+        .unwrap();
+    fx.content.commit().unwrap();
+    assert!(
+        object_ids(&fx.content).unwrap().contains(&obj),
+        "both generations are in the index"
+    );
+    // The superseded chunk text is still stored, so a verified clause would
+    // match it if the generation were not checked.
+    assert_eq!(
+        fx.catalog.chunks_for(obj, old_gen, &[0]).unwrap().len(),
+        1,
+        "the old generation's chunk is still in the catalog"
+    );
+    (obj, old_gen, new_gen)
+}
+
+#[test]
+fn old_and_new_generation_documents_coexist_without_a_stale_hit() {
+    let fx = fixture();
+    fx.extract_all();
+    coexisting_generations(&fx);
+
+    for opts in [ExecOptions::default(), lazy_opts()] {
+        for q in [
+            "content:lowercase",
+            "content:~lowercase",
+            "content:=lowercase",
+            r"content:/lowerc\w+/",
+        ] {
+            let r = fx.run_with(q, &opts, None, 50);
+            assert!(r.hits.is_empty(), "{q}: {:?}", sorted_names(&r));
+            assert_eq!(r.total.value, 0, "{q}");
+        }
+        // Only the current generation answers, and it still snippets.
+        for q in ["content:brandnew", "content:~brandnew"] {
+            let r = fx.run_with(q, &opts, None, 50);
+            assert_eq!(sorted_names(&r), vec!["notes.txt"], "{q}");
+            assert!(!r.hits[0].snippets.is_empty(), "{q}");
+            assert!(r.hits[0].snippets[0].text.contains("brandnew"), "{q}");
+        }
+    }
+    // The plan says why the stale candidate went away.
+    let steps = fx.run("content:lowercase").explanation.unwrap().steps;
+    let c = steps.iter().find(|s| s.stage == "content").unwrap();
+    assert!(c.description.contains("older generation dropped"), "{c:?}");
+}
+
+#[test]
+fn a_stale_candidate_cut_by_truncation_is_reported_not_silent() {
+    let fx = fixture();
+    fx.extract_all();
+    coexisting_generations(&fx);
+    // Candidates are cut before their generation is known, so a truncated
+    // list can keep the superseded chunk of a file and drop the current one.
+    // `notes` is in both generations and in no other file, and only one
+    // candidate survives, so the outcome is either the file (the current
+    // chunk won the cut) or a warning that names both causes — never the
+    // superseded text presented as a hit.
+    for (mode, mut opts) in [
+        ("top-k", ExecOptions::default()),
+        ("candidates", ExecOptions::default()),
+    ] {
+        if mode == "top-k" {
+            opts.content.top_k = 1;
+        } else {
+            opts.content.max_candidates = 1;
+        }
+        let q = if mode == "top-k" {
+            "content:notes"
+        } else {
+            "content:~notes"
+        };
+        let r = fx.run_with(q, &opts, None, 50);
+        if r.hits.is_empty() {
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.contains("superseded generation")),
+                "{mode}: {:?}",
+                r.warnings
+            );
+        } else {
+            assert_eq!(sorted_names(&r), vec!["notes.txt"], "{mode}");
+            assert!(r.hits[0].snippets[0].text.contains("brandnew"), "{mode}");
+        }
+        assert!(
+            r.warnings.iter().any(|w| w.contains("subset")),
+            "{mode}: truncation is always reported: {:?}",
+            r.warnings
+        );
+    }
 }

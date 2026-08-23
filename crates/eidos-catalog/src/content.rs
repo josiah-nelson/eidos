@@ -779,8 +779,9 @@ pub(crate) fn flip_state(
         params![object.0, state.as_str(), content_id.map(|c| c.0.to_vec())],
     )?;
     // Aggregate content counters on every parent chain.
-    let mut delta = AggDelta::for_file(&ext, size as u64, alloc as u64, old, -1);
-    let add = AggDelta::for_file(&ext, size as u64, alloc as u64, state, 1);
+    // Timestamps are untouched by a state flip, so the delta carries none.
+    let mut delta = AggDelta::for_file(&ext, size as u64, alloc as u64, None, old, -1);
+    let add = AggDelta::for_file(&ext, size as u64, alloc as u64, None, state, 1);
     delta.file_count = 0;
     delta.logical = 0;
     delta.allocated = 0;
