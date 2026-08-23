@@ -43,6 +43,23 @@ pub struct TotalCount {
     pub value: u64,
     /// `false` when `value` is a lower bound.
     pub exact: bool,
+    /// Where the value came from.
+    #[serde(default)]
+    pub origin: TotalOrigin,
+}
+
+/// Provenance of a [`TotalCount`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TotalOrigin {
+    /// Computed for this request.
+    #[default]
+    Counted,
+    /// Reused from the first page of this walk (carried by the cursor) —
+    /// the index generation has not changed since.
+    Cursor,
+    /// Not counted: the candidates seen so far, a lower bound.
+    Bound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -295,6 +312,7 @@ mod tests {
             total: TotalCount {
                 value: 0,
                 exact: true,
+                origin: TotalOrigin::Counted,
             },
             timing: Timing::default(),
             completeness: vec![mk(true, false)],

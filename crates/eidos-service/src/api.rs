@@ -732,6 +732,9 @@ pub(crate) struct SearchBody {
     pub(crate) facets: Vec<eidos_domain::FacetRequest>,
     #[serde(default)]
     pub(crate) include_retired: bool,
+    /// Total-count policy: `auto` (default), `exact`, or `none`.
+    #[serde(default)]
+    pub(crate) count: eidos_domain::CountPolicy,
 }
 
 fn default_search_limit() -> u32 {
@@ -776,6 +779,7 @@ pub(crate) fn build_request(
             snippets: true,
             facets: body.facets,
             include_retired: body.include_retired,
+            count: body.count,
         },
         notes,
     ))
@@ -847,6 +851,8 @@ struct SearchGetQuery {
     /// Comma-separated facet fields.
     #[serde(default)]
     facets: String,
+    #[serde(default)]
+    count: eidos_domain::CountPolicy,
 }
 
 async fn search_get(
@@ -880,6 +886,7 @@ async fn search_get(
             explain: q.explain,
             facets,
             include_retired: false,
+            count: q.count,
         },
     )
     .await

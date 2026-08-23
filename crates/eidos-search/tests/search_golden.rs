@@ -1096,3 +1096,182 @@ fn cursor_with_only_one_structured_field_is_rejected() {
         );
     }
 }
+
+// --- Count policy ---------------------------------------------------------
+
+#[test]
+fn later_pages_reuse_the_first_page_total_under_auto() {
+    let fx = fixture();
+    let req = sorted_req(&fx, "", SortField::Name, false, 4);
+    let p1 = fx.run_req(req.clone());
+    assert_eq!(p1.total.origin, TotalOrigin::Counted);
+    assert!(p1.total.exact);
+    let total = p1.total.value;
+    assert!(total > 8);
+    let cursor = p1.next_cursor.clone().unwrap();
+    assert!(cursor.contains(&format!(";t:{total};x:1")), "{cursor}");
+    assert!(p1
+        .explanation
+        .as_ref()
+        .unwrap()
+        .steps
+        .iter()
+        .any(|s| s.description.contains("exact count")));
+
+    let mut req2 = req.clone();
+    req2.cursor = Some(cursor);
+    let p2 = fx.run_req(req2);
+    assert_eq!(p2.total.value, total);
+    assert!(p2.total.exact);
+    assert_eq!(p2.total.origin, TotalOrigin::Cursor);
+    assert!(p2
+        .explanation
+        .as_ref()
+        .unwrap()
+        .steps
+        .iter()
+        .any(|s| s.description.contains("no count")));
+    // The carried total keeps flowing through the walk and it still ends
+    // exactly where a counted walk would.
+    let (ids, pages) = walk_pages(&fx, req.clone());
+    assert_eq!(ids.len() as u64, total);
+    assert_eq!(pages as u64, total.div_ceil(4));
+}
+
+#[test]
+fn exact_policy_recounts_and_none_policy_reports_a_bound() {
+    let fx = fixture();
+    let mut req = sorted_req(&fx, "", SortField::Name, false, 4);
+    let counted = fx.run_req(req.clone()).total.value;
+
+    req.count = CountPolicy::Exact;
+    let p1 = fx.run_req(req.clone());
+    assert_eq!(p1.total.origin, TotalOrigin::Counted);
+    let mut req2 = req.clone();
+    req2.cursor = p1.next_cursor.clone();
+    let p2 = fx.run_req(req2);
+    assert_eq!(
+        p2.total.origin,
+        TotalOrigin::Counted,
+        "exact recounts every page"
+    );
+    assert_eq!(p2.total.value, counted);
+
+    req.count = CountPolicy::None;
+    let p1 = fx.run_req(req.clone());
+    assert_eq!(p1.total.origin, TotalOrigin::Bound);
+    assert!(!p1.total.exact);
+    assert_eq!(p1.hits.len(), 4);
+    assert_eq!(p1.total.value, 5, "four seen plus one known to follow");
+    assert!(!p1.next_cursor.as_ref().unwrap().contains(";t:"));
+    // Walking to the end still visits every match exactly once, and the
+    // last page has no cursor.
+    let (ids, _) = walk_pages(&fx, req.clone());
+    assert_eq!(ids.len() as u64, counted);
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len());
+}
+
+#[test]
+fn carried_total_is_dropped_when_the_index_changes() {
+    let fx = fixture();
+    let req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    let p1 = fx.run_req(req.clone());
+    assert_eq!(p1.total.value, 5);
+    let cursor = p1.next_cursor.clone().unwrap();
+
+    let root = fx
+        .catalog
+        .get_source(fx.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let serial = native_key(&fx, root).volume_serial;
+    let snapshot = eidos_catalog::changes::ObjectSnapshot {
+        native: NativeIdentity::from_u128(serial, u128::MAX - 2, IdentityConfidence::Native),
+        kind: ObjectKind::File,
+        attributes: FileAttributes(0x20),
+        size: 1,
+        allocated: 4096,
+        link_count: 1,
+        created: Some(UnixNanos::now()),
+        modified: Some(UnixNanos::now()),
+        changed: None,
+        accessed: None,
+        reparse_tag: 0,
+    };
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[eidos_catalog::changes::ChangeEvent::Link {
+                parent: native_key(&fx, root),
+                name: "zz.bin".into(),
+                snapshot,
+            }],
+            None,
+        )
+        .unwrap();
+    fx.index.follow_once(&fx.catalog, 1000).unwrap();
+    fx.index.reload().unwrap();
+
+    let mut req2 = req.clone();
+    req2.cursor = Some(cursor);
+    let p2 = fx.run_req(req2);
+    assert_eq!(
+        p2.total.origin,
+        TotalOrigin::Counted,
+        "recounted on a new generation"
+    );
+    assert_eq!(p2.total.value, 6);
+}
+
+#[test]
+fn half_carried_total_in_cursor_is_rejected() {
+    let fx = fixture();
+    let p1 = fx.run_req(sorted_req(&fx, "ext:bin", SortField::Name, false, 2));
+    let cursor = p1.next_cursor.clone().unwrap();
+    let base = cursor.split(";t:").next().unwrap().to_string();
+    for bad in [
+        format!("{base};t:5"),
+        format!("{base};x:1"),
+        "o:2;t:5;x:1".to_string(),
+    ] {
+        let mut req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+        req.cursor = Some(bad.clone());
+        let err = search(&fx.index, &fx.catalog, &req, &ExecOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                eidos_search::SearchError::Query(QueryError::InvalidCursor)
+            ),
+            "{bad:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn modified_carried_total_in_cursor_is_rejected() {
+    let fx = fixture();
+    let req = sorted_req(&fx, "", SortField::Name, false, 4);
+    let p1 = fx.run_req(req.clone());
+    let cursor = p1.next_cursor.clone().unwrap();
+    let total = p1.total.value;
+
+    for changed in [0, total + 10_000] {
+        let tampered = cursor.replacen(&format!(";t:{total};"), &format!(";t:{changed};"), 1);
+        assert_ne!(tampered, cursor);
+        let mut next = req.clone();
+        next.cursor = Some(tampered);
+        let err = search(&fx.index, &fx.catalog, &next, &ExecOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                eidos_search::SearchError::Query(QueryError::InvalidCursor)
+            ),
+            "tampered total {changed}: {err}"
+        );
+    }
+}

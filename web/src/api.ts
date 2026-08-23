@@ -402,7 +402,7 @@ export interface SearchResponse {
   schema_version: number
   hits: Hit[]
   next_cursor?: string
-  total: { value: number; exact: boolean }
+  total: { value: number; exact: boolean; origin?: 'counted' | 'cursor' | 'bound' }
   timing: { total_ms: number; plan_ms: number; retrieve_ms: number; verify_ms: number; join_ms: number }
   completeness: SourceCompleteness[]
   explanation?: { readable: string; steps: PlanStep[] }

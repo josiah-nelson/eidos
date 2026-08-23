@@ -46,6 +46,10 @@ pub struct CatalogIndex {
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
     fields: schema::Fields,
+    /// Process-local key that makes structured cursors tamper-evident. A
+    /// cursor is deliberately short-lived: reopening the index invalidates
+    /// it just as an index-generation change invalidates stable paging.
+    cursor_key: [u8; 32],
     /// Set when `open` (re)created the directory: the catalog's recorded
     /// projection state is then stale and every source must be rebuilt.
     recreated: std::sync::atomic::AtomicBool,
@@ -109,18 +113,26 @@ impl CatalogIndex {
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
+        let mut cursor_key = [0_u8; 32];
+        getrandom::fill(&mut cursor_key)
+            .map_err(|e| SearchError::Other(format!("could not initialize cursor signing: {e}")))?;
         Ok(Arc::new(Self {
             dir,
             index,
             reader,
             writer: Mutex::new(writer),
             fields,
+            cursor_key,
             recreated: std::sync::atomic::AtomicBool::new(needs_create),
         }))
     }
 
     pub fn fields(&self) -> &schema::Fields {
         &self.fields
+    }
+
+    pub(crate) fn cursor_key(&self) -> &[u8; 32] {
+        &self.cursor_key
     }
 
     pub fn index(&self) -> &Index {

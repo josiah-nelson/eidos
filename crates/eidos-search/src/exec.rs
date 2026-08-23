@@ -1680,38 +1680,54 @@ fn sort_key_cmp(a: &Stored, b: &Stored, sort: Sort) -> std::cmp::Ordering {
 pub const STALE_SLACK: usize = 8;
 
 /// Page cursor: `o:<consumed candidates>;g:<index generation>;q:<query
-/// fingerprint>`. The offset counts every candidate the previous pages
-/// consumed — including stale projection documents that produced no hit —
-/// so a page never re-examines what an earlier page skipped. `g` is the
-/// Tantivy searcher generation the cursor was issued from (a change is
-/// reported as a warning: offsets are not stable across commits); `q`
-/// binds the cursor to the query, mode, sort, and scope it was issued for.
-/// The legacy `o:<offset>` form is still accepted without either check.
+/// fingerprint>[;t:<total>;x:<exact>];s:<signature>`. The offset counts every candidate
+/// the previous pages consumed — including stale projection documents that
+/// produced no hit — so a page never re-examines what an earlier page
+/// skipped. `g` is the Tantivy searcher generation the cursor was issued
+/// from (a change is reported as a warning: offsets are not stable across
+/// commits); `q` binds the cursor to the query, mode, sort, and scope it
+/// was issued for; `t`/`x` carry the first page's total and whether it was
+/// exact, so later pages of a top-k walk do not recount while the
+/// generation is unchanged. `s` authenticates the full structured cursor,
+/// preventing a caller from changing the carried total or any paging state.
+/// The legacy `o:<offset>` form is still accepted without any of the checks
+/// and cannot carry a total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cursor {
     offset: usize,
     generation: Option<u64>,
     fingerprint: Option<u64>,
+    total: Option<(u64, bool)>,
 }
 
-fn decode_cursor(c: &Option<String>) -> std::result::Result<Cursor, QueryError> {
+fn decode_cursor(
+    c: &Option<String>,
+    signing_key: &[u8; 32],
+) -> std::result::Result<Cursor, QueryError> {
     let s = match c {
         None => {
             return Ok(Cursor {
                 offset: 0,
                 generation: None,
                 fingerprint: None,
+                total: None,
             })
         }
         Some(s) => s,
+    };
+    let (unsigned, signature) = match s.rsplit_once(";s:") {
+        Some((unsigned, signature)) if !signature.is_empty() => (unsigned, Some(signature)),
+        _ => (s.as_str(), None),
     };
     let mut cursor = Cursor {
         offset: 0,
         generation: None,
         fingerprint: None,
+        total: None,
     };
     let mut seen_offset = false;
-    for part in s.split(';') {
+    let (mut total, mut exact): (Option<u64>, Option<bool>) = (None, None);
+    for part in unsigned.split(';') {
         let (key, value) = part.split_once(':').ok_or(QueryError::InvalidCursor)?;
         match key {
             "o" => {
@@ -1723,20 +1739,53 @@ fn decode_cursor(c: &Option<String>) -> std::result::Result<Cursor, QueryError> 
                 cursor.fingerprint =
                     Some(u64::from_str_radix(value, 16).map_err(|_| QueryError::InvalidCursor)?)
             }
+            "t" => total = Some(value.parse().map_err(|_| QueryError::InvalidCursor)?),
+            "x" => {
+                exact = Some(match value {
+                    "1" => true,
+                    "0" => false,
+                    _ => return Err(QueryError::InvalidCursor),
+                })
+            }
             _ => return Err(QueryError::InvalidCursor),
         }
     }
-    if !seen_offset || cursor.generation.is_some() != cursor.fingerprint.is_some() {
+    let structured = cursor.generation.is_some();
+    if !seen_offset
+        || structured != cursor.fingerprint.is_some()
+        || total.is_some() != exact.is_some()
+        || (total.is_some() && !structured)
+        || structured != signature.is_some()
+    {
         // Either the legacy `o:<n>` form or the full structured form; a
-        // cursor carrying only one of the two checks is not something the
-        // service ever issued.
+        // cursor carrying only part of a check is not something the service
+        // ever issued.
         return Err(QueryError::InvalidCursor);
     }
+    if let Some(signature) = signature {
+        let expected = blake3::keyed_hash(signing_key, unsigned.as_bytes());
+        if expected.to_hex().as_str() != signature {
+            return Err(QueryError::InvalidCursor);
+        }
+    }
+    cursor.total = total.zip(exact);
     Ok(cursor)
 }
 
-fn encode_cursor(offset: usize, generation: u64, fingerprint: u64) -> String {
-    format!("o:{offset};g:{generation};q:{fingerprint:016x}")
+fn encode_cursor(
+    offset: usize,
+    generation: u64,
+    fingerprint: u64,
+    total: Option<(u64, bool)>,
+    signing_key: &[u8; 32],
+) -> String {
+    let mut s = format!("o:{offset};g:{generation};q:{fingerprint:016x}");
+    if let Some((t, exact)) = total {
+        s.push_str(&format!(";t:{t};x:{}", u8::from(exact)));
+    }
+    let signature = blake3::keyed_hash(signing_key, s.as_bytes());
+    s.push_str(&format!(";s:{signature}"));
+    s
 }
 
 /// Stable (process-independent) fingerprint of everything that determines
@@ -1761,6 +1810,8 @@ type Candidates<'a> = Box<dyn Iterator<Item = Result<Stored>> + 'a>;
 /// deterministic for one searcher, so continuing from the previous position
 /// yields the same order.
 type Collector<'a> = Box<dyn Fn(usize) -> Result<Vec<(f32, DocAddress)>> + 'a>;
+/// Top-k addresses plus the exact match count when it was taken.
+type Collected = (Vec<(f32, DocAddress)>, Option<usize>);
 
 struct Regrowing<'a> {
     collect: Collector<'a>,
@@ -1813,7 +1864,7 @@ pub fn search_with_content(
 ) -> Result<SearchResponse> {
     let t0 = Instant::now();
     req.validate(&opts.limits)?;
-    let cursor = decode_cursor(&req.cursor)?;
+    let cursor = decode_cursor(&req.cursor, index.cursor_key())?;
     let fingerprint = query_fingerprint(req);
     if let Some(q) = cursor.fingerprint {
         if q != fingerprint {
@@ -1904,427 +1955,475 @@ pub fn search_with_content(
     let t1 = Instant::now();
     let mut warnings = ctx.warnings.clone();
     let index_generation = searcher.generation().generation_id();
+    let same_generation = cursor.generation == Some(index_generation);
     if cursor.generation.is_some_and(|g| g != index_generation) {
         warnings.push(
             "the index changed since this cursor was issued; page boundaries may have shifted, so a result may repeat or be skipped"
                 .into(),
         );
     }
+    // A total carried by the cursor is reused only while the index is the
+    // one it was counted on, and only under the default policy.
+    let carried_total = match req.count {
+        CountPolicy::Auto if same_generation => cursor.total,
+        _ => None,
+    };
     let mut steps = ctx.steps.clone();
     let mut verify_ms = 0.0;
 
-    let (page, total, total_exact): (Candidates<'_>, u64, bool) = if collect_all {
-        let addrs: HashSet<DocAddress> = searcher.search(&root, &DocSetCollector)?;
-        let mut truncated = false;
-        let mut list: Vec<DocAddress> = addrs.into_iter().collect();
-        list.sort();
-        if list.len() > opts.max_candidates {
-            truncated = true;
-            list.truncate(opts.max_candidates);
-            warnings.push(format!(
-                "more than {} candidates; results are truncated — narrow the query",
-                opts.max_candidates
-            ));
-        }
-        let candidates = list.len() as u64;
-        // Fast-field pass: numeric keys and term ordinals for every
-        // candidate (cheap). Folded strings are resolved only when a verifier
-        // or a name/path sort needs them.
-        let tv = Instant::now();
-        let mut cols: HashMap<u32, FastCols> = HashMap::new();
-        for a in &list {
-            if let std::collections::hash_map::Entry::Vacant(e) = cols.entry(a.segment_ord) {
-                e.insert(FastCols::open(&searcher, a.segment_ord)?);
-            }
-        }
-        let mut rows: Vec<FastRow> = list
-            .iter()
-            .map(|a| cols.get(&a.segment_ord).expect("opened").row(*a))
-            .collect();
-        drop(list);
-        if has_content {
-            // Deferred clauses contribute their upper bound until verified;
-            // the page walk replaces it with the verified score.
-            for r in rows.iter_mut() {
-                r.score = content_bound(&content_sets, r.object_id);
-            }
-        }
-        let fast = &ctx.fast_verifiers;
-        let need_stored = !ctx.verifiers.is_empty() || tight;
-        let sort_by_string = matches!(req.sort.field, SortField::Name | SortField::Path);
-        let lazy = !need_stored
-            && (lazy_content
-                || (rows.len() > LAZY_VERIFY_MIN && (!fast.is_empty() || sort_by_string)));
-        let by_bound = lazy_content && req.sort.field == SortField::Relevance && !tight;
-        let mut lazy_cx = if lazy_content {
-            Some(LazyContent::new(
-                &mut content_sets,
-                catalog,
-                opts.content.max_verify,
-            ))
-        } else {
-            None
-        };
-        let want = offset + limit + STALE_SLACK;
-
-        // Explain and warn for a page walk; returns (total, exact).
-        let report_walk = |steps: &mut Vec<PlanStep>,
-                           warnings: &mut Vec<String>,
-                           outcome_len: usize,
-                           examined: usize,
-                           exhausted: bool,
-                           lc: Option<&LazyContent<'_>>,
-                           elapsed_ms: f64|
-         -> (u64, bool) {
-            let mut desc =
-                format!("lazy: {examined} of {candidates} candidates examined in sort order");
-            if !fast.is_empty() {
-                desc.push_str(" on folded fast fields");
-            }
-            if let Some(lc) = lc {
-                desc.push_str(&format!(
-                    "; {} chunks fetched for content verification",
-                    lc.fetched
+    let (page, total, total_exact, total_origin): (Candidates<'_>, Option<u64>, bool, TotalOrigin) =
+        if collect_all {
+            let addrs: HashSet<DocAddress> = searcher.search(&root, &DocSetCollector)?;
+            let mut truncated = false;
+            let mut list: Vec<DocAddress> = addrs.into_iter().collect();
+            list.sort();
+            if list.len() > opts.max_candidates {
+                truncated = true;
+                list.truncate(opts.max_candidates);
+                warnings.push(format!(
+                    "more than {} candidates; results are truncated — narrow the query",
+                    opts.max_candidates
                 ));
             }
-            if !exhausted {
-                desc.push_str("; total is an upper bound");
+            let candidates = list.len() as u64;
+            // Fast-field pass: numeric keys and term ordinals for every
+            // candidate (cheap). Folded strings are resolved only when a verifier
+            // or a name/path sort needs them.
+            let tv = Instant::now();
+            let mut cols: HashMap<u32, FastCols> = HashMap::new();
+            for a in &list {
+                if let std::collections::hash_map::Entry::Vacant(e) = cols.entry(a.segment_ord) {
+                    e.insert(FastCols::open(&searcher, a.segment_ord)?);
+                }
             }
-            steps.push(PlanStep {
-                stage: "verify".into(),
-                description: desc,
-                candidates: Some(candidates),
-                verified: Some(outcome_len as u64),
-                elapsed_ms: Some(elapsed_ms),
-            });
-            if lc.is_some_and(|lc| lc.exhausted) {
-                warnings.push(format!(
+            let mut rows: Vec<FastRow> = list
+                .iter()
+                .map(|a| cols.get(&a.segment_ord).expect("opened").row(*a))
+                .collect();
+            drop(list);
+            if has_content {
+                // Deferred clauses contribute their upper bound until verified;
+                // the page walk replaces it with the verified score.
+                for r in rows.iter_mut() {
+                    r.score = content_bound(&content_sets, r.object_id);
+                }
+            }
+            let fast = &ctx.fast_verifiers;
+            let need_stored = !ctx.verifiers.is_empty() || tight;
+            let sort_by_string = matches!(req.sort.field, SortField::Name | SortField::Path);
+            let lazy = !need_stored
+                && (lazy_content
+                    || (rows.len() > LAZY_VERIFY_MIN && (!fast.is_empty() || sort_by_string)));
+            let by_bound = lazy_content && req.sort.field == SortField::Relevance && !tight;
+            let mut lazy_cx = if lazy_content {
+                Some(LazyContent::new(
+                    &mut content_sets,
+                    catalog,
+                    opts.content.max_verify,
+                ))
+            } else {
+                None
+            };
+            let want = offset + limit + STALE_SLACK;
+
+            // Explain and warn for a page walk; returns (total, exact).
+            let report_walk = |steps: &mut Vec<PlanStep>,
+                               warnings: &mut Vec<String>,
+                               outcome_len: usize,
+                               examined: usize,
+                               exhausted: bool,
+                               lc: Option<&LazyContent<'_>>,
+                               elapsed_ms: f64|
+             -> (u64, bool) {
+                let mut desc =
+                    format!("lazy: {examined} of {candidates} candidates examined in sort order");
+                if !fast.is_empty() {
+                    desc.push_str(" on folded fast fields");
+                }
+                if let Some(lc) = lc {
+                    desc.push_str(&format!(
+                        "; {} chunks fetched for content verification",
+                        lc.fetched
+                    ));
+                }
+                if !exhausted {
+                    desc.push_str("; total is an upper bound");
+                }
+                steps.push(PlanStep {
+                    stage: "verify".into(),
+                    description: desc,
+                    candidates: Some(candidates),
+                    verified: Some(outcome_len as u64),
+                    elapsed_ms: Some(elapsed_ms),
+                });
+                if lc.is_some_and(|lc| lc.exhausted) {
+                    warnings.push(format!(
                     "content verification stopped after {} chunk fetches; results are a subset — narrow the query",
                     opts.content.max_verify
                 ));
-            } else if !exhausted {
-                warnings.push(format!(
+                } else if !exhausted {
+                    warnings.push(format!(
                     "{candidates} candidates; the total and facet counts are upper bounds — hits shown are verified"
                 ));
-            }
-            let total = if exhausted {
-                outcome_len as u64
-            } else {
-                candidates
+                }
+                let total = if exhausted {
+                    outcome_len as u64
+                } else {
+                    candidates
+                };
+                (total, exhausted && !truncated && !content_truncated)
             };
-            (total, exhausted && !truncated && !content_truncated)
-        };
 
-        if !lazy {
-            // Eager: resolve strings where needed and verify everything.
-            if !fast.is_empty() || sort_by_string {
-                let threads = (rows.len() / 2_000).clamp(1, verify_threads());
-                let per = rows.len().div_ceil(threads).max(1);
-                let cols_ref = &cols;
-                let mut parts: Vec<Vec<FastRow>> = Vec::new();
-                let mut chunks: Vec<Vec<FastRow>> = Vec::new();
-                let mut it = rows.into_iter().peekable();
-                while it.peek().is_some() {
-                    chunks.push(it.by_ref().take(per).collect());
-                }
-                std::thread::scope(|sc| {
-                    let handles: Vec<_> = chunks
-                        .into_iter()
-                        .map(|mut part| {
-                            sc.spawn(move || {
-                                part.retain_mut(|r| {
-                                    let c = cols_ref.get(&r.addr.segment_ord).expect("opened");
-                                    c.resolve(r);
-                                    c.passes(r, fast)
-                                });
-                                part
-                            })
-                        })
-                        .collect();
-                    for h in handles {
-                        parts.push(h.join().expect("fast-field thread"));
+            if !lazy {
+                // Eager: resolve strings where needed and verify everything.
+                if !fast.is_empty() || sort_by_string {
+                    let threads = (rows.len() / 2_000).clamp(1, verify_threads());
+                    let per = rows.len().div_ceil(threads).max(1);
+                    let cols_ref = &cols;
+                    let mut parts: Vec<Vec<FastRow>> = Vec::new();
+                    let mut chunks: Vec<Vec<FastRow>> = Vec::new();
+                    let mut it = rows.into_iter().peekable();
+                    while it.peek().is_some() {
+                        chunks.push(it.by_ref().take(per).collect());
                     }
-                });
-                rows = parts.into_iter().flatten().collect();
-                if !fast.is_empty() {
-                    steps.push(PlanStep {
-                        stage: "verify".into(),
-                        description: format!(
-                            "{candidates} candidates verified on folded fast fields"
-                        ),
-                        candidates: Some(candidates),
-                        verified: Some(rows.len() as u64),
-                        elapsed_ms: Some(tv.elapsed().as_secs_f64() * 1000.0),
-                    });
-                }
-            }
-            if need_stored {
-                let threads = (rows.len() / 500).clamp(1, verify_threads());
-                let per = rows.len().div_ceil(threads).max(1);
-                let searcher_ref = &searcher;
-                let parts: Vec<Result<Vec<Stored>>> = std::thread::scope(|sc| {
-                    let handles: Vec<_> = rows
-                        .chunks(per)
-                        .map(|part| {
-                            sc.spawn(move || -> Result<Vec<Stored>> {
-                                let mut out = Vec::with_capacity(part.len());
-                                for r in part {
-                                    let doc: TantivyDocument = searcher_ref.doc(r.addr)?;
-                                    out.push(read_stored(f, &doc, r.score));
-                                }
-                                Ok(out)
+                    std::thread::scope(|sc| {
+                        let handles: Vec<_> = chunks
+                            .into_iter()
+                            .map(|mut part| {
+                                sc.spawn(move || {
+                                    part.retain_mut(|r| {
+                                        let c = cols_ref.get(&r.addr.segment_ord).expect("opened");
+                                        c.resolve(r);
+                                        c.passes(r, fast)
+                                    });
+                                    part
+                                })
                             })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().expect("store thread"))
-                        .collect()
-                });
-                let mut stored: Vec<Stored> = Vec::with_capacity(rows.len());
-                for part in parts {
-                    stored.extend(part?);
+                            .collect();
+                        for h in handles {
+                            parts.push(h.join().expect("fast-field thread"));
+                        }
+                    });
+                    rows = parts.into_iter().flatten().collect();
+                    if !fast.is_empty() {
+                        steps.push(PlanStep {
+                            stage: "verify".into(),
+                            description: format!(
+                                "{candidates} candidates verified on folded fast fields"
+                            ),
+                            candidates: Some(candidates),
+                            verified: Some(rows.len() as u64),
+                            elapsed_ms: Some(tv.elapsed().as_secs_f64() * 1000.0),
+                        });
+                    }
                 }
-                let fast_candidates = rows.len() as u64;
-                drop(rows);
-                let tv2 = Instant::now();
-                let mut verified: Vec<Stored> = stored
-                    .into_iter()
-                    .filter(|s| ctx.verifiers.iter().all(|v| v(s, catalog)))
-                    .collect();
-                if tight {
-                    // Rank the tightest containers first: a directory is "loose"
-                    // when a candidate beneath it also satisfies the predicate.
-                    let ids: HashSet<ObjectId> = verified.iter().map(|s| s.object_id).collect();
-                    let mut loose: HashSet<ObjectId> = HashSet::new();
-                    for s in &verified {
-                        for a in &s.ancestors {
-                            if ids.contains(a) {
-                                loose.insert(*a);
+                if need_stored {
+                    let threads = (rows.len() / 500).clamp(1, verify_threads());
+                    let per = rows.len().div_ceil(threads).max(1);
+                    let searcher_ref = &searcher;
+                    let parts: Vec<Result<Vec<Stored>>> = std::thread::scope(|sc| {
+                        let handles: Vec<_> = rows
+                            .chunks(per)
+                            .map(|part| {
+                                sc.spawn(move || -> Result<Vec<Stored>> {
+                                    let mut out = Vec::with_capacity(part.len());
+                                    for r in part {
+                                        let doc: TantivyDocument = searcher_ref.doc(r.addr)?;
+                                        out.push(read_stored(f, &doc, r.score));
+                                    }
+                                    Ok(out)
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().expect("store thread"))
+                            .collect()
+                    });
+                    let mut stored: Vec<Stored> = Vec::with_capacity(rows.len());
+                    for part in parts {
+                        stored.extend(part?);
+                    }
+                    let fast_candidates = rows.len() as u64;
+                    drop(rows);
+                    let tv2 = Instant::now();
+                    let mut verified: Vec<Stored> = stored
+                        .into_iter()
+                        .filter(|s| ctx.verifiers.iter().all(|v| v(s, catalog)))
+                        .collect();
+                    if tight {
+                        // Rank the tightest containers first: a directory is "loose"
+                        // when a candidate beneath it also satisfies the predicate.
+                        let ids: HashSet<ObjectId> = verified.iter().map(|s| s.object_id).collect();
+                        let mut loose: HashSet<ObjectId> = HashSet::new();
+                        for s in &verified {
+                            for a in &s.ancestors {
+                                if ids.contains(a) {
+                                    loose.insert(*a);
+                                }
                             }
                         }
-                    }
-                    for s in verified.iter_mut() {
-                        s.score = if loose.contains(&s.object_id) {
-                            0.5
-                        } else {
-                            1.0
-                        };
-                    }
-                    steps.push(PlanStep {
+                        for s in verified.iter_mut() {
+                            s.score = if loose.contains(&s.object_id) {
+                                0.5
+                            } else {
+                                1.0
+                            };
+                        }
+                        steps.push(PlanStep {
                         stage: "rank".into(),
                         description: "tightest containing directories first; ancestors that only contain matches via a child are ranked second".into(),
                         candidates: Some(verified.len() as u64),
                         verified: Some(verified.iter().filter(|s| s.score >= 1.0).count() as u64),
                         elapsed_ms: None,
                     });
-                }
-                verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
-                if !ctx.verifiers.is_empty() {
-                    steps.push(PlanStep {
-                        stage: "verify".into(),
-                        description: format!(
-                            "{fast_candidates} candidates verified against stored originals"
-                        ),
-                        candidates: Some(fast_candidates),
-                        verified: Some(verified.len() as u64),
-                        elapsed_ms: Some(tv2.elapsed().as_secs_f64() * 1000.0),
-                    });
-                }
-                let sort = if tight && req.sort.field == SortField::Relevance {
-                    Sort {
-                        field: SortField::Relevance,
-                        descending: true,
                     }
-                } else {
-                    req.sort
-                };
-                verified.sort_by(|a, b| {
-                    if tight {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| {
-                                sort_key_cmp(
-                                    a,
-                                    b,
-                                    if sort.field == SortField::Relevance {
-                                        Sort {
-                                            field: SortField::Name,
-                                            descending: false,
-                                        }
-                                    } else {
-                                        sort
-                                    },
-                                )
-                            })
-                    } else {
-                        sort_key_cmp(a, b, sort)
-                    }
-                });
-                if let Some(lc) = lazy_cx.as_mut() {
-                    // Stored verifiers ran eagerly; content is still verified
-                    // only as far as the page needs.
-                    let tw = Instant::now();
-                    let n = verified.len();
-                    let outcome =
-                        lazy_walk(verified.into_iter(), want, |_| true, Some(lc), by_bound)?;
                     verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
-                    let (total, exact) = report_walk(
-                        &mut steps,
-                        &mut warnings,
-                        outcome.verified.len(),
-                        outcome.examined.min(n),
-                        outcome.exhausted,
-                        Some(lc),
-                        tw.elapsed().as_secs_f64() * 1000.0,
-                    );
-                    let page: Candidates<'_> =
-                        Box::new(outcome.verified.into_iter().skip(offset).map(Ok));
-                    (page, total, exact)
+                    if !ctx.verifiers.is_empty() {
+                        steps.push(PlanStep {
+                            stage: "verify".into(),
+                            description: format!(
+                                "{fast_candidates} candidates verified against stored originals"
+                            ),
+                            candidates: Some(fast_candidates),
+                            verified: Some(verified.len() as u64),
+                            elapsed_ms: Some(tv2.elapsed().as_secs_f64() * 1000.0),
+                        });
+                    }
+                    let sort = if tight && req.sort.field == SortField::Relevance {
+                        Sort {
+                            field: SortField::Relevance,
+                            descending: true,
+                        }
+                    } else {
+                        req.sort
+                    };
+                    verified.sort_by(|a, b| {
+                        if tight {
+                            b.score
+                                .partial_cmp(&a.score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| {
+                                    sort_key_cmp(
+                                        a,
+                                        b,
+                                        if sort.field == SortField::Relevance {
+                                            Sort {
+                                                field: SortField::Name,
+                                                descending: false,
+                                            }
+                                        } else {
+                                            sort
+                                        },
+                                    )
+                                })
+                        } else {
+                            sort_key_cmp(a, b, sort)
+                        }
+                    });
+                    if let Some(lc) = lazy_cx.as_mut() {
+                        // Stored verifiers ran eagerly; content is still verified
+                        // only as far as the page needs.
+                        let tw = Instant::now();
+                        let n = verified.len();
+                        let outcome =
+                            lazy_walk(verified.into_iter(), want, |_| true, Some(lc), by_bound)?;
+                        verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
+                        let (total, exact) = report_walk(
+                            &mut steps,
+                            &mut warnings,
+                            outcome.verified.len(),
+                            outcome.examined.min(n),
+                            outcome.exhausted,
+                            Some(lc),
+                            tw.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let page: Candidates<'_> =
+                            Box::new(outcome.verified.into_iter().skip(offset).map(Ok));
+                        (page, Some(total), exact, TotalOrigin::Counted)
+                    } else {
+                        let total = verified.len() as u64;
+                        let page: Candidates<'_> =
+                            Box::new(verified.into_iter().skip(offset).map(Ok));
+                        (
+                            page,
+                            Some(total),
+                            !truncated && !content_truncated,
+                            TotalOrigin::Counted,
+                        )
+                    }
                 } else {
-                    let total = verified.len() as u64;
-                    let page: Candidates<'_> = Box::new(verified.into_iter().skip(offset).map(Ok));
-                    (page, total, !truncated && !content_truncated)
+                    verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
+                    rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
+                    let total = rows.len() as u64;
+                    let page: Candidates<'_> = Box::new(rows.into_iter().skip(offset).map(|r| {
+                        let doc: TantivyDocument = searcher.doc(r.addr)?;
+                        Ok(read_stored(f, &doc, r.score))
+                    }));
+                    (
+                        page,
+                        Some(total),
+                        !truncated && !content_truncated,
+                        TotalOrigin::Counted,
+                    )
                 }
             } else {
+                // Lazy: order candidates by cheap keys, then resolve and verify
+                // in that order only until the page is filled. Every returned hit
+                // is verified; the total is an upper bound unless the walk ended.
+                let cols_ref = &cols;
+                let pass = |r: &mut FastRow| {
+                    cols_ref
+                        .get(&r.addr.segment_ord)
+                        .expect("opened")
+                        .passes(r, fast)
+                };
+                let outcome = if sort_by_string {
+                    let merged = MergeByString::new(
+                        rows,
+                        cols_ref,
+                        req.sort.field == SortField::Name,
+                        req.sort.descending,
+                    );
+                    lazy_walk(merged, want, pass, lazy_cx.as_mut(), by_bound)?
+                } else {
+                    rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
+                    lazy_walk(rows.into_iter(), want, pass, lazy_cx.as_mut(), by_bound)?
+                };
                 verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
-                rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
-                let total = rows.len() as u64;
-                let page: Candidates<'_> = Box::new(rows.into_iter().skip(offset).map(|r| {
-                    let doc: TantivyDocument = searcher.doc(r.addr)?;
-                    Ok(read_stored(f, &doc, r.score))
-                }));
-                (page, total, !truncated && !content_truncated)
+                let (total, exact) = report_walk(
+                    &mut steps,
+                    &mut warnings,
+                    outcome.verified.len(),
+                    outcome.examined,
+                    outcome.exhausted,
+                    lazy_cx.as_ref(),
+                    verify_ms,
+                );
+                let page: Candidates<'_> =
+                    Box::new(outcome.verified.into_iter().skip(offset).map(|r| {
+                        let doc: TantivyDocument = searcher.doc(r.addr)?;
+                        Ok(read_stored(f, &doc, r.score))
+                    }));
+                (page, Some(total), exact, TotalOrigin::Counted)
             }
         } else {
-            // Lazy: order candidates by cheap keys, then resolve and verify
-            // in that order only until the page is filled. Every returned hit
-            // is verified; the total is an upper bound unless the walk ended.
-            let cols_ref = &cols;
-            let pass = |r: &mut FastRow| {
-                cols_ref
-                    .get(&r.addr.segment_ord)
-                    .expect("opened")
-                    .passes(r, fast)
-            };
-            let outcome = if sort_by_string {
-                let merged = MergeByString::new(
-                    rows,
-                    cols_ref,
-                    req.sort.field == SortField::Name,
-                    req.sort.descending,
-                );
-                lazy_walk(merged, want, pass, lazy_cx.as_mut(), by_bound)?
+            let order = if req.sort.descending {
+                Order::Desc
             } else {
-                rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
-                lazy_walk(rows.into_iter(), want, pass, lazy_cx.as_mut(), by_bound)?
+                Order::Asc
             };
-            verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
-            let (total, exact) = report_walk(
-                &mut steps,
-                &mut warnings,
-                outcome.verified.len(),
-                outcome.examined,
-                outcome.exhausted,
-                lazy_cx.as_ref(),
-                verify_ms,
-            );
-            let page: Candidates<'_> =
-                Box::new(outcome.verified.into_iter().skip(offset).map(|r| {
-                    let doc: TantivyDocument = searcher.doc(r.addr)?;
-                    Ok(read_stored(f, &doc, r.score))
-                }));
-            (page, total, exact)
-        }
-    } else {
-        let order = if req.sort.descending {
-            Order::Desc
-        } else {
-            Order::Asc
+            // Collect the top `n` in sort order. The candidate stream below asks
+            // for more (doubling, bounded by the match count) when a run of
+            // stale documents exhausts what was collected, so a page is short
+            // only when the matches themselves run out. The exact count is a
+            // full pass over the matches, so it is taken only when the policy
+            // asks for it: on the first page (`Auto`), every page (`Exact`), or
+            // never (`None`).
+            let searcher_ref = &searcher;
+            let root_ref: &dyn TQuery = root.as_ref();
+            let sort = req.sort;
+            let collect = move |n: usize, count: bool| -> Result<Collected> {
+                let top = TopDocs::with_limit(n.max(1));
+                Ok(match sort.field {
+                    SortField::Relevance => {
+                        let (hits, count) =
+                            top_and_count(searcher_ref, root_ref, top.order_by_score(), count)?;
+                        (hits, count)
+                    }
+                    SortField::Name | SortField::Path => {
+                        let field = if sort.field == SortField::Name {
+                            "name_folded"
+                        } else {
+                            "path_folded"
+                        };
+                        let (hits, count) = top_and_count(
+                            searcher_ref,
+                            root_ref,
+                            top.order_by_string_fast_field(field, order),
+                            count,
+                        )?;
+                        (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
+                    }
+                    SortField::Modified | SortField::Created => {
+                        let field = if sort.field == SortField::Modified {
+                            "newest_modified"
+                        } else {
+                            "created"
+                        };
+                        let (hits, count) = top_and_count(
+                            searcher_ref,
+                            root_ref,
+                            top.order_by_fast_field::<i64>(field, order),
+                            count,
+                        )?;
+                        (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
+                    }
+                    SortField::Size | SortField::SubtreeSize | SortField::AllocatedSize => {
+                        let field = if sort.field == SortField::AllocatedSize {
+                            "subtree_allocated"
+                        } else {
+                            "subtree_logical"
+                        };
+                        let (hits, count) = top_and_count(
+                            searcher_ref,
+                            root_ref,
+                            top.order_by_fast_field::<u64>(field, order),
+                            count,
+                        )?;
+                        (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
+                    }
+                })
+            };
+            let n = offset + limit + STALE_SLACK;
+            let need_count = match req.count {
+                CountPolicy::Exact => true,
+                CountPolicy::Auto => carried_total.is_none(),
+                CountPolicy::None => false,
+            };
+            let (addrs, count) = collect(n, need_count)?;
+            let known: Option<(u64, bool, TotalOrigin)> = match count {
+                Some(c) => Some((c as u64, true, TotalOrigin::Counted)),
+                None => carried_total.map(|(t, exact)| (t, exact, TotalOrigin::Cursor)),
+            };
+            steps.push(PlanStep {
+                stage: "retrieve".into(),
+                description: match (req.sort.field, known) {
+                    (SortField::Relevance, Some((_, _, TotalOrigin::Counted))) => {
+                        "BM25 ranked retrieval, top-k + exact count".into()
+                    }
+                    (SortField::Relevance, _) => "BM25 ranked retrieval, top-k (no count)".into(),
+                    (other, Some((_, _, TotalOrigin::Counted))) => {
+                        format!("fast-field sorted retrieval by {other:?}, top-k + exact count")
+                    }
+                    (other, _) => {
+                        format!("fast-field sorted retrieval by {other:?}, top-k (no count)")
+                    }
+                },
+                candidates: known.map(|(t, _, _)| t),
+                verified: None,
+                elapsed_ms: None,
+            });
+            let regrowing = Regrowing {
+                collect: Box::new(move |n| collect(n, false).map(|(hits, _)| hits)),
+                buf: addrs,
+                pos: 0,
+                n,
+                total: known.map(|(t, _, _)| t as usize).unwrap_or(usize::MAX),
+            };
+            let page: Candidates<'_> = Box::new(regrowing.skip(offset).map(|r| {
+                let (score, a) = r?;
+                let doc: TantivyDocument = searcher.doc(a)?;
+                Ok(read_stored(f, &doc, score))
+            }));
+            match known {
+                Some((t, exact, origin)) => (page, Some(t), exact, origin),
+                None => (page, None, false, TotalOrigin::Bound),
+            }
         };
-        // Collect the top `n` in sort order. The candidate stream below asks
-        // for more (doubling, bounded by the match count) when a run of
-        // stale documents exhausts what was collected, so a page is short
-        // only when the matches themselves run out.
-        let searcher_ref = &searcher;
-        let root_ref: &dyn TQuery = root.as_ref();
-        let sort = req.sort;
-        let collect = move |n: usize| -> Result<(Vec<(f32, DocAddress)>, usize)> {
-            let top = TopDocs::with_limit(n.max(1));
-            Ok(match sort.field {
-                SortField::Relevance => {
-                    let (hits, count) =
-                        searcher_ref.search(root_ref, &(top.order_by_score(), Count))?;
-                    (hits, count)
-                }
-                SortField::Name | SortField::Path => {
-                    let field = if sort.field == SortField::Name {
-                        "name_folded"
-                    } else {
-                        "path_folded"
-                    };
-                    let (hits, count) = searcher_ref.search(
-                        root_ref,
-                        &(top.order_by_string_fast_field(field, order), Count),
-                    )?;
-                    (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
-                }
-                SortField::Modified | SortField::Created => {
-                    let field = if sort.field == SortField::Modified {
-                        "newest_modified"
-                    } else {
-                        "created"
-                    };
-                    let (hits, count) = searcher_ref.search(
-                        root_ref,
-                        &(top.order_by_fast_field::<i64>(field, order), Count),
-                    )?;
-                    (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
-                }
-                SortField::Size | SortField::SubtreeSize | SortField::AllocatedSize => {
-                    let field = if sort.field == SortField::AllocatedSize {
-                        "subtree_allocated"
-                    } else {
-                        "subtree_logical"
-                    };
-                    let (hits, count) = searcher_ref.search(
-                        root_ref,
-                        &(top.order_by_fast_field::<u64>(field, order), Count),
-                    )?;
-                    (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
-                }
-            })
-        };
-        let n = offset + limit + STALE_SLACK;
-        let (addrs, count) = collect(n)?;
-        steps.push(PlanStep {
-            stage: "retrieve".into(),
-            description: match req.sort.field {
-                SortField::Relevance => "BM25 ranked retrieval, top-k".into(),
-                other => format!("fast-field sorted retrieval by {other:?}, top-k"),
-            },
-            candidates: Some(count as u64),
-            verified: None,
-            elapsed_ms: None,
-        });
-        let regrowing = Regrowing {
-            collect: Box::new(move |n| collect(n).map(|(hits, _)| hits)),
-            buf: addrs,
-            pos: 0,
-            n,
-            total: count,
-        };
-        let page: Candidates<'_> = Box::new(regrowing.skip(offset).map(|r| {
-            let (score, a) = r?;
-            let doc: TantivyDocument = searcher.doc(a)?;
-            Ok(read_stored(f, &doc, score))
-        }));
-        (page, count as u64, true)
-    };
     let retrieve_ms = t1.elapsed().as_secs_f64() * 1000.0 - verify_ms;
     let t2 = Instant::now();
-    let (hits, facets, consumed) = build_hits(
+    let (hits, facets, consumed, more) = build_hits(
         index,
         catalog,
         req,
@@ -2351,8 +2450,23 @@ pub fn search_with_content(
     // that produced no hit are never re-examined by the next page, and a
     // page of nothing but stale documents still makes progress.
     let consumed_total = offset + consumed;
-    let next_cursor = if consumed_total < total as usize {
-        Some(encode_cursor(consumed_total, index_generation, fingerprint))
+    let (total, total_exact) = match total {
+        Some(t) => (t, total_exact),
+        // Not counted: what this walk has seen so far is a lower bound.
+        None => (consumed_total as u64 + u64::from(more), false),
+    };
+    let has_more = match total_origin {
+        TotalOrigin::Bound => more,
+        _ => consumed_total < total as usize,
+    };
+    let next_cursor = if has_more {
+        Some(encode_cursor(
+            consumed_total,
+            index_generation,
+            fingerprint,
+            (total_origin != TotalOrigin::Bound).then_some((total, total_exact)),
+            index.cursor_key(),
+        ))
     } else {
         None
     };
@@ -2363,6 +2477,7 @@ pub fn search_with_content(
         total: TotalCount {
             value: total,
             exact: total_exact,
+            origin: total_origin,
         },
         timing: Timing {
             total_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -2386,9 +2501,10 @@ pub fn search_with_content(
 }
 
 /// Join candidates with the catalog in page order until `limit` hits are
-/// assembled or the candidates run out. Returns the hits, facets, and the
+/// assembled or the candidates run out. Returns the hits, facets, the
 /// number of candidates consumed (stale ones included) so the cursor can
-/// advance past everything this page examined.
+/// advance past everything this page examined, and whether at least one
+/// more candidate exists beyond them.
 #[allow(clippy::too_many_arguments)]
 fn build_hits(
     index: &CatalogIndex,
@@ -2400,7 +2516,7 @@ fn build_hits(
     facet_query: &dyn TQuery,
     content_sets: &[ContentSet],
     opts: &ExecOptions,
-) -> Result<(Vec<Hit>, Vec<Facet>, usize)> {
+) -> Result<(Vec<Hit>, Vec<Facet>, usize, bool)> {
     let sources: HashMap<SourceId, eidos_catalog::SourceRecord> = catalog
         .list_sources()?
         .into_iter()
@@ -2408,8 +2524,11 @@ fn build_hits(
         .collect();
     let mut hits = Vec::with_capacity(limit);
     let mut consumed = 0usize;
-    for s in candidates {
+    let mut candidates = candidates.peekable();
+    let mut more = false;
+    for s in candidates.by_ref() {
         if hits.len() >= limit {
+            more = true;
             break;
         }
         let s = s?;
@@ -2496,6 +2615,9 @@ fn build_hits(
             source_state: src.map(|x| x.state).unwrap_or(SourceState::New),
         });
     }
+    if !more {
+        more = candidates.peek().is_some();
+    }
     let facets = if req.facets.is_empty() {
         Vec::new()
     } else {
@@ -2509,7 +2631,22 @@ fn build_hits(
             catalog,
         )?
     };
-    Ok((hits, facets, consumed))
+    Ok((hits, facets, consumed, more))
+}
+
+/// Run a top-k collector, with the exact match count only when asked for.
+fn top_and_count<C: tantivy::collector::Collector>(
+    searcher: &Searcher,
+    query: &dyn TQuery,
+    top: C,
+    count: bool,
+) -> Result<(C::Fruit, Option<usize>)> {
+    if count {
+        let (fruit, n) = searcher.search(query, &(top, Count))?;
+        Ok((fruit, Some(n)))
+    } else {
+        Ok((searcher.search(query, &top)?, None))
+    }
 }
 
 /// Diverse line-aware snippets for one file: the best-scoring chunks across

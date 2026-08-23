@@ -225,6 +225,20 @@ pub enum SortField {
     Created,
 }
 
+/// How the total match count is produced for a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CountPolicy {
+    /// Exact on the first page; later pages reuse the first page's total
+    /// (carried in the cursor) while the index generation is unchanged.
+    #[default]
+    Auto,
+    /// Recount on every page.
+    Exact,
+    /// Never pay for a count: totals that are not free are lower bounds.
+    None,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Sort {
     #[serde(default)]
@@ -279,6 +293,9 @@ pub struct SearchRequest {
     /// Include retired sources. Off by default.
     #[serde(default)]
     pub include_retired: bool,
+    /// Total-count policy (see [`CountPolicy`]).
+    #[serde(default)]
+    pub count: CountPolicy,
 }
 
 fn default_limit() -> u32 {
@@ -300,6 +317,7 @@ impl SearchRequest {
             snippets: true,
             facets: Vec::new(),
             include_retired: false,
+            count: CountPolicy::Auto,
         }
     }
 }

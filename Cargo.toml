@@ -42,6 +42,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs", "compression-
 rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 tantivy = "0.26"
 blake3 = "1.8"
+getrandom = "0.4"
 crc32fast = "1.5"
 clap = { version = "4.6", features = ["derive", "env"] }
 regex = "1.13"

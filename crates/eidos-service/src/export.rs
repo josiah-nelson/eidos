@@ -251,6 +251,7 @@ pub async fn export_get(
         explain: false,
         facets: Vec::new(),
         include_retired: q.include_retired,
+        count: eidos_domain::CountPolicy::Auto,
     };
     let p = plan(&st, body, q.format, q.bom, q.limit)?;
     start(st, p).await
@@ -270,6 +271,7 @@ pub async fn export_post(
         explain: false,
         facets: Vec::new(),
         include_retired: b.include_retired,
+        count: eidos_domain::CountPolicy::Auto,
     };
     let p = plan(&st, body, b.format, b.bom, b.limit)?;
     start(st, p).await

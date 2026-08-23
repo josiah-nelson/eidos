@@ -127,6 +127,11 @@ impl LatencySamples {
         self.samples_us.len()
     }
 
+    /// Append every sample of `other`.
+    pub fn extend(&mut self, other: &LatencySamples) {
+        self.samples_us.extend_from_slice(&other.samples_us);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.samples_us.is_empty()
     }
