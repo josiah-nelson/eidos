@@ -17,6 +17,8 @@ import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
 import { ContentPreviewPanel } from '../ContentPreview'
 import { bytes, count, duration, when } from '../format'
 import { applyFacetClick, negate, type FacetForms } from '../query-clause'
+import { SavedSearchControls } from '../SavedSearches'
+import { PAGE_SIZES, canonicalSearchParams, readSearchView } from '../saved-searches'
 
 /** What a "show context" click opens: stored text around one chunk. */
 export interface PreviewTarget {
@@ -26,7 +28,6 @@ export interface PreviewTarget {
   generation?: number
 }
 
-const PAGE = 100
 const FILE_FACETS: FacetField[] = ['source', 'extension', 'kind', 'content_state', 'size_bucket', 'modified_bucket']
 const DIR_FACETS: FacetField[] = ['source', 'size_bucket', 'modified_bucket']
 
@@ -45,13 +46,10 @@ const EXAMPLES: [string, string][] = [
 
 export default function SearchPage() {
   const [params, setParams] = useSearchParams()
-  const q = params.get('q') ?? ''
-  const mode = (params.get('mode') as ResultMode) || 'files'
-  const sort = (params.get('sort') as SortField) || 'relevance'
-  const desc = params.get('desc') !== '0'
+  const view = readSearchView(params)
+  const { q, mode, sort, desc, pageSize, details: showPlan } = view
   const [draft, setDraft] = useState(q)
   const [lastQ, setLastQ] = useState(q)
-  const [showPlan, setShowPlan] = useState(false)
   const [preview, setPreview] = useState<PreviewTarget | null>(null)
   if (q !== lastQ) {
     // URL changed (back/forward, example click): resync the editor.
@@ -76,9 +74,9 @@ export default function SearchPage() {
   })
 
   const results = useInfiniteQuery({
-    queryKey: ['search', q, mode, sort, desc],
+    queryKey: ['search', q, mode, sort, desc, pageSize],
     queryFn: ({ pageParam }) =>
-      api.search({ q, mode, sort, desc, limit: PAGE, cursor: pageParam || undefined, facets: pageParam ? [] : mode === 'directories' ? DIR_FACETS : FILE_FACETS, explain: !pageParam }),
+      api.search({ q, mode, sort, desc, limit: pageSize, cursor: pageParam || undefined, facets: pageParam ? [] : mode === 'directories' ? DIR_FACETS : FILE_FACETS, explain: !pageParam }),
     initialPageParam: '',
     getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: params.has('q'),
@@ -133,6 +131,13 @@ export default function SearchPage() {
           <option value="modified">Modified</option>
           <option value="created">Created</option>
         </select>
+        <select value={pageSize} onChange={(e) => set({ page: e.target.value })} title="results per page">
+          {PAGE_SIZES.map((size) => (
+            <option key={size} value={size}>
+              {size}/page
+            </option>
+          ))}
+        </select>
         <button type="button" className="btn small" onClick={() => set({ desc: desc ? '0' : '1' })} title="direction">
           {desc ? '▼' : '▲'}
         </button>
@@ -162,6 +167,11 @@ export default function SearchPage() {
           <span className="muted">Type a query. Bare words match names; use field:value for filters.</span>
         )}
       </div>
+
+      <SavedSearchControls
+        state={view}
+        onRun={(saved) => setParams(canonicalSearchParams(saved), { replace: true })}
+      />
 
       {!params.has('q') && (
         <div className="card" style={{ marginTop: 12 }}>
@@ -218,7 +228,7 @@ export default function SearchPage() {
               </span>
               <div style={{ flex: 1 }} />
               {first.explanation && (
-                <button className="btn small" onClick={() => setShowPlan((v) => !v)}>
+                <button className="btn small" onClick={() => set({ details: showPlan ? '' : '1' })}>
                   {showPlan ? 'Hide plan' : 'Explain'}
                 </button>
               )}
