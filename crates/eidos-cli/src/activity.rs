@@ -121,6 +121,13 @@ fn print_activity(v: &serde_json::Value) {
                 states,
                 crate::profile::human_bytes(n(s, "content_bytes_indexed")),
             );
+            if let Some(deferred) = s["reconciliation_deferred"].as_object() {
+                println!(
+                    "     automatic rescan deferred: {} (next check {})",
+                    deferred["reason"].as_str().unwrap_or("busy"),
+                    deferred["next_eligible_at"].as_str().unwrap_or("unknown")
+                );
+            }
         }
     }
     if let Some(cur) = w["current"].as_array() {

@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
 import { api, type ActivitySourceView, type ApiInt, type RetryReport } from '../api'
 import { ErrorBox, Spinner, StateBadge } from '../components'
-import { bytes, count, duration, integerNumber } from '../format'
+import { bytes, count, duration, integerNumber, when } from '../format'
 
 const STATE_ORDER = ['indexed', 'partial', 'pending', 'stale', 'failed', 'unsupported', 'excluded']
 
@@ -127,6 +127,11 @@ function SourceRow({ s }: { s: ActivitySourceView }) {
     <tr>
       <td>
         <Link to={`/sources/${s.source_id}`}>{s.name}</Link> <StateBadge state={s.state} />
+        {s.reconciliation_deferred && (
+          <div className="muted small" title={`next check ${when(s.reconciliation_deferred.next_eligible_at)}`}>
+            rescan deferred: {s.reconciliation_deferred.reason}
+          </div>
+        )}
       </td>
       <td>
         <label className="toggle">

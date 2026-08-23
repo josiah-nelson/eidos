@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
 import { api, type ApiInt, type SourceView } from '../api'
 import { ErrorBox, Spinner, StateBadge } from '../components'
-import { ago, bytes, count, duration, integerNumber, rate } from '../format'
+import { ago, bytes, count, duration, integerNumber, rate, when } from '../format'
 
 export default function SourcesPage() {
   const qc = useQueryClient()
@@ -151,6 +151,15 @@ function SourceCard({
           {ago(source.last_scan_completed_at)}
           {source.published_generation != null ? ` (generation ${source.published_generation})` : ''}
         </dd>
+        {s.reconciliation_deferred && (
+          <>
+            <dt>Automatic rescan</dt>
+            <dd>
+              deferred: {s.reconciliation_deferred.reason} · next check{' '}
+              {when(s.reconciliation_deferred.next_eligible_at)}
+            </dd>
+          </>
+        )}
         <dt>Change feed</dt>
         <dd>
           {s.watcher ? (

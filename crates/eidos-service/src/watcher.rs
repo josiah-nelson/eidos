@@ -245,13 +245,17 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                     std::thread::sleep(POLL_INTERVAL);
                     continue;
                 }
-                status.set(
-                    WatcherState::Reconciling,
-                    Some("establishing checkpoint".into()),
-                );
-                status.reconciles.fetch_add(1, Ordering::Relaxed);
-                match scanner::start_scan(&state, source_id) {
-                    Ok(_) | Err(scanner::StartScanError::AlreadyRunning) => {}
+                match scanner::start_feed_recovery_scan(&state, source_id, UnixNanos::now()) {
+                    Ok(scanner::AutomaticScanOutcome::Started(_)) => {
+                        status.set(
+                            WatcherState::Reconciling,
+                            Some("establishing checkpoint".into()),
+                        );
+                        status.reconciles.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(scanner::AutomaticScanOutcome::Deferred(d)) => {
+                        status.set(WatcherState::Reconciling, Some(d.reason));
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "watcher: could not start reconcile scan");
                         std::thread::sleep(Duration::from_secs(5));
@@ -340,11 +344,13 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                     next_usn,
                     ..cp.clone()
                 };
+                let expected_cp = cp.to_checkpoint();
+                let next_cp = new_cp.to_checkpoint();
                 match state
                     .catalog
-                    .apply_changes(source_id, &events, Some(&new_cp.to_checkpoint()))
+                    .apply_feed_changes(source_id, &events, &expected_cp, &next_cp)
                 {
-                    Ok(astats) => {
+                    Ok(Some(astats)) => {
                         status.batches.fetch_add(1, Ordering::Relaxed);
                         status.events.fetch_add(astats.events, Ordering::Relaxed);
                         status.records.fetch_add(tstats.records, Ordering::Relaxed);
@@ -368,6 +374,13 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                             let _ = restore_state(&state, source_id);
                         }
                     }
+                    Ok(None) => {
+                        tracing::debug!(
+                            source = source_id.0,
+                            "checkpoint changed while a feed batch was in flight; discarding the stale batch"
+                        );
+                        vol = None;
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "watcher: apply failed; will retry batch");
                         std::thread::sleep(Duration::from_secs(2));
@@ -382,11 +395,15 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         .catalog
                         .set_source_state(source_id, SourceState::Degraded, Some(&reason));
                 let _ = state.catalog.clear_checkpoint(source_id);
-                status.reconciles.fetch_add(1, Ordering::Relaxed);
                 status.set(WatcherState::Reconciling, Some(reason));
                 vol = None;
-                match scanner::start_scan(&state, source_id) {
-                    Ok(_) | Err(scanner::StartScanError::AlreadyRunning) => {}
+                match scanner::start_feed_recovery_scan(&state, source_id, UnixNanos::now()) {
+                    Ok(scanner::AutomaticScanOutcome::Started(_)) => {
+                        status.reconciles.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(scanner::AutomaticScanOutcome::Deferred(d)) => {
+                        status.set(WatcherState::Reconciling, Some(d.reason));
+                    }
                     Err(e) => tracing::error!(error = %e, "reconcile start failed"),
                 }
                 std::thread::sleep(Duration::from_secs(1));
@@ -695,12 +712,13 @@ pub fn spawn_reconciler(state: &Arc<AppState>) {
 }
 
 fn reconcile_tick(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let now = UnixNanos::now();
+    reconcile_tick_at(state, UnixNanos::now())
+}
+
+fn reconcile_tick_at(state: &Arc<AppState>, now: UnixNanos) -> anyhow::Result<()> {
     for s in state.catalog.list_sources()? {
         if s.published_generation.is_none() || s.state == SourceState::Retired {
-            continue;
-        }
-        if state.scan_progress(s.id).is_some_and(|p| !p.is_finished()) {
+            state.clear_reconciliation_deferral(s.id);
             continue;
         }
         let has_feed = s.checkpoint_kind.as_deref() == Some("usn")
@@ -710,6 +728,7 @@ fn reconcile_tick(state: &Arc<AppState>) -> anyhow::Result<()> {
                 .get(&s.id)
                 .is_some_and(|w| !w.is_stopped());
         if has_feed {
+            state.clear_reconciliation_deferral(s.id);
             continue;
         }
         let interval = s
@@ -733,8 +752,286 @@ fn reconcile_tick(state: &Arc<AppState>) -> anyhow::Result<()> {
         }
         if age_s >= interval && state.auto_reconcile {
             tracing::info!(source = s.id.0, age_s, "periodic reconciliation due");
-            let _ = scanner::start_scan(state, s.id);
+            match scanner::start_automatic_scan(state, s.id, now) {
+                Ok(scanner::AutomaticScanOutcome::Started(_)) => {
+                    tracing::info!(source = s.id.0, "periodic reconciliation started");
+                }
+                Ok(scanner::AutomaticScanOutcome::Deferred(d)) => {
+                    tracing::info!(
+                        source = s.id.0,
+                        reason = %d.reason,
+                        next_eligible_at = d.next_eligible_at.0,
+                        "periodic reconciliation deferred"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(source = s.id.0, error = %e, "periodic reconciliation start failed");
+                }
+            }
+        } else {
+            state.clear_reconciliation_deferral(s.id);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod coordination_tests {
+    use super::{reconcile_tick_at, DEFAULT_RECONCILE_INTERVAL_S};
+    use crate::scanner::{
+        run_full_scan, start_automatic_scan, start_scan, wait_for_scan, AutomaticScanOutcome,
+        ScanProgress, StartScanError,
+    };
+    use crate::state::AppState;
+    use crate::ServiceConfig;
+    use eidos_catalog::jobs::NewJob;
+    use eidos_catalog::scan::ScanKind;
+    use eidos_catalog::NewSource;
+    use eidos_domain::{JobStage, Priority, SourceId, SourceKind, UnixNanos};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        state: Arc<AppState>,
+        source_id: SourceId,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("source");
+            std::fs::create_dir_all(root.join("docs")).unwrap();
+            std::fs::write(root.join("docs").join("readme.txt"), b"hello").unwrap();
+            let config = ServiceConfig {
+                data_dir: dir.path().join("data"),
+                scan_threads: 1,
+                auto_reconcile: true,
+                content: true,
+                content_workers: 1,
+                ..Default::default()
+            };
+            let mut state = AppState::open(&config).unwrap();
+            // Keep the fixture independent of Windows volume and journal
+            // capabilities, even when the test suite runs elevated.
+            state.lister = Arc::new(eidos_scanner::std_lister::StdLister);
+            let state = Arc::new(state);
+            let source_id = state
+                .catalog
+                .add_source(&NewSource {
+                    host_id: state.host_id,
+                    name: "coordination-fixture".into(),
+                    kind: SourceKind::WindowsGeneric,
+                    root_path: root.display().to_string(),
+                    aliases: vec![],
+                })
+                .unwrap();
+            state
+                .catalog
+                .set_content_policy(source_id, false, 1)
+                .unwrap();
+            let summary = run_full_scan(&state, source_id, &ScanProgress::new(source_id)).unwrap();
+            assert_eq!(summary.generation, 1);
+            state
+                .catalog
+                .set_content_policy(source_id, true, 1)
+                .unwrap();
+            Self {
+                _dir: dir,
+                state,
+                source_id,
+            }
+        }
+
+        fn next_due(&self) -> UnixNanos {
+            let completed = self
+                .state
+                .catalog
+                .get_source(self.source_id)
+                .unwrap()
+                .unwrap()
+                .last_scan_completed_at
+                .unwrap();
+            UnixNanos(completed.0 + (DEFAULT_RECONCILE_INTERVAL_S + 1) * 1_000_000_000)
+        }
+
+        fn queue_content(&self, count: u32) {
+            let jobs = (0..count)
+                .map(|i| NewJob {
+                    source_id: self.source_id,
+                    object_id: None,
+                    object_generation: 1,
+                    stage: JobStage::ContentText,
+                    priority: Priority::NormalText,
+                    idempotency_key: format!("coordination:{}:{i}", self.source_id.0),
+                    payload: None,
+                    estimated_cost: 0,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                self.state.catalog.enqueue_many(&jobs).unwrap(),
+                count as usize
+            );
+        }
+
+        fn drain_content(&self) {
+            while let Some(job) = self
+                .state
+                .catalog
+                .claim_job(&[JobStage::ContentText], "coordination-test")
+                .unwrap()
+            {
+                self.state.catalog.complete_job(job.id).unwrap();
+            }
+        }
+
+        fn wait(&self, progress: &ScanProgress) -> eidos_catalog::scan::ScanSummary {
+            wait_for_scan(progress, Duration::from_secs(10))
+                .expect("scan did not finish")
+                .expect("scan failed")
+        }
+    }
+
+    #[test]
+    fn content_work_defers_ticks_but_manual_override_and_later_tick_run() {
+        let fixture = Fixture::new();
+        fixture.queue_content(2);
+        let due = fixture.next_due();
+
+        reconcile_tick_at(&fixture.state, due).unwrap();
+        let first = fixture
+            .state
+            .reconciliation_deferral(fixture.source_id)
+            .expect("content should defer reconciliation");
+        assert_eq!(first.reason, "content crawl active (2 queued, 0 running)");
+        assert!(first.next_eligible_at.0 > due.0);
+        assert!(fixture.state.scan_progress(fixture.source_id).is_none());
+
+        // A fast second scheduler tick returns the remembered result instead
+        // of querying and attempting another generation.
+        reconcile_tick_at(&fixture.state, UnixNanos(due.0 + 1_000_000_000)).unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .reconciliation_deferral(fixture.source_id)
+                .unwrap(),
+            first
+        );
+
+        // Explicit operator intent overrides content coordination.
+        let manual = start_scan(&fixture.state, fixture.source_id).unwrap();
+        assert_eq!(fixture.wait(&manual).generation, 2);
+        assert!(fixture
+            .state
+            .reconciliation_deferral(fixture.source_id)
+            .is_none());
+
+        fixture.drain_content();
+        reconcile_tick_at(&fixture.state, fixture.next_due()).unwrap();
+        let automatic = fixture
+            .state
+            .scan_progress(fixture.source_id)
+            .expect("eligible reconciliation should start");
+        assert_eq!(fixture.wait(&automatic).generation, 3);
+    }
+
+    #[test]
+    fn durable_open_generation_blocks_manual_and_automatic_starts() {
+        let fixture = Fixture::new();
+        let session = fixture
+            .state
+            .catalog
+            .begin_scan(fixture.source_id, ScanKind::Reconcile)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .catalog
+                .open_scan_generation(fixture.source_id)
+                .unwrap(),
+            Some(2)
+        );
+        assert!(matches!(
+            start_scan(&fixture.state, fixture.source_id),
+            Err(StartScanError::AlreadyRunning)
+        ));
+
+        let due = fixture.next_due();
+        reconcile_tick_at(&fixture.state, due).unwrap();
+        let first = fixture
+            .state
+            .reconciliation_deferral(fixture.source_id)
+            .expect("open generation should defer reconciliation");
+        assert_eq!(first.reason, "scan generation 2 is already open");
+        reconcile_tick_at(&fixture.state, UnixNanos(due.0 + 1_000_000_000)).unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .reconciliation_deferral(fixture.source_id)
+                .unwrap(),
+            first
+        );
+
+        session
+            .abort("test releases durable scan ownership")
+            .unwrap();
+        let outcome =
+            start_automatic_scan(&fixture.state, fixture.source_id, first.next_eligible_at)
+                .unwrap();
+        let AutomaticScanOutcome::Started(progress) = outcome else {
+            panic!("reconciliation remained deferred after the open generation closed");
+        };
+        assert_eq!(fixture.wait(&progress).generation, 3);
+    }
+
+    #[test]
+    fn paused_content_queue_does_not_block_automatic_reconciliation() {
+        use std::sync::atomic::Ordering;
+
+        let fixture = Fixture::new();
+        fixture.queue_content(1);
+        fixture
+            .state
+            .content_enabled
+            .store(false, Ordering::Relaxed);
+
+        let outcome =
+            start_automatic_scan(&fixture.state, fixture.source_id, fixture.next_due()).unwrap();
+        let AutomaticScanOutcome::Started(progress) = outcome else {
+            panic!("a paused content queue should not defer reconciliation");
+        };
+        assert_eq!(fixture.wait(&progress).generation, 2);
+    }
+
+    #[test]
+    fn feed_recovery_bypasses_content_but_not_scan_ownership() {
+        let fixture = Fixture::new();
+        fixture.queue_content(1);
+        let outcome = crate::scanner::start_feed_recovery_scan(
+            &fixture.state,
+            fixture.source_id,
+            fixture.next_due(),
+        )
+        .unwrap();
+        let AutomaticScanOutcome::Started(progress) = outcome else {
+            panic!("native feed recovery should bypass the content delay");
+        };
+        assert_eq!(fixture.wait(&progress).generation, 2);
+
+        let session = fixture
+            .state
+            .catalog
+            .begin_scan(fixture.source_id, ScanKind::Reconcile)
+            .unwrap();
+        let outcome = crate::scanner::start_feed_recovery_scan(
+            &fixture.state,
+            fixture.source_id,
+            fixture.next_due(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, AutomaticScanOutcome::Deferred(_)));
+        session
+            .abort("test releases feed recovery ownership")
+            .unwrap();
+    }
 }

@@ -107,6 +107,23 @@ pub struct ScanSession {
 }
 
 impl Catalog {
+    /// The generation currently being built for a source, if any.
+    ///
+    /// Callers use this as durable scan ownership: an interrupted or
+    /// externally-started generation counts as running even when the current
+    /// process has no in-memory progress handle for it.
+    pub fn open_scan_generation(&self, source_id: SourceId) -> Result<Option<i64>> {
+        self.with_reader(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT generation FROM scan_generations WHERE source_id = ?1 AND state = 'open' ORDER BY generation DESC LIMIT 1",
+                    params![source_id.0],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
+    }
+
     /// Open a scan generation for `source_id`.
     pub fn begin_scan(&self, source_id: SourceId, kind: ScanKind) -> Result<ScanSession> {
         let now = UnixNanos::now().0;

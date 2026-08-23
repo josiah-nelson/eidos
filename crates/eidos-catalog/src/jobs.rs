@@ -338,6 +338,30 @@ impl Catalog {
         })
     }
 
+    /// Queued and running counts for one source and stage. Scheduler paths
+    /// use this focused query instead of rebuilding the all-source activity
+    /// summary for every candidate source.
+    pub fn active_job_counts(&self, source: SourceId, stage: JobStage) -> Result<(u64, u64)> {
+        self.with_reader(|conn| {
+            let mut counts = (0, 0);
+            let mut stmt = conn.prepare_cached(
+                "SELECT state, COUNT(*) FROM jobs WHERE source_id = ?1 AND stage = ?2 AND state IN ('queued','running') GROUP BY state",
+            )?;
+            let rows = stmt.query_map(params![source.0, stage.as_str()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?;
+            for row in rows {
+                let (state, count) = row?;
+                if state == "queued" {
+                    counts.0 += count;
+                } else {
+                    counts.1 += count;
+                }
+            }
+            Ok(counts)
+        })
+    }
+
     pub fn complete_job(&self, id: JobId) -> Result<()> {
         self.with_writer(|conn| {
             conn.execute(

@@ -128,17 +128,49 @@ impl Catalog {
     ) -> Result<ApplyStats> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let mut applier = Applier::new(&tx, source_id)?;
-            for ev in events {
-                applier.apply(ev)?;
-            }
-            applier.finish()?;
-            let stats = applier.stats;
+            let stats = apply_events_conn(&tx, source_id, events)?;
             if let Some(cp) = checkpoint {
                 set_checkpoint_conn(&tx, source_id, cp)?;
             }
             tx.commit()?;
             Ok(stats)
+        })
+    }
+
+    /// Apply a live-feed batch only if the checkpoint it was read from is
+    /// still current. This prevents an in-flight watcher batch from restoring
+    /// a checkpoint that another scan or recovery path replaced.
+    pub fn apply_feed_changes(
+        &self,
+        source_id: SourceId,
+        events: &[ChangeEvent],
+        expected: &Checkpoint,
+        next: &Checkpoint,
+    ) -> Result<Option<ApplyStats>> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let current: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT checkpoint_kind, checkpoint_json FROM sources WHERE source_id = ?1 AND checkpoint_kind IS NOT NULL AND checkpoint_json IS NOT NULL",
+                    params![source_id.0],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let current = current
+                .map(|(kind, value)| {
+                    Ok::<_, CatalogError>(Checkpoint {
+                        kind,
+                        value: serde_json::from_str(&value)?,
+                    })
+                })
+                .transpose()?;
+            if current.as_ref() != Some(expected) {
+                return Ok(None);
+            }
+            let stats = apply_events_conn(&tx, source_id, events)?;
+            set_checkpoint_conn(&tx, source_id, next)?;
+            tx.commit()?;
+            Ok(Some(stats))
         })
     }
 
@@ -204,6 +236,19 @@ impl Catalog {
     ) -> Result<Option<ObjectId>> {
         self.with_reader(|conn| find_object_id(conn, source_id, key))
     }
+}
+
+fn apply_events_conn(
+    tx: &Transaction<'_>,
+    source_id: SourceId,
+    events: &[ChangeEvent],
+) -> Result<ApplyStats> {
+    let mut applier = Applier::new(tx, source_id)?;
+    for event in events {
+        applier.apply(event)?;
+    }
+    applier.finish()?;
+    Ok(applier.stats)
 }
 
 pub(crate) fn set_checkpoint_conn(
