@@ -160,8 +160,15 @@ fn print_table(v: &SearchView, q: &str) {
     for f in &r.facets {
         println!("facet {:?}:", f.field);
         for val in &f.values {
+            // Range buckets carry the clause that selects them; print it so
+            // the bucket can be turned into a query by copying it.
+            let clause = val
+                .range
+                .as_ref()
+                .map(|r| format!("   {}", r.clause))
+                .unwrap_or_default();
             println!(
-                "    {:<24} {}",
+                "    {:<28} {:>8}{clause}",
                 val.label.clone().unwrap_or_else(|| val.value.clone()),
                 val.count
             );

@@ -22,6 +22,7 @@ mod search;
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "eidos", version, about = "Filesystem indexer")]
@@ -79,6 +80,24 @@ struct ServeArgs {
     /// Content extraction threads (per-source budgets apply on top).
     #[arg(long, env = "EIDOS_CONTENT_WORKERS", default_value_t = 4)]
     content_workers: usize,
+    /// Expensive API operations (search, browse, counts) admitted at once.
+    #[arg(long, env = "EIDOS_MAX_CONCURRENT_QUERIES", default_value_t = 4)]
+    max_concurrent_queries: usize,
+    /// Requests allowed to wait for a free slot before load is shed (503).
+    #[arg(long, env = "EIDOS_QUERY_QUEUE_DEPTH", default_value_t = 32)]
+    query_queue_depth: usize,
+    /// How long a queued request waits for a free slot before it is shed.
+    #[arg(long, env = "EIDOS_QUERY_QUEUE_WAIT_MS", default_value_t = 5_000)]
+    query_queue_wait_ms: u64,
+    /// Response deadline for search (the query itself runs to completion).
+    #[arg(long, env = "EIDOS_SEARCH_TIMEOUT_MS", default_value_t = 30_000)]
+    search_timeout_ms: u64,
+    /// Response deadline for the other expensive operations.
+    #[arg(long, env = "EIDOS_OPERATION_TIMEOUT_MS", default_value_t = 60_000)]
+    operation_timeout_ms: u64,
+    /// Maximum accepted JSON request body.
+    #[arg(long, env = "EIDOS_MAX_BODY_BYTES", default_value_t = 1 << 20)]
+    max_body_bytes: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -114,6 +133,14 @@ fn main() -> anyhow::Result<()> {
                 auto_reconcile: !args.no_auto_reconcile,
                 content: !args.no_content,
                 content_workers: args.content_workers,
+                admission: eidos_service::admission::AdmissionConfig {
+                    concurrency: args.max_concurrent_queries.max(1),
+                    queue_depth: args.query_queue_depth,
+                    queue_wait: Duration::from_millis(args.query_queue_wait_ms),
+                    search_timeout: Duration::from_millis(args.search_timeout_ms),
+                    operation_timeout: Duration::from_millis(args.operation_timeout_ms),
+                    max_body_bytes: args.max_body_bytes,
+                },
             })
         }
     }

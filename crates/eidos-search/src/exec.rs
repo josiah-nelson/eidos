@@ -8,6 +8,7 @@ use crate::content::{
     self, object_score, verify_objects, verify_threads, ContentClause, ContentIndex, ContentOpts,
     Matcher, VerifyJob,
 };
+use crate::facets::RangeBucket;
 use crate::regex_plan::TrigramPlan;
 use crate::schema::{attr_bit, attr_name, fold, Fields};
 use crate::{CatalogIndex, Result, SearchError, PROJECTION_NAME};
@@ -604,6 +605,7 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
             let fld = match field {
                 TimeField::Modified => f.modified,
                 TimeField::Created => f.created,
+                TimeField::SubtreeModified => f.newest_modified,
                 TimeField::Changed | TimeField::Accessed => {
                     return Err(QueryError::Other {
                         message: format!("{field:?} time is not indexed"),
@@ -615,7 +617,13 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
                 after.map_or("-∞".to_string(), |t| t.to_rfc3339()),
                 before.map_or("∞".to_string(), |t| t.to_rfc3339())
             ));
-            i64_range(fld, after.map(|t| t.0), before.map(|t| t.0))
+            let range = i64_range(fld, after.map(|t| t.0), before.map(|t| t.0));
+            if *field == TimeField::SubtreeModified {
+                // A directory predicate, like `subtree:` and `files:`.
+                all_of(vec![term_text(f.kind, "directory"), range])
+            } else {
+                range
+            }
         }
         Query::Attributes { all_of: a, none_of: n } => {
             let mut clauses: Vec<(Occur, Box<dyn TQuery>)> = vec![(Occur::Must, Box::new(AllQuery))];
@@ -1060,19 +1068,36 @@ fn compile_content(
             }
         }
     }
+    let stale = drop_stale_generations(ctx.catalog, &mut by_object, &mut deferred)?;
     let objects = deferred.as_ref().map_or(by_object.len(), |c| c.len());
     ctx.steps.push(PlanStep {
         stage: "content".into(),
         description: format!(
-            "{} → {} file(s){}",
+            "{} → {} file(s){}{}",
             ret.description,
             objects,
-            if ret.deferred { " (unverified)" } else { "" }
+            if ret.deferred { " (unverified)" } else { "" },
+            if stale > 0 {
+                format!("; {stale} of an older generation dropped")
+            } else {
+                String::new()
+            }
         ),
         candidates: Some(ret.candidates),
         verified: ret.verified,
         elapsed_ms: Some(ret.elapsed_ms),
     });
+    if stale > 0 && ret.truncated {
+        // Candidates are cut before their generation is known, so a chunk of
+        // a superseded generation can occupy the budget that the same file's
+        // current chunk would have used. The result is a subset either way
+        // (the truncation warning above says so); name the second cause.
+        ctx.warnings.push(format!(
+            "content clause \"{value}\": {stale} file(s) matched only on a superseded generation. \
+             The candidate list was truncated, so a current-generation match of theirs may have \
+             been cut with it — narrow the query"
+        ));
+    }
     let ids: Vec<ObjectId> = match &deferred {
         Some(c) => c.keys().copied().collect(),
         None => by_object.keys().copied().collect(),
@@ -1093,6 +1118,45 @@ fn compile_content(
         deferred,
     });
     Ok(q)
+}
+
+/// Drop content matches whose generation is not the object's current one,
+/// returning how many objects were removed.
+///
+/// The content index is committed asynchronously (ADR-0005): a queued
+/// deletion of an object's old chunk documents becomes visible only at the
+/// next commit, and between a file changing and its re-extraction the index
+/// legitimately still holds the previous generation. Such a document
+/// describes text the file no longer contains, so it must not compose into a
+/// file hit at all — filtering here (before the object set reaches the
+/// catalog-index query) also keeps stale objects out of totals and facets,
+/// and covers both the eager and the page-driven path of ADR-0008, whose
+/// candidates are grouped per generation as well.
+fn drop_stale_generations(
+    catalog: &Catalog,
+    by_object: &mut HashMap<ObjectId, ObjectMatch>,
+    deferred: &mut Option<HashMap<ObjectId, (u32, Vec<u32>)>>,
+) -> std::result::Result<usize, QueryError> {
+    let ids: Vec<ObjectId> = match deferred {
+        Some(c) => c.keys().copied().collect(),
+        None => by_object.keys().copied().collect(),
+    };
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let current = catalog
+        .object_generations(&ids)
+        .map_err(|e| QueryError::Other {
+            message: e.to_string(),
+        })?;
+    let before = ids.len();
+    match deferred {
+        // An object gone from the catalog (`None`) is stale too.
+        Some(c) => c.retain(|o, (g, _)| current.get(o) == Some(g)),
+        None => by_object.retain(|o, m| current.get(o) == Some(&m.generation)),
+    }
+    let after = deferred.as_ref().map_or(by_object.len(), |c| c.len());
+    Ok(before - after)
 }
 
 /// Source scope visible before compilation: `source:` clauses that are
@@ -1607,13 +1671,124 @@ fn sort_key_cmp(a: &Stored, b: &Stored, sort: Sort) -> std::cmp::Ordering {
     ord.then_with(|| a.entry_id.cmp(&b.entry_id))
 }
 
-fn decode_cursor(c: &Option<String>) -> std::result::Result<usize, QueryError> {
-    match c {
-        None => Ok(0),
-        Some(s) => s
-            .strip_prefix("o:")
-            .and_then(|n| n.parse::<usize>().ok())
-            .ok_or(QueryError::InvalidCursor),
+/// Extra candidates fetched beyond the page so that documents the catalog
+/// no longer knows (the projection is slightly behind) can be replaced on
+/// the same page instead of shortening it. The eager paths hold every
+/// candidate and the top-k path re-collects with a growing limit, so only
+/// the page-driven lazy path (bounded by its chunk-fetch budget) can still
+/// return a short page behind a longer run of stale documents.
+pub const STALE_SLACK: usize = 8;
+
+/// Page cursor: `o:<consumed candidates>;g:<index generation>;q:<query
+/// fingerprint>`. The offset counts every candidate the previous pages
+/// consumed — including stale projection documents that produced no hit —
+/// so a page never re-examines what an earlier page skipped. `g` is the
+/// Tantivy searcher generation the cursor was issued from (a change is
+/// reported as a warning: offsets are not stable across commits); `q`
+/// binds the cursor to the query, mode, sort, and scope it was issued for.
+/// The legacy `o:<offset>` form is still accepted without either check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    offset: usize,
+    generation: Option<u64>,
+    fingerprint: Option<u64>,
+}
+
+fn decode_cursor(c: &Option<String>) -> std::result::Result<Cursor, QueryError> {
+    let s = match c {
+        None => {
+            return Ok(Cursor {
+                offset: 0,
+                generation: None,
+                fingerprint: None,
+            })
+        }
+        Some(s) => s,
+    };
+    let mut cursor = Cursor {
+        offset: 0,
+        generation: None,
+        fingerprint: None,
+    };
+    let mut seen_offset = false;
+    for part in s.split(';') {
+        let (key, value) = part.split_once(':').ok_or(QueryError::InvalidCursor)?;
+        match key {
+            "o" => {
+                cursor.offset = value.parse().map_err(|_| QueryError::InvalidCursor)?;
+                seen_offset = true;
+            }
+            "g" => cursor.generation = Some(value.parse().map_err(|_| QueryError::InvalidCursor)?),
+            "q" => {
+                cursor.fingerprint =
+                    Some(u64::from_str_radix(value, 16).map_err(|_| QueryError::InvalidCursor)?)
+            }
+            _ => return Err(QueryError::InvalidCursor),
+        }
+    }
+    if !seen_offset || cursor.generation.is_some() != cursor.fingerprint.is_some() {
+        // Either the legacy `o:<n>` form or the full structured form; a
+        // cursor carrying only one of the two checks is not something the
+        // service ever issued.
+        return Err(QueryError::InvalidCursor);
+    }
+    Ok(cursor)
+}
+
+fn encode_cursor(offset: usize, generation: u64, fingerprint: u64) -> String {
+    format!("o:{offset};g:{generation};q:{fingerprint:016x}")
+}
+
+/// Stable (process-independent) fingerprint of everything that determines
+/// the candidate order a cursor walks: query, mode, sort, and scope.
+fn query_fingerprint(req: &SearchRequest) -> u64 {
+    let key = serde_json::to_string(&(&req.query, req.mode, req.sort, req.include_retired))
+        .unwrap_or_default();
+    // FNV-1a: small, dependency-free, and identical across builds.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Candidates in page order; each resolves lazily to its stored fields.
+type Candidates<'a> = Box<dyn Iterator<Item = Result<Stored>> + 'a>;
+
+/// Top-k results that re-collect with a doubled limit (bounded by the
+/// match count) when consumed past what was collected. Re-collection is
+/// deterministic for one searcher, so continuing from the previous position
+/// yields the same order.
+type Collector<'a> = Box<dyn Fn(usize) -> Result<Vec<(f32, DocAddress)>> + 'a>;
+
+struct Regrowing<'a> {
+    collect: Collector<'a>,
+    buf: Vec<(f32, DocAddress)>,
+    pos: usize,
+    n: usize,
+    total: usize,
+}
+
+impl Iterator for Regrowing<'_> {
+    type Item = Result<(f32, DocAddress)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.buf.len() {
+            if self.n >= self.total || self.buf.len() < self.n {
+                return None; // everything that matches has been collected
+            }
+            self.n = (self.n * 2).min(self.total);
+            match (self.collect)(self.n) {
+                Ok(b) => self.buf = b,
+                Err(e) => return Some(Err(e)),
+            }
+            if self.pos >= self.buf.len() {
+                return None;
+            }
+        }
+        let item = self.buf[self.pos];
+        self.pos += 1;
+        Some(Ok(item))
     }
 }
 
@@ -1638,7 +1813,17 @@ pub fn search_with_content(
 ) -> Result<SearchResponse> {
     let t0 = Instant::now();
     req.validate(&opts.limits)?;
-    let offset = decode_cursor(&req.cursor)?;
+    let cursor = decode_cursor(&req.cursor)?;
+    let fingerprint = query_fingerprint(req);
+    if let Some(q) = cursor.fingerprint {
+        if q != fingerprint {
+            return Err(QueryError::CursorMismatch {
+                message: "the cursor was issued for a different query, mode, sort, or scope".into(),
+            }
+            .into());
+        }
+    }
+    let offset = cursor.offset;
     let limit = req.limit.max(1) as usize;
     let f = index.fields();
     let all_sources = catalog.list_sources()?;
@@ -1718,10 +1903,17 @@ pub fn search_with_content(
         !ctx.verifiers.is_empty() || !ctx.fast_verifiers.is_empty() || tight || has_content;
     let t1 = Instant::now();
     let mut warnings = ctx.warnings.clone();
+    let index_generation = searcher.generation().generation_id();
+    if cursor.generation.is_some_and(|g| g != index_generation) {
+        warnings.push(
+            "the index changed since this cursor was issued; page boundaries may have shifted, so a result may repeat or be skipped"
+                .into(),
+        );
+    }
     let mut steps = ctx.steps.clone();
     let mut verify_ms = 0.0;
 
-    let (page, total, total_exact): (Vec<Stored>, u64, bool) = if collect_all {
+    let (page, total, total_exact): (Candidates<'_>, u64, bool) = if collect_all {
         let addrs: HashSet<DocAddress> = searcher.search(&root, &DocSetCollector)?;
         let mut truncated = false;
         let mut list: Vec<DocAddress> = addrs.into_iter().collect();
@@ -1773,7 +1965,7 @@ pub fn search_with_content(
         } else {
             None
         };
-        let want = offset + limit;
+        let want = offset + limit + STALE_SLACK;
 
         // Explain and warn for a page walk; returns (total, exact).
         let report_walk = |steps: &mut Vec<PlanStep>,
@@ -1987,27 +2179,22 @@ pub fn search_with_content(
                         Some(lc),
                         tw.elapsed().as_secs_f64() * 1000.0,
                     );
-                    let page: Vec<Stored> = outcome
-                        .verified
-                        .into_iter()
-                        .skip(offset)
-                        .take(limit)
-                        .collect();
+                    let page: Candidates<'_> =
+                        Box::new(outcome.verified.into_iter().skip(offset).map(Ok));
                     (page, total, exact)
                 } else {
                     let total = verified.len() as u64;
-                    let page: Vec<Stored> = verified.into_iter().skip(offset).take(limit).collect();
+                    let page: Candidates<'_> = Box::new(verified.into_iter().skip(offset).map(Ok));
                     (page, total, !truncated && !content_truncated)
                 }
             } else {
                 verify_ms = tv.elapsed().as_secs_f64() * 1000.0;
                 rows.sort_by(|a, b| fast_sort_cmp(a, b, req.sort));
                 let total = rows.len() as u64;
-                let mut page = Vec::with_capacity(limit);
-                for r in rows.into_iter().skip(offset).take(limit) {
+                let page: Candidates<'_> = Box::new(rows.into_iter().skip(offset).map(|r| {
                     let doc: TantivyDocument = searcher.doc(r.addr)?;
-                    page.push(read_stored(f, &doc, r.score));
-                }
+                    Ok(read_stored(f, &doc, r.score))
+                }));
                 (page, total, !truncated && !content_truncated)
             }
         } else {
@@ -2043,63 +2230,74 @@ pub fn search_with_content(
                 lazy_cx.as_ref(),
                 verify_ms,
             );
-            let mut page = Vec::with_capacity(limit);
-            for r in outcome.verified.into_iter().skip(offset).take(limit) {
-                let doc: TantivyDocument = searcher.doc(r.addr)?;
-                page.push(read_stored(f, &doc, r.score));
-            }
+            let page: Candidates<'_> =
+                Box::new(outcome.verified.into_iter().skip(offset).map(|r| {
+                    let doc: TantivyDocument = searcher.doc(r.addr)?;
+                    Ok(read_stored(f, &doc, r.score))
+                }));
             (page, total, exact)
         }
     } else {
-        let n = (offset + limit).max(1);
-        let top = TopDocs::with_limit(n);
         let order = if req.sort.descending {
             Order::Desc
         } else {
             Order::Asc
         };
-        let (addrs, count): (Vec<(f32, DocAddress)>, usize) = match req.sort.field {
-            SortField::Relevance => {
-                let (hits, count) = searcher.search(&root, &(top.order_by_score(), Count))?;
-                (hits, count)
-            }
-            SortField::Name | SortField::Path => {
-                let field = if req.sort.field == SortField::Name {
-                    "name_folded"
-                } else {
-                    "path_folded"
-                };
-                let (hits, count) = searcher.search(
-                    &root,
-                    &(top.order_by_string_fast_field(field, order), Count),
-                )?;
-                (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
-            }
-            SortField::Modified | SortField::Created => {
-                let field = if req.sort.field == SortField::Modified {
-                    "newest_modified"
-                } else {
-                    "created"
-                };
-                let (hits, count) = searcher.search(
-                    &root,
-                    &(top.order_by_fast_field::<i64>(field, order), Count),
-                )?;
-                (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
-            }
-            SortField::Size | SortField::SubtreeSize | SortField::AllocatedSize => {
-                let field = if req.sort.field == SortField::AllocatedSize {
-                    "subtree_allocated"
-                } else {
-                    "subtree_logical"
-                };
-                let (hits, count) = searcher.search(
-                    &root,
-                    &(top.order_by_fast_field::<u64>(field, order), Count),
-                )?;
-                (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
-            }
+        // Collect the top `n` in sort order. The candidate stream below asks
+        // for more (doubling, bounded by the match count) when a run of
+        // stale documents exhausts what was collected, so a page is short
+        // only when the matches themselves run out.
+        let searcher_ref = &searcher;
+        let root_ref: &dyn TQuery = root.as_ref();
+        let sort = req.sort;
+        let collect = move |n: usize| -> Result<(Vec<(f32, DocAddress)>, usize)> {
+            let top = TopDocs::with_limit(n.max(1));
+            Ok(match sort.field {
+                SortField::Relevance => {
+                    let (hits, count) =
+                        searcher_ref.search(root_ref, &(top.order_by_score(), Count))?;
+                    (hits, count)
+                }
+                SortField::Name | SortField::Path => {
+                    let field = if sort.field == SortField::Name {
+                        "name_folded"
+                    } else {
+                        "path_folded"
+                    };
+                    let (hits, count) = searcher_ref.search(
+                        root_ref,
+                        &(top.order_by_string_fast_field(field, order), Count),
+                    )?;
+                    (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
+                }
+                SortField::Modified | SortField::Created => {
+                    let field = if sort.field == SortField::Modified {
+                        "newest_modified"
+                    } else {
+                        "created"
+                    };
+                    let (hits, count) = searcher_ref.search(
+                        root_ref,
+                        &(top.order_by_fast_field::<i64>(field, order), Count),
+                    )?;
+                    (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
+                }
+                SortField::Size | SortField::SubtreeSize | SortField::AllocatedSize => {
+                    let field = if sort.field == SortField::AllocatedSize {
+                        "subtree_allocated"
+                    } else {
+                        "subtree_logical"
+                    };
+                    let (hits, count) = searcher_ref.search(
+                        root_ref,
+                        &(top.order_by_fast_field::<u64>(field, order), Count),
+                    )?;
+                    (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
+                }
+            })
         };
+        let n = offset + limit + STALE_SLACK;
+        let (addrs, count) = collect(n)?;
         steps.push(PlanStep {
             stage: "retrieve".into(),
             description: match req.sort.field {
@@ -2110,21 +2308,29 @@ pub fn search_with_content(
             verified: None,
             elapsed_ms: None,
         });
-        let mut page = Vec::with_capacity(limit);
-        for (score, a) in addrs.into_iter().skip(offset) {
+        let regrowing = Regrowing {
+            collect: Box::new(move |n| collect(n).map(|(hits, _)| hits)),
+            buf: addrs,
+            pos: 0,
+            n,
+            total: count,
+        };
+        let page: Candidates<'_> = Box::new(regrowing.skip(offset).map(|r| {
+            let (score, a) = r?;
             let doc: TantivyDocument = searcher.doc(a)?;
-            page.push(read_stored(f, &doc, score));
-        }
+            Ok(read_stored(f, &doc, score))
+        }));
         (page, count as u64, true)
     };
     let retrieve_ms = t1.elapsed().as_secs_f64() * 1000.0 - verify_ms;
     let t2 = Instant::now();
-    let (hits, facets) = build_hits(
+    let (hits, facets, consumed) = build_hits(
         index,
         catalog,
         req,
         &searcher,
         page,
+        limit,
         root.as_ref(),
         &content_sets,
         opts,
@@ -2135,17 +2341,18 @@ pub fn search_with_content(
         &in_scope.iter().map(|s| s.id).collect::<Vec<_>>(),
         &mut warnings,
     )?;
-    if content_index.is_some_and(|c| c.is_rebuilding()) {
-        warnings.push(
-            "the content index is being rebuilt from stored chunks; content results are partial until it finishes"
-                .into(),
-        );
+    if let Some(reason) = content_index.and_then(|c| c.content_incomplete_reason()) {
+        warnings.push(reason);
         for c in completeness.iter_mut() {
             c.content_complete = false;
         }
     }
-    let next_cursor = if (offset + hits.len()) < total as usize {
-        Some(format!("o:{}", offset + hits.len()))
+    // Advance by candidates consumed, not hits returned: stale documents
+    // that produced no hit are never re-examined by the next page, and a
+    // page of nothing but stale documents still makes progress.
+    let consumed_total = offset + consumed;
+    let next_cursor = if consumed_total < total as usize {
+        Some(encode_cursor(consumed_total, index_generation, fingerprint))
     } else {
         None
     };
@@ -2178,24 +2385,35 @@ pub fn search_with_content(
     })
 }
 
+/// Join candidates with the catalog in page order until `limit` hits are
+/// assembled or the candidates run out. Returns the hits, facets, and the
+/// number of candidates consumed (stale ones included) so the cursor can
+/// advance past everything this page examined.
 #[allow(clippy::too_many_arguments)]
 fn build_hits(
     index: &CatalogIndex,
     catalog: &Catalog,
     req: &SearchRequest,
     searcher: &Searcher,
-    page: Vec<Stored>,
+    candidates: Candidates<'_>,
+    limit: usize,
     facet_query: &dyn TQuery,
     content_sets: &[ContentSet],
     opts: &ExecOptions,
-) -> Result<(Vec<Hit>, Vec<Facet>)> {
+) -> Result<(Vec<Hit>, Vec<Facet>, usize)> {
     let sources: HashMap<SourceId, eidos_catalog::SourceRecord> = catalog
         .list_sources()?
         .into_iter()
         .map(|s| (s.id, s))
         .collect();
-    let mut hits = Vec::with_capacity(page.len());
-    for s in page {
+    let mut hits = Vec::with_capacity(limit);
+    let mut consumed = 0usize;
+    for s in candidates {
+        if hits.len() >= limit {
+            break;
+        }
+        let s = s?;
+        consumed += 1;
         let obj = match catalog.get_object(s.object_id)? {
             Some(o) if o.deleted_at.is_none() => o,
             _ => continue, // index slightly ahead/behind the catalog
@@ -2232,6 +2450,9 @@ fn build_hits(
                     .filter(|r| r.generation == obj.generation)
                     .map(|r| r.coverage)
                     .unwrap_or(Coverage::None),
+                // The generation the stored chunks belong to, which may lag
+                // the object when a change is waiting for re-extraction.
+                generation: rec.as_ref().map(|r| r.generation),
                 indexed_bytes: rec
                     .as_ref()
                     .filter(|r| r.generation == obj.generation)
@@ -2278,9 +2499,17 @@ fn build_hits(
     let facets = if req.facets.is_empty() {
         Vec::new()
     } else {
-        facets_for(index, searcher, facet_query, &req.facets, &sources, catalog)?
+        facets_for(
+            index,
+            searcher,
+            facet_query,
+            &req.facets,
+            req.mode,
+            &sources,
+            catalog,
+        )?
     };
-    Ok((hits, facets))
+    Ok((hits, facets, consumed))
 }
 
 /// Diverse line-aware snippets for one file: the best-scoring chunks across
@@ -2412,19 +2641,23 @@ fn make_snippet(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn facets_for(
     index: &CatalogIndex,
     searcher: &Searcher,
     query: &dyn TQuery,
     requests: &[FacetRequest],
+    mode: ResultMode,
     sources: &HashMap<SourceId, eidos_catalog::SourceRecord>,
     catalog: &Catalog,
 ) -> Result<Vec<Facet>> {
     use tantivy::aggregation::agg_req::Aggregations;
     use tantivy::aggregation::AggregationCollector;
     let _ = index;
-    let now = UnixNanos::now().0;
-    let day = 86_400_000_000_000i64;
+    let now = UnixNanos::now();
+    // Bucket tables for the range facets, kept so the response can be built
+    // from the same boundaries the aggregation was asked for.
+    let mut tables: HashMap<FacetField, Vec<RangeBucket>> = HashMap::new();
     let mut spec = serde_json::Map::new();
     for r in requests {
         let size = r.limit.clamp(1, 500);
@@ -2443,16 +2676,16 @@ fn facets_for(
                 serde_json::json!({"terms": {"field": "parent_id", "size": size}})
             }
             FacetField::SizeBucket => {
-                serde_json::json!({"range": {"field": "subtree_logical", "ranges": [
-                {"to": 4096.0}, {"from": 4096.0, "to": 65536.0}, {"from": 65536.0, "to": 1048576.0},
-                {"from": 1048576.0, "to": 16777216.0}, {"from": 16777216.0, "to": 268435456.0},
-                {"from": 268435456.0, "to": 1073741824.0}, {"from": 1073741824.0}]}})
+                let buckets = crate::facets::size_buckets(mode);
+                let spec = range_spec("subtree_logical", &buckets);
+                tables.insert(r.field, buckets);
+                spec
             }
             FacetField::ModifiedBucket => {
-                serde_json::json!({"range": {"field": "newest_modified", "ranges": [
-                {"from": (now - day) as f64}, {"from": (now - 7 * day) as f64, "to": (now - day) as f64},
-                {"from": (now - 30 * day) as f64, "to": (now - 7 * day) as f64},
-                {"from": (now - 365 * day) as f64, "to": (now - 30 * day) as f64}, {"to": (now - 365 * day) as f64}]}})
+                let buckets = crate::facets::time_buckets(now, mode);
+                let spec = range_spec("newest_modified", &buckets);
+                tables.insert(r.field, buckets);
+                spec
             }
         };
         spec.insert(format!("{:?}", r.field).to_lowercase(), v);
@@ -2482,6 +2715,38 @@ fn facets_for(
             .unwrap_or(0)
             > 0;
         let mut values = Vec::new();
+        // Range facets are emitted from the bucket table, in its display
+        // order, so every value carries the boundaries and clauses the
+        // aggregation was built from.
+        if let Some(table) = tables.remove(&r.field) {
+            for bucket in table {
+                let Some(b) = buckets.iter().find(|b| {
+                    bound_eq(b.get("from"), bucket.from) && bound_eq(b.get("to"), bucket.to)
+                }) else {
+                    continue;
+                };
+                let count = b.get("doc_count").and_then(|c| c.as_u64()).unwrap_or(0);
+                if count == 0 {
+                    continue;
+                }
+                values.push(FacetValue {
+                    value: b
+                        .get("key")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    count,
+                    label: Some(bucket.label),
+                    range: bucket.range,
+                });
+            }
+            out.push(Facet {
+                field: r.field,
+                values,
+                truncated,
+            });
+            continue;
+        }
         for b in buckets {
             let count = b.get("doc_count").and_then(|c| c.as_u64()).unwrap_or(0);
             if count == 0 {
@@ -2511,14 +2776,6 @@ fn facets_for(
                         catalog.render_path(ObjectId(id)).ok().flatten(),
                     )
                 }
-                FacetField::SizeBucket | FacetField::ModifiedBucket => {
-                    let from = b.get("from").and_then(|v| v.as_f64());
-                    let to = b.get("to").and_then(|v| v.as_f64());
-                    (
-                        raw_key.as_str().unwrap_or("").to_string(),
-                        Some(bucket_label(r.field, from, to, now)),
-                    )
-                }
                 _ => {
                     let s = raw_key.as_str().unwrap_or("").to_string();
                     let label = if s.is_empty() {
@@ -2533,6 +2790,7 @@ fn facets_for(
                 value: value_s,
                 count,
                 label,
+                range: None,
             });
         }
         out.push(Facet {
@@ -2544,38 +2802,32 @@ fn facets_for(
     Ok(out)
 }
 
-fn bucket_label(field: FacetField, from: Option<f64>, to: Option<f64>, now: i64) -> String {
-    match field {
-        FacetField::SizeBucket => {
-            let h = |v: f64| -> String {
-                let b = v as u64;
-                if b >= 1 << 30 {
-                    format!("{}G", b >> 30)
-                } else if b >= 1 << 20 {
-                    format!("{}M", b >> 20)
-                } else if b >= 1 << 10 {
-                    format!("{}K", b >> 10)
-                } else {
-                    format!("{b}")
-                }
-            };
-            match (from, to) {
-                (None, Some(t)) => format!("< {}", h(t)),
-                (Some(f), Some(t)) => format!("{} – {}", h(f), h(t)),
-                (Some(f), None) => format!("≥ {}", h(f)),
-                _ => "all".into(),
+/// The aggregation request for one bucket table.
+fn range_spec(field: &str, buckets: &[RangeBucket]) -> serde_json::Value {
+    let ranges: Vec<serde_json::Value> = buckets
+        .iter()
+        .map(|b| {
+            let mut m = serde_json::Map::new();
+            if let Some(f) = b.from {
+                m.insert("from".into(), (f as f64).into());
             }
-        }
-        FacetField::ModifiedBucket => {
-            let days = |v: f64| ((now as f64 - v) / 86_400_000_000_000.0).round() as i64;
-            match (from, to) {
-                (Some(f), None) => format!("last {} day(s)", days(f)),
-                (Some(f), Some(t)) => format!("{}–{} days ago", days(t), days(f)),
-                (None, Some(t)) => format!("older than {} days", days(t)),
-                _ => "all".into(),
+            if let Some(t) = b.to {
+                m.insert("to".into(), (t as f64).into());
             }
-        }
-        _ => String::new(),
+            serde_json::Value::Object(m)
+        })
+        .collect();
+    serde_json::json!({"range": {"field": field, "ranges": ranges}})
+}
+
+/// Match a returned bucket boundary against the table it was built from.
+/// Boundaries are whole bytes or UTC-midnight nanoseconds, both exactly
+/// representable as `f64`, so the comparison is exact.
+fn bound_eq(returned: Option<&serde_json::Value>, want: Option<i64>) -> bool {
+    match (returned.and_then(|v| v.as_f64()), want) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b as f64,
+        _ => false,
     }
 }
 

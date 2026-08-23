@@ -95,13 +95,45 @@ retrieved generation get no snippets rather than wrong ones.
 - Per-source concurrency (`sources.content_concurrency`, default 2) bounds
   how many workers read one volume; `sources.content_enabled` turns
   extraction off per source (queued jobs are dropped, re-enabling re-queues).
+  A worker takes one unit of that budget *inside* the claiming transaction,
+  before any job of the batch is marked `running`, and holds it in an RAII
+  reservation for the batch, so workers racing on a stale count cannot
+  oversubscribe a source and the unit comes back on an empty claim, an
+  error, cancellation, shutdown, or a panic. A source with no free capacity
+  is skipped and the next eligible source is claimed instead, so a
+  saturated HDD or share never starves the rest of the pool. Budgets are
+  loaded before the pool starts, and a source whose policy has never been
+  read admits nothing rather than falling back to the default, so a failed
+  policy load makes workers idle instead of overrunning a slow volume. Live
+  reservations and their high-water marks are reported by `GET
+  /api/activity` (`workers.concurrency`, and `content_reserved` per source).
 - Publication is two-phase: the worker writes chunks and the content record
   as `indexing`, adds documents to the index writer, and completes the job;
   the coordinator commits every 2 s or 20,000 documents and only then
   `mark_content_indexed` flips object states (aggregates + outbox, so the
   catalog index follows). A crash between the two phases leaves `indexing`
-  records that `requeue_unfinished_content` re-queues at startup; an empty
-  content index at startup resets every indexed object to `pending`.
+  records that `requeue_unfinished_content` re-queues at startup.
+- The content index is rebuilt from stored chunks — never by re-reading
+  files — when it is empty at startup while chunks exist (lost or recreated
+  index, schema change) or when a previous rebuild did not finish. The
+  rebuild is *scheduled* synchronously at open (`begin_rebuild`: durable
+  `rebuild.json` marker in the index directory, written via rename, whose
+  presence alone — even torn or unreadable — means "rebuild required";
+  phase `pending`), so the
+  very first search or readiness check already reports content as partial;
+  `start_background` then runs it. The run holds the index writer gate (a
+  reader–writer lock that every `add_chunks`/`delete_*`/`commit` takes on
+  the read side) for its whole duration, content workers claim no jobs and
+  the coordinator commits nothing while the phase is `pending`/`running`,
+  and the phase, progress, and last error are exposed in `GET /api/activity`
+  (`content_rebuild`) and `eidos activity`. Success removes the marker
+  (phase `idle`); failure, an interrupting shutdown, or a crash leave it in
+  place (phase `failed` with the reason, or `pending` after a restart), so
+  the next start rebuilds again and every response in between says why
+  content results are incomplete. Building into a replacement directory and
+  swapping was rejected for now: the live index is empty in the only
+  scenario that triggers a rebuild, and swapping directories under open
+  memory maps is not reliable on Windows.
 - Transient I/O failures retry with the job backoff; binary files and
   deterministic failures are terminal and visible (`state:unsupported`,
   `state:failed`, with the reason in the hit).

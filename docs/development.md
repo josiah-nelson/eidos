@@ -17,7 +17,7 @@ with a reduced (std-only) lister and no change feeds.
 ## Commands
 
 ```powershell
-# One-shot: format check, clippy (deny warnings), all tests, release build, web lint+build
+# One-shot: format check, clippy (deny warnings), all tests, release build, web lint+test+build
 .\scripts\check.ps1            # -SkipWeb / -SkipRelease to shorten
 
 # Individually
@@ -25,7 +25,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
-cd web; npm ci; npm run lint; npm run build
+cd web; npm ci; npm run lint; npm test; npm run build
 ```
 
 Tests never touch user data: every integration test builds its own fixture
@@ -49,7 +49,48 @@ the catalog outbox every 500 ms (`GET /api/index` shows follower state).
 (`EIDOS_BIND`, default loopback — the API has no authentication yet and warns
 when bound elsewhere), `--web-dir` (`EIDOS_WEB_DIR`, empty for API only),
 `--scan-threads`, `--no-auto-reconcile`, `--no-content` (metadata only),
-`--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4).
+`--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4), plus the
+admission-control flags below.
+
+### Operational limits
+
+Search, browse, archive listing and count endpoints run blocking
+SQLite/Tantivy work. The service admits a bounded number of them at once and
+sheds the rest rather than letting latency grow without bound:
+
+| Flag | Environment | Default | Meaning |
+|---|---|---|---|
+| `--max-concurrent-queries` | `EIDOS_MAX_CONCURRENT_QUERIES` | 4 | Expensive operations running at once |
+| `--query-queue-depth` | `EIDOS_QUERY_QUEUE_DEPTH` | 32 | Requests allowed to wait for a slot |
+| `--query-queue-wait-ms` | `EIDOS_QUERY_QUEUE_WAIT_MS` | 5000 | How long a queued request waits |
+| `--search-timeout-ms` | `EIDOS_SEARCH_TIMEOUT_MS` | 30000 | Response deadline for search |
+| `--operation-timeout-ms` | `EIDOS_OPERATION_TIMEOUT_MS` | 60000 | Response deadline for browse/counts/archive/maintenance |
+| `--max-body-bytes` | `EIDOS_MAX_BODY_BYTES` | 1048576 | Largest accepted JSON request body |
+
+Beyond the queue bound, or after the queue wait, a request is answered
+`503` with `{"kind":"busy"}` and a `Retry-After` header. Past its deadline it
+is answered `504` with `{"kind":"timeout"}`. Health, activity and index
+status never enter the gate, so they stay responsive while queries saturate
+it.
+
+A deadline ends the *response*, not the query: a running SQLite or Tantivy
+call cannot be cancelled mid-call, so the permit is released by the blocking
+task when it finishes, not when the client gives up. The catalog and index
+therefore never see a half-applied operation, and `GET /api/index` (and
+`/api/activity`) report the difference: `admission.in_flight` counts work
+still holding a permit and `admission.detached` counts the part of it whose
+client has already gone — the deadline passed, or the connection went away.
+Both fall back to zero as the abandoned work drains; `rejected_busy` and
+`timed_out` are cumulative.
+
+Defaults assume the loopback default bind: one browser plus a CLI on a
+machine that is also scanning and extracting content. Before binding
+anywhere else, note that the API still has no authentication or per-client
+rate limiting, so these limits protect the process, not the deployment — the
+gate is global, and any client may fill it. A remote-facing deployment needs
+a fronting proxy that terminates TLS, authenticates, and applies per-client
+rate limits, and should raise `--max-concurrent-queries` only as far as the
+disk backing `catalog.db` can serve concurrent readers.
 
 Content extraction runs in the service for every source whose content
 policy is enabled (the default). Turn it off or bound it per source before
@@ -95,6 +136,37 @@ becomes ineligible, the action returns `409` and asks the operator to preview
 again instead of substituting a different pre-existing failure. The endpoints
 are `POST /api/jobs/{id}/retry` and
 `POST /api/sources/{id}/content/retry`.
+
+### Stored-text preview
+
+`GET /api/objects/{id}/content?generation=G&ordinal=N&before=B&after=A`
+returns the text the indexer stored for one object generation — the catalog's
+extraction cache, never a read of the source file, and never addressed by
+filesystem path.
+
+- `ordinal` (default 0) picks the chunk; `before`/`after` add neighbouring
+  chunks, clamped to 4 per side.
+- `generation` is optional. When it is supplied and does not match the
+  generation the stored chunks belong to, the request fails with `409` and
+  `{"kind": "stale_generation", "requested_generation", "current_generation"}`
+  so a client holding an old search hit refetches instead of rendering text
+  from a different version of the file. Search hits carry the value to send
+  as `content.generation`.
+- A successful response reports the content record's `state`, `coverage`,
+  `indexed_bytes`/`total_bytes`, `reason`, each chunk's byte and line ranges,
+  and `stale: true` when the object has moved on to a newer generation than
+  the stored text.
+- Responses are bounded: 4 neighbouring chunks per side, 256 KiB of text, and
+  4000 lines. `truncated` (per response and per chunk) says when the limits
+  cut something; `has_more_before`/`has_more_after` drive paging outwards. The
+  requested chunk is always returned (cut down if it alone is too big) and
+  neighbours only whole, so a client paging outwards steps the window rather
+  than widening it once the budget binds.
+- The blocking read goes through the same admission gate as browsing, so a
+  burst of previews cannot starve the blocking pool.
+- Text is sanitised before serialisation: C0/C1 control characters other than
+  tab, CR and LF, and bidirectional overrides, become U+FFFD (one for one, so
+  offsets still line up) and the chunk is flagged `sanitized`.
 
 Searching through the running service:
 

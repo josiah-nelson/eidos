@@ -1,5 +1,7 @@
 // Typed client for the eidos HTTP API. Shapes mirror the Rust serde output.
 
+import type { PreviewWindow } from './preview-window'
+
 export type SourceState =
   | 'new'
   | 'enumerating'
@@ -345,17 +347,40 @@ export interface Hit {
   changed?: number
   attributes: number
   hard_link_count: number
-  content: { state: ContentState; coverage: string; indexed_bytes?: number; content_id?: string; reason?: string }
+  content: {
+    state: ContentState
+    coverage: string
+    generation?: number
+    indexed_bytes?: number
+    content_id?: string
+    reason?: string
+  }
   score?: number
   snippets?: Snippet[]
   directory?: DirectorySummary
   source_state: SourceState
 }
 
+/**
+ * Exact boundaries of a size or modification-time bucket plus the query text
+ * that selects or excludes it. The interval is half-open (`from` inclusive,
+ * `to` exclusive) and either end may be open. Always append `clause` /
+ * `exclude` verbatim: the bounds are informative only — times are Unix
+ * nanoseconds, which exceed the precision of a JavaScript number.
+ */
+export interface FacetRange {
+  from?: number
+  to?: number
+  clause: string
+  exclude: string
+}
+
 export interface FacetValue {
   value: string
   count: number
   label?: string
+  /** Present for range buckets the current result mode can express. */
+  range?: FacetRange
 }
 
 export interface Facet {
@@ -422,6 +447,48 @@ export interface IndexStatus {
   }[]
 }
 
+// ----- stored-text preview -------------------------------------------------
+
+export interface PreviewChunk {
+  ordinal: number
+  byte_start: number
+  byte_end: number
+  line_start: number
+  line_end: number
+  chars: number
+  text: string
+  truncated: boolean
+  sanitized: boolean
+}
+
+/**
+ * A window of the text the indexer stored for one object generation. Never
+ * the file on disk: the service reads it out of the catalog.
+ */
+export interface ContentPreview {
+  object_id: number
+  path: string | null
+  generation: number
+  object_generation: number
+  stale: boolean
+  state: ContentState
+  coverage: string
+  indexed_bytes: number
+  total_bytes: number
+  chunk_count: number
+  line_count: number
+  encoding: string | null
+  reason: string | null
+  requested_ordinal: number
+  chunks: PreviewChunk[]
+  has_more_before: boolean
+  has_more_after: boolean
+  truncated: boolean
+  limits: { max_neighbors: number; max_bytes: number; max_lines: number }
+}
+
+export type { PreviewWindow }
+
 export class ApiError extends Error {
   status: number
   kind: string
@@ -472,6 +539,15 @@ export const api = {
       `/api/objects/${id}/children?sort=${q.sort}&desc=${q.desc}&offset=${q.offset}&limit=${q.limit}&hidden=${q.hidden}`,
     ),
   extensions: (id: number, limit = 30) => request<ExtensionCount[]>(`/api/objects/${id}/extensions?limit=${limit}`),
+  contentPreview: (id: number, w: PreviewWindow) => {
+    const p = new URLSearchParams({
+      ordinal: String(w.ordinal),
+      before: String(w.before),
+      after: String(w.after),
+    })
+    if (w.generation != null) p.set('generation', String(w.generation))
+    return request<ContentPreview>(`/api/objects/${id}/content?${p.toString()}`)
+  },
   resolve: (source: number, path: string) =>
     request<{ object_id: number; path: string | null }>(
       `/api/resolve?source=${source}&path=${encodeURIComponent(path)}`,
@@ -578,6 +654,8 @@ export interface ActivitySourceView {
   state: SourceState
   content_enabled: boolean
   content_concurrency: number
+  content_reserved: number
+  content_peak_reserved: number
   jobs_queued: number
   jobs_running: number
   jobs_failed: number

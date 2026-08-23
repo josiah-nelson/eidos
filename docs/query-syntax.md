@@ -14,7 +14,7 @@ editable.
 | `"release notes"` | name phrase |
 | `*.cs`, `setup?.exe` | glob on the name (case-insensitive) |
 | `G:\Tools`, `\\server\share\x` | bare absolute path scopes to that directory |
-| `-term`, `NOT term` | negation |
+| `-term`, `NOT term`, `-(a b)` | negation of a term or of a whole group |
 | `a OR b`, `(a b) OR c` | disjunction and grouping; adjacent terms are AND |
 
 ## Fields
@@ -31,6 +31,7 @@ editable.
 | `has:` | `has:idb`, `has:cs>=3`, `has:log:10..100` | directory contains N files with that extension anywhere beneath (use Directories mode) |
 | `files:` | `files:>1000` | directory descendant file count |
 | `subtree:` / `subtree_alloc:` | `subtree:>1G` | directory subtree size |
+| `subtree_mtime:` | `subtree_mtime:>=2026-01-01`, `subtree_mtime:7d` | newest modification time anywhere beneath a directory (same date forms as `mtime:`) |
 | `attr:` | `attr:hidden`, `attr:hidden,system`, `-attr:reparse` | readonly hidden system archive temporary sparse reparse compressed offline encrypted |
 | `source:` | `source:G`, `source:G,R`, `source:2` | configured source name or id |
 | `in:` | `in:o:123`, `in:o:123~2` | under an object id (optional max depth) |
@@ -41,7 +42,90 @@ editable.
 Result mode (`files`, `directories`, `both`) and sort (`relevance`, `name`,
 `path`, `size`, `allocated_size`, `subtree_size`, `modified`, `created`)
 are request parameters, not syntax. Directory predicates (`has:`, `files:`,
-`subtree:`) only produce results in `directories`/`both` mode.
+`subtree:`, `subtree_mtime:`) only produce results in `directories`/`both`
+mode.
+
+## Facet buckets
+
+The `size_bucket` and `modified_bucket` facets return, next to the count,
+the exact boundaries of each bucket and the query text that selects or
+excludes it, so a client turns a click into a filter without re-deriving
+anything:
+
+```json
+{ "value": "1048576-16777216", "count": 42,
+  "label": "≥ 1 MiB, < 16 MiB",
+  "range": { "from": 1048576, "to": 16777216,
+             "clause": "size:>=1M size:<16M",
+             "exclude": "-(size:>=1M size:<16M)" } }
+```
+
+- Buckets are half-open: `from` is inclusive, `to` is exclusive, and the
+  first and last bucket are open-ended (`size:<4k`, `size:>=1G`). Labels
+  spell both boundaries; the `range` bounds are bytes for sizes and Unix
+  nanoseconds for times.
+- Modification-time boundaries are UTC midnights, so the clause is an
+  absolute date (`mtime:>=2026-08-16 mtime:<2026-08-23`) that means the same
+  thing whenever it is re-run — unlike a relative window such as `mtime:7d`.
+  Labels name the days they cover and say `UTC`; a bucket therefore shifts
+  by up to a day against a viewer's local calendar.
+- Which field the clause uses follows the result mode, because the facet
+  measures whatever the row shows: in `files` mode the file's own size and
+  modification time (`size:`, `mtime:`), in `directories` mode the subtree
+  size and newest descendant modification time (`subtree:`,
+  `subtree_mtime:`). In `both` mode the buckets mix the two, no single
+  clause reproduces them, and `range` is omitted — the buckets are counts
+  only.
+- Clauses combine with AND like everything else, so appending one only ever
+  narrows the query. The web UI applies a click this way, and a client
+  should do the same:
+  - Selecting a bucket drops any other bucket of the same facet, since
+    adjacent buckets are disjoint and intersecting them can only give
+    nothing, and drops exclusions of those buckets, which the selection
+    already implies.
+  - Excluding a bucket removes only its own inclusion; exclusions of
+    different buckets are independent and accumulate.
+  - Only a bucket's own clause is ever removed. Any other bound stays:
+    `size:>=100` plus the `< 4 KiB` bucket is the intersection of both. A
+    clause you typed that reads exactly like a bucket counts as that
+    bucket — nothing distinguishes the two, and keeping both would leave
+    no results.
+  - Because AND binds tighter than OR, a query that already contains a
+    top-level `OR` is parenthesised first, so the clause filters every
+    branch: `a OR b` becomes `(a OR b) size:<4k`.
+
+## Pagination cursors
+
+A response whose results continue carries `next_cursor`; pass it back as
+`cursor` with the *same* query, mode, sort, and scope to get the next page.
+Cursors are opaque, but their shape is documented so that behaviour is
+predictable:
+
+```text
+o:<consumed>;g:<index generation>;q:<query fingerprint>
+```
+
+- `o` counts every candidate the previous pages consumed in sort order,
+  including index documents that no longer had a live catalog row (the
+  projection lags the catalog briefly after changes). Such documents are
+  skipped, the page is refilled from the next candidates, and the cursor
+  moves past them, so no result is repeated or skipped because of them and a
+  page of nothing but stale documents still makes progress. Only the
+  page-driven content-verification path can return a short page behind a
+  long run of stale documents (its refill is bounded by the chunk-fetch
+  budget); the cursor still advances.
+- `q` binds the cursor to the request it was issued for. Reusing it with a
+  different query, mode, sort, or scope is rejected with a structured
+  `query` error ("cursor does not belong to this request … restart from the
+  first page").
+- `g` is the index generation the cursor was issued from. Offsets are not
+  stable across index commits: if the index changed between pages the
+  request still succeeds, but the response carries a warning that a result
+  may repeat or be skipped. Restart from the first page when exactness
+  matters.
+- A malformed cursor is rejected with `invalid cursor`; so is a structured
+  cursor carrying only one of `g` and `q`. The legacy `o:<n>` form is still
+  accepted without the query or generation checks.
 
 ## Semantics worth knowing
 

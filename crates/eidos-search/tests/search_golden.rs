@@ -325,6 +325,95 @@ fn facets() {
     assert_eq!(sizes.values.iter().map(|v| v.count).sum::<u64>(), 17);
 }
 
+/// Every size and modification-time bucket carries clauses that reproduce
+/// exactly the bucket the user clicked — including the first (open below),
+/// the last (open above), and the exclusions — in both result modes.
+#[test]
+fn range_bucket_clauses_reproduce_their_bucket() {
+    let fx = fixture();
+    for (mode, base) in [
+        (ResultMode::Files, ""),
+        (ResultMode::Directories, ""),
+        // An existing bound on the same field must still combine, not be
+        // silently replaced.
+        (ResultMode::Files, "size:>=100"),
+    ] {
+        let mut req = fx.req(base);
+        req.mode = mode;
+        req.facets = vec![
+            FacetRequest {
+                field: FacetField::SizeBucket,
+                limit: 10,
+            },
+            FacetRequest {
+                field: FacetField::ModifiedBucket,
+                limit: 10,
+            },
+        ];
+        let r = fx.run_req(req);
+        let total = r.total.value;
+        assert!(total > 0, "{mode:?} {base:?} has no results");
+        let mut open_below = 0;
+        let mut open_above = 0;
+        for facet in &r.facets {
+            let mut summed = 0;
+            for v in &facet.values {
+                let range = v.range.as_ref().unwrap_or_else(|| {
+                    panic!("{:?} bucket {} has no clause", facet.field, v.value)
+                });
+                open_below += u32::from(range.from.is_none());
+                open_above += u32::from(range.to.is_none());
+                let mut include = fx.req(&format!("{base} {}", range.clause));
+                include.mode = mode;
+                assert_eq!(
+                    fx.run_req(include).total.value,
+                    v.count,
+                    "{:?} include {} in {mode:?}",
+                    facet.field,
+                    range.clause
+                );
+                let mut exclude = fx.req(&format!("{base} {}", range.exclude));
+                exclude.mode = mode;
+                assert_eq!(
+                    fx.run_req(exclude).total.value,
+                    total - v.count,
+                    "{:?} exclude {} in {mode:?}",
+                    facet.field,
+                    range.exclude
+                );
+                summed += v.count;
+            }
+            assert_eq!(summed, total, "{:?} buckets cover every hit", facet.field);
+        }
+        // Everything in the fixture is small, so the open-below first bucket
+        // is always exercised above; the open-above bucket is whichever
+        // modification-time bucket the run lands in (`facets.rs` unit tests
+        // pin the clause text for both ends).
+        assert_eq!(r.facets.len(), 2);
+        assert!(open_below >= 1, "no open-ended first bucket in {mode:?}");
+        let _ = open_above;
+    }
+}
+
+/// The buckets mix per-file and per-subtree values in `both` mode, so they
+/// are labelled but carry no clause rather than a clause that means
+/// something else.
+#[test]
+fn range_buckets_are_display_only_in_both_mode() {
+    let fx = fixture();
+    let mut req = fx.req("");
+    req.mode = ResultMode::Both;
+    req.facets = vec![FacetRequest {
+        field: FacetField::SizeBucket,
+        limit: 10,
+    }];
+    let r = fx.run_req(req);
+    let sizes = &r.facets[0];
+    assert!(!sizes.values.is_empty());
+    assert!(sizes.values.iter().all(|v| v.range.is_none()));
+    assert!(sizes.values.iter().all(|v| v.label.is_some()));
+}
+
 #[test]
 fn content_clause_is_rejected_truthfully() {
     let fx = fixture();
@@ -654,4 +743,356 @@ fn large_candidate_sets_verify_lazily_in_sort_order() {
     let r = run("name:ite_m", SortField::Name, false, 10, None);
     assert!(r.total.exact);
     assert_eq!(r.total.value, 520);
+}
+
+/// The same subtree twice, a subtree nested inside it, and a descendant
+/// named on its own: one rebuild of `proj` has to cover all four, whichever
+/// order the rows arrive in.
+#[test]
+fn duplicate_and_nested_subtree_rows_are_coalesced() {
+    for outer_first in [true, false] {
+        let fx = fixture();
+        let before = fx.index.num_docs();
+        let object = |rel: &str| {
+            fx.catalog
+                .resolve_relative(fx.source, rel)
+                .unwrap()
+                .unwrap()
+        };
+        let proj = object("proj");
+        let src = object("proj/src");
+        let helpers = object("proj/src/util/Helpers.cs");
+        let now = UnixNanos::now();
+        let row = |seq: i64, object: ObjectId, op: &str| eidos_catalog::jobs::OutboxRow {
+            seq,
+            source_id: fx.source,
+            object_id: object,
+            op: op.into(),
+            generation: 1,
+            created_at: now,
+        };
+        let (first, third) = if outer_first {
+            (proj, src)
+        } else {
+            (src, proj)
+        };
+        let rows = [
+            row(1, first, "subtree"),
+            row(2, helpers, "upsert"),
+            row(3, third, "subtree"),
+            row(4, proj, "subtree"),
+        ];
+        let affected = 1 + fx.catalog.descendant_object_ids(proj).unwrap().len() as u64;
+
+        eidos_catalog::projection::reset_query_count();
+        let stats = fx.index.apply_outbox(&fx.catalog, &rows).unwrap();
+        let queries = eidos_catalog::projection::query_count();
+        fx.index.reload().unwrap();
+
+        assert_eq!(stats.rows, 4);
+        assert_eq!(stats.subtree_rebuilds, 3);
+        // Every affected object is deleted and re-added exactly once...
+        assert_eq!(
+            stats.documents_deleted, affected,
+            "outer_first={outer_first}"
+        );
+        assert_eq!(stats.documents_added, affected, "outer_first={outer_first}");
+        // ...leaving the index with the documents it started with.
+        assert_eq!(fx.index.num_docs(), before);
+        // Two ancestor probes (one per distinct root), one descendant walk,
+        // and the batched reads: the nested root is never walked, and the
+        // arrival order does not change that.
+        assert!(
+            queries <= 12,
+            "{queries} catalog queries to rebuild {affected} objects (outer_first={outer_first})"
+        );
+        assert!(fx.names("name:=Helpers.cs").contains(&"Helpers.cs".into()));
+    }
+}
+
+// --- Cursors: stale projection documents, query binding, index changes ---
+
+fn native_key(fx: &Fx, id: ObjectId) -> eidos_catalog::changes::NativeKey {
+    let o = fx.catalog.get_object(id).unwrap().unwrap();
+    eidos_catalog::changes::NativeKey::from(o.native.expect("native identity"))
+}
+
+/// Tombstone catalog rows without letting the index follow, so the
+/// projection still carries documents the catalog no longer has.
+fn tombstone_in_catalog_only(fx: &Fx, ids: &[ObjectId]) {
+    let events: Vec<eidos_catalog::changes::ChangeEvent> = ids
+        .iter()
+        .map(|id| eidos_catalog::changes::ChangeEvent::Delete {
+            object: native_key(fx, *id),
+        })
+        .collect();
+    fx.catalog.apply_changes(fx.source, &events, None).unwrap();
+}
+
+fn sorted_req(fx: &Fx, q: &str, field: SortField, descending: bool, limit: u32) -> SearchRequest {
+    let mut req = fx.req(q);
+    req.sort = Sort { field, descending };
+    req.limit = limit;
+    req
+}
+
+fn walk_pages(fx: &Fx, mut req: SearchRequest) -> (Vec<ObjectId>, usize) {
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    loop {
+        let r = fx.run_req(req.clone());
+        pages += 1;
+        ids.extend(r.hits.iter().map(|h| h.object_id));
+        match r.next_cursor {
+            Some(c) => req.cursor = Some(c),
+            None => return (ids, pages),
+        }
+        assert!(pages < 100, "cursor never terminated");
+    }
+}
+
+#[test]
+fn cursor_skips_stale_documents_and_refills_the_page() {
+    let fx = fixture();
+    let all = fx
+        .run_req(sorted_req(&fx, "ext:bin", SortField::Name, false, 50))
+        .hits
+        .iter()
+        .map(|h| h.object_id)
+        .collect::<Vec<_>>();
+    assert_eq!(all.len(), 5);
+    let req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    let p1 = fx.run_req(req.clone());
+    assert_eq!(
+        p1.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[..2]
+    );
+    // The two candidates the next page would show vanish from the catalog;
+    // the index still carries them.
+    tombstone_in_catalog_only(&fx, &all[2..4]);
+    let mut req2 = req.clone();
+    req2.cursor = p1.next_cursor.clone();
+    let p2 = fx.run_req(req2);
+    assert_eq!(
+        p2.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        vec![all[4]],
+        "stale candidates are skipped and the page is refilled from later ones"
+    );
+    assert!(p2.next_cursor.is_none(), "every candidate was consumed");
+    assert!(
+        p2.warnings.iter().all(|w| !w.contains("index changed")),
+        "same index generation: no warning"
+    );
+}
+
+#[test]
+fn cursor_makes_progress_through_a_page_of_only_stale_documents() {
+    let fx = fixture();
+    let all = fx
+        .run_req(sorted_req(&fx, "ext:bin", SortField::Name, false, 50))
+        .hits
+        .iter()
+        .map(|h| h.object_id)
+        .collect::<Vec<_>>();
+    tombstone_in_catalog_only(&fx, &all[1..3]);
+    let (ids, pages) = walk_pages(&fx, sorted_req(&fx, "ext:bin", SortField::Name, false, 1));
+    assert_eq!(ids, vec![all[0], all[3], all[4]]);
+    assert_eq!(
+        pages, 3,
+        "the stale pair is consumed by one page, not revisited"
+    );
+}
+
+#[test]
+fn cursor_is_bound_to_its_request() {
+    let fx = fixture();
+    let p1 = fx.run_req(sorted_req(&fx, "ext:bin", SortField::Name, false, 2));
+    let cursor = p1.next_cursor.clone().expect("more pages");
+    assert!(cursor.starts_with("o:2;g:"), "{cursor}");
+
+    // Different query.
+    let mut other = sorted_req(&fx, "ext:cs", SortField::Name, false, 2);
+    other.cursor = Some(cursor.clone());
+    let err = search(&fx.index, &fx.catalog, &other, &ExecOptions::default()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            eidos_search::SearchError::Query(QueryError::CursorMismatch { .. })
+        ),
+        "{err}"
+    );
+    // Different sort of the same query.
+    let mut other = sorted_req(&fx, "ext:bin", SortField::Name, true, 2);
+    other.cursor = Some(cursor.clone());
+    assert!(search(&fx.index, &fx.catalog, &other, &ExecOptions::default()).is_err());
+    // Same request: accepted.
+    let mut same = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    same.cursor = Some(cursor);
+    assert_eq!(fx.run_req(same).hits.len(), 2);
+    // Legacy offset-only cursor: accepted without the checks.
+    let mut legacy = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    legacy.cursor = Some("o:2".into());
+    let r = fx.run_req(legacy);
+    assert_eq!(r.hits.len(), 2);
+    assert!(r.warnings.iter().all(|w| !w.contains("index changed")));
+    // Malformed.
+    for bad in ["x:1", "o:abc", "o:1;g:zz", "o:1;q:nothex", "", "2"] {
+        let mut req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+        req.cursor = Some(bad.into());
+        let err = search(&fx.index, &fx.catalog, &req, &ExecOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                eidos_search::SearchError::Query(QueryError::InvalidCursor)
+            ),
+            "{bad:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn cursor_warns_when_the_index_changed_between_pages() {
+    let fx = fixture();
+    let req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    let p1 = fx.run_req(req.clone());
+    let cursor = p1.next_cursor.clone().expect("more pages");
+
+    // A file appears and the index follows it: new searcher generation.
+    let root = fx
+        .catalog
+        .get_source(fx.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let serial = native_key(&fx, root).volume_serial;
+    let snapshot = eidos_catalog::changes::ObjectSnapshot {
+        native: NativeIdentity::from_u128(serial, u128::MAX - 1, IdentityConfidence::Native),
+        kind: ObjectKind::File,
+        attributes: FileAttributes(0x20),
+        size: 1,
+        allocated: 4096,
+        link_count: 1,
+        created: Some(UnixNanos::now()),
+        modified: Some(UnixNanos::now()),
+        changed: None,
+        accessed: None,
+        reparse_tag: 0,
+    };
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[eidos_catalog::changes::ChangeEvent::Link {
+                parent: native_key(&fx, root),
+                name: "aa.bin".into(),
+                snapshot,
+            }],
+            None,
+        )
+        .unwrap();
+    fx.index.follow_once(&fx.catalog, 1000).unwrap();
+    fx.index.reload().unwrap();
+
+    let mut req2 = req.clone();
+    req2.cursor = Some(cursor);
+    let p2 = fx.run_req(req2);
+    assert!(
+        p2.warnings.iter().any(|w| w.contains("index changed")),
+        "{:?}",
+        p2.warnings
+    );
+    assert_eq!(p2.total.value, 6);
+    // A fresh first page carries no such warning and a cursor for the new
+    // generation.
+    let p1b = fx.run_req(req);
+    assert!(p1b.warnings.iter().all(|w| !w.contains("index changed")));
+    let mut req3 = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    req3.cursor = p1b.next_cursor;
+    assert!(fx
+        .run_req(req3)
+        .warnings
+        .iter()
+        .all(|w| !w.contains("index changed")));
+}
+
+#[test]
+fn paging_through_ties_is_consistent_in_both_directions() {
+    let fx = fixture();
+    for (field, descending) in [
+        (SortField::Name, false),
+        (SortField::Name, true),
+        (SortField::Size, true),
+        (SortField::Size, false),
+        (SortField::Modified, false),
+        (SortField::Path, true),
+    ] {
+        let full = fx
+            .run_req(sorted_req(&fx, "ext:bin", field, descending, 50))
+            .hits
+            .iter()
+            .map(|h| h.object_id)
+            .collect::<Vec<_>>();
+        assert_eq!(full.len(), 5);
+        let (paged, pages) = walk_pages(&fx, sorted_req(&fx, "ext:bin", field, descending, 1));
+        assert_eq!(paged, full, "{field:?} desc={descending}");
+        assert_eq!(pages, 5);
+        let (paged2, _) = walk_pages(&fx, sorted_req(&fx, "ext:bin", field, descending, 2));
+        assert_eq!(paged2, full, "{field:?} desc={descending} limit 2");
+    }
+}
+
+#[test]
+fn cursor_refills_a_page_behind_a_long_run_of_stale_documents() {
+    let fx = fixture();
+    // Every file, top-k path (no verification), sorted by name.
+    let all = fx
+        .run_req(sorted_req(&fx, "", SortField::Name, false, 100))
+        .hits
+        .iter()
+        .map(|h| h.object_id)
+        .collect::<Vec<_>>();
+    assert!(all.len() >= 16, "{}", all.len());
+    let req = sorted_req(&fx, "", SortField::Name, false, 2);
+    let p1 = fx.run_req(req.clone());
+    assert_eq!(
+        p1.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[..2]
+    );
+    // Far more than STALE_SLACK consecutive candidates vanish from the
+    // catalog; the index still carries all of them.
+    let stale = all.len() - 4;
+    tombstone_in_catalog_only(&fx, &all[2..stale]);
+    let mut req2 = req.clone();
+    req2.cursor = p1.next_cursor.clone();
+    let p2 = fx.run_req(req2.clone());
+    assert_eq!(
+        p2.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[stale..stale + 2],
+        "the top-k collector regrows past the stale run and fills the page"
+    );
+    let mut req3 = req.clone();
+    req3.cursor = p2.next_cursor.clone();
+    let p3 = fx.run_req(req3);
+    assert_eq!(
+        p3.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[stale + 2..]
+    );
+    assert!(p3.next_cursor.is_none());
+}
+
+#[test]
+fn cursor_with_only_one_structured_field_is_rejected() {
+    let fx = fixture();
+    for bad in ["o:2;g:1", "o:2;q:0123456789abcdef"] {
+        let mut req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+        req.cursor = Some(bad.into());
+        let err = search(&fx.index, &fx.catalog, &req, &ExecOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                eidos_search::SearchError::Query(QueryError::InvalidCursor)
+            ),
+            "{bad:?}: {err}"
+        );
+    }
 }

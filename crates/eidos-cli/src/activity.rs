@@ -74,6 +74,19 @@ fn print_activity(v: &serde_json::Value) {
     if let Some(e) = w["last_error"].as_str() {
         println!("last error: {e}");
     }
+    let rb = &v["content_rebuild"];
+    if let Some(phase) = rb["phase"].as_str().filter(|p| *p != "idle") {
+        println!(
+            "content index rebuild: {phase}  {} / {} docs  {} s{}",
+            n(rb, "docs"),
+            n(rb, "chunks"),
+            n(rb, "elapsed_ms") / 1000,
+            rb["error"]
+                .as_str()
+                .map(|e| format!("  error: {e}"))
+                .unwrap_or_default()
+        );
+    }
     if let Some(sources) = v["sources"].as_array() {
         println!(
             "{:<4} {:<16} {:<18} {:<8} {:>7} {:>7}  states",
@@ -95,7 +108,11 @@ fn print_activity(v: &serde_json::Value) {
                 s["name"].as_str().unwrap_or(""),
                 s["state"].as_str().unwrap_or(""),
                 if s["content_enabled"].as_bool().unwrap_or(false) {
-                    format!("on x{}", n(s, "content_concurrency"))
+                    format!(
+                        "on {}/{}",
+                        n(s, "content_reserved"),
+                        n(s, "content_concurrency")
+                    )
                 } else {
                     "off".into()
                 },

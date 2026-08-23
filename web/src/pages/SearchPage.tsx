@@ -2,9 +2,19 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Link, useSearchParams } from 'react-router'
-import { api, type FacetField, type Hit, type ResultMode, type SortField } from '../api'
+import { api, type FacetField, type FacetValue, type Hit, type ResultMode, type SortField } from '../api'
 import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
+import { ContentPreviewPanel } from '../ContentPreview'
 import { bytes, count, duration, when } from '../format'
+import { applyFacetClick, negate, type FacetForms } from '../query-clause'
+
+/** What a "show context" click opens: stored text around one chunk. */
+export interface PreviewTarget {
+  objectId: number
+  name: string
+  ordinal: number
+  generation?: number
+}
 
 const PAGE = 100
 const FILE_FACETS: FacetField[] = ['source', 'extension', 'kind', 'content_state', 'size_bucket', 'modified_bucket']
@@ -32,6 +42,7 @@ export default function SearchPage() {
   const [draft, setDraft] = useState(q)
   const [lastQ, setLastQ] = useState(q)
   const [showPlan, setShowPlan] = useState(false)
+  const [preview, setPreview] = useState<PreviewTarget | null>(null)
   if (q !== lastQ) {
     // URL changed (back/forward, example click): resync the editor.
     setLastQ(q)
@@ -64,10 +75,17 @@ export default function SearchPage() {
   })
   const first = results.data?.pages[0]
   const hits = useMemo(() => results.data?.pages.flatMap((p) => p.hits) ?? [], [results.data])
+  // Later pages can warn too (e.g. the index changed since the cursor was
+  // issued), so show every distinct warning from every loaded page.
+  const warnings = useMemo(
+    () => Array.from(new Set(results.data?.pages.flatMap((p) => p.warnings ?? []) ?? [])),
+    [results.data],
+  )
 
   const submit = () => set({ q: draft })
-  const addClause = (clause: string) => {
-    const next = draft.trim().length ? `${draft.trim()} ${clause}` : clause
+  /** Refine the query with a facet value, including or excluding it. */
+  const click = (value: FacetForms, form: 'include' | 'exclude', siblings: FacetForms[]) => {
+    const next = applyFacetClick(draft, value, form, siblings)
     setDraft(next)
     set({ q: next })
   }
@@ -175,7 +193,7 @@ export default function SearchPage() {
             {first.completeness.map((c) => (
               <CompletenessBanner key={c.source_id} c={c} />
             ))}
-            {(first.warnings ?? []).map((w, i) => (
+            {warnings.map((w, i) => (
               <div key={i} className="banner warn">
                 <span className="badge warn">warning</span>
                 <span>{w}</span>
@@ -223,6 +241,7 @@ export default function SearchPage() {
               hasMore={results.hasNextPage ?? false}
               fetching={results.isFetchingNextPage}
               fetchMore={() => results.fetchNextPage()}
+              onPreview={setPreview}
             />
           </div>
           <aside className="side">
@@ -231,24 +250,44 @@ export default function SearchPage() {
                 <h2 style={{ marginTop: 0 }}>{f.field.replace('_', ' ')}</h2>
                 <ul className="facet-list">
                   {f.values.slice(0, 12).map((v) => {
-                    const clause = facetClause(f.field, v.value, v.label)
+                    const forms = facetForms(f.field, v)
+                    // Range buckets are disjoint, so picking one supersedes another.
+                    const siblings = f.values.flatMap((o) =>
+                      o !== v && o.range ? [o.range] : [],
+                    )
                     return (
                       <li key={v.value}>
-                        {clause ? (
+                        {forms ? (
                           <a
                             href="#"
+                            title={`add  ${forms.clause}`}
                             onClick={(e) => {
                               e.preventDefault()
-                              addClause(clause)
+                              click(forms, 'include', siblings)
                             }}
                           >
                             {v.label ?? v.value ?? '(none)'}
                           </a>
                         ) : (
-                          <span>{v.label ?? v.value}</span>
+                          <span title={v.label}>{v.label ?? v.value}</span>
                         )}
                         <span>{count(v.count)}</span>
-                        <span />
+                        {forms ? (
+                          <a
+                            href="#"
+                            className="facet-exclude"
+                            title={`add  ${forms.exclude}`}
+                            aria-label={`exclude ${v.label ?? v.value}`}
+                            onClick={(e) => {
+                              e.preventDefault()
+                              click(forms, 'exclude', siblings)
+                            }}
+                          >
+                            −
+                          </a>
+                        ) : (
+                          <span />
+                        )}
                       </li>
                     )
                   })}
@@ -259,8 +298,28 @@ export default function SearchPage() {
           </aside>
         </div>
       )}
+      {preview && (
+        <ContentPreviewPanel
+          objectId={preview.objectId}
+          name={preview.name}
+          ordinal={preview.ordinal}
+          generation={preview.generation}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   )
+}
+
+/**
+ * The clauses that select and exclude one facet value. Range buckets carry
+ * them from the server; term facets get them from the value itself. `null`
+ * when the value cannot be turned into a filter at all.
+ */
+function facetForms(field: FacetField, v: FacetValue): FacetForms | null {
+  if (v.range) return v.range
+  const clause = facetClause(field, v.value, v.label)
+  return clause ? { clause, exclude: negate(clause) } : null
 }
 
 function facetClause(field: FacetField, value: string, label?: string): string | null {
@@ -284,12 +343,14 @@ function HitTable({
   hasMore,
   fetching,
   fetchMore,
+  onPreview,
 }: {
   hits: Hit[]
   mode: ResultMode
   hasMore: boolean
   fetching: boolean
   fetchMore: () => void
+  onPreview: (t: PreviewTarget) => void
 }) {
   const parentRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -358,6 +419,21 @@ function HitTable({
                       .map(([e, n]) => `${e || '∅'} ${n}`)
                       .join(' · ')}
                   </span>
+                ) : h.content.state === 'indexed' || h.content.state === 'partial' ? (
+                  <button
+                    className="linkish"
+                    title="Show the text the indexer stored for this file"
+                    onClick={() =>
+                      onPreview({
+                        objectId: h.object_id,
+                        name: h.name,
+                        ordinal: snippets[0]?.chunk_ordinal ?? 0,
+                        generation: h.content.generation,
+                      })
+                    }
+                  >
+                    <ContentBadge state={h.content.state} />
+                  </button>
                 ) : (
                   <ContentBadge state={h.content.state} />
                 )}
@@ -367,7 +443,21 @@ function HitTable({
                   {snippets.map((s) => (
                     <div key={s.chunk_ordinal + ':' + s.line_start}>
                       <span className="line">L{s.line_start + 1}</span>
-                      <Highlighted text={s.text} ranges={s.highlights} />
+                      <Highlighted text={s.text} ranges={s.highlights} />{' '}
+                      <button
+                        className="linkish"
+                        title="Show the indexed text around this match"
+                        onClick={() =>
+                          onPreview({
+                            objectId: h.object_id,
+                            name: h.name,
+                            ordinal: s.chunk_ordinal,
+                            generation: h.content.generation,
+                          })
+                        }
+                      >
+                        show context
+                      </button>
                     </div>
                   ))}
                 </div>

@@ -151,6 +151,9 @@ function SourceRow({ s }: { s: ActivitySourceView }) {
             if (Number.isFinite(v) && v >= 1 && v !== s.content_concurrency) policy.mutate({ concurrency: v })
           }}
         />
+        <div className="muted small" title="workers holding a slot of this source's budget (peak this session)">
+          {s.content_reserved} in flight · peak {s.content_peak_reserved}
+        </div>
       </td>
       <td className="num">{count(s.jobs_queued)}</td>
       <td className="num">{count(s.jobs_running)}</td>
