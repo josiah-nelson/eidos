@@ -655,3 +655,54 @@ fn large_candidate_sets_verify_lazily_in_sort_order() {
     assert!(r.total.exact);
     assert_eq!(r.total.value, 520);
 }
+
+#[test]
+fn duplicate_and_nested_subtree_rows_are_coalesced() {
+    let fx = fixture();
+    let before = fx.index.num_docs();
+    let object = |rel: &str| {
+        fx.catalog
+            .resolve_relative(fx.source, rel)
+            .unwrap()
+            .unwrap()
+    };
+    let proj = object("proj");
+    let src = object("proj/src");
+    let helpers = object("proj/src/util/Helpers.cs");
+    let now = UnixNanos::now();
+    let row = |seq: i64, object: ObjectId, op: &str| eidos_catalog::jobs::OutboxRow {
+        seq,
+        source_id: fx.source,
+        object_id: object,
+        op: op.into(),
+        generation: 1,
+        created_at: now,
+    };
+    // The same subtree twice, a subtree nested inside it, and a descendant
+    // named on its own: one rebuild of `proj` covers all four.
+    let rows = [
+        row(1, proj, "subtree"),
+        row(2, helpers, "upsert"),
+        row(3, src, "subtree"),
+        row(4, proj, "subtree"),
+    ];
+    let affected = 1 + fx.catalog.descendant_object_ids(proj).unwrap().len() as u64;
+
+    eidos_catalog::projection::reset_query_count();
+    let stats = fx.index.apply_outbox(&fx.catalog, &rows).unwrap();
+    let queries = eidos_catalog::projection::query_count();
+    fx.index.reload().unwrap();
+
+    assert_eq!(stats.rows, 4);
+    assert_eq!(stats.subtree_rebuilds, 3);
+    // Every affected object is deleted and re-added exactly once...
+    assert_eq!(stats.documents_deleted, affected);
+    assert_eq!(stats.documents_added, affected);
+    // ...leaving the index with the documents it started with.
+    assert_eq!(fx.index.num_docs(), before);
+    assert!(
+        queries <= 12,
+        "{queries} catalog queries to rebuild {affected} objects"
+    );
+    assert!(fx.names("name:=Helpers.cs").contains(&"Helpers.cs".into()));
+}
