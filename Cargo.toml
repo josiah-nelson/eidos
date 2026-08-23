@@ -37,6 +37,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util"] }
 axum = { version = "0.8", features = ["json", "query", "tokio", "http1"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "fs", "compression-gzip"] }
 rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 tantivy = "0.26"
