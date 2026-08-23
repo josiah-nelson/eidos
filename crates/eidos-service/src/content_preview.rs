@@ -29,7 +29,7 @@ use axum::Json;
 use eidos_catalog::content::ChunkRow;
 use eidos_domain::{ContentState, Coverage, ObjectId};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::Semaphore;
 
 /// Neighbouring chunks per side. Requests above this are clamped, not
@@ -43,7 +43,13 @@ pub const MAX_RESPONSE_LINES: usize = 4_000;
 /// Previews in flight. Each one holds a blocking thread and decompresses up
 /// to `2 * MAX_NEIGHBORS + 1` chunks, so the endpoint is admitted rather than
 /// left to fan out across the whole runtime.
-static SLOTS: Semaphore = Semaphore::const_new(8);
+///
+/// The permit is *owned* and moved into the blocking task, not held by the
+/// handler future: a client that disconnects mid-request drops the future
+/// while the blocking catalog read is still running, and a borrowed permit
+/// would be released there — letting aborted requests pile blocking work up
+/// past this bound.
+static SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 
 #[derive(Debug, Deserialize)]
 pub struct PreviewQuery {
@@ -121,13 +127,16 @@ pub async fn object_content(
     Path(id): Path<i64>,
     Query(q): Query<PreviewQuery>,
 ) -> ApiResult<PreviewView> {
-    let _permit = SLOTS
-        .acquire()
+    let permit = SLOTS
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|_| ApiError::internal("preview admission closed"))?;
     let (before, after) = (q.before.min(MAX_NEIGHBORS), q.after.min(MAX_NEIGHBORS));
     let (object, generation, ordinal) = (ObjectId(id), q.generation, q.ordinal);
     let view = tokio::task::spawn_blocking(move || {
+        // Held until the blocking read finishes, even if the caller is gone.
+        let _permit = permit;
         load_preview(&st, object, generation, ordinal, before, after)
     })
     .await

@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { ApiError, api, type PreviewChunk, type PreviewWindow } from './api'
 import { ContentBadge, ErrorBox, Spinner } from './components'
 import { bytes, count } from './format'
+import { stepWindow } from './preview-window'
 
 /**
  * Panel over the text the indexer *stored* for one object generation.
@@ -36,20 +37,18 @@ export function ContentPreviewPanel({
   const max = p?.limits.max_neighbors ?? 4
   const conflict = preview.error instanceof ApiError && preview.error.kind === 'stale_generation'
 
-  // Past the per-request neighbour limit, re-centre the window on the edge
-  // chunk instead of asking the server for more than it will ever return.
-  const moreAbove = () =>
-    setWin((w) =>
-      w.before < max
-        ? { ...w, before: w.before + 1 }
-        : { ...w, ordinal: p?.chunks[0]?.ordinal ?? w.ordinal, before: max, after: 0 },
-    )
-  const moreBelow = () =>
-    setWin((w) =>
-      w.after < max
-        ? { ...w, after: w.after + 1 }
-        : { ...w, ordinal: p?.chunks[p.chunks.length - 1]?.ordinal ?? w.ordinal, before: 0, after: max },
-    )
+  // Widening only helps while the server still returns the whole window; past
+  // that (its neighbour limit, or its byte budget) the window steps outwards
+  // so the next chunk becomes the requested one. See `preview-window.ts`.
+  const step = (direction: 'up' | 'down') => () =>
+    setWin((w) => {
+      const chunks = p?.chunks ?? []
+      if (chunks.length === 0) return w
+      const shown = { first: chunks[0].ordinal, last: chunks[chunks.length - 1].ordinal, max }
+      return stepWindow(w, shown, direction)
+    })
+  const moreAbove = step('up')
+  const moreBelow = step('down')
 
   return (
     <div className="preview-backdrop" onClick={onClose}>

@@ -1,5 +1,7 @@
 // Typed client for the eidos HTTP API. Shapes mirror the Rust serde output.
 
+import type { PreviewWindow } from './preview-window'
+
 export type SourceState =
   | 'new'
   | 'enumerating'
@@ -485,13 +487,7 @@ export interface ContentPreview {
   limits: { max_neighbors: number; max_bytes: number; max_lines: number }
 }
 
-export interface PreviewWindow {
-  ordinal: number
-  before: number
-  after: number
-  /** Omit to read whatever generation the catalog currently holds. */
-  generation?: number
-}
+export type { PreviewWindow }
 
 export class ApiError extends Error {
   status: number
