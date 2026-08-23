@@ -101,7 +101,6 @@ fn fixture() -> Fx {
     .unwrap();
     let index = CatalogIndex::open(dir.path().join("index")).unwrap();
     index.sync_sources(&catalog).unwrap();
-    index.reload().unwrap();
     let content = ContentIndex::open(dir.path().join("content")).unwrap();
     Fx {
         _dir: dir,
@@ -124,7 +123,6 @@ impl Fx {
         )
         .unwrap();
         self.index.follow_once(&self.catalog, 10_000).unwrap();
-        self.index.reload().unwrap();
     }
 
     /// Extract everything pending and publish; then let the catalog index
@@ -138,7 +136,6 @@ impl Fx {
         let published =
             drain_content_jobs(&self.catalog, &self.content, &Limits::default(), "test").unwrap();
         self.index.follow_once(&self.catalog, 10_000).unwrap();
-        self.index.reload().unwrap();
         published
     }
 
@@ -191,7 +188,6 @@ impl Fx {
             published = self.catalog.mark_content_indexed(&pending).unwrap();
         }
         self.index.follow_once(&self.catalog, 10_000).unwrap();
-        self.index.reload().unwrap();
         (published, dirty)
     }
 

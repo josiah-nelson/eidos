@@ -72,7 +72,7 @@ impl CatalogIndex {
             Ok(())
         })?;
         drop(writer);
-        self.writer().commit()?;
+        self.commit_and_reload()?;
         catalog.set_projection_source(PROJECTION_NAME, source_id, generation, documents)?;
         let stats = RebuildStats {
             source_id: source_id.0,
@@ -95,7 +95,7 @@ impl CatalogIndex {
         let f = self.fields();
         self.writer()
             .delete_term(Term::from_field_u64(f.source_id, source_id.0 as u64));
-        self.writer().commit()?;
+        self.commit_and_reload()?;
         catalog.clear_projection_source(PROJECTION_NAME, source_id)?;
         Ok(())
     }
@@ -206,7 +206,7 @@ impl CatalogIndex {
             stats.documents_added += added;
         }
         if !rows.is_empty() {
-            self.writer().commit()?;
+            self.commit_and_reload()?;
         }
         stats.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(stats)
