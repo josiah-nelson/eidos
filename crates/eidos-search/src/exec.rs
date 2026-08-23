@@ -1680,7 +1680,7 @@ fn sort_key_cmp(a: &Stored, b: &Stored, sort: Sort) -> std::cmp::Ordering {
 pub const STALE_SLACK: usize = 8;
 
 /// Page cursor: `o:<consumed candidates>;g:<index generation>;q:<query
-/// fingerprint>[;t:<total>;x:<exact>]`. The offset counts every candidate
+/// fingerprint>[;t:<total>;x:<exact>];s:<signature>`. The offset counts every candidate
 /// the previous pages consumed — including stale projection documents that
 /// produced no hit — so a page never re-examines what an earlier page
 /// skipped. `g` is the Tantivy searcher generation the cursor was issued
@@ -1688,8 +1688,10 @@ pub const STALE_SLACK: usize = 8;
 /// commits); `q` binds the cursor to the query, mode, sort, and scope it
 /// was issued for; `t`/`x` carry the first page's total and whether it was
 /// exact, so later pages of a top-k walk do not recount while the
-/// generation is unchanged. The legacy `o:<offset>` form is still accepted
-/// without any of the checks.
+/// generation is unchanged. `s` authenticates the full structured cursor,
+/// preventing a caller from changing the carried total or any paging state.
+/// The legacy `o:<offset>` form is still accepted without any of the checks
+/// and cannot carry a total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cursor {
     offset: usize,
@@ -1698,7 +1700,10 @@ struct Cursor {
     total: Option<(u64, bool)>,
 }
 
-fn decode_cursor(c: &Option<String>) -> std::result::Result<Cursor, QueryError> {
+fn decode_cursor(
+    c: &Option<String>,
+    signing_key: &[u8; 32],
+) -> std::result::Result<Cursor, QueryError> {
     let s = match c {
         None => {
             return Ok(Cursor {
@@ -1710,6 +1715,10 @@ fn decode_cursor(c: &Option<String>) -> std::result::Result<Cursor, QueryError> 
         }
         Some(s) => s,
     };
+    let (unsigned, signature) = match s.rsplit_once(";s:") {
+        Some((unsigned, signature)) if !signature.is_empty() => (unsigned, Some(signature)),
+        _ => (s.as_str(), None),
+    };
     let mut cursor = Cursor {
         offset: 0,
         generation: None,
@@ -1718,7 +1727,7 @@ fn decode_cursor(c: &Option<String>) -> std::result::Result<Cursor, QueryError> 
     };
     let mut seen_offset = false;
     let (mut total, mut exact): (Option<u64>, Option<bool>) = (None, None);
-    for part in s.split(';') {
+    for part in unsigned.split(';') {
         let (key, value) = part.split_once(':').ok_or(QueryError::InvalidCursor)?;
         match key {
             "o" => {
@@ -1746,11 +1755,18 @@ fn decode_cursor(c: &Option<String>) -> std::result::Result<Cursor, QueryError> 
         || structured != cursor.fingerprint.is_some()
         || total.is_some() != exact.is_some()
         || (total.is_some() && !structured)
+        || structured != signature.is_some()
     {
         // Either the legacy `o:<n>` form or the full structured form; a
         // cursor carrying only part of a check is not something the service
         // ever issued.
         return Err(QueryError::InvalidCursor);
+    }
+    if let Some(signature) = signature {
+        let expected = blake3::keyed_hash(signing_key, unsigned.as_bytes());
+        if expected.to_hex().as_str() != signature {
+            return Err(QueryError::InvalidCursor);
+        }
     }
     cursor.total = total.zip(exact);
     Ok(cursor)
@@ -1761,11 +1777,14 @@ fn encode_cursor(
     generation: u64,
     fingerprint: u64,
     total: Option<(u64, bool)>,
+    signing_key: &[u8; 32],
 ) -> String {
     let mut s = format!("o:{offset};g:{generation};q:{fingerprint:016x}");
     if let Some((t, exact)) = total {
         s.push_str(&format!(";t:{t};x:{}", u8::from(exact)));
     }
+    let signature = blake3::keyed_hash(signing_key, s.as_bytes());
+    s.push_str(&format!(";s:{signature}"));
     s
 }
 
@@ -1845,7 +1864,7 @@ pub fn search_with_content(
 ) -> Result<SearchResponse> {
     let t0 = Instant::now();
     req.validate(&opts.limits)?;
-    let cursor = decode_cursor(&req.cursor)?;
+    let cursor = decode_cursor(&req.cursor, index.cursor_key())?;
     let fingerprint = query_fingerprint(req);
     if let Some(q) = cursor.fingerprint {
         if q != fingerprint {
@@ -2449,6 +2468,7 @@ pub fn search_with_content(
             index_generation,
             fingerprint,
             (total_origin != TotalOrigin::Bound).then_some((total, total_exact)),
+            index.cursor_key(),
         ))
     } else {
         None

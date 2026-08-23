@@ -625,12 +625,14 @@ dependencies = [
 name = "eidos-search"
 version = "0.5.0-dev"
 dependencies = [
+ "blake3",
  "eidos-archive",
  "eidos-catalog",
  "eidos-content",
  "eidos-domain",
  "eidos-query",
  "eidos-scanner",
+ "getrandom 0.4.3",
  "parking_lot",
  "regex",
  "regex-syntax",

@@ -102,7 +102,7 @@ Cursors are opaque, but their shape is documented so that behaviour is
 predictable:
 
 ```text
-o:<consumed>;g:<index generation>;q:<query fingerprint>
+o:<consumed>;g:<index generation>;q:<query fingerprint>[;t:<total>;x:<exact>];s:<signature>
 ```
 
 - `o` counts every candidate the previous pages consumed in sort order,
@@ -123,9 +123,11 @@ o:<consumed>;g:<index generation>;q:<query fingerprint>
   request still succeeds, but the response carries a warning that a result
   may repeat or be skipped. Restart from the first page when exactness
   matters.
-- A malformed cursor is rejected with `invalid cursor`; so is a structured
-  cursor carrying only one of `g` and `q`. The legacy `o:<n>` form is still
-  accepted without the query or generation checks.
+- `s` authenticates the complete structured cursor. Editing the offset,
+  generation, query fingerprint, or carried total is rejected with `invalid
+  cursor`. Signatures are process-local, so restart from the first page after
+  a service restart. The legacy `o:<n>` form is still accepted without the
+  query or generation checks, but it cannot carry a total.
 - `t`/`x` carry the first page's total and whether it was exact. Under the
   default count policy (`count=auto`) later pages of a top-k walk reuse that
   total instead of recounting (`total.origin = "cursor"`) while the index

@@ -1251,3 +1251,27 @@ fn half_carried_total_in_cursor_is_rejected() {
         );
     }
 }
+
+#[test]
+fn modified_carried_total_in_cursor_is_rejected() {
+    let fx = fixture();
+    let req = sorted_req(&fx, "", SortField::Name, false, 4);
+    let p1 = fx.run_req(req.clone());
+    let cursor = p1.next_cursor.clone().unwrap();
+    let total = p1.total.value;
+
+    for changed in [0, total + 10_000] {
+        let tampered = cursor.replacen(&format!(";t:{total};"), &format!(";t:{changed};"), 1);
+        assert_ne!(tampered, cursor);
+        let mut next = req.clone();
+        next.cursor = Some(tampered);
+        let err = search(&fx.index, &fx.catalog, &next, &ExecOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                eidos_search::SearchError::Query(QueryError::InvalidCursor)
+            ),
+            "tampered total {changed}: {err}"
+        );
+    }
+}
