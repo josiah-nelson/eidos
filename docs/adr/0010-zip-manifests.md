@@ -49,8 +49,10 @@ budgets and visibility as text extraction.
   worker renders. The content worker routes containers to the parser,
   stages `archive_members` in bounded 1,024-row transactions, then
   generation-checks and atomically publishes the `archive_records` and
-  content rows. A newer object generation rejects the stale result. The
-  content state is `indexed` with the reason "zip manifest: N members, D
+  content rows. A newer object generation rejects the stale result, while
+  a retry of an already-published generation is an idempotent no-op so it
+  cannot mutate the member set readers are using. The content state is
+  `indexed` with the reason "zip manifest: N members, D
   directories", `partial` when truncated, `failed` when corrupt. A file
   with a container extension that has no end record falls back to text
   extraction (a misnamed text file still indexes as text; binary ends

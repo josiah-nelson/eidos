@@ -321,12 +321,28 @@ fn stale_archive_generation_is_not_published() {
 }
 
 #[test]
-fn manifest_rows_persist_and_trim_across_bounded_batches() {
+fn manifest_rows_persist_in_batches_and_published_retries_are_idempotent() {
     let fx = fixture();
     fx.extract_all();
     let zip = fx.object("pkg/tool.zip");
     let mut rec = fx.catalog.archive_record(zip).unwrap().unwrap();
-    let content = fx.catalog.content_record(zip).unwrap().unwrap();
+    let mut content = fx.catalog.content_record(zip).unwrap().unwrap();
+    write(
+        &fx.root.join("pkg/tool.zip"),
+        &build(&[Entry::file("new.bin", &[7u8; 8_192])], b"changed", false),
+    );
+    run_scan(
+        &fx.catalog,
+        fx.source,
+        eidos_scanner::default_lister().as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    let generation = fx.catalog.get_object(zip).unwrap().unwrap().generation;
+    rec.generation = generation;
+    content.generation = generation;
+    content.state = ContentState::Indexed;
+    content.coverage = Coverage::Full;
     let members: Vec<ArchiveMember> = (0..2_500u32)
         .map(|ordinal| {
             let name = format!("member-{ordinal:04}.txt");
@@ -371,15 +387,31 @@ fn manifest_rows_persist_and_trim_across_bounded_batches() {
         .unwrap();
     assert_eq!(total, 2_500);
 
+    let mut retry = rec.clone();
     let short = &members[..3];
-    rec.member_count = short.len() as u64;
-    rec.declared_size = short.len() as u64;
-    rec.compressed_size = short.len() as u64;
-    rec.claimed_entries = short.len() as u64;
+    retry.member_count = short.len() as u64;
+    retry.declared_size = short.len() as u64;
+    retry.compressed_size = short.len() as u64;
+    retry.claimed_entries = short.len() as u64;
     assert!(fx
         .catalog
-        .store_archive(&rec, short, &content, None)
+        .store_archive(&retry, short, &content, None)
         .unwrap());
+    write(
+        &fx.root.join("pkg/tool.zip"),
+        &build(&[Entry::file("newer.bin", &[8u8; 16_384])], b"newer", false),
+    );
+    run_scan(
+        &fx.catalog,
+        fx.source,
+        eidos_scanner::default_lister().as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        fx.catalog.get_object(zip).unwrap().unwrap().generation,
+        generation + 1
+    );
     let (_, total) = fx
         .catalog
         .archive_members(
@@ -391,7 +423,8 @@ fn manifest_rows_persist_and_trim_across_bounded_batches() {
             },
         )
         .unwrap();
-    assert_eq!(total, 3);
+    assert_eq!(total, 2_500);
+    assert_eq!(fx.catalog.archive_record(zip).unwrap(), Some(rec));
 }
 
 #[test]

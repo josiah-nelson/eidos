@@ -112,6 +112,17 @@ fn archive_generation_is_current(conn: &Connection, rec: &ArchiveRecord) -> Resu
         .is_some())
 }
 
+fn archive_generation_is_published(conn: &Connection, rec: &ArchiveRecord) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM archive_records WHERE object_id = ?1 AND generation = ?2",
+            params![rec.object_id.0, rec.generation as i64],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 fn insert_archive_members(
     conn: &Connection,
     rec: &ArchiveRecord,
@@ -225,6 +236,33 @@ impl Catalog {
             crate::CatalogError::InvalidState("archive has more than u32::MAX members".into())
         })?;
 
+        // The parser is deterministic for an object generation. A duplicate
+        // retry must not stage over or trim the member set that readers are
+        // already using for that same generation.
+        let preflight = self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !archive_generation_is_current(&tx, rec)? {
+                return Ok(None);
+            }
+            if archive_generation_is_published(&tx, rec)? {
+                if let Some(job) = complete_job {
+                    tx.execute(
+                        "UPDATE jobs SET state = 'done', finished_at = ?2, last_error = NULL WHERE job_id = ?1",
+                        params![job.0, UnixNanos::now().0],
+                    )?;
+                }
+                tx.commit()?;
+                return Ok(Some(true));
+            }
+            tx.commit()?;
+            Ok(Some(false))
+        })?;
+        match preflight {
+            None => return Ok(false),
+            Some(true) => return Ok(true),
+            Some(false) => {}
+        }
+
         for batch in members.chunks(ARCHIVE_MEMBER_BATCH) {
             let stored = self.with_writer(|conn| {
                 let tx =
@@ -286,6 +324,20 @@ impl Catalog {
     /// container by extension that is not one by content). Returns `false`
     /// when the object has already advanced to a newer generation.
     pub fn store_archive_marker(&self, rec: &ArchiveRecord) -> Result<bool> {
+        let preflight = self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !archive_generation_is_current(&tx, rec)? {
+                return Ok(None);
+            }
+            let published = archive_generation_is_published(&tx, rec)?;
+            tx.commit()?;
+            Ok(Some(published))
+        })?;
+        match preflight {
+            None => return Ok(false),
+            Some(true) => return Ok(true),
+            Some(false) => {}
+        }
         if !self.trim_archive_member_tail(rec, 0)? {
             self.discard_unpublished_archive_members(rec)?;
             return Ok(false);
