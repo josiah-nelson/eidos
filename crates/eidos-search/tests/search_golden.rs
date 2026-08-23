@@ -76,7 +76,6 @@ fn fixture() -> Fx {
     let index = CatalogIndex::open(dir.path().join("index")).unwrap();
     let rebuilt = index.sync_sources(&catalog).unwrap();
     assert_eq!(rebuilt.len(), 1);
-    index.reload().unwrap();
     Fx {
         _dir: dir,
         root,
@@ -445,7 +444,6 @@ fn follower_applies_catalog_changes() {
         .contains("rebuilding"));
     let (rebuilt, _) = fx.index.follow_once(&fx.catalog, 100).unwrap();
     assert_eq!(rebuilt.len(), 1);
-    fx.index.reload().unwrap();
     assert_eq!(
         fx.names("ext:cs"),
         vec!["Helpers.cs", "Main.cs", "New.cs", "Program.cs"]
@@ -502,7 +500,6 @@ fn follower_applies_catalog_changes() {
     );
     let (_, follow) = fx.index.follow_once(&fx.catalog, 100).unwrap();
     assert!(follow.unwrap().documents_added >= 1);
-    fx.index.reload().unwrap();
     assert!(fx.names("ext:cs").contains(&"Incremental.cs".to_string()));
     // Delete through the outbox.
     fx.catalog
@@ -518,9 +515,87 @@ fn follower_applies_catalog_changes() {
         )
         .unwrap();
     fx.index.follow_once(&fx.catalog, 100).unwrap();
-    fx.index.reload().unwrap();
     assert!(!fx.names("ext:cs").contains(&"Incremental.cs".to_string()));
     assert_eq!(fx.catalog.outbox_pending().unwrap(), 0);
+}
+
+#[test]
+fn rapid_projection_commits_are_visible_when_follow_returns() {
+    use eidos_catalog::changes::{ChangeEvent, NativeKey, ObjectSnapshot};
+
+    let fx = fixture();
+    // Consume scan-time outbox rows so every following iteration exercises
+    // only the incremental commit under test.
+    fx.index.follow_once(&fx.catalog, 10_000).unwrap();
+
+    let parent = fx
+        .catalog
+        .resolve_relative(fx.source, "proj/src")
+        .unwrap()
+        .unwrap();
+    let parent_native = fx
+        .catalog
+        .get_object(parent)
+        .unwrap()
+        .unwrap()
+        .native
+        .unwrap();
+
+    // More than one watcher interval on a typical Windows test runner. With
+    // delayed reloads this either observes stale results or races an atomic
+    // meta.json replacement; explicit commit-and-reload makes each return a
+    // visibility boundary.
+    for i in 0..32_u128 {
+        let native_id = 0xF000_0000 + i;
+        let name = format!("Rapid-{i:02}.txt");
+        let snapshot = ObjectSnapshot {
+            native: NativeIdentity::from_u128(
+                parent_native.volume_serial,
+                native_id,
+                IdentityConfidence::Native,
+            ),
+            kind: ObjectKind::File,
+            attributes: FileAttributes(0x20),
+            size: i as u64 + 1,
+            allocated: 4096,
+            link_count: 1,
+            created: Some(UnixNanos::now()),
+            modified: Some(UnixNanos::now()),
+            changed: None,
+            accessed: None,
+            reparse_tag: 0,
+        };
+        fx.catalog
+            .apply_changes(
+                fx.source,
+                &[ChangeEvent::Link {
+                    parent: NativeKey::from(parent_native),
+                    name: name.clone(),
+                    snapshot,
+                }],
+                None,
+            )
+            .unwrap();
+        let (_, followed) = fx.index.follow_once(&fx.catalog, 100).unwrap();
+        assert!(followed.is_some());
+        assert_eq!(fx.names(&format!("name:={name}")), vec![name.clone()]);
+
+        fx.catalog
+            .apply_changes(
+                fx.source,
+                &[ChangeEvent::Delete {
+                    object: NativeKey {
+                        volume_serial: parent_native.volume_serial,
+                        id: native_id,
+                    },
+                }],
+                None,
+            )
+            .unwrap();
+        let (_, followed) = fx.index.follow_once(&fx.catalog, 100).unwrap();
+        assert!(followed.is_some());
+        assert!(fx.names(&format!("name:={name}")).is_empty());
+    }
 }
 
 #[test]
