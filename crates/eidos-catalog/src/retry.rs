@@ -350,6 +350,7 @@ const FAILED_CONTENT_SQL: &str = "SELECT o.object_id, o.source_id, o.generation,
        AND (?2 IS NULL OR o.source_id = ?2)
        AND (?3 IS NULL OR c.failure_class = ?3)
        AND (?4 IS NULL OR c.error LIKE ?4 ESCAPE '\\')
+       AND (?5 IS NULL OR c.processed_at <= ?5)
        AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.object_id = o.object_id AND j.stage = 'content_text'
                        AND j.state IN ('queued','running'))
      ORDER BY o.object_id
