@@ -59,7 +59,10 @@ o:<consumed>;g:<index generation>;q:<query fingerprint>
   projection lags the catalog briefly after changes). Such documents are
   skipped, the page is refilled from the next candidates, and the cursor
   moves past them, so no result is repeated or skipped because of them and a
-  page of nothing but stale documents still makes progress.
+  page of nothing but stale documents still makes progress. Only the
+  page-driven content-verification path can return a short page behind a
+  long run of stale documents (its refill is bounded by the chunk-fetch
+  budget); the cursor still advances.
 - `q` binds the cursor to the request it was issued for. Reusing it with a
   different query, mode, sort, or scope is rejected with a structured
   `query` error ("cursor does not belong to this request … restart from the
@@ -69,8 +72,9 @@ o:<consumed>;g:<index generation>;q:<query fingerprint>
   request still succeeds, but the response carries a warning that a result
   may repeat or be skipped. Restart from the first page when exactness
   matters.
-- A malformed cursor is rejected with `invalid cursor`. The legacy `o:<n>`
-  form is still accepted without the query or generation checks.
+- A malformed cursor is rejected with `invalid cursor`; so is a structured
+  cursor carrying only one of `g` and `q`. The legacy `o:<n>` form is still
+  accepted without the query or generation checks.
 
 ## Semantics worth knowing
 

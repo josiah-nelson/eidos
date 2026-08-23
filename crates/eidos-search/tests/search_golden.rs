@@ -886,3 +886,59 @@ fn paging_through_ties_is_consistent_in_both_directions() {
         assert_eq!(paged2, full, "{field:?} desc={descending} limit 2");
     }
 }
+
+#[test]
+fn cursor_refills_a_page_behind_a_long_run_of_stale_documents() {
+    let fx = fixture();
+    // Every file, top-k path (no verification), sorted by name.
+    let all = fx
+        .run_req(sorted_req(&fx, "", SortField::Name, false, 100))
+        .hits
+        .iter()
+        .map(|h| h.object_id)
+        .collect::<Vec<_>>();
+    assert!(all.len() >= 16, "{}", all.len());
+    let req = sorted_req(&fx, "", SortField::Name, false, 2);
+    let p1 = fx.run_req(req.clone());
+    assert_eq!(
+        p1.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[..2]
+    );
+    // Far more than STALE_SLACK consecutive candidates vanish from the
+    // catalog; the index still carries all of them.
+    let stale = all.len() - 4;
+    tombstone_in_catalog_only(&fx, &all[2..stale]);
+    let mut req2 = req.clone();
+    req2.cursor = p1.next_cursor.clone();
+    let p2 = fx.run_req(req2.clone());
+    assert_eq!(
+        p2.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[stale..stale + 2],
+        "the top-k collector regrows past the stale run and fills the page"
+    );
+    let mut req3 = req.clone();
+    req3.cursor = p2.next_cursor.clone();
+    let p3 = fx.run_req(req3);
+    assert_eq!(
+        p3.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[stale + 2..]
+    );
+    assert!(p3.next_cursor.is_none());
+}
+
+#[test]
+fn cursor_with_only_one_structured_field_is_rejected() {
+    let fx = fixture();
+    for bad in ["o:2;g:1", "o:2;q:0123456789abcdef"] {
+        let mut req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+        req.cursor = Some(bad.into());
+        let err = search(&fx.index, &fx.catalog, &req, &ExecOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                eidos_search::SearchError::Query(QueryError::InvalidCursor)
+            ),
+            "{bad:?}: {err}"
+        );
+    }
+}

@@ -1609,7 +1609,10 @@ fn sort_key_cmp(a: &Stored, b: &Stored, sort: Sort) -> std::cmp::Ordering {
 
 /// Extra candidates fetched beyond the page so that documents the catalog
 /// no longer knows (the projection is slightly behind) can be replaced on
-/// the same page instead of shortening it.
+/// the same page instead of shortening it. The eager paths hold every
+/// candidate and the top-k path re-collects with a growing limit, so only
+/// the page-driven lazy path (bounded by its chunk-fetch budget) can still
+/// return a short page behind a longer run of stale documents.
 pub const STALE_SLACK: usize = 8;
 
 /// Page cursor: `o:<consumed candidates>;g:<index generation>;q:<query
@@ -1659,7 +1662,10 @@ fn decode_cursor(c: &Option<String>) -> std::result::Result<Cursor, QueryError> 
             _ => return Err(QueryError::InvalidCursor),
         }
     }
-    if !seen_offset {
+    if !seen_offset || cursor.generation.is_some() != cursor.fingerprint.is_some() {
+        // Either the legacy `o:<n>` form or the full structured form; a
+        // cursor carrying only one of the two checks is not something the
+        // service ever issued.
         return Err(QueryError::InvalidCursor);
     }
     Ok(cursor)
@@ -1685,6 +1691,42 @@ fn query_fingerprint(req: &SearchRequest) -> u64 {
 
 /// Candidates in page order; each resolves lazily to its stored fields.
 type Candidates<'a> = Box<dyn Iterator<Item = Result<Stored>> + 'a>;
+
+/// Top-k results that re-collect with a doubled limit (bounded by the
+/// match count) when consumed past what was collected. Re-collection is
+/// deterministic for one searcher, so continuing from the previous position
+/// yields the same order.
+type Collector<'a> = Box<dyn Fn(usize) -> Result<Vec<(f32, DocAddress)>> + 'a>;
+
+struct Regrowing<'a> {
+    collect: Collector<'a>,
+    buf: Vec<(f32, DocAddress)>,
+    pos: usize,
+    n: usize,
+    total: usize,
+}
+
+impl Iterator for Regrowing<'_> {
+    type Item = Result<(f32, DocAddress)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.buf.len() {
+            if self.n >= self.total || self.buf.len() < self.n {
+                return None; // everything that matches has been collected
+            }
+            self.n = (self.n * 2).min(self.total);
+            match (self.collect)(self.n) {
+                Ok(b) => self.buf = b,
+                Err(e) => return Some(Err(e)),
+            }
+            if self.pos >= self.buf.len() {
+                return None;
+            }
+        }
+        let item = self.buf[self.pos];
+        self.pos += 1;
+        Some(Ok(item))
+    }
+}
 
 /// Execute a search request without a content index (content clauses are
 /// rejected with an explanation).
@@ -2132,55 +2174,66 @@ pub fn search_with_content(
             (page, total, exact)
         }
     } else {
-        let n = (offset + limit + STALE_SLACK).max(1);
-        let top = TopDocs::with_limit(n);
         let order = if req.sort.descending {
             Order::Desc
         } else {
             Order::Asc
         };
-        let (addrs, count): (Vec<(f32, DocAddress)>, usize) = match req.sort.field {
-            SortField::Relevance => {
-                let (hits, count) = searcher.search(&root, &(top.order_by_score(), Count))?;
-                (hits, count)
-            }
-            SortField::Name | SortField::Path => {
-                let field = if req.sort.field == SortField::Name {
-                    "name_folded"
-                } else {
-                    "path_folded"
-                };
-                let (hits, count) = searcher.search(
-                    &root,
-                    &(top.order_by_string_fast_field(field, order), Count),
-                )?;
-                (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
-            }
-            SortField::Modified | SortField::Created => {
-                let field = if req.sort.field == SortField::Modified {
-                    "newest_modified"
-                } else {
-                    "created"
-                };
-                let (hits, count) = searcher.search(
-                    &root,
-                    &(top.order_by_fast_field::<i64>(field, order), Count),
-                )?;
-                (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
-            }
-            SortField::Size | SortField::SubtreeSize | SortField::AllocatedSize => {
-                let field = if req.sort.field == SortField::AllocatedSize {
-                    "subtree_allocated"
-                } else {
-                    "subtree_logical"
-                };
-                let (hits, count) = searcher.search(
-                    &root,
-                    &(top.order_by_fast_field::<u64>(field, order), Count),
-                )?;
-                (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
-            }
+        // Collect the top `n` in sort order. The candidate stream below asks
+        // for more (doubling, bounded by the match count) when a run of
+        // stale documents exhausts what was collected, so a page is short
+        // only when the matches themselves run out.
+        let searcher_ref = &searcher;
+        let root_ref: &dyn TQuery = root.as_ref();
+        let sort = req.sort;
+        let collect = move |n: usize| -> Result<(Vec<(f32, DocAddress)>, usize)> {
+            let top = TopDocs::with_limit(n.max(1));
+            Ok(match sort.field {
+                SortField::Relevance => {
+                    let (hits, count) =
+                        searcher_ref.search(root_ref, &(top.order_by_score(), Count))?;
+                    (hits, count)
+                }
+                SortField::Name | SortField::Path => {
+                    let field = if sort.field == SortField::Name {
+                        "name_folded"
+                    } else {
+                        "path_folded"
+                    };
+                    let (hits, count) = searcher_ref.search(
+                        root_ref,
+                        &(top.order_by_string_fast_field(field, order), Count),
+                    )?;
+                    (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
+                }
+                SortField::Modified | SortField::Created => {
+                    let field = if sort.field == SortField::Modified {
+                        "newest_modified"
+                    } else {
+                        "created"
+                    };
+                    let (hits, count) = searcher_ref.search(
+                        root_ref,
+                        &(top.order_by_fast_field::<i64>(field, order), Count),
+                    )?;
+                    (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
+                }
+                SortField::Size | SortField::SubtreeSize | SortField::AllocatedSize => {
+                    let field = if sort.field == SortField::AllocatedSize {
+                        "subtree_allocated"
+                    } else {
+                        "subtree_logical"
+                    };
+                    let (hits, count) = searcher_ref.search(
+                        root_ref,
+                        &(top.order_by_fast_field::<u64>(field, order), Count),
+                    )?;
+                    (hits.into_iter().map(|(_, a)| (1.0, a)).collect(), count)
+                }
+            })
         };
+        let n = offset + limit + STALE_SLACK;
+        let (addrs, count) = collect(n)?;
         steps.push(PlanStep {
             stage: "retrieve".into(),
             description: match req.sort.field {
@@ -2191,7 +2244,15 @@ pub fn search_with_content(
             verified: None,
             elapsed_ms: None,
         });
-        let page: Candidates<'_> = Box::new(addrs.into_iter().skip(offset).map(|(score, a)| {
+        let regrowing = Regrowing {
+            collect: Box::new(move |n| collect(n).map(|(hits, _)| hits)),
+            buf: addrs,
+            pos: 0,
+            n,
+            total: count,
+        };
+        let page: Candidates<'_> = Box::new(regrowing.skip(offset).map(|r| {
+            let (score, a) = r?;
             let doc: TantivyDocument = searcher.doc(a)?;
             Ok(read_stored(f, &doc, score))
         }));
