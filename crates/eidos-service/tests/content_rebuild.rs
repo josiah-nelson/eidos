@@ -360,3 +360,35 @@ fn shutdown_during_rebuild_leaves_it_pending_for_the_next_start() {
     assert_eq!(state.content_index.num_docs(), e.chunks);
     stop(state);
 }
+
+#[test]
+fn torn_marker_still_schedules_a_rebuild() {
+    let e = indexed_env();
+    // The index is intact, but a crash left a truncated marker behind.
+    std::fs::write(content_dir(&e.data).join(REBUILD_MARKER), b"{\"chunks\": 3").unwrap();
+
+    let state = open_state(&e.data);
+    assert!(
+        state.content_rebuild,
+        "marker presence alone schedules a rebuild"
+    );
+    let st = state.content_index.rebuild_status();
+    assert_eq!(st.phase, RebuildPhase::Pending);
+    assert_eq!(
+        st.chunks, e.chunks,
+        "chunk count refreshed from the catalog"
+    );
+    assert!(!search(&state, "content:alpha").all_sources_complete(true));
+    state.start_background().unwrap();
+    assert!(wait_until(Duration::from_secs(30), || !state
+        .content_index
+        .is_rebuilding()));
+    assert_eq!(
+        state.content_index.rebuild_status().phase,
+        RebuildPhase::Idle
+    );
+    assert!(!content_dir(&e.data).join(REBUILD_MARKER).exists());
+    assert_eq!(state.content_index.num_docs(), e.chunks);
+    assert!(search(&state, "content:alpha").all_sources_complete(true));
+    stop(state);
+}

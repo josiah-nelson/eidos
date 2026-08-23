@@ -321,18 +321,24 @@ impl ContentIndex {
             .try_into()?;
         // An unfinished rebuild (marker left behind by a crash, a failure,
         // or a shutdown) makes the index partial until it is rebuilt again.
-        let marker: Option<RebuildMarker> = std::fs::read(dir.join(REBUILD_MARKER))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok());
-        let rebuild = match marker {
-            Some(m) => RebuildState {
-                phase: RebuildPhase::Pending,
-                chunks: m.chunks,
-                started: None,
-                finished: None,
-                error: Some("a previous rebuild did not finish".into()),
-            },
-            None => RebuildState {
+        // The marker's *presence* is the signal; an unreadable or torn
+        // marker is still a marker (the chunk count is advisory and the
+        // scheduler refreshes it from the catalog).
+        let marker_path = dir.join(REBUILD_MARKER);
+        let rebuild = match std::fs::metadata(&marker_path) {
+            Ok(_) => {
+                let parsed: Option<RebuildMarker> = std::fs::read(&marker_path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok());
+                RebuildState {
+                    phase: RebuildPhase::Pending,
+                    chunks: parsed.map(|m| m.chunks).unwrap_or(0),
+                    started: None,
+                    finished: None,
+                    error: Some("a previous rebuild did not finish".into()),
+                }
+            }
+            Err(_) => RebuildState {
                 phase: RebuildPhase::Idle,
                 chunks: 0,
                 started: None,
@@ -398,7 +404,9 @@ impl ContentIndex {
         let f = &self.fields;
         self.writer()
             .delete_term(Term::from_field_u64(f.source_id, source.0 as u64));
-        self.commit()?;
+        // The gate is held above: commit without re-acquiring it (a queued
+        // rebuild writer would otherwise block the nested read forever).
+        self.commit_locked()?;
         Ok(())
     }
 
@@ -504,10 +512,13 @@ impl ContentIndex {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         };
-        std::fs::write(
-            self.dir.join(REBUILD_MARKER),
-            serde_json::to_vec(&marker).expect("marker"),
-        )?;
+        // Written to a temporary file and renamed into place so a crash
+        // mid-write cannot leave a marker that is missing altogether; an
+        // incomplete temporary file is ignored and a torn marker still
+        // counts as present (see `open`).
+        let tmp = self.dir.join(format!("{REBUILD_MARKER}.tmp"));
+        std::fs::write(&tmp, serde_json::to_vec(&marker).expect("marker"))?;
+        std::fs::rename(&tmp, self.dir.join(REBUILD_MARKER))?;
         let mut st = self.rebuild.lock();
         st.phase = RebuildPhase::Pending;
         st.chunks = chunks;

@@ -105,7 +105,9 @@ retrieved generation get no snippets rather than wrong ones.
   files — when it is empty at startup while chunks exist (lost or recreated
   index, schema change) or when a previous rebuild did not finish. The
   rebuild is *scheduled* synchronously at open (`begin_rebuild`: durable
-  `rebuild.json` marker in the index directory, phase `pending`), so the
+  `rebuild.json` marker in the index directory, written via rename, whose
+  presence alone — even torn or unreadable — means "rebuild required";
+  phase `pending`), so the
   very first search or readiness check already reports content as partial;
   `start_background` then runs it. The run holds the index writer gate (a
   reader–writer lock that every `add_chunks`/`delete_*`/`commit` takes on
