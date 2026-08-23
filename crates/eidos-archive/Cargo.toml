@@ -8,6 +8,7 @@ description = "Archive member inventories from container metadata (ZIP central d
 
 [dependencies]
 eidos-domain = { workspace = true }
+crc32fast = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
