@@ -2,7 +2,17 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Link, useSearchParams } from 'react-router'
-import { api, type FacetField, type FacetValue, type Hit, type ResultMode, type SortField } from '../api'
+import {
+  api,
+  exportUrl,
+  type ExportFormat,
+  type FacetField,
+  type FacetValue,
+  type Hit,
+  type ResultMode,
+  type SearchResponse,
+  type SortField,
+} from '../api'
 import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
 import { ContentPreviewPanel } from '../ContentPreview'
 import { bytes, count, duration, when } from '../format'
@@ -212,6 +222,7 @@ export default function SearchPage() {
                   {showPlan ? 'Hide plan' : 'Explain'}
                 </button>
               )}
+              <ExportMenu q={q} mode={mode} sort={sort} desc={desc} page={first} />
             </div>
             {showPlan && first.explanation && (
               <div className="card" style={{ marginBottom: 8 }}>
@@ -320,6 +331,63 @@ function facetForms(field: FacetField, v: FacetValue): FacetForms | null {
   if (v.range) return v.range
   const clause = facetClause(field, v.value, v.label)
   return clause ? { clause, exclude: negate(clause) } : null
+}
+
+/**
+ * Export the current query. The links hit `/api/search/export`, which walks
+ * the cursors server-side and streams; the browser never holds the result set.
+ */
+function ExportMenu({
+  q,
+  mode,
+  sort,
+  desc,
+  page,
+}: {
+  q: string
+  mode: ResultMode
+  sort: SortField
+  desc: boolean
+  page: SearchResponse
+}) {
+  const health = useQuery({ queryKey: ['health'], queryFn: api.health, staleTime: 60_000 })
+  const cap = health.data?.export_max_rows
+  const [copied, setCopied] = useState('')
+  const href = (format: ExportFormat, bom = false) => exportUrl({ q, mode, sort, desc }, format, bom)
+  const copyPage = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(page, null, 2))
+      setCopied('Copied')
+    } catch {
+      setCopied('Clipboard unavailable')
+    }
+  }
+  return (
+    <details className="menu">
+      <summary className="btn small">Export</summary>
+      <div className="menu-body">
+        <div className="muted">
+          Streams every matching row{cap ? ` · up to ${count(cap)} rows` : ''}
+          {page.total.value > (cap ?? Infinity) ? ' · this query would be truncated' : ''}
+        </div>
+        <a href={href('csv')} download>
+          CSV
+        </a>
+        <a href={href('csv', true)} download>
+          CSV with BOM (Excel)
+        </a>
+        <a href={href('json')} download>
+          JSON
+        </a>
+        <a href={href('ndjson')} download>
+          NDJSON (one row per line)
+        </a>
+        <button type="button" className="btn small" onClick={copyPage}>
+          {copied || 'Copy this page as JSON'}
+        </button>
+      </div>
+    </details>
+  )
 }
 
 function facetClause(field: FacetField, value: string, label?: string): string | null {

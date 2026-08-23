@@ -8,6 +8,7 @@ use anyhow::Context;
 use clap::Args;
 use eidos_domain::{ResultMode, SearchResponse, SortField};
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Args, Debug)]
 pub struct SearchArgs {
@@ -38,6 +39,18 @@ pub struct SearchArgs {
     /// Comma-separated facets: source,extension,kind,content_state,top_directory,size_bucket,modified_bucket
     #[arg(long)]
     pub facets: Option<String>,
+    /// Stream the whole result set through /api/search/export: csv, json, or ndjson.
+    #[arg(long, value_name = "FORMAT")]
+    pub export: Option<String>,
+    /// Destination for --export; `-` or omitted writes to stdout.
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<PathBuf>,
+    /// Row cap for --export. The service cap still applies.
+    #[arg(long, value_name = "N")]
+    pub export_limit: Option<u64>,
+    /// Prefix a UTF-8 BOM to a CSV export (for Excel).
+    #[arg(long)]
+    pub bom: bool,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +71,9 @@ struct ApiErr {
 
 pub fn run(args: SearchArgs) -> anyhow::Result<i32> {
     let q = args.query.join(" ");
+    if args.export.is_some() {
+        return export(&args, &q);
+    }
     let mode: ResultMode = serde_json::from_value(serde_json::Value::String(args.mode.clone()))
         .with_context(|| format!("invalid mode {}", args.mode))?;
     let sort: SortField = serde_json::from_value(serde_json::Value::String(args.sort.clone()))
@@ -217,4 +233,116 @@ fn print_table(v: &SearchView, q: &str) {
     if let Some(c) = &r.next_cursor {
         println!("next: --cursor {c}");
     }
+}
+
+/// Percent-encode a query-string value (RFC 3986 unreserved set kept as-is).
+fn encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Stream `/api/search/export` straight to a file (or stdout) without holding
+/// the result set in memory.
+fn export(args: &SearchArgs, q: &str) -> anyhow::Result<i32> {
+    let format = args.export.as_deref().unwrap_or("csv");
+    if !matches!(format, "csv" | "json" | "ndjson") {
+        anyhow::bail!("invalid --export format {format} (csv, json, ndjson)");
+    }
+    let mut url = format!(
+        "{}/api/search/export?format={}&q={}&mode={}&sort={}&desc={}",
+        args.url.trim_end_matches('/'),
+        format,
+        encode(q),
+        encode(&args.mode),
+        encode(&args.sort),
+        args.desc
+    );
+    if let Some(n) = args.export_limit {
+        url.push_str(&format!("&limit={n}"));
+    }
+    if args.bom {
+        url.push_str("&bom=1");
+    }
+    let agent: ureq::Agent = ureq::config::Config::builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut resp = agent
+        .get(&url)
+        .call()
+        .with_context(|| format!("connecting to {}", args.url))?;
+    let status = resp.status().as_u16();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let total = header("x-eidos-export-total");
+    let exact = header("x-eidos-export-total-exact");
+    let cap = header("x-eidos-export-max-rows");
+    if status >= 400 {
+        let text = resp.body_mut().read_to_string()?;
+        let err: ApiErr = serde_json::from_str(&text).unwrap_or(ApiErr {
+            error: text.clone(),
+            kind: String::new(),
+        });
+        eprintln!("error ({} {}): {}", status, err.kind, err.error);
+        return Ok(1);
+    }
+    let mut reader = resp.body_mut().as_reader();
+    let out_path = match args.out.as_deref() {
+        Some(p) if p != std::path::Path::new("-") => Some(p),
+        _ => None,
+    };
+    // The service aborts the body when a page fails mid-walk, so a partial
+    // export always surfaces here as a read error rather than as a short file
+    // that looks complete.
+    let copied = match out_path {
+        Some(p) => {
+            let mut f =
+                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?;
+            std::io::copy(&mut reader, &mut f)
+        }
+        None => std::io::copy(&mut reader, &mut std::io::stdout().lock()),
+    };
+    match copied {
+        Ok(n) => {
+            if let Some(p) = out_path {
+                eprintln!("wrote {n} bytes to {}", p.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("export failed mid-stream: {e}");
+            if let Some(p) = out_path {
+                eprintln!("{} is incomplete", p.display());
+            }
+            return Ok(1);
+        }
+    }
+    if let (Some(total), Some(cap)) = (total.as_deref(), cap.as_deref()) {
+        let truncated = total
+            .parse::<u64>()
+            .ok()
+            .zip(cap.parse::<u64>().ok())
+            .is_some_and(|(t, c)| t > c);
+        eprintln!(
+            "matched {total}{} result(s); export cap {cap}{}",
+            if exact.as_deref() == Some("false") {
+                "+"
+            } else {
+                ""
+            },
+            if truncated { " (TRUNCATED)" } else { "" }
+        );
+    }
+    Ok(0)
 }

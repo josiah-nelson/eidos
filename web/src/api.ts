@@ -286,6 +286,7 @@ export interface Health {
   catalog_path: string
   sources: number
   running_scans: number
+  export_max_rows: number
 }
 
 // ----- search --------------------------------------------------------------
@@ -421,6 +422,19 @@ export interface SearchParams {
   cursor?: string
   facets: FacetField[]
   explain: boolean
+}
+
+export type ExportFormat = 'csv' | 'json' | 'ndjson'
+
+/** URL of the streaming export of a query's whole result set. */
+export function exportUrl(
+  p: { q: string; mode: ResultMode; sort: SortField; desc: boolean },
+  format: ExportFormat,
+  bom = false,
+): string {
+  const qs = new URLSearchParams({ format, q: p.q, mode: p.mode, sort: p.sort, desc: String(p.desc) })
+  if (bom) qs.set('bom', '1')
+  return `/api/search/export?${qs.toString()}`
 }
 
 export interface IndexStatus {

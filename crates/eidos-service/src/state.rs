@@ -24,6 +24,11 @@ pub struct AppState {
     pub content_enabled: AtomicBool,
     pub content_worker_count: usize,
     pub exec_opts: eidos_search::exec::ExecOptions,
+    /// Bounds and counters for `/api/search/export`.
+    pub export: crate::export::ExportLimits,
+    pub export_stats: Arc<crate::export::ExportStats>,
+    /// One permit per streaming export (see [`crate::export::ExportLimits`]).
+    pub export_gate: Arc<tokio::sync::Semaphore>,
     pub host_id: HostId,
     pub host_name: String,
     pub lister: Arc<dyn DirectoryLister>,
@@ -89,6 +94,15 @@ impl AppState {
         if rebuild_content {
             content_index.begin_rebuild(stats.chunks)?;
         }
+        // An export holds at most one admission permit at a time. When the
+        // shared gate has several slots, keep the export bound strictly below
+        // it; with a one-slot gate, export pages are non-queueing and yield to
+        // interactive waiters in Admission::run_export.
+        let mut export_limits = config.export;
+        export_limits.concurrency = export_limits
+            .concurrency
+            .min(config.admission.concurrency.saturating_sub(1))
+            .max(1);
         let state = Self {
             admission: Arc::new(crate::admission::Admission::new(config.admission.clone())),
             catalog,
@@ -99,6 +113,9 @@ impl AppState {
             content_enabled: AtomicBool::new(config.content),
             content_worker_count: config.content_workers,
             exec_opts: eidos_search::exec::ExecOptions::default(),
+            export: export_limits,
+            export_stats: Arc::new(crate::export::ExportStats::default()),
+            export_gate: Arc::new(tokio::sync::Semaphore::new(export_limits.concurrency)),
             host_id,
             host_name,
             lister: Arc::from(eidos_scanner::default_lister()),
