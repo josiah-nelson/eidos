@@ -82,6 +82,24 @@ test('a clause added to a disjunction filters every branch', () => {
   assert.equal(applyClause('(a OR b) ext:cs', 'ext:md'), '(a OR b) ext:cs ext:md')
 })
 
+test('replacing a whole branch leaves no dangling operator', () => {
+  // The removed bucket was one side of the disjunction; `OR ext:md` and
+  // `a AND` would both fail to parse.
+  assert.equal(
+    applyFacetClick('size:<4k OR ext:md', medium, 'include', others(medium)),
+    'ext:md size:>=4k size:<64k',
+  )
+  assert.equal(
+    applyFacetClick('ext:md OR size:<4k', medium, 'include', others(medium)),
+    'ext:md size:>=4k size:<64k',
+  )
+  assert.equal(
+    applyFacetClick('a AND size:<4k', medium, 'include', others(medium)),
+    'a size:>=4k size:<64k',
+  )
+  assert.equal(applyFacetClick('size:<4k', medium, 'include', others(medium)), 'size:>=4k size:<64k')
+})
+
 test('term facet clauses negate without grouping', () => {
   assert.equal(negate('ext:cs'), '-ext:cs')
   assert.equal(negate('size:>=4k size:<64k'), '-(size:>=4k size:<64k)')

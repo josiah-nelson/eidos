@@ -54,13 +54,30 @@ function indexOfRun(tokens: string[], run: string[]): number {
   return -1
 }
 
+const isOperator = (token: string | undefined) =>
+  token === 'OR' || token === '|' || token === 'AND' || token === '&&'
+
+/**
+ * Drop operators a removal left dangling. Taking `size:<4k` out of
+ * `size:<4k OR ext:md` leaves a leading `OR`, which does not parse.
+ */
+function dropDanglingOperators(tokens: string[]): string[] {
+  const out: string[] = []
+  for (const t of tokens) {
+    if (isOperator(t) && (out.length === 0 || isOperator(out[out.length - 1]))) continue
+    out.push(t)
+  }
+  while (out.length > 0 && isOperator(out[out.length - 1])) out.pop()
+  return out
+}
+
 /** Remove every occurrence of a contiguous token run. */
 function removeRun(tokens: string[], run: string[]): string[] {
   let out = tokens
   for (;;) {
     const at = indexOfRun(out, run)
     if (at < 0) return out
-    out = [...out.slice(0, at), ...out.slice(at + run.length)]
+    out = dropDanglingOperators([...out.slice(0, at), ...out.slice(at + run.length)])
   }
 }
 
