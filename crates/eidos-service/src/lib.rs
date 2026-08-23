@@ -7,6 +7,7 @@
 
 pub mod admission;
 pub mod api;
+pub mod content_preview;
 pub mod content_workers;
 pub mod follower;
 pub mod scanner;

@@ -36,6 +36,10 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
         .route("/objects/{id}/children", get(children))
         .route("/objects/{id}/extensions", get(extensions))
         .route("/objects/{id}/archive", get(archive))
+        .route(
+            "/objects/{id}/content",
+            get(crate::content_preview::object_content),
+        )
         .route("/sources/{id}/archives", post(requeue_archives))
         .route("/resolve", get(resolve))
         .route("/search", post(search).get(search_get))
@@ -74,6 +78,8 @@ pub struct ApiError {
     message: String,
     /// Emitted as `Retry-After` (seconds) when load is shed.
     retry_after_s: Option<u64>,
+    /// Extra machine-readable fields merged into the error body.
+    details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -83,19 +89,30 @@ impl ApiError {
             kind,
             message: message.into(),
             retry_after_s: None,
+            details: None,
         }
     }
-    fn not_found(msg: impl Into<String>) -> Self {
+    pub(crate) fn not_found(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", msg)
     }
-    fn bad_request(msg: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", msg)
     }
-    fn conflict(msg: impl Into<String>) -> Self {
+    pub(crate) fn conflict(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", msg)
     }
-    fn internal(msg: impl Into<String>) -> Self {
+    pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
+    }
+    /// Replace the stable error code clients switch on.
+    pub(crate) fn with_kind(mut self, kind: &'static str) -> Self {
+        self.kind = kind;
+        self
+    }
+    /// Merge an object of extra fields into the error body.
+    pub(crate) fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 }
 
@@ -132,20 +149,21 @@ impl From<eidos_catalog::CatalogError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({ "error": self.message, "kind": self.kind });
+        let mut body = serde_json::Map::new();
+        body.insert("error".into(), serde_json::Value::String(self.message));
+        body.insert("kind".into(), serde_json::Value::String(self.kind.into()));
+        if let Some(serde_json::Value::Object(extra)) = self.details {
+            body.extend(extra);
+        }
+        let body = Json(serde_json::Value::Object(body));
         match self.retry_after_s {
-            Some(s) => (
-                self.status,
-                [(header::RETRY_AFTER, s.to_string())],
-                Json(body),
-            )
-                .into_response(),
-            None => (self.status, Json(body)).into_response(),
+            Some(s) => (self.status, [(header::RETRY_AFTER, s.to_string())], body).into_response(),
+            None => (self.status, body).into_response(),
         }
     }
 }
 
-type ApiResult<T> = Result<Json<T>, ApiError>;
+pub(crate) type ApiResult<T> = Result<Json<T>, ApiError>;
 
 // ----- health --------------------------------------------------------------
 
