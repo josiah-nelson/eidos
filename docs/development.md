@@ -79,8 +79,9 @@ task when it finishes, not when the client gives up. The catalog and index
 therefore never see a half-applied operation, and `GET /api/index` (and
 `/api/activity`) report the difference: `admission.in_flight` counts work
 still holding a permit and `admission.detached` counts the part of it whose
-client has already gone. Both fall back to zero as the abandoned work drains;
-`rejected_busy` and `timed_out` are cumulative.
+client has already gone — the deadline passed, or the connection went away.
+Both fall back to zero as the abandoned work drains; `rejected_busy` and
+`timed_out` are cumulative.
 
 Defaults assume the loopback default bind: one browser plus a CLI on a
 machine that is also scanning and extracting content. Before binding

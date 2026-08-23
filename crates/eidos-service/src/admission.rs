@@ -27,8 +27,10 @@
 //!
 //! The accounting reflects that: `in_flight` counts blocking tasks that still
 //! hold a permit, so it stays elevated after a timeout, and `detached` counts
-//! how many of those no longer have a client waiting. Both return to zero once
-//! the abandoned work drains, which is what makes "no permit leaks" testable.
+//! how many of those no longer have a client waiting — because the deadline
+//! passed, or because the client disconnected and axum dropped the handler.
+//! Both return to zero once the abandoned work drains, which is what makes
+//! "no permit leaks" testable.
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -157,6 +159,26 @@ impl Drop for Work {
         }
         self.counters.in_flight.fetch_sub(1, Ordering::Relaxed);
         self.counters.completed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Marks admitted work as detached when the awaiting request goes away —
+/// whether it timed out or the client disconnected — unless the work already
+/// finished. Lives on the async side; the permit is unaffected.
+struct Abandoned {
+    counters: Arc<Counters>,
+    state: Arc<AtomicU8>,
+}
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        if self
+            .state
+            .compare_exchange(RUNNING, DETACHED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.counters.detached.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -293,20 +315,20 @@ impl Admission {
             }
             f()
         });
+        // Every way of losing the client — deadline, or this future being
+        // dropped because the connection went away — leaves the blocking task
+        // running. Marking it here catches all of them; on the success paths
+        // the work already reported itself finished, so this is a no-op.
+        let _abandoned = Abandoned {
+            counters: self.counters.clone(),
+            state: state.clone(),
+        };
 
         let deadline = self.timeout_for(op);
         match tokio::time::timeout(deadline, handle).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(join)) => Err(AdmissionError::Failed(join.to_string())),
             Err(_elapsed) => {
-                // Dropping the join handle detaches the blocking task; it is
-                // not cancelled, so the catalog/index work still completes.
-                if state
-                    .compare_exchange(RUNNING, DETACHED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    self.counters.detached.fetch_add(1, Ordering::Relaxed);
-                }
                 self.counters.timed_out.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     op = op.label(),
@@ -352,7 +374,8 @@ pub struct AdmissionView {
     pub in_flight: u64,
     /// Requests waiting for a permit right now.
     pub queued: u64,
-    /// In-flight work whose response already timed out.
+    /// In-flight work with no client left waiting for it (timed out, or the
+    /// connection went away).
     pub detached: u64,
     pub admitted: u64,
     pub completed: u64,

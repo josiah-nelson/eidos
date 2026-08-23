@@ -349,6 +349,44 @@ async fn timeout_answers_504_and_the_permit_follows_the_blocking_work() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_request_keeps_its_permit_until_the_work_finishes() {
+    let e = env(AdmissionConfig {
+        concurrency: 1,
+        queue_depth: 0,
+        queue_wait: Duration::from_millis(10),
+        search_timeout: Duration::from_secs(30),
+        ..Default::default()
+    });
+    let app = router(&e);
+    let gate = Gate::install(&e.state, "search");
+
+    // A client that goes away drops the handler future well before the
+    // deadline; the query behind it is still running.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(200),
+        call(&app, post_json("/api/search", search_body("marker"))),
+    )
+    .await;
+    assert!(dropped.is_err(), "the request should not have completed");
+    gate.wait_entered(1).await;
+
+    let view = admission_view(&app).await;
+    assert_eq!(gauge(&view, "in_flight"), 1);
+    assert_eq!(gauge(&view, "detached"), 1, "disconnect counts as detached");
+    assert_eq!(gauge(&view, "timed_out"), 0, "no deadline was reached");
+
+    gate.release(&e.state);
+    wait_for(
+        || {
+            let v = e.state.admission.view();
+            v.in_flight == 0 && v.detached == 0 && v.admitted == v.completed
+        },
+        "abandoned work releases its permit and clears the gauges",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oversized_request_body_is_rejected() {
     let e = env(AdmissionConfig {
         max_body_bytes: 2048,
