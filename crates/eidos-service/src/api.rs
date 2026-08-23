@@ -3,10 +3,11 @@
 //! Every listing is paginated server-side. Every source-level response
 //! carries completeness. Errors are JSON `{ "error": ..., "kind": ... }`.
 
+use crate::admission::{AdmissionError, Expensive};
 use crate::scanner::{start_scan, ScanProgressView, StartScanError};
 use crate::state::AppState;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -40,6 +41,12 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
         .route("/search", post(search).get(search_get))
         .route("/search/parse", get(search_parse))
         .route("/index", get(index_status))
+        // Every API body is a small JSON document; nothing here streams
+        // uploads. hyper's HTTP/1 defaults bound the request line and the
+        // header block, this bounds the body.
+        .layer(DefaultBodyLimit::max(
+            state.admission.config().max_body_bytes,
+        ))
         .with_state(state);
     let mut app = Router::new().nest("/api", api);
     if let Some(dir) = web_dir {
@@ -65,28 +72,50 @@ pub struct ApiError {
     status: StatusCode,
     kind: &'static str,
     message: String,
+    /// Emitted as `Retry-After` (seconds) when load is shed.
+    retry_after_s: Option<u64>,
 }
 
 impl ApiError {
-    fn not_found(msg: impl Into<String>) -> Self {
+    fn new(status: StatusCode, kind: &'static str, message: impl Into<String>) -> Self {
         Self {
-            status: StatusCode::NOT_FOUND,
-            kind: "not_found",
-            message: msg.into(),
+            status,
+            kind,
+            message: message.into(),
+            retry_after_s: None,
         }
+    }
+    fn not_found(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", msg)
     }
     fn bad_request(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            kind: "bad_request",
-            message: msg.into(),
-        }
+        Self::new(StatusCode::BAD_REQUEST, "bad_request", msg)
     }
     fn conflict(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            kind: "conflict",
-            message: msg.into(),
+        Self::new(StatusCode::CONFLICT, "conflict", msg)
+    }
+    fn internal(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
+    }
+}
+
+impl From<AdmissionError> for ApiError {
+    fn from(e: AdmissionError) -> Self {
+        let message = e.to_string();
+        match e {
+            // Load shedding: the request never ran, so retrying is safe.
+            AdmissionError::Busy { retry_after_s, .. } => ApiError {
+                retry_after_s: Some(retry_after_s),
+                ..ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "busy", message)
+            },
+            // The response gave up; the blocking work runs to completion and
+            // releases its permit then, so a retry may still find the gate
+            // full for a while.
+            AdmissionError::Timeout { .. } => ApiError {
+                retry_after_s: Some(1),
+                ..ApiError::new(StatusCode::GATEWAY_TIMEOUT, "timeout", message)
+            },
+            AdmissionError::Failed(_) => ApiError::internal(message),
         }
     }
 }
@@ -96,11 +125,7 @@ impl From<eidos_catalog::CatalogError> for ApiError {
         match e {
             eidos_catalog::CatalogError::NotFound(m) => ApiError::not_found(m),
             eidos_catalog::CatalogError::InvalidState(m) => ApiError::conflict(m),
-            other => ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                kind: "internal",
-                message: other.to_string(),
-            },
+            other => ApiError::internal(other.to_string()),
         }
     }
 }
@@ -108,7 +133,15 @@ impl From<eidos_catalog::CatalogError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = serde_json::json!({ "error": self.message, "kind": self.kind });
-        (self.status, Json(body)).into_response()
+        match self.retry_after_s {
+            Some(s) => (
+                self.status,
+                [(header::RETRY_AFTER, s.to_string())],
+                Json(body),
+            )
+                .into_response(),
+            None => (self.status, Json(body)).into_response(),
+        }
     }
 }
 
@@ -183,15 +216,19 @@ fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, ApiError> {
 
 async fn list_sources(State(st): State<Arc<AppState>>) -> ApiResult<Vec<SourceView>> {
     let st2 = st.clone();
-    let views = tokio::task::spawn_blocking(move || -> Result<Vec<SourceView>, ApiError> {
-        st2.catalog
-            .list_sources()?
-            .into_iter()
-            .map(|s| source_view(&st2, s))
-            .collect()
-    })
-    .await
-    .map_err(|e| ApiError::bad_request(e.to_string()))??;
+    let views = st
+        .admission
+        .run(
+            Expensive::Counts,
+            move || -> Result<Vec<SourceView>, ApiError> {
+                st2.catalog
+                    .list_sources()?
+                    .into_iter()
+                    .map(|s| source_view(&st2, s))
+                    .collect()
+            },
+        )
+        .await??;
     Ok(Json(views))
 }
 
@@ -278,33 +315,42 @@ async fn get_source(
     Path(id): Path<i64>,
 ) -> ApiResult<SourceDetail> {
     let sid = SourceId(id);
-    let s = st
-        .catalog
-        .get_source(sid)?
-        .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
-    let root_aggregate = match s.root_object_id {
-        Some(r) => st.catalog.directory_aggregate(r)?,
-        None => None,
-    };
-    let view = source_view(&st, s)?;
-    let generations = st.catalog.list_generations(sid, 20)?;
-    let exclusions = st
-        .catalog
-        .exclusion_summary(sid)?
-        .into_iter()
-        .map(|(stage, reason, count, bytes)| ExclusionRow {
-            stage,
-            reason,
-            count,
-            bytes,
-        })
-        .collect();
-    Ok(Json(SourceDetail {
-        view,
-        generations,
-        root_aggregate,
-        exclusions,
-    }))
+    let gate = st.admission.clone();
+    let detail = gate
+        .run(
+            Expensive::Counts,
+            move || -> Result<SourceDetail, ApiError> {
+                let s = st
+                    .catalog
+                    .get_source(sid)?
+                    .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
+                let root_aggregate = match s.root_object_id {
+                    Some(r) => st.catalog.directory_aggregate(r)?,
+                    None => None,
+                };
+                let view = source_view(&st, s)?;
+                let generations = st.catalog.list_generations(sid, 20)?;
+                let exclusions = st
+                    .catalog
+                    .exclusion_summary(sid)?
+                    .into_iter()
+                    .map(|(stage, reason, count, bytes)| ExclusionRow {
+                        stage,
+                        reason,
+                        count,
+                        bytes,
+                    })
+                    .collect();
+                Ok(SourceDetail {
+                    view,
+                    generations,
+                    root_aggregate,
+                    exclusions,
+                })
+            },
+        )
+        .await??;
+    Ok(Json(detail))
 }
 
 async fn scan_source(
@@ -400,27 +446,36 @@ async fn get_object(
     Path(id): Path<i64>,
 ) -> ApiResult<ObjectDetail> {
     let oid = ObjectId(id);
-    let object = st
-        .catalog
-        .get_object(oid)?
-        .ok_or_else(|| ApiError::not_found(format!("object {oid}")))?;
-    let path = st.catalog.render_path(oid)?;
-    let entries = st.catalog.entries_for_object(oid)?;
-    let aggregate = if object.kind.is_directory_like() {
-        st.catalog.directory_aggregate(oid)?
-    } else {
-        None
-    };
-    let policy = st.catalog.policy_decisions(oid)?;
-    let source = st.catalog.source_completeness(object.source_id)?;
-    Ok(Json(ObjectDetail {
-        object,
-        path,
-        entries,
-        aggregate,
-        policy,
-        source,
-    }))
+    let gate = st.admission.clone();
+    let detail = gate
+        .run(
+            Expensive::Browse,
+            move || -> Result<ObjectDetail, ApiError> {
+                let object = st
+                    .catalog
+                    .get_object(oid)?
+                    .ok_or_else(|| ApiError::not_found(format!("object {oid}")))?;
+                let path = st.catalog.render_path(oid)?;
+                let entries = st.catalog.entries_for_object(oid)?;
+                let aggregate = if object.kind.is_directory_like() {
+                    st.catalog.directory_aggregate(oid)?
+                } else {
+                    None
+                };
+                let policy = st.catalog.policy_decisions(oid)?;
+                let source = st.catalog.source_completeness(object.source_id)?;
+                Ok(ObjectDetail {
+                    object,
+                    path,
+                    entries,
+                    aggregate,
+                    policy,
+                    source,
+                })
+            },
+        )
+        .await??;
+    Ok(Json(detail))
 }
 
 #[derive(Deserialize)]
@@ -459,13 +514,6 @@ async fn children(
     Query(q): Query<ChildrenQuery>,
 ) -> ApiResult<ChildrenView> {
     let oid = ObjectId(id);
-    let object = st
-        .catalog
-        .get_object(oid)?
-        .ok_or_else(|| ApiError::not_found(format!("object {oid}")))?;
-    if !object.kind.is_directory_like() {
-        return Err(ApiError::bad_request("object is not a directory"));
-    }
     let page = ChildrenPage {
         sort: q.sort,
         descending: q.desc,
@@ -473,23 +521,36 @@ async fn children(
         limit: q.limit.clamp(1, 2000),
         include_hidden: q.hidden,
     };
-    let st2 = st.clone();
-    let result = tokio::task::spawn_blocking(move || st2.catalog.list_children(oid, &page))
-        .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))??;
-    let path = st.catalog.render_path(oid)?;
-    let parent_id = st
-        .catalog
-        .entries_for_object(oid)?
-        .first()
-        .and_then(|e| e.parent_id);
-    let source = st.catalog.source_completeness(object.source_id)?;
-    Ok(Json(ChildrenView {
-        result,
-        path,
-        parent_id,
-        source,
-    }))
+    let gate = st.admission.clone();
+    let view = gate
+        .run(
+            Expensive::Browse,
+            move || -> Result<ChildrenView, ApiError> {
+                let object = st
+                    .catalog
+                    .get_object(oid)?
+                    .ok_or_else(|| ApiError::not_found(format!("object {oid}")))?;
+                if !object.kind.is_directory_like() {
+                    return Err(ApiError::bad_request("object is not a directory"));
+                }
+                let result = st.catalog.list_children(oid, &page)?;
+                let path = st.catalog.render_path(oid)?;
+                let parent_id = st
+                    .catalog
+                    .entries_for_object(oid)?
+                    .first()
+                    .and_then(|e| e.parent_id);
+                let source = st.catalog.source_completeness(object.source_id)?;
+                Ok(ChildrenView {
+                    result,
+                    path,
+                    parent_id,
+                    source,
+                })
+            },
+        )
+        .await??;
+    Ok(Json(view))
 }
 
 #[derive(Deserialize)]
@@ -524,29 +585,33 @@ async fn archive(
     Query(q): Query<ArchiveQuery>,
 ) -> ApiResult<ArchiveView> {
     let oid = ObjectId(id);
-    let record = st
-        .catalog
-        .archive_record(oid)?
-        .ok_or_else(|| ApiError::not_found(format!("object {oid} has no archive manifest")))?;
     let query = eidos_catalog::archive::MemberQuery {
         parent: q.parent,
         prefix: q.prefix,
         offset: q.offset,
         limit: q.limit.clamp(1, 5000),
     };
-    let (st2, q2) = (st.clone(), query.clone());
-    let (members, total) =
-        tokio::task::spawn_blocking(move || st2.catalog.archive_members(oid, &q2))
-            .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))??;
-    Ok(Json(ArchiveView {
-        object_id: oid,
-        path: st.catalog.render_path(oid)?,
-        record,
-        members,
-        total,
-        query,
-    }))
+    let gate = st.admission.clone();
+    let view = gate
+        .run(
+            Expensive::Archive,
+            move || -> Result<ArchiveView, ApiError> {
+                let record = st.catalog.archive_record(oid)?.ok_or_else(|| {
+                    ApiError::not_found(format!("object {oid} has no archive manifest"))
+                })?;
+                let (members, total) = st.catalog.archive_members(oid, &query)?;
+                Ok(ArchiveView {
+                    object_id: oid,
+                    path: st.catalog.render_path(oid)?,
+                    record,
+                    members,
+                    total,
+                    query,
+                })
+            },
+        )
+        .await??;
+    Ok(Json(view))
 }
 
 #[derive(Serialize)]
@@ -561,13 +626,15 @@ async fn requeue_archives(
     Path(id): Path<i64>,
 ) -> ApiResult<RequeueView> {
     let sid = SourceId(id);
-    st.catalog
-        .get_source(sid)?
-        .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
-    let st2 = st.clone();
-    let queued = tokio::task::spawn_blocking(move || st2.catalog.requeue_archives(Some(sid)))
-        .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))??;
+    let gate = st.admission.clone();
+    let queued = gate
+        .run(Expensive::Maintenance, move || -> Result<u64, ApiError> {
+            st.catalog
+                .get_source(sid)?
+                .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
+            Ok(st.catalog.requeue_archives(Some(sid))?)
+        })
+        .await??;
     Ok(Json(RequeueView { queued }))
 }
 
@@ -585,10 +652,13 @@ async fn extensions(
     Path(id): Path<i64>,
     Query(q): Query<LimitQuery>,
 ) -> ApiResult<Vec<ExtensionCount>> {
-    Ok(Json(
-        st.catalog
-            .extension_counts(ObjectId(id), q.limit.min(1000))?,
-    ))
+    let gate = st.admission.clone();
+    let counts = gate
+        .run(Expensive::Counts, move || {
+            st.catalog.extension_counts(ObjectId(id), q.limit.min(1000))
+        })
+        .await??;
+    Ok(Json(counts))
 }
 
 #[derive(Deserialize)]
@@ -680,18 +750,19 @@ async fn run_search(st: Arc<AppState>, body: SearchBody) -> ApiResult<SearchView
     let query = req.query.clone();
     let rendered = eidos_query::render(&query);
     let st2 = st.clone();
-    let response = tokio::task::spawn_blocking(move || {
-        eidos_search::exec::search_with_content(
-            &st2.index,
-            Some(&st2.content_index),
-            &st2.catalog,
-            &req,
-            &st2.exec_opts,
-        )
-    })
-    .await
-    .map_err(|e| ApiError::bad_request(e.to_string()))?
-    .map_err(search_error)?;
+    let response = st
+        .admission
+        .run(Expensive::Search, move || {
+            eidos_search::exec::search_with_content(
+                &st2.index,
+                Some(&st2.content_index),
+                &st2.catalog,
+                &req,
+                &st2.exec_opts,
+            )
+        })
+        .await?
+        .map_err(search_error)?;
     Ok(Json(SearchView {
         response,
         query,
@@ -702,17 +773,15 @@ async fn run_search(st: Arc<AppState>, body: SearchBody) -> ApiResult<SearchView
 
 fn search_error(e: eidos_search::SearchError) -> ApiError {
     match e {
-        eidos_search::SearchError::Query(q) => ApiError {
-            status: StatusCode::BAD_REQUEST,
-            kind: "query",
-            message: q.to_string(),
-        },
+        eidos_search::SearchError::Query(q) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "query", q.to_string())
+        }
         eidos_search::SearchError::Catalog(c) => c.into(),
-        other => ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            kind: "search",
-            message: other.to_string(),
-        },
+        other => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "search",
+            other.to_string(),
+        ),
     }
 }
 
@@ -866,6 +935,8 @@ pub struct ActivityView {
     pub content_index_documents: u64,
     /// Rebuild-from-stored-chunks state of the content index.
     pub content_rebuild: eidos_search::content::RebuildStatus,
+    /// Admission-control gauges and totals for expensive API operations.
+    pub admission: crate::admission::AdmissionView,
     pub sources: Vec<ActivitySourceView>,
     pub recent_failures: Vec<eidos_catalog::jobs::JobRecord>,
 }
@@ -905,6 +976,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
             follower: st2.follower.view(&st2),
             content_index_documents: st2.content_index.num_docs(),
             content_rebuild: st2.content_index.rebuild_status(),
+            admission: st2.admission.view(),
             sources,
             recent_failures: st2.catalog.recent_failed_jobs(20)?,
         })
@@ -917,6 +989,8 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
 #[derive(Serialize)]
 struct IndexStatus {
     follower: crate::follower::FollowerView,
+    /// Admission-control gauges and totals for expensive API operations.
+    admission: crate::admission::AdmissionView,
     sources: Vec<IndexSourceState>,
 }
 
@@ -950,6 +1024,7 @@ async fn index_status(State(st): State<Arc<AppState>>) -> ApiResult<IndexStatus>
     }
     Ok(Json(IndexStatus {
         follower: st.follower.view(&st),
+        admission: st.admission.view(),
         sources,
     }))
 }

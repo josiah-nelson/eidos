@@ -94,6 +94,39 @@ anything:
     top-level `OR` is parenthesised first, so the clause filters every
     branch: `a OR b` becomes `(a OR b) size:<4k`.
 
+## Pagination cursors
+
+A response whose results continue carries `next_cursor`; pass it back as
+`cursor` with the *same* query, mode, sort, and scope to get the next page.
+Cursors are opaque, but their shape is documented so that behaviour is
+predictable:
+
+```text
+o:<consumed>;g:<index generation>;q:<query fingerprint>
+```
+
+- `o` counts every candidate the previous pages consumed in sort order,
+  including index documents that no longer had a live catalog row (the
+  projection lags the catalog briefly after changes). Such documents are
+  skipped, the page is refilled from the next candidates, and the cursor
+  moves past them, so no result is repeated or skipped because of them and a
+  page of nothing but stale documents still makes progress. Only the
+  page-driven content-verification path can return a short page behind a
+  long run of stale documents (its refill is bounded by the chunk-fetch
+  budget); the cursor still advances.
+- `q` binds the cursor to the request it was issued for. Reusing it with a
+  different query, mode, sort, or scope is rejected with a structured
+  `query` error ("cursor does not belong to this request … restart from the
+  first page").
+- `g` is the index generation the cursor was issued from. Offsets are not
+  stable across index commits: if the index changed between pages the
+  request still succeeds, but the response carries a warning that a result
+  may repeat or be skipped. Restart from the first page when exactness
+  matters.
+- A malformed cursor is rejected with `invalid cursor`; so is a structured
+  cursor carrying only one of `g` and `q`. The legacy `o:<n>` form is still
+  accepted without the query or generation checks.
+
 ## Semantics worth knowing
 
 - Name/path matching is case-insensitive unless a case-sensitive modifier is

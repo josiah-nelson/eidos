@@ -246,6 +246,17 @@ attempt discards whatever it already wrote for that object generation so no
 later commit can publish partial output. The failure reason keeps the whole
 underlying error chain (ADR-0012).
 
+Interactive requests get the same treatment at the HTTP edge: expensive
+operations (search, browse, archive listing, counts) pass through a bounded
+admission gate with a bounded queue, so overload is answered as load shedding
+(`503`, `kind: "busy"`) or a deadline (`504`, `kind: "timeout"`) instead of
+unbounded latency, while health and status endpoints stay outside it. Because
+a blocking catalog or index call cannot be cancelled mid-call, a deadline ends
+the response only: the permit belongs to the blocking task and is released
+when that work completes, which keeps the accounting honest and the catalog
+consistent. See [development.md](development.md) for the limits and their
+defaults.
+
 ## 9. Content records and chunks
 
 Content processing is streaming:

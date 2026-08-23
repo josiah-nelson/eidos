@@ -809,3 +809,290 @@ fn duplicate_and_nested_subtree_rows_are_coalesced() {
         assert!(fx.names("name:=Helpers.cs").contains(&"Helpers.cs".into()));
     }
 }
+
+// --- Cursors: stale projection documents, query binding, index changes ---
+
+fn native_key(fx: &Fx, id: ObjectId) -> eidos_catalog::changes::NativeKey {
+    let o = fx.catalog.get_object(id).unwrap().unwrap();
+    eidos_catalog::changes::NativeKey::from(o.native.expect("native identity"))
+}
+
+/// Tombstone catalog rows without letting the index follow, so the
+/// projection still carries documents the catalog no longer has.
+fn tombstone_in_catalog_only(fx: &Fx, ids: &[ObjectId]) {
+    let events: Vec<eidos_catalog::changes::ChangeEvent> = ids
+        .iter()
+        .map(|id| eidos_catalog::changes::ChangeEvent::Delete {
+            object: native_key(fx, *id),
+        })
+        .collect();
+    fx.catalog.apply_changes(fx.source, &events, None).unwrap();
+}
+
+fn sorted_req(fx: &Fx, q: &str, field: SortField, descending: bool, limit: u32) -> SearchRequest {
+    let mut req = fx.req(q);
+    req.sort = Sort { field, descending };
+    req.limit = limit;
+    req
+}
+
+fn walk_pages(fx: &Fx, mut req: SearchRequest) -> (Vec<ObjectId>, usize) {
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    loop {
+        let r = fx.run_req(req.clone());
+        pages += 1;
+        ids.extend(r.hits.iter().map(|h| h.object_id));
+        match r.next_cursor {
+            Some(c) => req.cursor = Some(c),
+            None => return (ids, pages),
+        }
+        assert!(pages < 100, "cursor never terminated");
+    }
+}
+
+#[test]
+fn cursor_skips_stale_documents_and_refills_the_page() {
+    let fx = fixture();
+    let all = fx
+        .run_req(sorted_req(&fx, "ext:bin", SortField::Name, false, 50))
+        .hits
+        .iter()
+        .map(|h| h.object_id)
+        .collect::<Vec<_>>();
+    assert_eq!(all.len(), 5);
+    let req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    let p1 = fx.run_req(req.clone());
+    assert_eq!(
+        p1.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[..2]
+    );
+    // The two candidates the next page would show vanish from the catalog;
+    // the index still carries them.
+    tombstone_in_catalog_only(&fx, &all[2..4]);
+    let mut req2 = req.clone();
+    req2.cursor = p1.next_cursor.clone();
+    let p2 = fx.run_req(req2);
+    assert_eq!(
+        p2.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        vec![all[4]],
+        "stale candidates are skipped and the page is refilled from later ones"
+    );
+    assert!(p2.next_cursor.is_none(), "every candidate was consumed");
+    assert!(
+        p2.warnings.iter().all(|w| !w.contains("index changed")),
+        "same index generation: no warning"
+    );
+}
+
+#[test]
+fn cursor_makes_progress_through_a_page_of_only_stale_documents() {
+    let fx = fixture();
+    let all = fx
+        .run_req(sorted_req(&fx, "ext:bin", SortField::Name, false, 50))
+        .hits
+        .iter()
+        .map(|h| h.object_id)
+        .collect::<Vec<_>>();
+    tombstone_in_catalog_only(&fx, &all[1..3]);
+    let (ids, pages) = walk_pages(&fx, sorted_req(&fx, "ext:bin", SortField::Name, false, 1));
+    assert_eq!(ids, vec![all[0], all[3], all[4]]);
+    assert_eq!(
+        pages, 3,
+        "the stale pair is consumed by one page, not revisited"
+    );
+}
+
+#[test]
+fn cursor_is_bound_to_its_request() {
+    let fx = fixture();
+    let p1 = fx.run_req(sorted_req(&fx, "ext:bin", SortField::Name, false, 2));
+    let cursor = p1.next_cursor.clone().expect("more pages");
+    assert!(cursor.starts_with("o:2;g:"), "{cursor}");
+
+    // Different query.
+    let mut other = sorted_req(&fx, "ext:cs", SortField::Name, false, 2);
+    other.cursor = Some(cursor.clone());
+    let err = search(&fx.index, &fx.catalog, &other, &ExecOptions::default()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            eidos_search::SearchError::Query(QueryError::CursorMismatch { .. })
+        ),
+        "{err}"
+    );
+    // Different sort of the same query.
+    let mut other = sorted_req(&fx, "ext:bin", SortField::Name, true, 2);
+    other.cursor = Some(cursor.clone());
+    assert!(search(&fx.index, &fx.catalog, &other, &ExecOptions::default()).is_err());
+    // Same request: accepted.
+    let mut same = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    same.cursor = Some(cursor);
+    assert_eq!(fx.run_req(same).hits.len(), 2);
+    // Legacy offset-only cursor: accepted without the checks.
+    let mut legacy = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    legacy.cursor = Some("o:2".into());
+    let r = fx.run_req(legacy);
+    assert_eq!(r.hits.len(), 2);
+    assert!(r.warnings.iter().all(|w| !w.contains("index changed")));
+    // Malformed.
+    for bad in ["x:1", "o:abc", "o:1;g:zz", "o:1;q:nothex", "", "2"] {
+        let mut req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+        req.cursor = Some(bad.into());
+        let err = search(&fx.index, &fx.catalog, &req, &ExecOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                eidos_search::SearchError::Query(QueryError::InvalidCursor)
+            ),
+            "{bad:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn cursor_warns_when_the_index_changed_between_pages() {
+    let fx = fixture();
+    let req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    let p1 = fx.run_req(req.clone());
+    let cursor = p1.next_cursor.clone().expect("more pages");
+
+    // A file appears and the index follows it: new searcher generation.
+    let root = fx
+        .catalog
+        .get_source(fx.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let serial = native_key(&fx, root).volume_serial;
+    let snapshot = eidos_catalog::changes::ObjectSnapshot {
+        native: NativeIdentity::from_u128(serial, u128::MAX - 1, IdentityConfidence::Native),
+        kind: ObjectKind::File,
+        attributes: FileAttributes(0x20),
+        size: 1,
+        allocated: 4096,
+        link_count: 1,
+        created: Some(UnixNanos::now()),
+        modified: Some(UnixNanos::now()),
+        changed: None,
+        accessed: None,
+        reparse_tag: 0,
+    };
+    fx.catalog
+        .apply_changes(
+            fx.source,
+            &[eidos_catalog::changes::ChangeEvent::Link {
+                parent: native_key(&fx, root),
+                name: "aa.bin".into(),
+                snapshot,
+            }],
+            None,
+        )
+        .unwrap();
+    fx.index.follow_once(&fx.catalog, 1000).unwrap();
+    fx.index.reload().unwrap();
+
+    let mut req2 = req.clone();
+    req2.cursor = Some(cursor);
+    let p2 = fx.run_req(req2);
+    assert!(
+        p2.warnings.iter().any(|w| w.contains("index changed")),
+        "{:?}",
+        p2.warnings
+    );
+    assert_eq!(p2.total.value, 6);
+    // A fresh first page carries no such warning and a cursor for the new
+    // generation.
+    let p1b = fx.run_req(req);
+    assert!(p1b.warnings.iter().all(|w| !w.contains("index changed")));
+    let mut req3 = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+    req3.cursor = p1b.next_cursor;
+    assert!(fx
+        .run_req(req3)
+        .warnings
+        .iter()
+        .all(|w| !w.contains("index changed")));
+}
+
+#[test]
+fn paging_through_ties_is_consistent_in_both_directions() {
+    let fx = fixture();
+    for (field, descending) in [
+        (SortField::Name, false),
+        (SortField::Name, true),
+        (SortField::Size, true),
+        (SortField::Size, false),
+        (SortField::Modified, false),
+        (SortField::Path, true),
+    ] {
+        let full = fx
+            .run_req(sorted_req(&fx, "ext:bin", field, descending, 50))
+            .hits
+            .iter()
+            .map(|h| h.object_id)
+            .collect::<Vec<_>>();
+        assert_eq!(full.len(), 5);
+        let (paged, pages) = walk_pages(&fx, sorted_req(&fx, "ext:bin", field, descending, 1));
+        assert_eq!(paged, full, "{field:?} desc={descending}");
+        assert_eq!(pages, 5);
+        let (paged2, _) = walk_pages(&fx, sorted_req(&fx, "ext:bin", field, descending, 2));
+        assert_eq!(paged2, full, "{field:?} desc={descending} limit 2");
+    }
+}
+
+#[test]
+fn cursor_refills_a_page_behind_a_long_run_of_stale_documents() {
+    let fx = fixture();
+    // Every file, top-k path (no verification), sorted by name.
+    let all = fx
+        .run_req(sorted_req(&fx, "", SortField::Name, false, 100))
+        .hits
+        .iter()
+        .map(|h| h.object_id)
+        .collect::<Vec<_>>();
+    assert!(all.len() >= 16, "{}", all.len());
+    let req = sorted_req(&fx, "", SortField::Name, false, 2);
+    let p1 = fx.run_req(req.clone());
+    assert_eq!(
+        p1.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[..2]
+    );
+    // Far more than STALE_SLACK consecutive candidates vanish from the
+    // catalog; the index still carries all of them.
+    let stale = all.len() - 4;
+    tombstone_in_catalog_only(&fx, &all[2..stale]);
+    let mut req2 = req.clone();
+    req2.cursor = p1.next_cursor.clone();
+    let p2 = fx.run_req(req2.clone());
+    assert_eq!(
+        p2.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[stale..stale + 2],
+        "the top-k collector regrows past the stale run and fills the page"
+    );
+    let mut req3 = req.clone();
+    req3.cursor = p2.next_cursor.clone();
+    let p3 = fx.run_req(req3);
+    assert_eq!(
+        p3.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(),
+        all[stale + 2..]
+    );
+    assert!(p3.next_cursor.is_none());
+}
+
+#[test]
+fn cursor_with_only_one_structured_field_is_rejected() {
+    let fx = fixture();
+    for bad in ["o:2;g:1", "o:2;q:0123456789abcdef"] {
+        let mut req = sorted_req(&fx, "ext:bin", SortField::Name, false, 2);
+        req.cursor = Some(bad.into());
+        let err = search(&fx.index, &fx.catalog, &req, &ExecOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                eidos_search::SearchError::Query(QueryError::InvalidCursor)
+            ),
+            "{bad:?}: {err}"
+        );
+    }
+}
