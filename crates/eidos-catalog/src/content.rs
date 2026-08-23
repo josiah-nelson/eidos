@@ -195,6 +195,21 @@ impl Catalog {
         })
     }
 
+    /// Drop every stored chunk of one object generation.
+    ///
+    /// Used to discard what a failed extraction attempt already flushed, so
+    /// no later commit can publish a partial generation. Idempotent: a
+    /// retry (or the same cleanup after a restart) can repeat it.
+    pub fn delete_chunks(&self, object: ObjectId, generation: u32) -> Result<u64> {
+        self.with_writer(|conn| {
+            let n = conn.execute(
+                "DELETE FROM chunks WHERE object_id = ?1 AND generation = ?2",
+                params![object.0, generation as i64],
+            )?;
+            Ok(n as u64)
+        })
+    }
+
     /// Record the outcome of extraction and, when `publish` is true, flip the
     /// object's content state (with aggregate deltas and an outbox row).
     /// Workers call this with `publish = false` ("indexing") before the index
@@ -238,6 +253,17 @@ impl Catalog {
             tx.execute(
                 "DELETE FROM chunks WHERE object_id = ?1 AND generation < ?2",
                 params![rec.object_id.0, rec.generation as i64],
+            )?;
+            // Nor is anything an earlier attempt at *this* generation left
+            // beyond what the record now claims (including all of it when
+            // the record is a failure with no coverage).
+            tx.execute(
+                "DELETE FROM chunks WHERE object_id = ?1 AND generation = ?2 AND ordinal >= ?3",
+                params![
+                    rec.object_id.0,
+                    rec.generation as i64,
+                    rec.chunk_count as i64
+                ],
             )?;
             if publish {
                 flip_state(&tx, rec.object_id, rec.state, rec.content_id)?;
