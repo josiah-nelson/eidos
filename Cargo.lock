@@ -520,6 +520,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 
 [[package]]
+name = "eidos-archive"
+version = "0.5.0-dev"
+dependencies = [
+ "eidos-domain",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "eidos-catalog"
 version = "0.5.0-dev"
 dependencies = [
