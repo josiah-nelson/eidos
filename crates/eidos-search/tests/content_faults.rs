@@ -96,7 +96,10 @@ struct JobRow {
 
 impl Fx {
     fn object(&self) -> ObjectId {
-        let conn = self.catalog.open_writer().unwrap();
+        let conn = self
+            .catalog
+            .open_uncoordinated_writer_for_fault_injection()
+            .unwrap();
         ObjectId(
             conn.query_row(
                 "SELECT object_id FROM objects WHERE kind = 'file' AND deleted_at IS NULL",
@@ -129,7 +132,7 @@ impl Fx {
     /// connection, outside the pipeline).
     fn fail_chunk_inserts_from(&self, ordinal: u32) {
         self.catalog
-            .open_writer()
+            .open_uncoordinated_writer_for_fault_injection()
             .unwrap()
             .execute_batch(&format!(
                 "CREATE TRIGGER chunk_write_fault BEFORE INSERT ON chunks WHEN NEW.ordinal >= {ordinal}
@@ -140,7 +143,7 @@ impl Fx {
 
     fn repair_chunk_writes(&self) {
         self.catalog
-            .open_writer()
+            .open_uncoordinated_writer_for_fault_injection()
             .unwrap()
             .execute_batch("DROP TRIGGER chunk_write_fault;")
             .unwrap();
@@ -149,7 +152,7 @@ impl Fx {
     /// Skip the retry backoff so the next drain claims the job.
     fn due_now(&self) {
         self.catalog
-            .open_writer()
+            .open_uncoordinated_writer_for_fault_injection()
             .unwrap()
             .execute(
                 "UPDATE jobs SET scheduled_at = 0 WHERE state = 'queued'",
@@ -159,7 +162,10 @@ impl Fx {
     }
 
     fn job(&self) -> JobRow {
-        let conn = self.catalog.open_writer().unwrap();
+        let conn = self
+            .catalog
+            .open_uncoordinated_writer_for_fault_injection()
+            .unwrap();
         conn.query_row(
             "SELECT state, attempts, failure_class, last_error FROM jobs WHERE stage = 'content_text'",
             [],
@@ -177,7 +183,10 @@ impl Fx {
 
     /// `(rows, distinct generations)` of stored chunks for the object.
     fn stored_chunks(&self) -> (u32, u32) {
-        let conn = self.catalog.open_writer().unwrap();
+        let conn = self
+            .catalog
+            .open_uncoordinated_writer_for_fault_injection()
+            .unwrap();
         conn.query_row(
             "SELECT COUNT(*), COUNT(DISTINCT generation) FROM chunks WHERE object_id = ?1",
             [self.object().0],
@@ -187,7 +196,10 @@ impl Fx {
     }
 
     fn content_state(&self) -> ContentState {
-        let conn = self.catalog.open_writer().unwrap();
+        let conn = self
+            .catalog
+            .open_uncoordinated_writer_for_fault_injection()
+            .unwrap();
         let s: String = conn
             .query_row(
                 "SELECT content_state FROM objects WHERE object_id = ?1",

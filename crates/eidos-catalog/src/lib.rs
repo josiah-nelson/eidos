@@ -185,7 +185,15 @@ impl Catalog {
 
     /// Open an additional write connection (used by long-running scan
     /// sessions so they do not hold the shared writer lock).
-    pub fn open_writer(&self) -> Result<Connection> {
+    pub(crate) fn open_writer(&self) -> Result<Connection> {
+        open_connection(&self.path)
+    }
+
+    /// Open an uncoordinated connection for cross-crate failure injection.
+    /// Never enable this feature in a production dependency graph.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn open_uncoordinated_writer_for_fault_injection(&self) -> Result<Connection> {
         open_connection(&self.path)
     }
 
