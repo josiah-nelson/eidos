@@ -37,6 +37,12 @@ pub struct ArchiveLimits {
     pub max_name_bytes: usize,
     /// Archive comment kept (bytes).
     pub max_comment_bytes: usize,
+    /// Most path segments accepted for one member.
+    pub max_path_depth: usize,
+    /// Implicit directories retained while building the virtual tree.
+    pub max_implicit_dirs: u64,
+    /// Total UTF-8 bytes retained for implicit-directory paths.
+    pub max_implicit_dir_bytes: u64,
 }
 
 impl Default for ArchiveLimits {
@@ -46,6 +52,9 @@ impl Default for ArchiveLimits {
             max_directory_bytes: 256 * 1024 * 1024,
             max_name_bytes: 4096,
             max_comment_bytes: 1024,
+            max_path_depth: 256,
+            max_implicit_dirs: 1_000_000,
+            max_implicit_dir_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -342,10 +351,18 @@ const CP437_HIGH: [char; 128] = [
     '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{a0}',
 ];
 
-fn decode_name(bytes: &[u8], utf8_flag: bool, unicode_extra: Option<&[u8]>) -> (String, bool) {
-    if let Some(u) = unicode_extra {
-        if let Ok(s) = std::str::from_utf8(u) {
-            return (s.to_string(), false);
+fn decode_name(
+    bytes: &[u8],
+    utf8_flag: bool,
+    unicode_extra: Option<&(u32, Vec<u8>)>,
+) -> (String, bool) {
+    if let Some((stored_crc, unicode_bytes)) = unicode_extra {
+        // APPNOTE 4.6.9: the Unicode Path payload only belongs to this
+        // entry when its CRC matches the name bytes in the central header.
+        if *stored_crc == crc32fast::hash(bytes) {
+            if let Ok(s) = std::str::from_utf8(unicode_bytes) {
+                return (s.to_string(), false);
+            }
         }
     }
     match std::str::from_utf8(bytes) {
@@ -405,7 +422,7 @@ pub fn normalize_name(raw: &str) -> (String, u32) {
 
 struct Extra {
     zip64_sizes: Option<(Option<u64>, Option<u64>)>,
-    unicode_name: Option<Vec<u8>>,
+    unicode_name: Option<(u32, Vec<u8>)>,
     mtime: Option<UnixNanos>,
 }
 
@@ -442,7 +459,7 @@ fn parse_extra(extra: &[u8], size_ff: bool, comp_ff: bool) -> Extra {
             0x7075 => {
                 // Info-ZIP Unicode Path: version, CRC of the stored name, UTF-8 name.
                 if data.len() > 5 && data[0] == 1 {
-                    out.unicode_name = Some(data[5..].to_vec());
+                    out.unicode_name = Some((u32_at(data, 1), data[5..].to_vec()));
                 }
             }
             0x5455 => {
@@ -510,7 +527,8 @@ pub fn inventory_reader<R: Read + Seek>(
     let mut consumed = 0u64;
     let mut header = [0u8; CENTRAL_LEN];
     let mut seen: HashSet<String> = HashSet::new();
-    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    let mut implicit_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut implicit_dir_bytes = 0u64;
     let mut explicit_dirs: HashSet<String> = HashSet::new();
 
     while inv.member_count < end.entries {
@@ -583,19 +601,31 @@ pub fn inventory_reader<R: Read + Seek>(
         let size_ff = size32 == 0xFFFF_FFFF;
         let comp_ff = comp32 == 0xFFFF_FFFF;
         let extra = parse_extra(extra_bytes, size_ff, comp_ff);
-        let (mut size, mut compressed) = (size32 as u64, comp32 as u64);
-        if let Some((s, c)) = extra.zip64_sizes {
-            if let Some(s) = s {
-                size = s;
-            }
-            if let Some(c) = c {
-                compressed = c;
-            }
-        }
+        let zip64_sizes = extra.zip64_sizes.unwrap_or((None, None));
+        let size = if size_ff {
+            zip64_sizes.0.ok_or_else(|| {
+                ArchiveError::Corrupt(format!(
+                    "entry {} is missing its ZIP64 uncompressed size",
+                    inv.member_count
+                ))
+            })?
+        } else {
+            size32 as u64
+        };
+        let compressed = if comp_ff {
+            zip64_sizes.1.ok_or_else(|| {
+                ArchiveError::Corrupt(format!(
+                    "entry {} is missing its ZIP64 compressed size",
+                    inv.member_count
+                ))
+            })?
+        } else {
+            comp32 as u64
+        };
         let (raw_name, bad_encoding) = decode_name(
             name_bytes,
             gp_flags & 0x0800 != 0,
-            extra.unicode_name.as_deref(),
+            extra.unicode_name.as_ref(),
         );
         let (path, mut flags) = normalize_name(&raw_name);
         if bad_encoding {
@@ -609,25 +639,72 @@ pub fn inventory_reader<R: Read + Seek>(
         } else {
             path
         };
-        if !seen.insert(path.clone()) {
-            flags |= flag::DUPLICATE;
-        }
         let (parent, name) = match path.rsplit_once('/') {
             Some((p, n)) => (p.to_string(), n.to_string()),
             None => (String::new(), path.clone()),
         };
-        // Every ancestor is a directory of the virtual tree.
+        let path_depth = path.bytes().filter(|&b| b == b'/').count() + 1;
+        if path_depth > limits.max_path_depth {
+            inv.truncated = true;
+            inv.truncated_reason = Some(format!(
+                "path-depth limit ({}) reached at entry {}",
+                limits.max_path_depth, inv.member_count
+            ));
+            break;
+        }
+
+        // Every ancestor is a directory of the virtual tree. Work out the
+        // whole delta first so a truncated inventory contains no member with
+        // missing ancestors.
+        let releases_implicit = is_dir && implicit_dirs.contains(&path);
+        let mut projected_dir_count = implicit_dirs.len() as u64 - u64::from(releases_implicit);
+        let mut projected_dir_bytes = implicit_dir_bytes
+            - if releases_implicit {
+                path.len() as u64
+            } else {
+                0
+            };
+        let mut new_implicit_dirs = Vec::new();
         let mut anc = parent.as_str();
         while !anc.is_empty() {
-            dirs.insert(anc.to_string());
+            if !explicit_dirs.contains(anc) && !implicit_dirs.contains(anc) {
+                projected_dir_count += 1;
+                projected_dir_bytes = projected_dir_bytes.saturating_add(anc.len() as u64);
+                new_implicit_dirs.push(anc.to_string());
+            }
             anc = anc.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
         }
+        if projected_dir_count > limits.max_implicit_dirs {
+            inv.truncated = true;
+            inv.truncated_reason = Some(format!(
+                "implicit-directory limit ({}) reached at entry {}",
+                limits.max_implicit_dirs, inv.member_count
+            ));
+            break;
+        }
+        if projected_dir_bytes > limits.max_implicit_dir_bytes {
+            inv.truncated = true;
+            inv.truncated_reason = Some(format!(
+                "implicit-directory path-byte limit ({}) reached at entry {}",
+                limits.max_implicit_dir_bytes, inv.member_count
+            ));
+            break;
+        }
+        if releases_implicit {
+            implicit_dirs.remove(&path);
+        }
+        for dir in new_implicit_dirs {
+            implicit_dirs.insert(dir);
+        }
+        implicit_dir_bytes = projected_dir_bytes;
         if is_dir {
             explicit_dirs.insert(path.clone());
-            dirs.insert(path.clone());
         } else {
             inv.declared_size = inv.declared_size.saturating_add(size);
             inv.compressed_size = inv.compressed_size.saturating_add(compressed);
+        }
+        if !seen.insert(path.clone()) {
+            flags |= flag::DUPLICATE;
         }
         if flags != 0 {
             inv.suspicious_count += 1;
@@ -654,11 +731,7 @@ pub fn inventory_reader<R: Read + Seek>(
     inv.bytes_read += consumed;
 
     // Implicit directories: ancestors no member listed.
-    let mut next = inv.member_count as u32;
-    for d in dirs {
-        if explicit_dirs.contains(&d) {
-            continue;
-        }
+    for (next, d) in (inv.member_count as u32..).zip(implicit_dirs) {
         let (parent, name) = match d.rsplit_once('/') {
             Some((p, n)) => (p.to_string(), n.to_string()),
             None => (String::new(), d.clone()),
@@ -679,7 +752,6 @@ pub fn inventory_reader<R: Read + Seek>(
             encrypted: false,
             flags: 0,
         });
-        next += 1;
         inv.implicit_dir_count += 1;
     }
     inv.dir_count = explicit_dirs.len() as u64 + inv.implicit_dir_count;
@@ -786,7 +858,8 @@ mod tests {
         let mut unicode_extra = Entry::file("", b"x");
         unicode_extra.name = b"legacy.txt".to_vec();
         let mut extra = vec![0x75, 0x70];
-        let payload = [&[1u8][..], &[0, 0, 0, 0], "ünïcode.txt".as_bytes()].concat();
+        let name_crc = crc32fast::hash(&unicode_extra.name).to_le_bytes();
+        let payload = [&[1u8][..], &name_crc, "ünïcode.txt".as_bytes()].concat();
         extra.extend_from_slice(&(payload.len() as u16).to_le_bytes());
         extra.extend_from_slice(&payload);
         unicode_extra.extra = extra;
@@ -798,6 +871,21 @@ mod tests {
         assert_eq!(i.members[1].flags, 0);
         assert_eq!(i.members[2].path, "ünïcode.txt");
         assert_eq!(i.members[2].raw_name, "ünïcode.txt");
+    }
+
+    #[test]
+    fn unicode_path_requires_matching_stored_name_crc() {
+        let mut entry = Entry::file("legacy.txt", b"x");
+        let mut extra = vec![0x75, 0x70];
+        let payload = [&[1u8][..], &[0, 0, 0, 0], "wrong.txt".as_bytes()].concat();
+        extra.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        extra.extend_from_slice(&payload);
+        entry.extra = extra;
+
+        let z = build(&[entry], b"", false);
+        let i = inv(&z).unwrap();
+        assert_eq!(i.members[0].path, "legacy.txt");
+        assert_eq!(i.members[0].raw_name, "legacy.txt");
     }
 
     #[test]
@@ -815,6 +903,30 @@ mod tests {
         assert_eq!(i.members[0].size, 5u64 << 32);
         assert_eq!(i.members[0].compressed, 3u64 << 32);
         assert_eq!(i.declared_size, (5u64 << 32) + 3);
+    }
+
+    #[test]
+    fn missing_zip64_member_sizes_are_corrupt() {
+        let mut missing = Entry::file("missing.bin", b"");
+        missing.size_override = Some((0xFFFF_FFFF, 0xFFFF_FFFF));
+        let z = build(&[missing], b"", false);
+        match inv(&z) {
+            Err(ArchiveError::Corrupt(m)) => {
+                assert!(m.contains("missing its ZIP64 uncompressed size"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let mut incomplete = Entry::file("incomplete.bin", b"");
+        incomplete.size_override = Some((0xFFFF_FFFF, 0xFFFF_FFFF));
+        incomplete.extra = [&[0x01, 0x00, 8, 0][..], &123u64.to_le_bytes()].concat();
+        let z = build(&[incomplete], b"", false);
+        match inv(&z) {
+            Err(ArchiveError::Corrupt(m)) => {
+                assert!(m.contains("missing its ZIP64 compressed size"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -872,6 +984,58 @@ mod tests {
         let i = inventory_reader(Cursor::new(z.clone()), z.len() as u64, &limits).unwrap();
         assert!(i.truncated);
         assert_eq!(i.member_count, 2);
+    }
+
+    #[test]
+    fn implicit_directory_expansion_is_bounded() {
+        let z = build(&[Entry::file("a/b/c/file.txt", b"x")], b"", false);
+
+        let limits = ArchiveLimits {
+            max_path_depth: 3,
+            ..ArchiveLimits::default()
+        };
+        let i = inventory_reader(Cursor::new(z.clone()), z.len() as u64, &limits).unwrap();
+        assert!(i.truncated);
+        assert_eq!(i.member_count, 0);
+        assert!(i.members.is_empty());
+        assert!(i.truncated_reason.unwrap().contains("path-depth limit"));
+
+        let limits = ArchiveLimits {
+            max_implicit_dirs: 2,
+            ..ArchiveLimits::default()
+        };
+        let i = inventory_reader(Cursor::new(z.clone()), z.len() as u64, &limits).unwrap();
+        assert!(i.truncated);
+        assert_eq!(i.member_count, 0);
+        assert!(i.members.is_empty());
+        assert!(i
+            .truncated_reason
+            .unwrap()
+            .contains("implicit-directory limit"));
+
+        let limits = ArchiveLimits {
+            max_implicit_dir_bytes: 5,
+            ..ArchiveLimits::default()
+        };
+        let i = inventory_reader(Cursor::new(z.clone()), z.len() as u64, &limits).unwrap();
+        assert!(i.truncated);
+        assert_eq!(i.member_count, 0);
+        assert!(i.members.is_empty());
+        assert!(i.truncated_reason.unwrap().contains("path-byte limit"));
+    }
+
+    #[test]
+    fn later_explicit_directory_replaces_its_implicit_candidate() {
+        let z = build(
+            &[Entry::file("a/file.txt", b"x"), Entry::dir("a/")],
+            b"",
+            false,
+        );
+        let i = inv(&z).unwrap();
+        assert_eq!(i.member_count, 2);
+        assert_eq!(i.dir_count, 1);
+        assert_eq!(i.implicit_dir_count, 0);
+        assert_eq!(i.members.len(), 2);
     }
 
     #[test]
