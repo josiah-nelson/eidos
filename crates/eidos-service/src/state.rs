@@ -4,13 +4,35 @@ use crate::scanner::ScanProgress;
 use crate::watcher::WatcherStatus;
 use crate::ServiceConfig;
 use eidos_catalog::Catalog;
-use eidos_domain::{HostId, SourceId};
+use eidos_domain::{HostId, SourceId, UnixNanos};
 use eidos_scanner::DirectoryLister;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
+use ts_rs::TS;
+
+/// Why an automatic reconciliation is waiting and the earliest time the
+/// scheduler will reconsider it. Manual scans intentionally ignore content
+/// deferrals, but never overlap another scan generation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, TS)]
+pub struct ReconciliationDeferral {
+    pub reason: String,
+    pub next_eligible_at: UnixNanos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconciliationDeferralCause {
+    Scan,
+    Content,
+}
+
+#[derive(Debug, Clone)]
+struct StoredReconciliationDeferral {
+    view: ReconciliationDeferral,
+    cause: ReconciliationDeferralCause,
+}
 
 pub struct AppState {
     /// Bounded gate in front of expensive HTTP operations.
@@ -33,6 +55,7 @@ pub struct AppState {
     pub host_name: String,
     pub lister: Arc<dyn DirectoryLister>,
     pub scans: Mutex<HashMap<SourceId, Arc<ScanProgress>>>,
+    reconciliation_deferrals: Mutex<HashMap<SourceId, StoredReconciliationDeferral>>,
     pub watchers: Mutex<HashMap<SourceId, Arc<WatcherStatus>>>,
     pub started_at: Instant,
     pub scan_threads: usize,
@@ -120,6 +143,7 @@ impl AppState {
             host_name,
             lister: Arc::from(eidos_scanner::default_lister()),
             scans: Mutex::new(HashMap::new()),
+            reconciliation_deferrals: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             scan_threads: config.scan_threads,
@@ -138,6 +162,38 @@ impl AppState {
             scans.remove(&id);
         }
         Some(p)
+    }
+
+    pub fn reconciliation_deferral(&self, id: SourceId) -> Option<ReconciliationDeferral> {
+        self.reconciliation_deferrals
+            .lock()
+            .get(&id)
+            .map(|stored| stored.view.clone())
+    }
+
+    pub(crate) fn scheduled_reconciliation_deferral(
+        &self,
+        id: SourceId,
+    ) -> Option<(ReconciliationDeferral, ReconciliationDeferralCause)> {
+        self.reconciliation_deferrals
+            .lock()
+            .get(&id)
+            .map(|stored| (stored.view.clone(), stored.cause))
+    }
+
+    pub(crate) fn defer_reconciliation(
+        &self,
+        id: SourceId,
+        view: ReconciliationDeferral,
+        cause: ReconciliationDeferralCause,
+    ) {
+        self.reconciliation_deferrals
+            .lock()
+            .insert(id, StoredReconciliationDeferral { view, cause });
+    }
+
+    pub(crate) fn clear_reconciliation_deferral(&self, id: SourceId) {
+        self.reconciliation_deferrals.lock().remove(&id);
     }
 
     /// Per-source content concurrency budgets and live reservations.

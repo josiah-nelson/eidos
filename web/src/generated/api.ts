@@ -4,7 +4,7 @@
 /** Exact decimal JSON string used for every Rust i64/u64. */
 export type ApiInt = string;
 
-export type ActivitySourceView = { source_id: SourceId, name: string, state: SourceState, content_enabled: boolean, content_concurrency: number, content_reserved: number, content_peak_reserved: number, jobs_queued: ApiInt, jobs_running: ApiInt, jobs_failed: ApiInt, jobs_failed_bytes: ApiInt, content_states: { [key in string]: ApiInt }, content_bytes_indexed: ApiInt, };
+export type ActivitySourceView = { source_id: SourceId, name: string, state: SourceState, content_enabled: boolean, content_concurrency: number, content_reserved: number, content_peak_reserved: number, jobs_queued: ApiInt, jobs_running: ApiInt, jobs_failed: ApiInt, jobs_failed_bytes: ApiInt, content_states: { [key in string]: ApiInt }, content_bytes_indexed: ApiInt, reconciliation_deferred?: ReconciliationDeferral, };
 
 export type ActivityView = { content_enabled: boolean, jobs: JobCounts, content: ContentStats, archives: ArchiveStats, workers: ContentWorkersView, follower: FollowerView, content_index_documents: ApiInt, content_rebuild: RebuildStatus, admission: AdmissionView, sources: Array<ActivitySourceView>, recent_failures: Array<JobRecord>, };
 
@@ -168,6 +168,8 @@ export type RebuildPhase = "idle" | "pending" | "running" | "failed";
 
 export type RebuildStatus = { phase: RebuildPhase, chunks: ApiInt, docs: ApiInt, elapsed_ms: ApiInt, error?: string, };
 
+export type ReconciliationDeferral = { reason: string, next_eligible_at: UnixNanos, };
+
 export type RequeueView = { queued: ApiInt, };
 
 export type ResolveQuery = { source: ApiInt, path: string, };
@@ -208,7 +210,7 @@ export type SourceConcurrencyView = { source_id: SourceId, budget: number, reser
 
 export type SourceCounts = { objects: ApiInt, entries: ApiInt, directories: ApiInt, files: ApiInt, logical_bytes: ApiInt, allocated_bytes: ApiInt, content_pending: ApiInt, content_indexed: ApiInt, content_failed: ApiInt, content_excluded: ApiInt, content_unsupported: ApiInt, open_errors: ApiInt, };
 
-export type SourceDetail = { generations: Array<ScanGeneration>, root_aggregate: DirectoryAggregate | null, exclusions: Array<ExclusionRow>, source: SourceRecord, counts: SourceCounts, completeness: SourceCompleteness, scan?: ScanProgress, watcher?: WatcherView, };
+export type SourceDetail = { generations: Array<ScanGeneration>, root_aggregate: DirectoryAggregate | null, exclusions: Array<ExclusionRow>, source: SourceRecord, counts: SourceCounts, completeness: SourceCompleteness, scan?: ScanProgress, watcher?: WatcherView, reconciliation_deferred?: ReconciliationDeferral, };
 
 export type SourceId = ApiInt;
 
@@ -218,7 +220,7 @@ export type SourceRecord = { id: SourceId, host_id: HostId, name: string, kind: 
 
 export type SourceState = "new" | "enumerating" | "metadata_complete" | "content_pending" | "complete" | "degraded" | "offline" | "stale" | "reconciling" | "retired";
 
-export type SourceView = { source: SourceRecord, counts: SourceCounts, completeness: SourceCompleteness, scan?: ScanProgress, watcher?: WatcherView, };
+export type SourceView = { source: SourceRecord, counts: SourceCounts, completeness: SourceCompleteness, scan?: ScanProgress, watcher?: WatcherView, reconciliation_deferred?: ReconciliationDeferral, };
 
 export type TextField = "name" | "path" | "content";
 

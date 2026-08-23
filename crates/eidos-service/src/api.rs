@@ -239,6 +239,8 @@ pub struct SourceView {
     pub scan: Option<ScanProgressView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watcher: Option<crate::watcher::WatcherView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciliation_deferred: Option<crate::state::ReconciliationDeferral>,
 }
 
 fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, ApiError> {
@@ -247,6 +249,7 @@ fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, ApiError> {
     let mut completeness = eidos_catalog::read::completeness_from(&s, &counts, listing_errors);
     let scan = st.scan_progress(s.id).map(|p| p.view());
     let watcher = st.watcher_status(s.id).map(|w| w.view());
+    let reconciliation_deferred = st.reconciliation_deferral(s.id);
     // A stored checkpoint only means "live" while a watcher is actually
     // consuming it.
     if completeness.freshness == eidos_domain::Freshness::Live
@@ -260,6 +263,7 @@ fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, ApiError> {
         completeness,
         scan,
         watcher,
+        reconciliation_deferred,
     })
 }
 
@@ -969,6 +973,7 @@ async fn set_content_policy(
 }
 
 #[derive(Serialize, TS)]
+#[ts(optional_fields)]
 pub struct ActivitySourceView {
     pub source_id: SourceId,
     pub name: String,
@@ -986,6 +991,8 @@ pub struct ActivitySourceView {
     pub jobs_failed_bytes: u64,
     pub content_states: std::collections::BTreeMap<String, u64>,
     pub content_bytes_indexed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciliation_deferred: Option<crate::state::ReconciliationDeferral>,
 }
 
 #[derive(Serialize, TS)]
@@ -1033,6 +1040,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
                 jobs_failed_bytes: failed.1,
                 content_states: st2.catalog.content_state_counts(s.id)?,
                 content_bytes_indexed: stats.indexed_bytes,
+                reconciliation_deferred: st2.reconciliation_deferral(s.id),
             });
         }
         Ok(ActivityView {

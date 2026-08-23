@@ -155,6 +155,17 @@ the first crawl of a slow or remote root:
 The same controls are on the Activity and source pages of the web UI and at
 `POST /api/sources/{id}/content` / `GET /api/activity`.
 
+Automatic reconciliation of a feedless or SMB source yields while that
+source has queued or running content work, so a long rescan does not compete
+with the crawl already in progress. An explicit `eidos source scan` remains
+the operator override. A durable open scan generation also counts as running,
+even if the current process has no in-memory progress handle for it. The
+source and Activity views show `reconciliation_deferred.reason` and its
+`next_eligible_at` scheduler check; the same fields are returned by
+`GET /api/sources` and `GET /api/activity`. Native change-feed recovery keeps
+priority over content work because restoring its checkpoint closes a live
+catalog-consistency gap; it still never overlaps another scan generation.
+
 Transient failures (share offline, sharing violation) retry on their own with
 exponential backoff. Deterministic, corrupt, unsupported, and resource-limit
 failures are terminal on purpose: they come back only through an explicit

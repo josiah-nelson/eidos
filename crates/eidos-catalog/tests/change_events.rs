@@ -359,6 +359,57 @@ fn link_new_file_updates_chain_and_outbox() {
 }
 
 #[test]
+fn stale_feed_batch_cannot_restore_a_replaced_checkpoint() {
+    let fx = Fx::new();
+    let current = usn_checkpoint(5);
+    fx.catalog.set_checkpoint(fx.source, &current).unwrap();
+    let mut changed = fx.snapshot_of("a/one.txt");
+    changed.size = 999;
+    changed.allocated = 4096;
+
+    let stale = usn_checkpoint(4);
+    let next = usn_checkpoint(6);
+    assert!(!fx
+        .catalog
+        .advance_feed_checkpoint(fx.source, &stale, &next)
+        .unwrap());
+    assert_eq!(
+        fx.catalog.checkpoint(fx.source).unwrap().unwrap().0,
+        current
+    );
+    let outcome = fx
+        .catalog
+        .apply_feed_changes(
+            fx.source,
+            &[ChangeEvent::Update {
+                snapshot: changed.clone(),
+            }],
+            &stale,
+            &next,
+        )
+        .unwrap();
+    assert!(outcome.is_none());
+    assert_eq!(fx.snapshot_of("a/one.txt").size, 100);
+    assert_eq!(
+        fx.catalog.checkpoint(fx.source).unwrap().unwrap().0,
+        current
+    );
+
+    let outcome = fx
+        .catalog
+        .apply_feed_changes(
+            fx.source,
+            &[ChangeEvent::Update { snapshot: changed }],
+            &current,
+            &next,
+        )
+        .unwrap();
+    assert!(outcome.is_some());
+    assert_eq!(fx.snapshot_of("a/one.txt").size, 999);
+    assert_eq!(fx.catalog.checkpoint(fx.source).unwrap().unwrap().0, next);
+}
+
+#[test]
 fn update_changes_generation_and_bytes() {
     let fx = Fx::new();
     let before = fx
