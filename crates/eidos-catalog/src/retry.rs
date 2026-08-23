@@ -69,6 +69,11 @@ pub struct RetrySelector {
     /// Stop after requeueing this many. A confirmation can pass the count
     /// its preview reported and be sure the action stays within it.
     pub limit: Option<u32>,
+    /// Ignore failures recorded after this instant. A confirmation passes
+    /// the `as_of` of the preview it is confirming, so work that failed
+    /// between the two steps is left for the next round instead of being
+    /// requeued on the strength of a number that did not include it.
+    pub as_of: Option<UnixNanos>,
     /// Count what would happen without changing anything.
     pub preview: bool,
 }
@@ -101,6 +106,9 @@ impl RetrySelector {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryReport {
     pub preview: bool,
+    /// When this evaluation ran; pass it back as `as_of` to confirm exactly
+    /// the failures it counted.
+    pub as_of: UnixNanos,
     /// Jobs moved back to `queued`, plus failed objects put back to
     /// `pending` with a content job (or what would be, in a preview).
     pub accepted: u64,
@@ -184,8 +192,9 @@ const CANDIDATE_SQL: &str = "SELECT j.job_id, j.state, j.object_id, j.object_gen
        AND (?5 IS NULL OR j.failure_class = ?5)
        AND (?6 IS NULL OR j.last_error LIKE ?6 ESCAPE '\\')
        AND (?7 = 1 OR j.state = 'failed')
+       AND (?8 IS NULL OR j.finished_at IS NULL OR j.finished_at <= ?8)
      ORDER BY j.job_id
-     LIMIT ?8";
+     LIMIT ?9";
 
 impl Catalog {
     /// Requeue the failed work a selector names: failed jobs, and (for the
@@ -201,6 +210,7 @@ impl Catalog {
         let prefix = sel.reason_prefix.as_deref().map(like_prefix);
         let mut report = RetryReport {
             preview: sel.preview,
+            as_of: UnixNanos::now(),
             ..Default::default()
         };
         if sel.preview {
@@ -264,7 +274,7 @@ fn evaluate(
     limit: u64,
     report: &mut RetryReport,
 ) -> Result<()> {
-    let now = UnixNanos::now().0;
+    let now = report.as_of.0;
     let candidates: Vec<Candidate> = conn
         .prepare(CANDIDATE_SQL)?
         .query_map(
@@ -276,6 +286,7 @@ fn evaluate(
                 sel.class.map(|c| c.as_str()),
                 prefix,
                 sel.is_explicit() as i64,
+                sel.as_of.map(|t| t.0),
                 MAX_RETRY_BATCH as i64
             ],
             |r| {
@@ -342,7 +353,7 @@ const FAILED_CONTENT_SQL: &str = "SELECT o.object_id, o.source_id, o.generation,
        AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.object_id = o.object_id AND j.stage = 'content_text'
                        AND j.state IN ('queued','running'))
      ORDER BY o.object_id
-     LIMIT ?5";
+     LIMIT ?6";
 
 fn retry_failed_content(
     conn: &rusqlite::Connection,
@@ -368,6 +379,7 @@ fn retry_failed_content(
                 sel.source_id.map(|s| s.0),
                 sel.class.map(|c| c.as_str()),
                 prefix,
+                sel.as_of.map(|t| t.0),
                 MAX_RETRY_BATCH as i64
             ],
             |r| {

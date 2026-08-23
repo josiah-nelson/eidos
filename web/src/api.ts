@@ -501,7 +501,7 @@ export const api = {
     request<RetryReport>(`/api/jobs/${id}/retry`, { method: 'POST', body: JSON.stringify({ preview: false }) }),
   retrySourceContent: (
     id: number,
-    body: { class?: string; reason_prefix?: string; preview: boolean; limit?: number },
+    body: { class?: string; reason_prefix?: string; preview: boolean; limit?: number; as_of?: number },
   ) =>
     request<RetryReport>(`/api/sources/${id}/content/retry`, { method: 'POST', body: JSON.stringify(body) }),
 }
@@ -509,6 +509,7 @@ export const api = {
 // Result of a retry action (`preview: true` counts without acting).
 export interface RetryReport {
   preview: boolean
+  as_of: number
   accepted: number
   skipped: number
   rejected: number

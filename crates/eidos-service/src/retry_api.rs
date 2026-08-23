@@ -35,9 +35,13 @@ pub struct RetryBody {
     /// Count what would be retried without changing anything.
     #[serde(default)]
     pub preview: bool,
-    /// Cap on jobs touched by one call.
+    /// Requeue at most this many.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Ignore failures recorded after this instant (unix nanoseconds).
+    /// A confirmation passes the `as_of` of the preview it confirms.
+    #[serde(default)]
+    pub as_of: Option<i64>,
 }
 
 fn parse_class(raw: Option<&str>) -> Result<Option<FailureClass>, ApiError> {
@@ -99,6 +103,7 @@ async fn retry_source_content(
         reason_prefix: body.reason_prefix.filter(|p: &String| !p.trim().is_empty()),
         preview: body.preview,
         limit: body.limit,
+        as_of: body.as_of.map(eidos_domain::UnixNanos),
         ..RetrySelector::source(sid, JobStage::ContentText)
     };
     run(st, sel).await

@@ -542,3 +542,45 @@ fn a_limit_caps_how_many_are_requeued() {
         "the third failure is untouched"
     );
 }
+
+#[test]
+fn a_confirmation_ignores_failures_that_appeared_after_its_preview() {
+    let fx = Fx::new();
+    let job = fx.fail("one.txt", FailureClass::Deterministic, "boom");
+    let sel = RetrySelector::source(fx.source, JobStage::ContentText);
+    let preview = fx
+        .catalog
+        .retry_failed_jobs(&RetrySelector {
+            preview: true,
+            ..sel.clone()
+        })
+        .unwrap();
+    assert_eq!((preview.accepted, preview.bytes), (1, 100));
+
+    // Between the two clicks a worker records a new terminal failure — of
+    // the other family, so a count-only cap could have swapped it in.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let late = fx.record_failure("two.txt", FailureClass::Deterministic, "boom");
+
+    let applied = fx
+        .catalog
+        .retry_failed_jobs(&RetrySelector {
+            limit: Some(preview.accepted as u32),
+            as_of: Some(preview.as_of),
+            ..sel.clone()
+        })
+        .unwrap();
+    assert_eq!((applied.accepted, applied.bytes), (1, 100));
+    assert_eq!(applied.job_ids, vec![job], "exactly what was previewed");
+    assert_eq!(
+        fx.content_state(late),
+        ContentState::Failed,
+        "the late failure waits for its own preview"
+    );
+    assert_eq!(fx.active_jobs(late), 0);
+
+    // Without the watermark the next round picks it up.
+    let next = fx.catalog.retry_failed_jobs(&sel).unwrap();
+    assert_eq!((next.accepted, next.bytes), (1, 200));
+    assert_eq!(fx.content_state(late), ContentState::Pending);
+}

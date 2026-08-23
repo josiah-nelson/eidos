@@ -27,11 +27,10 @@ function retrySummary(r: RetryReport): string {
 }
 
 // Two-step bulk retry: the first click previews (count + bytes), the second
-// one acts. No browser dialogs. The confirmation carries the previewed count
-// as the cap, so failures that appear in between cannot be requeued on the
-// strength of a smaller number the operator saw (candidates are ordered
-// oldest first, so the applied set is a prefix of the previewed one); the
-// result line reports what actually happened.
+// one acts. No browser dialogs. The confirmation carries the preview's
+// `as_of` and its count, so the action stays inside the set the operator was
+// shown: anything that failed in between is excluded by `as_of`, and the
+// count caps the rest. The result line reports what actually happened.
 function BulkRetry({ s }: { s: ActivitySourceView }) {
   const qc = useQueryClient()
   const [preview, setPreview] = useState<RetryReport | null>(null)
@@ -44,7 +43,8 @@ function BulkRetry({ s }: { s: ActivitySourceView }) {
     },
   })
   const apply = useMutation({
-    mutationFn: (limit: number) => api.retrySourceContent(s.source_id, { preview: false, limit }),
+    mutationFn: (p: RetryReport) =>
+      api.retrySourceContent(s.source_id, { preview: false, limit: p.accepted, as_of: p.as_of }),
     onSuccess: (r) => {
       setPreview(null)
       setDone(r)
@@ -70,7 +70,7 @@ function BulkRetry({ s }: { s: ActivitySourceView }) {
           <button
             className="btn small primary"
             disabled={busy || preview.accepted === 0}
-            onClick={() => apply.mutate(preview.accepted)}
+            onClick={() => apply.mutate(preview)}
           >
             {apply.isPending ? 'requeueing…' : `confirm ${count(preview.accepted)} job(s) · ${bytes(preview.bytes)}`}
           </button>
