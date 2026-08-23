@@ -345,7 +345,14 @@ export interface Hit {
   changed?: number
   attributes: number
   hard_link_count: number
-  content: { state: ContentState; coverage: string; indexed_bytes?: number; content_id?: string; reason?: string }
+  content: {
+    state: ContentState
+    coverage: string
+    generation?: number
+    indexed_bytes?: number
+    content_id?: string
+    reason?: string
+  }
   score?: number
   snippets?: Snippet[]
   directory?: DirectorySummary
@@ -438,6 +445,54 @@ export interface IndexStatus {
   }[]
 }
 
+// ----- stored-text preview -------------------------------------------------
+
+export interface PreviewChunk {
+  ordinal: number
+  byte_start: number
+  byte_end: number
+  line_start: number
+  line_end: number
+  chars: number
+  text: string
+  truncated: boolean
+  sanitized: boolean
+}
+
+/**
+ * A window of the text the indexer stored for one object generation. Never
+ * the file on disk: the service reads it out of the catalog.
+ */
+export interface ContentPreview {
+  object_id: number
+  path: string | null
+  generation: number
+  object_generation: number
+  stale: boolean
+  state: ContentState
+  coverage: string
+  indexed_bytes: number
+  total_bytes: number
+  chunk_count: number
+  line_count: number
+  encoding: string | null
+  reason: string | null
+  requested_ordinal: number
+  chunks: PreviewChunk[]
+  has_more_before: boolean
+  has_more_after: boolean
+  truncated: boolean
+  limits: { max_neighbors: number; max_bytes: number; max_lines: number }
+}
+
+export interface PreviewWindow {
+  ordinal: number
+  before: number
+  after: number
+  /** Omit to read whatever generation the catalog currently holds. */
+  generation?: number
+}
+
 export class ApiError extends Error {
   status: number
   kind: string
@@ -488,6 +543,15 @@ export const api = {
       `/api/objects/${id}/children?sort=${q.sort}&desc=${q.desc}&offset=${q.offset}&limit=${q.limit}&hidden=${q.hidden}`,
     ),
   extensions: (id: number, limit = 30) => request<ExtensionCount[]>(`/api/objects/${id}/extensions?limit=${limit}`),
+  contentPreview: (id: number, w: PreviewWindow) => {
+    const p = new URLSearchParams({
+      ordinal: String(w.ordinal),
+      before: String(w.before),
+      after: String(w.after),
+    })
+    if (w.generation != null) p.set('generation', String(w.generation))
+    return request<ContentPreview>(`/api/objects/${id}/content?${p.toString()}`)
+  },
   resolve: (source: number, path: string) =>
     request<{ object_id: number; path: string | null }>(
       `/api/resolve?source=${source}&path=${encodeURIComponent(path)}`,
