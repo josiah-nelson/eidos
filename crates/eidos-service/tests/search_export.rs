@@ -220,6 +220,7 @@ async fn walks_every_page_without_duplicates_and_marks_truncation() {
         ExportLimits {
             page_size: 100,
             max_rows: 500,
+            ..Default::default()
         },
     );
     scan(&state, &e);
@@ -391,6 +392,7 @@ async fn dropping_the_response_body_stops_the_walk() {
         ExportLimits {
             page_size: 5,
             max_rows: 100_000,
+            ..Default::default()
         },
     );
     scan(&state, &e);
@@ -434,6 +436,7 @@ async fn client_disconnect_stops_the_walk() {
         ExportLimits {
             page_size: 5,
             max_rows: 100_000,
+            ..Default::default()
         },
     );
     scan(&state, &e);
@@ -493,6 +496,7 @@ async fn an_open_export_does_not_hold_the_admission_gate() {
         ExportLimits {
             page_size: 5,
             max_rows: 100_000,
+            ..Default::default()
         },
         eidos_service::admission::AdmissionConfig {
             // One permit: a stream-long permit would shut everything else out.
@@ -519,4 +523,183 @@ async fn an_open_export_does_not_hold_the_admission_gate() {
     let (status, _, _) = get(&app, "/api/search?q=ext:txt&limit=1").await;
     assert_eq!(status, StatusCode::OK, "search was shed behind the export");
     drop(body);
+}
+
+/// A page that cannot be fetched must not leave a tidy, short download
+/// behind: the body is aborted so every client sees a failed transfer.
+#[tokio::test]
+async fn a_failed_page_aborts_the_body() {
+    let e = env(|root| {
+        for i in 0..600 {
+            std::fs::write(root.join(format!("f{i:04}.txt")), b"x").unwrap();
+        }
+    });
+    let state = open_state(
+        &e,
+        ExportLimits {
+            page_size: 5,
+            max_rows: 100_000,
+            concurrency: 2,
+        },
+    );
+    scan(&state, &e);
+    let app = eidos_service::api::router(state.clone(), None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/search/export?format=ndjson&q=ext:txt&sort=name")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = resp.into_body();
+    body.frame().await.unwrap().unwrap();
+    // Closing the gate makes every later page shed, exactly as an overloaded
+    // or shutting-down service would.
+    state.admission.close();
+
+    let mut text = String::new();
+    let mut failed = false;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(f) => text.push_str(&String::from_utf8_lossy(&f.into_data().unwrap())),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        failed,
+        "the body ended cleanly after a failed page:
+{text}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(text.lines().next_back().unwrap()).unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["truncated"], true);
+    assert!(summary["error"].is_string(), "{summary}");
+    assert_eq!(state.export_stats.failed.load(Ordering::Relaxed), 1);
+}
+
+/// Exports are bounded on their own so a burst of them cannot occupy the
+/// whole admission gate and shed interactive search.
+#[tokio::test]
+async fn concurrent_exports_are_bounded() {
+    let e = env(|root| {
+        for i in 0..600 {
+            std::fs::write(root.join(format!("f{i:04}.txt")), b"x").unwrap();
+        }
+    });
+    let state = open_state(
+        &e,
+        ExportLimits {
+            page_size: 5,
+            max_rows: 100_000,
+            concurrency: 1,
+        },
+    );
+    scan(&state, &e);
+    let app = eidos_service::api::router(state.clone(), None);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/search/export?format=csv&q=ext:txt&sort=name")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = resp.into_body();
+    body.frame().await.unwrap().unwrap();
+
+    let (status, headers, err) = get(&app, "/api/search/export?format=csv&q=ext:txt").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(err.contains("\"busy\""), "{err}");
+    assert!(header(&headers, "retry-after").is_some());
+    assert_eq!(state.export_stats.rejected.load(Ordering::Relaxed), 1);
+
+    let (status, _, _) = get(&app, "/api/search?q=ext:txt&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "search was shed by export pressure");
+
+    // The slot comes back when the stream ends.
+    drop(body);
+    for _ in 0..40 {
+        if state.export_gate.available_permits() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(state.export_gate.available_permits(), 1);
+}
+
+/// Export pages do not consume the interactive queue. This is what preserves
+/// priority even when the entire admission gate is configured with one slot.
+#[tokio::test]
+async fn export_pages_do_not_queue_behind_interactive_work() {
+    let e = env(|root| {
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+    });
+    let state = open_state_with(
+        &e,
+        ExportLimits {
+            concurrency: 1,
+            ..Default::default()
+        },
+        eidos_service::admission::AdmissionConfig {
+            concurrency: 1,
+            ..Default::default()
+        },
+    );
+    scan(&state, &e);
+    let app = eidos_service::api::router(state.clone(), None);
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+    state.admission.set_blocking_hook(Some(Arc::new(move |op| {
+        if op == "search" {
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().take().unwrap().recv().unwrap();
+        }
+    })));
+
+    let search_app = app.clone();
+    let search = tokio::spawn(async move {
+        search_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/search?q=ext:txt&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(1),
+        app.clone().oneshot(
+            Request::builder()
+                .uri("/api/search/export?format=csv&q=ext:txt")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("export queued behind interactive search")
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(state.admission.view().queued, 0);
+
+    release_tx.send(()).unwrap();
+    assert_eq!(search.await.unwrap().status(), StatusCode::OK);
+    state.admission.set_blocking_hook(None);
 }

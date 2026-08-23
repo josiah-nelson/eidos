@@ -75,6 +75,8 @@ impl Default for AdmissionConfig {
 pub enum Expensive {
     /// Catalog/content query execution.
     Search,
+    /// One page of a streaming search export.
+    Export,
     /// Directory listing and object detail.
     Browse,
     /// Archive manifest listing.
@@ -89,6 +91,7 @@ impl Expensive {
     pub fn label(self) -> &'static str {
         match self {
             Expensive::Search => "search",
+            Expensive::Export => "export",
             Expensive::Browse => "browse",
             Expensive::Archive => "archive",
             Expensive::Counts => "counts",
@@ -238,7 +241,7 @@ impl Admission {
 
     fn timeout_for(&self, op: Expensive) -> Duration {
         match op {
-            Expensive::Search => self.config.search_timeout,
+            Expensive::Search | Expensive::Export => self.config.search_timeout,
             _ => self.config.operation_timeout,
         }
     }
@@ -265,9 +268,39 @@ impl Admission {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        self.run_inner(op, true, f).await
+    }
+
+    /// Run one export page only when it can start immediately.
+    ///
+    /// Export pages never join the shared queue. If interactive work is
+    /// already waiting, the page also yields a permit it happened to acquire;
+    /// this prevents a fast cursor walk from repeatedly getting ahead of a
+    /// queued search when the gate has only one slot.
+    pub(crate) async fn run_export<T, F>(&self, f: F) -> Result<T, AdmissionError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_inner(Expensive::Export, false, f).await
+    }
+
+    async fn run_inner<T, F>(
+        &self,
+        op: Expensive,
+        allow_queue: bool,
+        f: F,
+    ) -> Result<T, AdmissionError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(TryAcquireError::Closed) => return Err(self.busy(op, "service is shutting down")),
+            Err(TryAcquireError::NoPermits) if !allow_queue => {
+                return Err(self.busy(op, "no free slot; export pages do not queue"));
+            }
             Err(TryAcquireError::NoPermits) => {
                 let waiting = self.counters.queued.fetch_add(1, Ordering::Relaxed) + 1;
                 let _waiting = Waiting(self.counters.clone());
@@ -303,6 +336,10 @@ impl Admission {
                 }
             }
         };
+        if !allow_queue && self.counters.queued.load(Ordering::Acquire) > 0 {
+            drop(permit);
+            return Err(self.busy(op, "interactive work is waiting; export page yielded"));
+        }
 
         self.counters.in_flight.fetch_add(1, Ordering::Relaxed);
         self.counters.admitted.fetch_add(1, Ordering::Relaxed);

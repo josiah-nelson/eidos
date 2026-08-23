@@ -51,7 +51,8 @@ when bound elsewhere), `--web-dir` (`EIDOS_WEB_DIR`, empty for API only),
 `--scan-threads`, `--no-auto-reconcile`, `--no-content` (metadata only),
 `--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4),
 `--export-page-size N` (`EIDOS_EXPORT_PAGE_SIZE`, default 500) and
-`--export-max-rows N` (`EIDOS_EXPORT_MAX_ROWS`, default 100000) — see
+`--export-max-rows N` (`EIDOS_EXPORT_MAX_ROWS`, default 100000) and
+`--export-concurrency N` (`EIDOS_EXPORT_CONCURRENCY`, default 2) — see
 [Exporting results](query-syntax.md#exporting-results) — plus the
 admission-control flags below.
 
@@ -76,7 +77,11 @@ is answered `504` with `{"kind":"timeout"}`. Health, activity and index
 status never enter the gate, so they stay responsive while queries saturate
 it. An export takes a permit per page rather than one for its whole stream,
 so a long export interleaves with interactive queries instead of holding a
-slot for minutes.
+slot for minutes, and `--export-concurrency` bounds how many exports stream at
+once — clamped below `--max-concurrent-queries` whenever the gate has more
+than one slot. Export pages never join the shared queue and yield when
+interactive work is waiting, which preserves priority even with a one-slot
+gate. Exports past their own bound are refused with the same `503`.
 
 A deadline ends the *response*, not the query: a running SQLite or Tantivy
 call cannot be cancelled mid-call, so the permit is released by the blocking

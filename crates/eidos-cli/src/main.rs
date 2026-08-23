@@ -101,6 +101,9 @@ struct ServeArgs {
     /// Hard cap on rows a single export may emit.
     #[arg(long, env = "EIDOS_EXPORT_MAX_ROWS", default_value_t = 100_000)]
     export_max_rows: u64,
+    /// Exports allowed to stream at once (kept below --max-concurrent-queries).
+    #[arg(long, env = "EIDOS_EXPORT_CONCURRENCY", default_value_t = 2)]
+    export_concurrency: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -146,6 +149,7 @@ fn main() -> anyhow::Result<()> {
                 export: eidos_service::export::ExportLimits {
                     page_size: args.export_page_size.clamp(1, 1000),
                     max_rows: args.export_max_rows,
+                    concurrency: args.export_concurrency,
                 },
             })
         }

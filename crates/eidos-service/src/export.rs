@@ -9,7 +9,6 @@
 //! Three formats share one row schema (see [`COLUMNS`]): RFC 4180 CSV, a
 //! single JSON document, and newline-delimited JSON.
 
-use crate::admission::Expensive;
 use crate::api::{build_request, search_error, ApiError, SearchBody};
 use crate::state::AppState;
 use axum::body::{Body, Bytes};
@@ -55,6 +54,11 @@ pub struct ExportLimits {
     pub page_size: u32,
     /// Hard cap on exported rows; a request may ask for fewer, never more.
     pub max_rows: u64,
+    /// Exports allowed to stream at once. Because an export holds at most one
+    /// admission permit at a time, this is also the most of the admission gate
+    /// exports can occupy — it is clamped below the gate's own concurrency so
+    /// interactive queries always keep a slot.
+    pub concurrency: usize,
 }
 
 impl Default for ExportLimits {
@@ -62,6 +66,7 @@ impl Default for ExportLimits {
         Self {
             page_size: 500,
             max_rows: 100_000,
+            concurrency: 2,
         }
     }
 }
@@ -74,6 +79,10 @@ pub struct ExportStats {
     pub started: AtomicU64,
     pub finished: AtomicU64,
     pub cancelled: AtomicU64,
+    /// Exports that ended early because a page could not be fetched.
+    pub failed: AtomicU64,
+    /// Export requests refused because `ExportLimits::concurrency` was reached.
+    pub rejected: AtomicU64,
     /// Result pages fetched from the search executor, across all exports.
     pub pages: AtomicU64,
     pub rows: AtomicU64,
@@ -273,14 +282,15 @@ pub async fn export_post(
 /// A permit is taken *per page*, not for the whole stream: an export of
 /// 100,000 rows can run for minutes, and holding one of the few expensive-
 /// operation permits for that long would starve interactive search. Per page
-/// the cost is exactly one ordinary search, load shedding still applies (a
-/// busy service ends the export early rather than queueing behind it), and a
-/// stalled client can never pin a permit — between pages the export holds
-/// nothing.
+/// the cost is exactly one ordinary search. Export pages never join the shared
+/// queue and yield when interactive work is waiting; a busy service therefore
+/// ends an export rather than letting its repeated page requests get ahead of
+/// searches. A stalled client cannot pin a permit — between pages the export
+/// holds nothing.
 async fn fetch_page(st: &Arc<AppState>, req: &SearchRequest) -> Result<SearchResponse, ApiError> {
     let (st2, req) = (st.clone(), req.clone());
     st.admission
-        .run(Expensive::Search, move || {
+        .run_export(move || {
             st2.export_stats.pages.fetch_add(1, Ordering::Relaxed);
             eidos_search::exec::search_with_content(
                 &st2.index,
@@ -298,6 +308,21 @@ async fn fetch_page(st: &Arc<AppState>, req: &SearchRequest) -> Result<SearchRes
 /// surface as a normal JSON error response instead of a truncated stream,
 /// then hand the walk to a background task.
 async fn start(st: Arc<AppState>, p: Plan) -> Result<Response, ApiError> {
+    // One slot per streaming export, taken for the whole stream and released
+    // when the producer task ends however it ends. Exports therefore never
+    // occupy more than `export.concurrency` admission permits at any instant,
+    // which is what keeps a burst of concurrent exports from crowding
+    // interactive search out of the shared gate.
+    let slot = st.export_gate.clone().try_acquire_owned().map_err(|_| {
+        st.export_stats.rejected.fetch_add(1, Ordering::Relaxed);
+        ApiError::busy(
+            format!(
+                "{} exports are already streaming (the limit); retry when one finishes",
+                st.export.concurrency
+            ),
+            5,
+        )
+    })?;
     let first = fetch_page(&st, &p.req).await?;
 
     let total = first.total;
@@ -308,7 +333,10 @@ async fn start(st: Arc<AppState>, p: Plan) -> Result<Response, ApiError> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     st.export_stats.started.fetch_add(1, Ordering::Relaxed);
     let st3 = st.clone();
-    tokio::spawn(produce(st3, p, first, tx));
+    tokio::spawn(async move {
+        produce(st3, p, first, tx).await;
+        drop(slot);
+    });
 
     let mut resp = Response::new(Body::from_stream(ChannelStream { rx }));
     let filename = format!(
@@ -441,6 +469,20 @@ async fn produce(
         return;
     }
     write_footer(&mut buf, p.format, emitted, truncated, error.as_deref());
+    if let Some(message) = error {
+        st.export_stats.failed.fetch_add(1, Ordering::Relaxed);
+        // Send the footer (JSON and NDJSON stay parseable and carry `error`),
+        // then fail the body. Ending it cleanly would hand a CSV consumer —
+        // which has no envelope to read — a short file that looks complete;
+        // aborting the transfer makes every client see a failed download.
+        let _ = flush(&tx, &mut buf).await;
+        let _ = tx
+            .send(Err(std::io::Error::other(format!(
+                "export ended early: {message}"
+            ))))
+            .await;
+        return;
+    }
     if flush(&tx, &mut buf).await {
         st.export_stats.finished.fetch_add(1, Ordering::Relaxed);
     } else {

@@ -189,10 +189,21 @@ Each page passes through the same admission gate as `/api/search`
 permit per page rather than one for the whole stream: an export of 100,000
 rows can run for minutes, and holding a slot that long would starve
 interactive queries. Between pages an export holds nothing, so a stalled
-client cannot pin a permit; if the service sheds a page the export ends early
-with `truncated` set and `error` explaining why. Snippets, facets, and the
-plan explanation are never computed for an export, so page cost does not grow
-with the number of pages. Three response headers
+client cannot pin a permit. On top of that, `--export-concurrency` (default 2,
+kept below `--max-concurrent-queries` whenever the gate has more than one
+slot) bounds how many exports stream at once. Export pages never join the
+shared queue and yield when interactive work is waiting, which preserves
+priority with a one-slot gate too. An export beyond its own bound is refused
+up front with `503` and `{"kind":"busy"}`. Snippets, facets, and the plan
+explanation are never computed for an export, so page cost does not grow with
+the number of pages.
+
+If a page cannot be fetched part-way through — the gate sheds it, the query
+times out, the service is shutting down — the export writes its footer
+(`truncated: true` with a non-null `error`) and then **fails the transfer**
+rather than ending it cleanly. A short-but-tidy file would be indistinguishable
+from a complete one in CSV, which has no envelope; aborting means every client,
+`eidos search --export` included, reports a failed download. Three response headers
 describe the bounds up front: `X-Eidos-Export-Max-Rows`, `X-Eidos-Export-Total`
 and `X-Eidos-Export-Total-Exact`. A CSV export carries no envelope, so compare
 those two numbers to detect truncation.

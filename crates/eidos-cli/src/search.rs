@@ -299,17 +299,35 @@ fn export(args: &SearchArgs, q: &str) -> anyhow::Result<i32> {
         return Ok(1);
     }
     let mut reader = resp.body_mut().as_reader();
-    let written = match args.out.as_deref() {
-        Some(p) if p != std::path::Path::new("-") => {
+    let out_path = match args.out.as_deref() {
+        Some(p) if p != std::path::Path::new("-") => Some(p),
+        _ => None,
+    };
+    // The service aborts the body when a page fails mid-walk, so a partial
+    // export always surfaces here as a read error rather than as a short file
+    // that looks complete.
+    let copied = match out_path {
+        Some(p) => {
             let mut f =
                 std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?;
-            let n = std::io::copy(&mut reader, &mut f)?;
-            eprintln!("wrote {n} bytes to {}", p.display());
-            n
+            std::io::copy(&mut reader, &mut f)
         }
-        _ => std::io::copy(&mut reader, &mut std::io::stdout().lock())?,
+        None => std::io::copy(&mut reader, &mut std::io::stdout().lock()),
     };
-    let _ = written;
+    match copied {
+        Ok(n) => {
+            if let Some(p) = out_path {
+                eprintln!("wrote {n} bytes to {}", p.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("export failed mid-stream: {e}");
+            if let Some(p) = out_path {
+                eprintln!("{} is incomplete", p.display());
+            }
+            return Ok(1);
+        }
+    }
     if let (Some(total), Some(cap)) = (total.as_deref(), cap.as_deref()) {
         let truncated = total
             .parse::<u64>()

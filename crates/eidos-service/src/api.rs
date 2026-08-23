@@ -102,6 +102,13 @@ impl ApiError {
     fn internal(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
     }
+    /// Load shed by a bound of our own rather than by the admission gate.
+    pub(crate) fn busy(msg: impl Into<String>, retry_after_s: u64) -> Self {
+        Self {
+            retry_after_s: Some(retry_after_s),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy", msg)
+        }
+    }
 }
 
 impl From<AdmissionError> for ApiError {
