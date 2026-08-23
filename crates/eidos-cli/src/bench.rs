@@ -7,6 +7,7 @@ use clap::{Args, Subcommand};
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::Catalog;
 use eidos_domain::bench::{BenchTimer, LatencySamples};
+use eidos_domain::CountPolicy;
 use eidos_domain::{ResultMode, SearchRequest, Sort, SortField};
 use eidos_search::exec::{search_with_content, ExecOptions};
 use eidos_search::{CatalogIndex, ContentIndex};
@@ -45,6 +46,9 @@ pub enum BenchCommand {
         /// queries always run.
         #[arg(long)]
         family: Vec<String>,
+        /// Total-count policy for every request: auto (default), exact, none.
+        #[arg(long, default_value = "auto")]
+        count: String,
     },
     /// Time stored-chunk lookups (`chunks_for`) serially and in parallel.
     Chunks {
@@ -78,6 +82,30 @@ struct Case {
     mode: ResultMode,
     sort: SortField,
 }
+
+/// Broad queries paged through cursors: the first page is measured in the
+/// `paging-first` family, pages 2..=PAGING_PAGES in `paging-next`.
+const PAGING_CASES: &[Case] = &[
+    Case {
+        family: "paging",
+        text: "",
+        mode: ResultMode::Files,
+        sort: SortField::Name,
+    },
+    Case {
+        family: "paging",
+        text: "size:>0",
+        mode: ResultMode::Files,
+        sort: SortField::Size,
+    },
+    Case {
+        family: "paging",
+        text: "ext:dll",
+        mode: ResultMode::Files,
+        sort: SortField::Modified,
+    },
+];
+const PAGING_PAGES: u32 = 10;
 
 const CASES: &[Case] = &[
     Case {
@@ -241,6 +269,7 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             query,
             rebuild,
             family,
+            count,
         } => bench_search(
             &args.data_dir,
             iterations,
@@ -249,6 +278,7 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             query,
             rebuild,
             family,
+            count,
         ),
         BenchCommand::Content {
             file,
@@ -547,6 +577,7 @@ fn bench_content(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_search(
     data_dir: &std::path::Path,
     iterations: u32,
@@ -555,7 +586,10 @@ fn bench_search(
     extra: Vec<String>,
     rebuild: bool,
     families: Vec<String>,
+    count: String,
 ) -> anyhow::Result<()> {
+    let count: CountPolicy = serde_json::from_value(serde_json::Value::String(count.clone()))
+        .with_context(|| format!("unknown count policy {count:?} (auto, exact, none)"))?;
     let catalog = Catalog::open(data_dir.join("catalog.db"))?;
     let index = CatalogIndex::open(data_dir.join("index").join("catalog"))?;
     let content = ContentIndex::open(data_dir.join("index").join("content"))?;
@@ -623,6 +657,73 @@ fn bench_search(
     let mut per_query: Vec<(String, f64, u64)> = Vec::new();
     let opts = ExecOptions::default();
     let mut errors = 0u64;
+    // Cursor walks: one iteration = first page + the following pages.
+    let paging = families.is_empty() || families.iter().any(|f| f == "paging");
+    if paging {
+        for c in PAGING_CASES {
+            let parsed = eidos_query::parse(c.text)?;
+            let first = SearchRequest {
+                mode: c.mode,
+                sort: Sort {
+                    field: c.sort,
+                    descending: c.sort != SortField::Name,
+                },
+                limit: 50,
+                explain: false,
+                snippets: false,
+                count,
+                ..SearchRequest::new(parsed.query)
+            };
+            let mut first_samples = LatencySamples::default();
+            let mut next_samples = LatencySamples::default();
+            let mut total = 0u64;
+            for _ in 0..iterations.clamp(1, 5) {
+                let mut req = first.clone();
+                for page in 1..=PAGING_PAGES {
+                    let t = Instant::now();
+                    let r = match search_with_content(&index, Some(&content), &catalog, &req, &opts)
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("{} page {page}: {e}", c.text);
+                            errors += 1;
+                            break;
+                        }
+                    };
+                    let d = t.elapsed();
+                    all.push(d);
+                    if page == 1 {
+                        total = r.total.value;
+                        first_samples.push(d);
+                    } else {
+                        next_samples.push(d);
+                    }
+                    match r.next_cursor {
+                        Some(cur) => req.cursor = Some(cur),
+                        None => break,
+                    }
+                }
+            }
+            per_query.push((
+                format!("{} [page 1]", c.text),
+                first_samples.percentile_ms(95.0),
+                total,
+            ));
+            per_query.push((
+                format!("{} [pages 2-{PAGING_PAGES}]", c.text),
+                next_samples.percentile_ms(95.0),
+                total,
+            ));
+            per_family
+                .entry("paging-first".into())
+                .or_default()
+                .extend(&first_samples);
+            per_family
+                .entry("paging-next".into())
+                .or_default()
+                .extend(&next_samples);
+        }
+    }
     for (family, text, mode, sort) in &cases {
         let parsed = match eidos_query::parse(text) {
             Ok(p) => p,
@@ -641,6 +742,7 @@ fn bench_search(
             limit: 50,
             explain: false,
             snippets: false,
+            count,
             ..SearchRequest::new(parsed.query)
         };
         let mut samples = LatencySamples::default();
