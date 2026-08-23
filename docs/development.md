@@ -17,7 +17,7 @@ with a reduced (std-only) lister and no change feeds.
 ## Commands
 
 ```powershell
-# One-shot: format check, clippy (deny warnings), all tests, release build, web lint+build
+# One-shot: format check, clippy (deny warnings), all tests, release build, web lint+test+build
 .\scripts\check.ps1            # -SkipWeb / -SkipRelease to shorten
 
 # Individually
@@ -25,7 +25,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
-cd web; npm ci; npm run lint; npm run build
+cd web; npm ci; npm run lint; npm test; npm run build
 ```
 
 Tests never touch user data: every integration test builds its own fixture

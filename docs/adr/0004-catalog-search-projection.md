@@ -89,6 +89,23 @@ catalog — idempotent, so a crash between index commit and position update
 only repeats work. The position is recorded in the catalog
 (`projection_state`) after the index commit.
 
+Both paths read the catalog in batches of `PROJECTION_BATCH` (1 024) rows.
+A rebuild loads the source's path nodes once — directories, virtual
+directories, and archive containers, which are ordinary files that own
+virtual members — and then resolves the descendant extensions of a whole
+batch of directories in one query instead of one query per directory; it
+holds one batch of rows plus that path-node map, nothing proportional to
+the source otherwise. An outbox batch is coalesced before anything is
+written: duplicate and nested `subtree` rows collapse into a single
+rebuild, every affected object is deleted exactly once (subtree roots also
+by ancestry, which catches documents from a superseded generation), and the
+re-adds then run through one batched read that walks each ancestor chain
+once for the batch rather than once per descendant. Deleting before adding
+is what keeps a subtree row from removing documents added earlier in the
+same batch. Because containers are path nodes, a rebuilt member document
+renders under its container (`…\tool.zip\src\lib\mod.rs`) — the path the
+incremental route always produced.
+
 ### Query syntax
 
 `eidos-query` parses an Everything-style syntax (`docs/QUERY_SYNTAX.md`) into
@@ -108,3 +125,10 @@ executor.
   could cut the dictionary walk if corpora grow by an order of magnitude.
 - Content clauses are rejected with an explicit message until Milestone 4
   — never silently ignored.
+- Batched projection reads on a synthetic 36 005-entry source (6 000
+  directories six levels down, release build): a full rebuild goes from
+  6 007 to 9 catalog queries at the same wall time (95 ms → 99 ms) and
+  ~0.6 MB more peak heap for the row batch it holds; rebuilding the whole
+  subtree goes from 252 006 queries and 886 ms to 83 queries and 142 ms,
+  for ~2.3 MB of path/ancestor caches (bounded by the directories in the
+  batch's chains, not by the files under them).

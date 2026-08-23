@@ -215,10 +215,11 @@ machine- and human-readable explanation with every response.
 ### 7.9 Web UI
 
 Every release ships a coherent UI: search with an editable interpretation,
-virtualized results, snippets with line/byte locations, facets, directory
-browser and treemap, source completeness and health, backlog and throughput,
-exclusions and errors, and availability-aware open/download actions. The UI
-never requests or renders millions of rows.
+virtualized results, snippets with line/byte locations, facets that refine
+the query in one click (including exact size and modification-time ranges),
+directory browser and treemap, source completeness and health, backlog and
+throughput, exclusions and errors, and availability-aware open/download
+actions. The UI never requests or renders millions of rows.
 
 ### 7.10 CLI and MCP
 

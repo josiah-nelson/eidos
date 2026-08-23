@@ -95,7 +95,11 @@ fn print_activity(v: &serde_json::Value) {
                 s["name"].as_str().unwrap_or(""),
                 s["state"].as_str().unwrap_or(""),
                 if s["content_enabled"].as_bool().unwrap_or(false) {
-                    format!("on x{}", n(s, "content_concurrency"))
+                    format!(
+                        "on {}/{}",
+                        n(s, "content_reserved"),
+                        n(s, "content_concurrency")
+                    )
                 } else {
                     "off".into()
                 },

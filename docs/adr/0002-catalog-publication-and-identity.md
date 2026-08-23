@@ -84,6 +84,14 @@ signed deltas up the parent chain for incremental changes; subtree moves use
 `AggDelta::from_subtree` to subtract/add a whole subtree without recomputing
 descendants (exercised from Milestone 2).
 
+`newest_modified`/`oldest_modified` are not summable, so the delta also
+carries the timestamps entering and leaving the subtree. Raising an extremum
+is a comparison; removing the entry that *provided* one leaves the stored
+value unknown, so `apply_delta` re-derives that single directory from its
+direct children (one query, same definition the rebuild uses) and continues
+upward only while an ancestor's extremum is invalidated too. The incremental
+result equals the rebuild result by test.
+
 ## Consequences
 
 - A first-time scan shows growing counts in the UI with a "partial" banner;
