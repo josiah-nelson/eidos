@@ -209,6 +209,13 @@ Retries distinguish transient source errors, unsupported content, deterministic
 parse failure, resource-limit failure, and corrupt input. Deterministic failures
 do not retry forever.
 
+Failures of the stores a stage writes to — a database write error, a full disk,
+an index writer error — are classified separately from failures of the input.
+They are transient by definition and retry under the same backoff, and the
+attempt discards whatever it already wrote for that object generation so no
+later commit can publish partial output. The failure reason keeps the whole
+underlying error chain (ADR-0011).
+
 ## 9. Content records and chunks
 
 Content processing is streaming:
