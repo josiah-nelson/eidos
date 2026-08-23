@@ -516,8 +516,8 @@ fn a_limit_caps_how_many_are_requeued() {
     let det = fx.fail("one.txt", FailureClass::Deterministic, "boom");
     let second = fx.fail("two.txt", FailureClass::Deterministic, "boom");
     fx.fail("three.txt", FailureClass::Deterministic, "boom");
-    // A confirmation passes the count its preview reported; candidates are
-    // ordered oldest first, so the action stays inside what was shown.
+    // `limit` caps the number accepted; two-step callers additionally pass
+    // the preview's exact-set confirmation token (covered below).
     let sel = RetrySelector {
         limit: Some(2),
         ..RetrySelector::source(fx.source, JobStage::ContentText)
@@ -567,6 +567,7 @@ fn a_confirmation_ignores_failures_that_appeared_after_its_preview() {
         .catalog
         .retry_failed_jobs(&RetrySelector {
             as_of: Some(preview.as_of),
+            confirmation: preview.confirmation.clone(),
             ..sel.clone()
         })
         .unwrap();
@@ -588,4 +589,49 @@ fn a_confirmation_ignores_failures_that_appeared_after_its_preview() {
     let next = fx.catalog.retry_failed_jobs(&sel).unwrap();
     assert_eq!((next.accepted, next.bytes), (1, 200));
     assert_eq!(fx.content_state(late), ContentState::Pending);
+}
+
+#[test]
+fn a_confirmation_rejects_substitution_from_outside_the_preview() {
+    let fx = Fx::new();
+    let first = fx.fail("one.txt", FailureClass::Deterministic, "boom");
+    let second = fx.fail("two.txt", FailureClass::Deterministic, "boom");
+    let third = fx.fail("three.txt", FailureClass::Deterministic, "boom");
+    let sel = RetrySelector {
+        limit: Some(2),
+        ..RetrySelector::source(fx.source, JobStage::ContentText)
+    };
+    let preview = fx
+        .catalog
+        .retry_failed_jobs(&RetrySelector {
+            preview: true,
+            ..sel.clone()
+        })
+        .unwrap();
+    assert_eq!((preview.accepted, preview.bytes), (2, 300));
+
+    // One previewed candidate becomes ineligible. A count + watermark alone
+    // would fill its slot with `third`, which predates the watermark but was
+    // outside the preview's cap.
+    fx.catalog
+        .retry_failed_jobs(&RetrySelector::job(first))
+        .unwrap();
+    let err = fx
+        .catalog
+        .retry_failed_jobs(&RetrySelector {
+            as_of: Some(preview.as_of),
+            confirmation: preview.confirmation,
+            ..sel
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, eidos_catalog::CatalogError::InvalidState(_)),
+        "{err}"
+    );
+    assert_eq!(fx.state(second), JobState::Failed, "action was atomic");
+    assert_eq!(
+        fx.state(third),
+        JobState::Failed,
+        "unpreviewed substitute moved"
+    );
 }

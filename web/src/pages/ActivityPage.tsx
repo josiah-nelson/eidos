@@ -28,9 +28,10 @@ function retrySummary(r: RetryReport): string {
 
 // Two-step bulk retry: the first click previews (count + bytes), the second
 // one acts. No browser dialogs. The confirmation carries the preview's
-// `as_of` and its count, so the action stays inside the set the operator was
-// shown: anything that failed in between is excluded by `as_of`, and the
-// count caps the rest. The result line reports what actually happened.
+// `as_of`, count, and exact-set confirmation token. Anything that failed in
+// between is excluded by `as_of`; if an older candidate changed, the token no
+// longer matches and the server asks for a fresh preview rather than
+// substituting work the operator was not shown.
 function BulkRetry({ s }: { s: ActivitySourceView }) {
   const qc = useQueryClient()
   const [preview, setPreview] = useState<RetryReport | null>(null)
@@ -44,7 +45,12 @@ function BulkRetry({ s }: { s: ActivitySourceView }) {
   })
   const apply = useMutation({
     mutationFn: (p: RetryReport) =>
-      api.retrySourceContent(s.source_id, { preview: false, limit: p.accepted, as_of: p.as_of }),
+      api.retrySourceContent(s.source_id, {
+        preview: false,
+        limit: p.accepted,
+        as_of: p.as_of,
+        confirmation: p.confirmation ?? undefined,
+      }),
     onSuccess: (r) => {
       setPreview(null)
       setDone(r)

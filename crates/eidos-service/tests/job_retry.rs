@@ -151,6 +151,7 @@ fn retry_endpoints_requeue_a_failed_job_that_workers_then_process() {
     assert_eq!(preview["preview"], serde_json::Value::Bool(true));
     assert_eq!(n(&preview, "accepted"), 1);
     assert_eq!(n(&preview, "bytes"), TEXT.len() as u64);
+    assert_eq!(preview["confirmation"].as_str().unwrap().len(), 64);
     assert_eq!((n(&preview, "skipped"), n(&preview, "rejected")), (0, 0));
     assert_eq!(state.catalog.job_counts(None).unwrap().failed, 1);
 
@@ -235,11 +236,23 @@ fn retry_endpoints_requeue_a_failed_job_that_workers_then_process() {
             true,
         )
         .unwrap();
+    let deterministic_preview = post(
+        &rt,
+        &app,
+        &format!("/api/sources/{}/content/retry", sid.0),
+        r#"{"class":"deterministic","preview":true}"#,
+    );
+    let confirmation = serde_json::json!({
+        "class": "deterministic",
+        "limit": n(&deterministic_preview, "accepted"),
+        "as_of": deterministic_preview["as_of"],
+        "confirmation": deterministic_preview["confirmation"],
+    });
     let deterministic = post(
         &rt,
         &app,
         &format!("/api/sources/{}/content/retry", sid.0),
-        r#"{"class":"deterministic"}"#,
+        &confirmation.to_string(),
     );
     assert_eq!(n(&deterministic, "accepted"), 1);
     assert_eq!(n(&deterministic, "bytes"), TEXT.len() as u64);

@@ -66,14 +66,17 @@ pub struct RetrySelector {
     pub class: Option<FailureClass>,
     /// Match jobs whose `last_error` starts with this text.
     pub reason_prefix: Option<String>,
-    /// Stop after requeueing this many. A confirmation can pass the count
-    /// its preview reported and be sure the action stays within it.
+    /// Stop after requeueing this many.
     pub limit: Option<u32>,
     /// Ignore failures recorded after this instant. A confirmation passes
     /// the `as_of` of the preview it is confirming, so work that failed
     /// between the two steps is left for the next round instead of being
     /// requeued on the strength of a number that did not include it.
     pub as_of: Option<UnixNanos>,
+    /// Opaque digest returned by a preview. When present on an action, the
+    /// exact accepted candidate sequence is recomputed inside the write
+    /// transaction and the action is rejected if it changed.
+    pub confirmation: Option<String>,
     /// Count what would happen without changing anything.
     pub preview: bool,
 }
@@ -106,9 +109,13 @@ impl RetrySelector {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryReport {
     pub preview: bool,
-    /// When this evaluation ran; pass it back as `as_of` to confirm exactly
-    /// the failures it counted.
+    /// When this evaluation ran; pass it back as `as_of` so later failures do
+    /// not invalidate the preview.
     pub as_of: UnixNanos,
+    /// Opaque digest of the exact accepted candidate set. A two-step caller
+    /// passes this back on the action so churn cannot substitute candidates
+    /// that were outside the preview.
+    pub confirmation: Option<String>,
     /// Jobs moved back to `queued`, plus failed objects put back to
     /// `pending` with a content job (or what would be, in a preview).
     pub accepted: u64,
@@ -150,6 +157,29 @@ impl RetryReport {
     pub fn total(&self) -> u64 {
         self.accepted + self.skipped + self.rejected
     }
+}
+
+fn selection_hasher() -> blake3::Hasher {
+    let mut h = blake3::Hasher::new();
+    h.update(b"eidos-retry-confirmation-v1\0");
+    h
+}
+
+fn select_job(h: &mut blake3::Hasher, id: JobId, bytes: u64) {
+    h.update(b"job\0");
+    h.update(&id.0.to_le_bytes());
+    h.update(&bytes.to_le_bytes());
+}
+
+fn select_content(h: &mut blake3::Hasher, object: ObjectId, generation: u32, bytes: u64) {
+    h.update(b"content\0");
+    h.update(&object.0.to_le_bytes());
+    h.update(&generation.to_le_bytes());
+    h.update(&bytes.to_le_bytes());
+}
+
+fn selection_token(h: &blake3::Hasher) -> String {
+    h.finalize().to_hex().to_string()
 }
 
 /// Escape SQL `LIKE` wildcards so a reason prefix is matched literally.
@@ -214,12 +244,41 @@ impl Catalog {
             ..Default::default()
         };
         if sel.preview {
-            self.with_reader(|conn| evaluate(conn, sel, &prefix, limit, &mut report))?;
+            let mut selection = selection_hasher();
+            self.with_reader(|conn| {
+                evaluate(conn, sel, &prefix, limit, &mut report, &mut selection)
+            })?;
+            report.confirmation = Some(selection_token(&selection));
         } else {
             self.with_writer(|conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                evaluate(&tx, sel, &prefix, limit, &mut report)?;
+                if let Some(expected) = &sel.confirmation {
+                    let mut preview_sel = sel.clone();
+                    preview_sel.preview = true;
+                    preview_sel.confirmation = None;
+                    let mut current = RetryReport {
+                        preview: true,
+                        as_of: report.as_of,
+                        ..Default::default()
+                    };
+                    let mut selection = selection_hasher();
+                    evaluate(
+                        &tx,
+                        &preview_sel,
+                        &prefix,
+                        limit,
+                        &mut current,
+                        &mut selection,
+                    )?;
+                    if selection_token(&selection) != *expected {
+                        return Err(crate::CatalogError::InvalidState(
+                            "retry preview is stale; preview again before confirming".into(),
+                        ));
+                    }
+                }
+                let mut selection = selection_hasher();
+                evaluate(&tx, sel, &prefix, limit, &mut report, &mut selection)?;
                 tx.commit()?;
                 Ok(())
             })?;
@@ -273,6 +332,7 @@ fn evaluate(
     prefix: &Option<String>,
     limit: u64,
     report: &mut RetryReport,
+    selection: &mut blake3::Hasher,
 ) -> Result<()> {
     let now = report.as_of.0;
     let candidates: Vec<Candidate> = conn
@@ -312,6 +372,7 @@ fn evaluate(
         }
         match classify(conn, &c)? {
             Verdict::Accept => {
+                let bytes = c.estimated_cost.max(0) as u64;
                 if !sel.preview {
                     conn.execute(
                         "UPDATE jobs SET state = 'queued', scheduled_at = ?2, started_at = NULL, finished_at = NULL,
@@ -320,7 +381,9 @@ fn evaluate(
                         params![c.job_id, now, c.attempts],
                     )?;
                 }
-                report.accept(Some(JobId(c.job_id)), c.estimated_cost.max(0) as u64);
+                let id = JobId(c.job_id);
+                select_job(selection, id, bytes);
+                report.accept(Some(id), bytes);
             }
             Verdict::Skip(why) => report.skip(why),
             Verdict::Reject(why) => report.reject(why),
@@ -330,7 +393,7 @@ fn evaluate(
         && sel.job_id.is_none()
         && sel.stage.is_none_or(|s| s == JobStage::ContentText)
     {
-        retry_failed_content(conn, sel, prefix, limit, now, report)?;
+        retry_failed_content(conn, sel, prefix, limit, now, report, selection)?;
     }
     Ok(())
 }
@@ -363,6 +426,7 @@ fn retry_failed_content(
     limit: u64,
     now: i64,
     report: &mut RetryReport,
+    selection: &mut blake3::Hasher,
 ) -> Result<()> {
     struct Row {
         object: ObjectId,
@@ -439,6 +503,7 @@ fn retry_failed_content(
             // keeps its failure until the re-run overwrites it.
             crate::content::flip_state(conn, row.object, ContentState::Pending, None)?;
         }
+        select_content(selection, row.object, row.generation, row.size);
         report.accept(existing.map(|(id, _)| JobId(id)), row.size);
     }
     Ok(())

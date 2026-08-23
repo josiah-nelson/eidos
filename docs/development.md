@@ -88,10 +88,13 @@ skips objects that were deleted, superseded by a newer generation, retired,
 or whose source has content extraction disabled — the response reports
 `accepted`, `skipped`, `rejected`, and `bytes` with per-reason counts. The
 Activity page has a retry button per recent failure and a two-step bulk retry
-per source that shows the preview count before acting — the confirmation
-carries that preview's `as_of` and count, so anything that fails in between
-waits for the next round; the endpoints are
-`POST /api/jobs/{id}/retry` and `POST /api/sources/{id}/content/retry`.
+per source that shows the preview count before acting. The confirmation
+carries that preview's `as_of`, count, and opaque exact-set token. Failures
+that appear later wait for the next round; if an older previewed failure
+becomes ineligible, the action returns `409` and asks the operator to preview
+again instead of substituting a different pre-existing failure. The endpoints
+are `POST /api/jobs/{id}/retry` and
+`POST /api/sources/{id}/content/retry`.
 
 Searching through the running service:
 

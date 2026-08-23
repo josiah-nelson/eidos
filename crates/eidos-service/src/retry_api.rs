@@ -42,6 +42,9 @@ pub struct RetryBody {
     /// A confirmation passes the `as_of` of the preview it confirms.
     #[serde(default)]
     pub as_of: Option<i64>,
+    /// Opaque exact-set digest returned by the preview being confirmed.
+    #[serde(default)]
+    pub confirmation: Option<String>,
 }
 
 fn parse_class(raw: Option<&str>) -> Result<Option<FailureClass>, ApiError> {
@@ -104,6 +107,7 @@ async fn retry_source_content(
         preview: body.preview,
         limit: body.limit,
         as_of: body.as_of.map(eidos_domain::UnixNanos),
+        confirmation: body.confirmation,
         ..RetrySelector::source(sid, JobStage::ContentText)
     };
     run(st, sel).await
