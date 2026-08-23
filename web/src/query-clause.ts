@@ -54,17 +54,29 @@ function indexOfRun(tokens: string[], run: string[]): number {
   return -1
 }
 
+const isOr = (token: string | undefined) => token === 'OR' || token === '|'
 const isOperator = (token: string | undefined) =>
-  token === 'OR' || token === '|' || token === 'AND' || token === '&&'
+  isOr(token) || token === 'AND' || token === '&&'
 
 /**
  * Drop operators a removal left dangling. Taking `size:<4k` out of
- * `size:<4k OR ext:md` leaves a leading `OR`, which does not parse.
+ * `size:<4k OR ext:md` leaves a leading `OR`, which does not parse, and out
+ * of `a AND size:<4k OR b` it leaves two operators between the surviving
+ * branches. A run collapses to one, and `OR` wins it: the branches it
+ * joined are still there, and turning them into an `AND` would drop results
+ * the query asked for.
  */
 function dropDanglingOperators(tokens: string[]): string[] {
   const out: string[] = []
   for (const t of tokens) {
-    if (isOperator(t) && (out.length === 0 || isOperator(out[out.length - 1]))) continue
+    if (isOperator(t)) {
+      if (out.length === 0) continue
+      const prev = out[out.length - 1]
+      if (isOperator(prev)) {
+        if (isOr(t) && !isOr(prev)) out[out.length - 1] = t
+        continue
+      }
+    }
     out.push(t)
   }
   while (out.length > 0 && isOperator(out[out.length - 1])) out.pop()

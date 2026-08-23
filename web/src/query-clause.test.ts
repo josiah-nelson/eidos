@@ -100,6 +100,19 @@ test('replacing a whole branch leaves no dangling operator', () => {
   assert.equal(applyFacetClick('size:<4k', medium, 'include', others(medium)), 'size:>=4k size:<64k')
 })
 
+test('a disjunction survives a replacement between unlike operators', () => {
+  // `(a AND size:<4k) OR b` and `a OR (size:<4k AND b)` both leave `a` and
+  // `b` joined by OR; collapsing to the AND instead would drop results.
+  assert.equal(
+    applyFacetClick('a AND size:<4k OR b', medium, 'include', others(medium)),
+    '(a OR b) size:>=4k size:<64k',
+  )
+  assert.equal(
+    applyFacetClick('a OR size:<4k AND b', medium, 'include', others(medium)),
+    '(a OR b) size:>=4k size:<64k',
+  )
+})
+
 test('term facet clauses negate without grouping', () => {
   assert.equal(negate('ext:cs'), '-ext:cs')
   assert.equal(negate('size:>=4k size:<64k'), '-(size:>=4k size:<64k)')
