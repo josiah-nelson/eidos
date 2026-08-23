@@ -4,6 +4,7 @@
 //! the service, CLI, web UI, saved queries, and (later) the NLQ adapter and MCP
 //! server. Changes here are schema changes and must be versioned.
 
+pub mod archive;
 pub mod bench;
 pub mod classify;
 pub mod ids;

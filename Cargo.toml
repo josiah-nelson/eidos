@@ -5,6 +5,7 @@ members = [
     "crates/eidos-catalog",
     "crates/eidos-scanner",
     "crates/eidos-content",
+    "crates/eidos-archive",
     "crates/eidos-search",
     "crates/eidos-query",
     "crates/eidos-service",
@@ -21,6 +22,7 @@ repository = "https://github.com/josiah-nelson/eidos"
 [workspace.dependencies]
 eidos-domain = { path = "crates/eidos-domain" }
 eidos-catalog = { path = "crates/eidos-catalog" }
+eidos-archive = { path = "crates/eidos-archive" }
 eidos-scanner = { path = "crates/eidos-scanner" }
 eidos-content = { path = "crates/eidos-content" }
 eidos-search = { path = "crates/eidos-search" }
