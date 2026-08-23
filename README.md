@@ -83,6 +83,7 @@ Everything eidos does to a source is read-only.
 | [docs/roadmap.md](docs/roadmap.md) | Releases, milestones, acceptance gates, non-goals |
 | [docs/query-syntax.md](docs/query-syntax.md) | The query language accepted by the UI, CLI, and API |
 | [docs/development.md](docs/development.md) | Toolchain, build/test/lint commands, benchmarks, layout |
+| [docs/releasing.md](docs/releasing.md) | Signed Windows release workflow and Azure Artifact Signing configuration |
 | [docs/benchmarks.md](docs/benchmarks.md) | Measured results on the reference corpus |
 | [docs/adr/](docs/adr/) | Architecture decision records |
 

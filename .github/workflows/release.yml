@@ -1,0 +1,186 @@
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  windows:
+    name: signed Windows x86-64 release
+    runs-on: windows-2025
+    environment: release
+
+    steps:
+      - name: Validate signing configuration
+        shell: pwsh
+        env:
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          ARTIFACT_SIGNING_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          $required = @{
+            AZURE_ARTIFACT_SIGNING_ENDPOINT = $env:ARTIFACT_SIGNING_ENDPOINT
+            AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME = $env:ARTIFACT_SIGNING_ACCOUNT
+            AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME = $env:ARTIFACT_SIGNING_PROFILE
+            AZURE_CLIENT_ID = $env:AZURE_CLIENT_ID
+            AZURE_CLIENT_SECRET = $env:AZURE_CLIENT_SECRET
+            AZURE_TENANT_ID = $env:AZURE_TENANT_ID
+          }
+
+          $missing = @($required.GetEnumerator() | Where-Object {
+            [string]::IsNullOrWhiteSpace([string]$_.Value)
+          } | ForEach-Object Key)
+
+          if ($missing.Count -gt 0) {
+            throw "Missing release environment configuration: $($missing -join ', ')"
+          }
+
+          $endpoint = $null
+          if (-not [Uri]::TryCreate(
+              $env:ARTIFACT_SIGNING_ENDPOINT,
+              [UriKind]::Absolute,
+              [ref]$endpoint
+            ) -or $endpoint.Scheme -ne 'https') {
+            throw 'AZURE_ARTIFACT_SIGNING_ENDPOINT must be an absolute HTTPS URL.'
+          }
+
+      - name: Check out the released revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Windows executable
+        run: cargo build --locked --release --bin eidos
+
+      - name: Sign Windows executable with Azure Artifact Signing
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          files: ${{ github.workspace }}\target\release\eidos.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: eidos
+          description-url: https://github.com/${{ github.repository }}
+          exclude-environment-credential: false
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Verify Authenticode signature and timestamp
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:GITHUB_WORKSPACE 'target\release\eidos.exe'
+          $signature = Get-AuthenticodeSignature -LiteralPath $binary
+
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "Authenticode verification failed: $($signature.StatusMessage)"
+          }
+          if ($null -eq $signature.TimeStamperCertificate) {
+            throw 'The executable has no trusted timestamp.'
+          }
+
+          Write-Host "Verified signer: $($signature.SignerCertificate.Subject)"
+          Write-Host "Certificate thumbprint: $($signature.SignerCertificate.Thumbprint)"
+
+      - name: Package signed release
+        id: package
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if ($env:EVENT_NAME -eq 'release') {
+            $version = $env:RELEASE_TAG
+          } else {
+            $version = "manual-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+          $version = $version -replace '[^0-9A-Za-z._-]', '-'
+
+          $packageName = "eidos-$version-windows-x86_64"
+          $stagingRoot = Join-Path $env:RUNNER_TEMP 'eidos-release'
+          $packageRoot = Join-Path $stagingRoot $packageName
+          $webRoot = Join-Path $packageRoot 'web\dist'
+
+          New-Item -ItemType Directory -Force -Path $webRoot | Out-Null
+          Copy-Item -LiteralPath 'target\release\eidos.exe' -Destination $packageRoot
+          Copy-Item -Path 'web\dist\*' -Destination $webRoot -Recurse
+          Copy-Item -LiteralPath 'README.md', 'LICENSE' -Destination $packageRoot
+
+          $archive = Join-Path $env:RUNNER_TEMP "$packageName.zip"
+          Compress-Archive -LiteralPath $packageRoot -DestinationPath $archive -CompressionLevel Optimal
+
+          $checksumPath = "$archive.sha256"
+          $checksum = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$checksum  $([IO.Path]::GetFileName($archive))" |
+            Set-Content -LiteralPath $checksumPath -NoNewline
+
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+          "checksum=$checksumPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload assets to published release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive }}
+          CHECKSUM_PATH: ${{ steps.package.outputs.checksum }}
+        run: |
+          gh release upload $env:RELEASE_TAG $env:ARCHIVE_PATH $env:CHECKSUM_PATH --clobber
+
+      - name: Upload manual test artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: eidos-signed-windows-x86_64
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
