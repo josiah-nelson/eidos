@@ -324,6 +324,13 @@ fn containers_get_manifests_and_members() {
         .any(|e| e.extension == "rs" && e.count == 1));
     let has_rs = fx.run_mode("has:rs", ResultMode::Directories);
     assert!(has_rs.hits.iter().any(|h| h.object_id == virtual_dir));
+    for query in ["files:=1", "count:=1", "subtree:=0"] {
+        let response = fx.run_mode(query, ResultMode::Directories);
+        assert!(
+            response.hits.iter().any(|h| h.object_id == virtual_dir),
+            "{query} omitted the virtual directory"
+        );
+    }
 
     // A normal reconciliation observes no virtual rows from the filesystem,
     // but must preserve their identities and rebuild the same accounting.

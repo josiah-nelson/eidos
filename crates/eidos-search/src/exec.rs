@@ -671,11 +671,21 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
                 SizeField::Logical => f.subtree_logical,
                 SizeField::Allocated => f.subtree_allocated,
             };
-            all_of(vec![term_text(f.kind, "directory"), u64_range(fld, *min, *max)])
+            all_of(vec![
+                any_of(vec![
+                    term_text(f.kind, "directory"),
+                    term_text(f.kind, "virtual_directory"),
+                ]),
+                u64_range(fld, *min, *max),
+            ])
         }
-        Query::DescendantCount { min, max } => {
-            all_of(vec![term_text(f.kind, "directory"), u64_range(f.file_count, *min, *max)])
-        }
+        Query::DescendantCount { min, max } => all_of(vec![
+            any_of(vec![
+                term_text(f.kind, "directory"),
+                term_text(f.kind, "virtual_directory"),
+            ]),
+            u64_range(f.file_count, *min, *max),
+        ]),
         Query::Archive { .. } => {
             return Err(QueryError::Other {
                 message: "archive clauses are not available until the ZIP manifest index exists (Milestone 5)".into(),
