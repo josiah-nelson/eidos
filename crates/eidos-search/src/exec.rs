@@ -2341,11 +2341,8 @@ pub fn search_with_content(
         &in_scope.iter().map(|s| s.id).collect::<Vec<_>>(),
         &mut warnings,
     )?;
-    if content_index.is_some_and(|c| c.is_rebuilding()) {
-        warnings.push(
-            "the content index is being rebuilt from stored chunks; content results are partial until it finishes"
-                .into(),
-        );
+    if let Some(reason) = content_index.and_then(|c| c.content_incomplete_reason()) {
+        warnings.push(reason);
         for c in completeness.iter_mut() {
             c.content_complete = false;
         }
@@ -2453,6 +2450,9 @@ fn build_hits(
                     .filter(|r| r.generation == obj.generation)
                     .map(|r| r.coverage)
                     .unwrap_or(Coverage::None),
+                // The generation the stored chunks belong to, which may lag
+                // the object when a change is waiting for re-extraction.
+                generation: rec.as_ref().map(|r| r.generation),
                 indexed_bytes: rec
                     .as_ref()
                     .filter(|r| r.generation == obj.generation)

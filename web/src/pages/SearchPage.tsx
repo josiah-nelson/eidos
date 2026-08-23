@@ -14,8 +14,17 @@ import {
   type SortField,
 } from '../api'
 import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
+import { ContentPreviewPanel } from '../ContentPreview'
 import { bytes, count, duration, when } from '../format'
 import { applyFacetClick, negate, type FacetForms } from '../query-clause'
+
+/** What a "show context" click opens: stored text around one chunk. */
+export interface PreviewTarget {
+  objectId: number
+  name: string
+  ordinal: number
+  generation?: number
+}
 
 const PAGE = 100
 const FILE_FACETS: FacetField[] = ['source', 'extension', 'kind', 'content_state', 'size_bucket', 'modified_bucket']
@@ -43,6 +52,7 @@ export default function SearchPage() {
   const [draft, setDraft] = useState(q)
   const [lastQ, setLastQ] = useState(q)
   const [showPlan, setShowPlan] = useState(false)
+  const [preview, setPreview] = useState<PreviewTarget | null>(null)
   if (q !== lastQ) {
     // URL changed (back/forward, example click): resync the editor.
     setLastQ(q)
@@ -242,6 +252,7 @@ export default function SearchPage() {
               hasMore={results.hasNextPage ?? false}
               fetching={results.isFetchingNextPage}
               fetchMore={() => results.fetchNextPage()}
+              onPreview={setPreview}
             />
           </div>
           <aside className="side">
@@ -297,6 +308,15 @@ export default function SearchPage() {
             ))}
           </aside>
         </div>
+      )}
+      {preview && (
+        <ContentPreviewPanel
+          objectId={preview.objectId}
+          name={preview.name}
+          ordinal={preview.ordinal}
+          generation={preview.generation}
+          onClose={() => setPreview(null)}
+        />
       )}
     </div>
   )
@@ -391,12 +411,14 @@ function HitTable({
   hasMore,
   fetching,
   fetchMore,
+  onPreview,
 }: {
   hits: Hit[]
   mode: ResultMode
   hasMore: boolean
   fetching: boolean
   fetchMore: () => void
+  onPreview: (t: PreviewTarget) => void
 }) {
   const parentRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -465,6 +487,21 @@ function HitTable({
                       .map(([e, n]) => `${e || '∅'} ${n}`)
                       .join(' · ')}
                   </span>
+                ) : h.content.state === 'indexed' || h.content.state === 'partial' ? (
+                  <button
+                    className="linkish"
+                    title="Show the text the indexer stored for this file"
+                    onClick={() =>
+                      onPreview({
+                        objectId: h.object_id,
+                        name: h.name,
+                        ordinal: snippets[0]?.chunk_ordinal ?? 0,
+                        generation: h.content.generation,
+                      })
+                    }
+                  >
+                    <ContentBadge state={h.content.state} />
+                  </button>
                 ) : (
                   <ContentBadge state={h.content.state} />
                 )}
@@ -474,7 +511,21 @@ function HitTable({
                   {snippets.map((s) => (
                     <div key={s.chunk_ordinal + ':' + s.line_start}>
                       <span className="line">L{s.line_start + 1}</span>
-                      <Highlighted text={s.text} ranges={s.highlights} />
+                      <Highlighted text={s.text} ranges={s.highlights} />{' '}
+                      <button
+                        className="linkish"
+                        title="Show the indexed text around this match"
+                        onClick={() =>
+                          onPreview({
+                            objectId: h.object_id,
+                            name: h.name,
+                            ordinal: s.chunk_ordinal,
+                            generation: h.content.generation,
+                          })
+                        }
+                      >
+                        show context
+                      </button>
                     </div>
                   ))}
                 </div>

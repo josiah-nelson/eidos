@@ -37,7 +37,12 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
         .route("/objects/{id}/children", get(children))
         .route("/objects/{id}/extensions", get(extensions))
         .route("/objects/{id}/archive", get(archive))
+        .route(
+            "/objects/{id}/content",
+            get(crate::content_preview::object_content),
+        )
         .route("/sources/{id}/archives", post(requeue_archives))
+        .merge(crate::retry_api::routes())
         .route("/resolve", get(resolve))
         .route("/search", post(search).get(search_get))
         .route(
@@ -79,6 +84,8 @@ pub struct ApiError {
     pub(crate) message: String,
     /// Emitted as `Retry-After` (seconds) when load is shed.
     retry_after_s: Option<u64>,
+    /// Extra machine-readable fields merged into the error body.
+    details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -88,18 +95,19 @@ impl ApiError {
             kind,
             message: message.into(),
             retry_after_s: None,
+            details: None,
         }
     }
-    fn not_found(msg: impl Into<String>) -> Self {
+    pub(crate) fn not_found(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", msg)
     }
     pub(crate) fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", msg)
     }
-    fn conflict(msg: impl Into<String>) -> Self {
+    pub(crate) fn conflict(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", msg)
     }
-    fn internal(msg: impl Into<String>) -> Self {
+    pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
     }
     /// Load shed by a bound of our own rather than by the admission gate.
@@ -108,6 +116,16 @@ impl ApiError {
             retry_after_s: Some(retry_after_s),
             ..Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy", msg)
         }
+    }
+    /// Replace the stable error code clients switch on.
+    pub(crate) fn with_kind(mut self, kind: &'static str) -> Self {
+        self.kind = kind;
+        self
+    }
+    /// Merge an object of extra fields into the error body.
+    pub(crate) fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 }
 
@@ -144,20 +162,21 @@ impl From<eidos_catalog::CatalogError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({ "error": self.message, "kind": self.kind });
+        let mut body = serde_json::Map::new();
+        body.insert("error".into(), serde_json::Value::String(self.message));
+        body.insert("kind".into(), serde_json::Value::String(self.kind.into()));
+        if let Some(serde_json::Value::Object(extra)) = self.details {
+            body.extend(extra);
+        }
+        let body = Json(serde_json::Value::Object(body));
         match self.retry_after_s {
-            Some(s) => (
-                self.status,
-                [(header::RETRY_AFTER, s.to_string())],
-                Json(body),
-            )
-                .into_response(),
-            None => (self.status, Json(body)).into_response(),
+            Some(s) => (self.status, [(header::RETRY_AFTER, s.to_string())], body).into_response(),
+            None => (self.status, body).into_response(),
         }
     }
 }
 
-type ApiResult<T> = Result<Json<T>, ApiError>;
+pub(crate) type ApiResult<T> = Result<Json<T>, ApiError>;
 
 // ----- health --------------------------------------------------------------
 
@@ -937,6 +956,9 @@ pub struct ActivitySourceView {
     pub content_peak_reserved: u32,
     pub jobs_queued: u64,
     pub jobs_running: u64,
+    pub jobs_failed: u64,
+    /// Estimated bytes behind the failed jobs of this source.
+    pub jobs_failed_bytes: u64,
     pub content_states: std::collections::BTreeMap<String, u64>,
     pub content_bytes_indexed: u64,
 }
@@ -950,6 +972,8 @@ pub struct ActivityView {
     pub workers: crate::content_workers::ContentWorkersView,
     pub follower: crate::follower::FollowerView,
     pub content_index_documents: u64,
+    /// Rebuild-from-stored-chunks state of the content index.
+    pub content_rebuild: eidos_search::content::RebuildStatus,
     /// Admission-control gauges and totals for expensive API operations.
     pub admission: crate::admission::AdmissionView,
     pub sources: Vec<ActivitySourceView>,
@@ -962,9 +986,13 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
         let by_source = st2
             .catalog
             .jobs_by_source(eidos_domain::JobStage::ContentText)?;
+        let failed_by_source = st2
+            .catalog
+            .failed_work_by_source(eidos_domain::JobStage::ContentText)?;
         let mut sources = Vec::new();
         for s in st2.catalog.list_sources()? {
             let q = by_source.get(&s.id).copied().unwrap_or((0, 0));
+            let failed = failed_by_source.get(&s.id).copied().unwrap_or((0, 0));
             let stats = st2.catalog.content_stats(Some(s.id))?;
             sources.push(ActivitySourceView {
                 source_id: s.id,
@@ -976,6 +1004,8 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
                 content_peak_reserved: st2.content_budgets().peak_reserved(s.id),
                 jobs_queued: q.0,
                 jobs_running: q.1,
+                jobs_failed: failed.0,
+                jobs_failed_bytes: failed.1,
                 content_states: st2.catalog.content_state_counts(s.id)?,
                 content_bytes_indexed: stats.indexed_bytes,
             });
@@ -990,6 +1020,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
             workers: st2.content_workers.view(st2.content_index.uncommitted()),
             follower: st2.follower.view(&st2),
             content_index_documents: st2.content_index.num_docs(),
+            content_rebuild: st2.content_index.rebuild_status(),
             admission: st2.admission.view(),
             sources,
             recent_failures: st2.catalog.recent_failed_jobs(20)?,

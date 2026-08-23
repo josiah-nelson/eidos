@@ -14,7 +14,7 @@ use eidos_domain::{ObjectId, SourceId, TextMode};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tantivy::collector::{DocSetCollector, TopDocs};
@@ -197,7 +197,65 @@ pub struct ContentIndex {
     /// commit coordinator that the writer holds work.
     pending_ops: AtomicU64,
     commits: AtomicU64,
-    rebuilding: std::sync::atomic::AtomicBool,
+    /// Writer protocol: every ordinary mutation (`add_chunks`,
+    /// `delete_object`, `delete_source`, `commit`) holds the read side; a
+    /// rebuild holds the write side for its whole duration, so nothing else
+    /// can interleave with `delete_all_documents` + re-add + commit.
+    gate: parking_lot::RwLock<()>,
+    rebuild: Mutex<RebuildState>,
+    rebuild_docs: AtomicU64,
+    rebuild_pacer: Mutex<Option<RebuildPacer>>,
+}
+
+/// Marker file written when a rebuild starts and removed when it finishes.
+/// Its presence at startup means the previous rebuild did not complete, so
+/// the index is partial and must be rebuilt again before content search is
+/// complete.
+pub const REBUILD_MARKER: &str = "rebuild.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebuildPhase {
+    /// No rebuild is pending; the index is complete with respect to stored chunks.
+    Idle,
+    /// A rebuild is required (marker present or scheduled) but has not started.
+    Pending,
+    /// The rebuild thread is running.
+    Running,
+    /// The last rebuild failed or was interrupted; the marker is kept so the
+    /// next start rebuilds again.
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RebuildStatus {
+    pub phase: RebuildPhase,
+    /// Stored chunks the rebuild has to index (0 when unknown).
+    pub chunks: u64,
+    /// Documents added so far (the total once finished).
+    pub docs: u64,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+struct RebuildState {
+    phase: RebuildPhase,
+    chunks: u64,
+    started: Option<Instant>,
+    finished: Option<Instant>,
+    error: Option<String>,
+}
+
+/// Diagnostic/test hook invoked once per rebuilt document with the running
+/// count; returning `Err` aborts the rebuild with that reason.
+pub type RebuildPacer = Arc<dyn Fn(u64) -> std::result::Result<(), String> + Send + Sync>;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RebuildMarker {
+    chunks: u64,
+    started_at_unix_s: u64,
 }
 
 impl std::fmt::Debug for ContentIndex {
@@ -265,6 +323,33 @@ impl ContentIndex {
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
+        // An unfinished rebuild (marker left behind by a crash, a failure,
+        // or a shutdown) makes the index partial until it is rebuilt again.
+        // The marker's *presence* is the signal; an unreadable or torn
+        // marker is still a marker (the chunk count is advisory and the
+        // scheduler refreshes it from the catalog).
+        let marker_path = dir.join(REBUILD_MARKER);
+        let rebuild = match std::fs::metadata(&marker_path) {
+            Ok(_) => {
+                let parsed: Option<RebuildMarker> = std::fs::read(&marker_path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok());
+                RebuildState {
+                    phase: RebuildPhase::Pending,
+                    chunks: parsed.map(|m| m.chunks).unwrap_or(0),
+                    started: None,
+                    finished: None,
+                    error: Some("a previous rebuild did not finish".into()),
+                }
+            }
+            Err(_) => RebuildState {
+                phase: RebuildPhase::Idle,
+                chunks: 0,
+                started: None,
+                finished: None,
+                error: None,
+            },
+        };
         Ok(Arc::new(Self {
             dir,
             index,
@@ -274,7 +359,10 @@ impl ContentIndex {
             uncommitted: AtomicU64::new(0),
             pending_ops: AtomicU64::new(0),
             commits: AtomicU64::new(0),
-            rebuilding: std::sync::atomic::AtomicBool::new(false),
+            gate: parking_lot::RwLock::new(()),
+            rebuild: Mutex::new(rebuild),
+            rebuild_docs: AtomicU64::new(0),
+            rebuild_pacer: Mutex::new(None),
         }))
     }
 
@@ -321,6 +409,7 @@ impl ContentIndex {
     /// generations). Takes effect at the next commit, ordered before any
     /// documents added afterwards.
     pub fn delete_object(&self, object: ObjectId) {
+        let _gate = self.gate.read();
         let f = &self.fields;
         self.writer()
             .delete_term(Term::from_field_u64(f.object_id, object.0 as u64));
@@ -328,11 +417,14 @@ impl ContentIndex {
     }
 
     pub fn delete_source(&self, source: SourceId) -> Result<()> {
+        let _gate = self.gate.read();
         let f = &self.fields;
         self.writer()
             .delete_term(Term::from_field_u64(f.source_id, source.0 as u64));
         self.pending_ops.fetch_add(1, Ordering::Relaxed);
-        self.commit()?;
+        // The gate is held above: commit without re-acquiring it (a queued
+        // rebuild writer would otherwise block the nested read forever).
+        self.commit_locked()?;
         Ok(())
     }
 
@@ -348,6 +440,7 @@ impl ContentIndex {
             return Ok(());
         }
         let f = &self.fields;
+        let _gate = self.gate.read();
         let writer = self.writer();
         for c in chunks {
             let mut d = TantivyDocument::new();
@@ -370,6 +463,12 @@ impl ContentIndex {
     /// Commit queued adds/deletes and make them visible. Returns the number
     /// of documents added since the previous commit.
     pub fn commit(&self) -> Result<u64> {
+        let _gate = self.gate.read();
+        self.commit_locked()
+    }
+
+    /// Commit without taking the gate (the caller holds it).
+    fn commit_locked(&self) -> Result<u64> {
         // Cleared before the commit: a mutation that races it is counted
         // again, which costs one extra commit but never loses one.
         let docs = self.uncommitted.swap(0, Ordering::Relaxed);
@@ -390,16 +489,106 @@ impl ContentIndex {
         self.writer.lock()
     }
 
-    /// True while `rebuild_from_chunks` runs: content results are partial.
+    /// True while a rebuild is pending or running: content results are
+    /// partial and workers must not touch the index.
     pub fn is_rebuilding(&self) -> bool {
-        self.rebuilding.load(Ordering::Relaxed)
+        matches!(
+            self.rebuild.lock().phase,
+            RebuildPhase::Pending | RebuildPhase::Running
+        )
+    }
+
+    pub fn rebuild_status(&self) -> RebuildStatus {
+        let st = self.rebuild.lock();
+        let elapsed = match (st.started, st.finished) {
+            (Some(s), Some(f)) => f.duration_since(s),
+            (Some(s), None) => s.elapsed(),
+            _ => std::time::Duration::ZERO,
+        };
+        RebuildStatus {
+            phase: st.phase,
+            chunks: st.chunks,
+            docs: self.rebuild_docs.load(Ordering::Relaxed),
+            elapsed_ms: elapsed.as_millis() as u64,
+            error: st.error.clone(),
+        }
+    }
+
+    /// Why content results are incomplete right now, if they are: a rebuild
+    /// is pending/running, or the last one failed and the index is partial.
+    pub fn content_incomplete_reason(&self) -> Option<String> {
+        let st = self.rebuild.lock();
+        match st.phase {
+            RebuildPhase::Idle => None,
+            RebuildPhase::Pending | RebuildPhase::Running => Some(format!(
+                "the content index is being rebuilt from stored chunks ({} of {} documents); content results are partial until it finishes",
+                self.rebuild_docs.load(Ordering::Relaxed),
+                st.chunks
+            )),
+            RebuildPhase::Failed => Some(format!(
+                "the content index rebuild failed ({}); content results are partial until the service is restarted and the rebuild completes",
+                st.error.as_deref().unwrap_or("unknown error")
+            )),
+        }
+    }
+
+    /// Schedule a rebuild: writes the durable marker and flips the phase to
+    /// `Pending` *synchronously*, so readiness and search report a partial
+    /// index from this moment on, before [`run_rebuild`](Self::run_rebuild)
+    /// starts on its thread.
+    pub fn begin_rebuild(&self, chunks: u64) -> Result<()> {
+        let marker = RebuildMarker {
+            chunks,
+            started_at_unix_s: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        // Written to a temporary file and renamed into place so a crash
+        // mid-write cannot leave a marker that is missing altogether; an
+        // incomplete temporary file is ignored and a torn marker still
+        // counts as present (see `open`).
+        let tmp = self.dir.join(format!("{REBUILD_MARKER}.tmp"));
+        std::fs::write(&tmp, serde_json::to_vec(&marker).expect("marker"))?;
+        std::fs::rename(&tmp, self.dir.join(REBUILD_MARKER))?;
+        let mut st = self.rebuild.lock();
+        st.phase = RebuildPhase::Pending;
+        st.chunks = chunks;
+        st.started = None;
+        st.finished = None;
+        st.error = None;
+        self.rebuild_docs.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Install (or clear) the per-document rebuild hook. Diagnostic/test use.
+    pub fn set_rebuild_pacer(&self, pacer: Option<RebuildPacer>) {
+        *self.rebuild_pacer.lock() = pacer;
     }
 
     /// Rebuild every chunk document from the catalog's stored chunks
-    /// (schema change, lost index) without reading any source file.
-    pub fn rebuild_from_chunks(&self, catalog: &Catalog) -> Result<u64> {
-        self.rebuilding.store(true, Ordering::Relaxed);
+    /// (schema change, lost index, unfinished previous rebuild) without
+    /// reading any source file.
+    ///
+    /// Holds the writer gate for the whole run, so no worker or coordinator
+    /// mutation can interleave. On success the marker is removed and the
+    /// phase returns to `Idle`; on failure or cancellation (`cancel`, checked
+    /// before every document) the phase becomes `Failed` with the reason and
+    /// the marker stays, so the next start rebuilds again. The partially
+    /// rebuilt index may be searchable in the meantime, but every response
+    /// reports content as incomplete.
+    pub fn run_rebuild(&self, catalog: &Catalog, cancel: &AtomicBool) -> Result<u64> {
+        let _gate = self.gate.write();
         let started = Instant::now();
+        {
+            let mut st = self.rebuild.lock();
+            st.phase = RebuildPhase::Running;
+            st.started = Some(started);
+            st.finished = None;
+            st.error = None;
+        }
+        self.rebuild_docs.store(0, Ordering::Relaxed);
+        let pacer = self.rebuild_pacer.lock().clone();
         let result = (|| -> Result<u64> {
             {
                 let writer = self.writer();
@@ -410,6 +599,14 @@ impl ContentIndex {
             let mut docs = 0u64;
             let mut since_commit = 0u64;
             catalog.for_each_indexed_chunk(|object, source, generation, ordinal, text| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(eidos_catalog::CatalogError::InvalidState(
+                        "interrupted by shutdown".into(),
+                    ));
+                }
+                if let Some(p) = &pacer {
+                    p(docs).map_err(eidos_catalog::CatalogError::InvalidState)?;
+                }
                 let mut d = TantivyDocument::new();
                 d.add_u64(f.object_id, object.0 as u64);
                 d.add_u64(f.source_id, source.0 as u64);
@@ -423,6 +620,7 @@ impl ContentIndex {
                 })?;
                 docs += 1;
                 since_commit += 1;
+                self.rebuild_docs.store(docs, Ordering::Relaxed);
                 if since_commit >= 200_000 {
                     since_commit = 0;
                     self.writer().commit().map_err(|e| {
@@ -431,17 +629,34 @@ impl ContentIndex {
                 }
                 Ok(())
             })?;
-            self.commit()?;
+            self.commit_locked()?;
             Ok(docs)
         })();
-        self.rebuilding.store(false, Ordering::Relaxed);
-        let docs = result?;
-        tracing::info!(
-            docs,
-            ms = started.elapsed().as_millis() as u64,
-            "content index rebuilt from stored chunks"
-        );
-        Ok(docs)
+        let mut st = self.rebuild.lock();
+        st.finished = Some(Instant::now());
+        match result {
+            Ok(docs) => {
+                let _ = std::fs::remove_file(self.dir.join(REBUILD_MARKER));
+                st.phase = RebuildPhase::Idle;
+                st.error = None;
+                tracing::info!(
+                    docs,
+                    ms = started.elapsed().as_millis() as u64,
+                    "content index rebuilt from stored chunks"
+                );
+                Ok(docs)
+            }
+            Err(e) => {
+                st.phase = RebuildPhase::Failed;
+                st.error = Some(e.to_string());
+                tracing::error!(
+                    error = %e,
+                    docs = self.rebuild_docs.load(Ordering::Relaxed),
+                    "content index rebuild failed; it will run again at the next start"
+                );
+                Err(e)
+            }
+        }
     }
 }
 

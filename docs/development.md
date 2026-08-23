@@ -115,6 +115,69 @@ the first crawl of a slow or remote root:
 The same controls are on the Activity and source pages of the web UI and at
 `POST /api/sources/{id}/content` / `GET /api/activity`.
 
+Transient failures (share offline, sharing violation) retry on their own with
+exponential backoff. Deterministic, corrupt, unsupported, and resource-limit
+failures are terminal on purpose: they come back only through an explicit
+operator retry, once the extractor, the limit, or the share is fixed. A retry
+covers both places a failure can live — a job left `failed` after its
+transient budget ran out, and an object whose extraction failed for good
+(the failure is on the content record and the job finished; the object goes
+back to `pending` with a fresh content job).
+
+```powershell
+.\target\release\eidos.exe content retry --source share --preview            # how many, how many bytes
+.\target\release\eidos.exe content retry --source share --class resource_limit
+.\target\release\eidos.exe content retry --source share --reason-prefix "extract:" --limit 500
+.\target\release\eidos.exe content retry 4213                                # one job id
+```
+
+Retrying keeps the diagnosis: `attempts`, `last_error`, and `failure_class`
+stay on the job, `requeue_count`/`requeued_at` record the action, and the
+automatic transient budget starts again from the requeue. A retry never
+touches a running job, never creates a second active job for one object, and
+skips objects that were deleted, superseded by a newer generation, retired,
+or whose source has content extraction disabled — the response reports
+`accepted`, `skipped`, `rejected`, and `bytes` with per-reason counts. The
+Activity page has a retry button per recent failure and a two-step bulk retry
+per source that shows the preview count before acting. The confirmation
+carries that preview's `as_of`, count, and opaque exact-set token. Failures
+that appear later wait for the next round; if an older previewed failure
+becomes ineligible, the action returns `409` and asks the operator to preview
+again instead of substituting a different pre-existing failure. The endpoints
+are `POST /api/jobs/{id}/retry` and
+`POST /api/sources/{id}/content/retry`.
+
+### Stored-text preview
+
+`GET /api/objects/{id}/content?generation=G&ordinal=N&before=B&after=A`
+returns the text the indexer stored for one object generation — the catalog's
+extraction cache, never a read of the source file, and never addressed by
+filesystem path.
+
+- `ordinal` (default 0) picks the chunk; `before`/`after` add neighbouring
+  chunks, clamped to 4 per side.
+- `generation` is optional. When it is supplied and does not match the
+  generation the stored chunks belong to, the request fails with `409` and
+  `{"kind": "stale_generation", "requested_generation", "current_generation"}`
+  so a client holding an old search hit refetches instead of rendering text
+  from a different version of the file. Search hits carry the value to send
+  as `content.generation`.
+- A successful response reports the content record's `state`, `coverage`,
+  `indexed_bytes`/`total_bytes`, `reason`, each chunk's byte and line ranges,
+  and `stale: true` when the object has moved on to a newer generation than
+  the stored text.
+- Responses are bounded: 4 neighbouring chunks per side, 256 KiB of text, and
+  4000 lines. `truncated` (per response and per chunk) says when the limits
+  cut something; `has_more_before`/`has_more_after` drive paging outwards. The
+  requested chunk is always returned (cut down if it alone is too big) and
+  neighbours only whole, so a client paging outwards steps the window rather
+  than widening it once the budget binds.
+- The blocking read goes through the same admission gate as browsing, so a
+  burst of previews cannot starve the blocking pool.
+- Text is sanitised before serialisation: C0/C1 control characters other than
+  tab, CR and LF, and bidirectional overrides, become U+FFFD (one for one, so
+  offsets still line up) and the chunk is flagged `sanitized`.
+
 Searching through the running service:
 
 ```powershell

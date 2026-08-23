@@ -4,6 +4,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { api, type ChildRow, type ChildSort } from '../api'
 import { CompletenessBanner, ContentBadge, ErrorBox, Spinner } from '../components'
+import { ContentPreviewPanel } from '../ContentPreview'
 import { attrFlags, bytes, count, when } from '../format'
 import { Treemap, type TreemapItem } from '../Treemap'
 
@@ -49,6 +50,7 @@ export default function BrowsePage() {
   const first = children.data?.pages[0]
   const total = first?.total ?? 0
   const [showMap, setShowMap] = useState(true)
+  const [preview, setPreview] = useState<{ objectId: number; name: string } | null>(null)
   const treemapItems: TreemapItem[] = useMemo(
     () =>
       rows.map((r) => ({
@@ -144,7 +146,16 @@ export default function BrowsePage() {
           fetching={children.isFetchingNextPage}
           hasMore={children.hasNextPage ?? false}
           fetchMore={() => children.fetchNextPage()}
+          onPreview={(objectId, name) => setPreview({ objectId, name })}
         />
+        {preview && (
+          <ContentPreviewPanel
+            objectId={preview.objectId}
+            name={preview.name}
+            ordinal={0}
+            onClose={() => setPreview(null)}
+          />
+        )}
       </div>
       <aside className="side">
         <div className="card">
@@ -227,6 +238,7 @@ function ChildrenTable({
   fetching,
   hasMore,
   fetchMore,
+  onPreview,
 }: {
   rows: ChildRow[]
   total: number
@@ -237,6 +249,7 @@ function ChildrenTable({
   fetching: boolean
   hasMore: boolean
   fetchMore: () => void
+  onPreview: (objectId: number, name: string) => void
 }) {
   const parentRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -312,6 +325,14 @@ function ChildrenTable({
                       {agg ? `${count(agg.content_pending)} pending` : '—'}
                     </span>
                   )
+                ) : r.object.content_state === 'indexed' || r.object.content_state === 'partial' ? (
+                  <button
+                    className="linkish"
+                    title="Show the text the indexer stored for this file"
+                    onClick={() => onPreview(r.object.id, r.entry.name)}
+                  >
+                    <ContentBadge state={r.object.content_state} />
+                  </button>
                 ) : (
                   <ContentBadge state={r.object.content_state} />
                 )}
