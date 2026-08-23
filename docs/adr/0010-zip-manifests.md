@@ -23,29 +23,34 @@ budgets and visibility as text extraction.
   fields are saturated, validates that the directory lies before its end
   record, and streams central file headers through a 256 KiB buffer. No
   local header is read and nothing is inflated. Multi-volume archives are
-  rejected as corrupt. Budgets: 1,000,000 members, 256 MiB of directory,
-  4 KiB names; reaching a budget truncates the inventory (`Partial`, reason
-  recorded) instead of failing it. Structural inconsistencies — directory
-  past the end record, entry signatures missing, a claimed entry count the
-  directory cannot hold — fail deterministically with the reason.
+  rejected as corrupt. Budgets: 1,000,000 explicit members, 256 MiB of
+  directory, 4 KiB names, 256 path segments, 1,000,000 implicit
+  directories, and 256 MiB of retained implicit-directory paths; reaching
+  a budget truncates the inventory (`Partial`, reason recorded) instead of
+  failing it. Structural inconsistencies — directory past the end record,
+  entry signatures missing, a claimed entry count the directory cannot
+  hold, or missing ZIP64 size replacements — fail deterministically with
+  the reason.
 - **Member names are normalised, never trusted.** `\` becomes `/`, leading
   `/` and drive letters are stripped, `.` and `..` segments are dropped,
   control characters removed, empty names replaced; each of these sets a
   flag on the member and the archive counts flagged members. Names are
-  UTF-8 when the flag or the Info-ZIP Unicode Path extra says so or when
-  the bytes are valid UTF-8, otherwise CP437. Timestamps come from the
-  NTFS or extended-timestamp extras when present, else the DOS fields
+  UTF-8 when the flag or a CRC-matched Info-ZIP Unicode Path extra says so,
+  or when the bytes are valid UTF-8, otherwise CP437. Timestamps come from
+  the NTFS or extended-timestamp extras when present, else the DOS fields
   (read as UTC, 2-second resolution). Directories missing from the archive
   but implied by member paths are synthesised as *implicit* members, so the
   virtual tree is complete.
 - **Manifests ride the content pipeline.** The scan policy now classifies
   ZIP-family extensions (`zip jar war ear aar apk ipa nupkg vsix xpi crx
   whl egg epub …`, never Office Open XML) as content candidates; their jobs
-  queue at `ArchiveManifest` priority, behind every text tier. The content
-  worker routes them to the parser and stores, in one transaction, the
-  `archive_records` row, the `archive_members` rows (replacing any earlier
-  generation's), and a content record that publishes the object's content
-  state — `indexed` with the reason "zip manifest: N members, D
+  queue at `ArchiveManifest` priority, behind every text tier. Hard-linked
+  objects use the extension of the same deterministic entry whose path the
+  worker renders. The content worker routes containers to the parser,
+  stages `archive_members` in bounded 1,024-row transactions, then
+  generation-checks and atomically publishes the `archive_records` and
+  content rows. A newer object generation rejects the stale result. The
+  content state is `indexed` with the reason "zip manifest: N members, D
   directories", `partial` when truncated, `failed` when corrupt. A file
   with a container extension that has no end record falls back to text
   extraction (a misnamed text file still indexes as text; binary ends
@@ -57,7 +62,8 @@ budgets and visibility as text extraction.
   manifest job for every container by extension whose current generation
   has no archive record — the path for catalogs crawled before this
   change, exposed as `POST /api/sources/{id}/archives` and
-  `eidos archive requeue <source>`.
+  `eidos archive requeue <source>`. Requeue selection and mutation run in
+  bounded 256-object transactions so other catalog writers can progress.
 - **Reading a manifest**: `GET /api/objects/{id}/archive` returns the
   record and one page of members, either the children of a virtual
   directory (`parent=`, directories first) or every member under a path

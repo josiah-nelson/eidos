@@ -258,7 +258,11 @@ fn process_archive(
                 reason: Some("no end-of-central-directory record; processed as text".into()),
                 ..base_record(ContentState::Unsupported)
             };
-            catalog.store_archive_marker(&rec)?;
+            if !catalog.store_archive_marker(&rec)? {
+                return Ok(Some(ProcessResult::Skipped(
+                    "superseded while reading archive metadata",
+                )));
+            }
             Ok(None)
         }
         Err(ArchiveError::Io(e)) => Ok(Some(ProcessResult::Retry {
@@ -279,7 +283,11 @@ fn process_archive(
                 0,
                 rec.elapsed_ms,
             );
-            catalog.store_archive(&rec, &[], &content, job)?;
+            if !catalog.store_archive(&rec, &[], &content, job)? {
+                return Ok(Some(ProcessResult::Skipped(
+                    "superseded while reading archive metadata",
+                )));
+            }
             Ok(Some(ProcessResult::Done(stats(ContentState::Failed, 0, 0))))
         }
         Ok(inv) => {
@@ -345,7 +353,11 @@ fn process_archive(
                 inv.bytes_read,
                 inv.elapsed_ms,
             );
-            catalog.store_archive(&rec, &members, &content, job)?;
+            if !catalog.store_archive(&rec, &members, &content, job)? {
+                return Ok(Some(ProcessResult::Skipped(
+                    "superseded while reading archive metadata",
+                )));
+            }
             Ok(Some(ProcessResult::Done(stats(
                 state,
                 inv.bytes_read,

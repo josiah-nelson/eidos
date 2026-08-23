@@ -7,7 +7,7 @@ use crate::content::{flip_state, upsert_content_record, ContentRecord};
 use crate::jobs::{enqueue_conn, NewJob};
 use crate::{Catalog, Result};
 use eidos_domain::*;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,6 +95,55 @@ fn member_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveMember> {
 const MEMBER_COLUMNS: &str =
     "ordinal, path, name, parent, raw_name, is_dir, implicit, size, compressed, method, crc32, modified, encrypted, flags";
 
+/// Release SQLite's single writer between bounded manifest batches.
+const ARCHIVE_MEMBER_BATCH: usize = 1_024;
+const ARCHIVE_REQUEUE_BATCH: usize = 256;
+
+fn archive_generation_is_current(conn: &Connection, rec: &ArchiveRecord) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM objects
+             WHERE object_id = ?1 AND source_id = ?2 AND generation = ?3
+               AND deleted_at IS NULL AND kind = 'file'",
+            params![rec.object_id.0, rec.source_id.0, rec.generation as i64],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn insert_archive_members(
+    conn: &Connection,
+    rec: &ArchiveRecord,
+    members: &[ArchiveMember],
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "INSERT OR REPLACE INTO archive_members (object_id, generation, {MEMBER_COLUMNS})
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+    ))?;
+    for m in members {
+        stmt.execute(params![
+            rec.object_id.0,
+            rec.generation as i64,
+            m.ordinal as i64,
+            m.path,
+            m.name,
+            m.parent,
+            m.raw_name,
+            m.is_dir as i64,
+            m.implicit as i64,
+            m.size as i64,
+            m.compressed as i64,
+            m.method as i64,
+            m.crc32 as i64,
+            m.modified.map(|t| t.0),
+            m.encrypted as i64,
+            m.flags as i64,
+        ])?;
+    }
+    Ok(())
+}
+
 /// SQL list of archive extensions for `lower(extension) IN (...)`.
 pub(crate) fn archive_extension_list() -> String {
     eidos_domain::archive::ZIP_EXTENSIONS
@@ -144,48 +193,68 @@ fn upsert_archive_record(tx: &rusqlite::Connection, rec: &ArchiveRecord) -> Resu
 
 impl Catalog {
     /// Store a manifest and its members with the content record that
-    /// publishes the object's content state, in one transaction; marks the
-    /// job done when given. Replaces any earlier manifest of the object.
+    /// publishes the object's content state. Member rows are staged in
+    /// bounded transactions; the final record publication is atomic and
+    /// only succeeds while the object is still at `rec.generation`. Returns
+    /// `false` when a newer generation superseded this result.
     pub fn store_archive(
         &self,
         rec: &ArchiveRecord,
         members: &[ArchiveMember],
         content: &ContentRecord,
         complete_job: Option<JobId>,
-    ) -> Result<()> {
-        self.with_writer(|conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            upsert_archive_record(&tx, rec)?;
-            tx.execute(
-                "DELETE FROM archive_members WHERE object_id = ?1",
-                params![rec.object_id.0],
-            )?;
-            {
-                let mut stmt = tx.prepare_cached(&format!(
-                    "INSERT INTO archive_members (object_id, generation, {MEMBER_COLUMNS})
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
-                ))?;
-                for m in members {
-                    stmt.execute(params![
-                        rec.object_id.0,
-                        rec.generation as i64,
-                        m.ordinal as i64,
-                        m.path,
-                        m.name,
-                        m.parent,
-                        m.raw_name,
-                        m.is_dir as i64,
-                        m.implicit as i64,
-                        m.size as i64,
-                        m.compressed as i64,
-                        m.method as i64,
-                        m.crc32 as i64,
-                        m.modified.map(|t| t.0),
-                        m.encrypted as i64,
-                        m.flags as i64,
-                    ])?;
+    ) -> Result<bool> {
+        if content.object_id != rec.object_id
+            || content.source_id != rec.source_id
+            || content.generation != rec.generation
+        {
+            return Err(crate::CatalogError::InvalidState(
+                "archive and content records identify different object generations".into(),
+            ));
+        }
+        if members
+            .iter()
+            .enumerate()
+            .any(|(ordinal, member)| member.ordinal as usize != ordinal)
+        {
+            return Err(crate::CatalogError::InvalidState(
+                "archive member ordinals must be contiguous from zero".into(),
+            ));
+        }
+        let member_count = u32::try_from(members.len()).map_err(|_| {
+            crate::CatalogError::InvalidState("archive has more than u32::MAX members".into())
+        })?;
+
+        for batch in members.chunks(ARCHIVE_MEMBER_BATCH) {
+            let stored = self.with_writer(|conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                if !archive_generation_is_current(&tx, rec)? {
+                    return Ok(false);
                 }
+                insert_archive_members(&tx, rec, batch)?;
+                tx.commit()?;
+                Ok(true)
+            })?;
+            if !stored {
+                self.discard_unpublished_archive_members(rec)?;
+                return Ok(false);
             }
+        }
+
+        // A retry using the same generation may contain fewer members than
+        // its earlier attempt. Trim that tail in bounded writer windows.
+        if !self.trim_archive_member_tail(rec, member_count)? {
+            self.discard_unpublished_archive_members(rec)?;
+            return Ok(false);
+        }
+
+        let stored = self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !archive_generation_is_current(&tx, rec)? {
+                return Ok(false);
+            }
+            upsert_archive_record(&tx, rec)?;
             upsert_content_record(&tx, content, true)?;
             // A container that was text in an earlier generation keeps no chunks.
             tx.execute(
@@ -200,23 +269,134 @@ impl Catalog {
                 )?;
             }
             tx.commit()?;
-            Ok(())
-        })
+            Ok(true)
+        })?;
+        if !stored {
+            self.discard_unpublished_archive_members(rec)?;
+            return Ok(false);
+        }
+
+        // The record now points only at the new generation, so older rows
+        // are invisible and can be reclaimed without one large transaction.
+        self.purge_older_archive_members(rec.object_id, rec.generation)?;
+        Ok(true)
     }
 
     /// Record a verdict without members or a content state change (a
-    /// container by extension that is not one by content).
-    pub fn store_archive_marker(&self, rec: &ArchiveRecord) -> Result<()> {
-        self.with_writer(|conn| {
+    /// container by extension that is not one by content). Returns `false`
+    /// when the object has already advanced to a newer generation.
+    pub fn store_archive_marker(&self, rec: &ArchiveRecord) -> Result<bool> {
+        if !self.trim_archive_member_tail(rec, 0)? {
+            self.discard_unpublished_archive_members(rec)?;
+            return Ok(false);
+        }
+        let stored = self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !archive_generation_is_current(&tx, rec)? {
+                return Ok(false);
+            }
             upsert_archive_record(&tx, rec)?;
-            tx.execute(
-                "DELETE FROM archive_members WHERE object_id = ?1",
-                params![rec.object_id.0],
-            )?;
             tx.commit()?;
-            Ok(())
-        })
+            Ok(true)
+        })?;
+        if stored {
+            self.purge_older_archive_members(rec.object_id, rec.generation)?;
+        }
+        Ok(stored)
+    }
+
+    fn trim_archive_member_tail(&self, rec: &ArchiveRecord, first_ordinal: u32) -> Result<bool> {
+        loop {
+            let (current, deleted) = self.with_writer(|conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                if !archive_generation_is_current(&tx, rec)? {
+                    return Ok((false, 0));
+                }
+                let n = tx.execute(
+                    "DELETE FROM archive_members
+                     WHERE object_id = ?1 AND generation = ?2 AND ordinal IN (
+                         SELECT ordinal FROM archive_members
+                         WHERE object_id = ?1 AND generation = ?2 AND ordinal >= ?3
+                         ORDER BY ordinal LIMIT ?4
+                     )",
+                    params![
+                        rec.object_id.0,
+                        rec.generation as i64,
+                        first_ordinal as i64,
+                        ARCHIVE_MEMBER_BATCH as i64
+                    ],
+                )?;
+                tx.commit()?;
+                Ok((true, n))
+            })?;
+            if !current {
+                return Ok(false);
+            }
+            if deleted < ARCHIVE_MEMBER_BATCH {
+                return Ok(true);
+            }
+        }
+    }
+
+    fn discard_unpublished_archive_members(&self, rec: &ArchiveRecord) -> Result<()> {
+        loop {
+            let deleted = self.with_writer(|conn| {
+                let published: Option<i64> = conn
+                    .query_row(
+                        "SELECT generation FROM archive_records WHERE object_id = ?1",
+                        params![rec.object_id.0],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if published == Some(rec.generation as i64) {
+                    return Ok(0);
+                }
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let n = tx.execute(
+                    "DELETE FROM archive_members
+                     WHERE object_id = ?1 AND generation = ?2 AND ordinal IN (
+                         SELECT ordinal FROM archive_members
+                         WHERE object_id = ?1 AND generation = ?2
+                         ORDER BY ordinal LIMIT ?3
+                     )",
+                    params![
+                        rec.object_id.0,
+                        rec.generation as i64,
+                        ARCHIVE_MEMBER_BATCH as i64
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(n)
+            })?;
+            if deleted < ARCHIVE_MEMBER_BATCH {
+                return Ok(());
+            }
+        }
+    }
+
+    fn purge_older_archive_members(&self, object: ObjectId, generation: u32) -> Result<()> {
+        loop {
+            let deleted = self.with_writer(|conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let n = tx.execute(
+                    "DELETE FROM archive_members
+                     WHERE object_id = ?1 AND generation < ?2 AND (generation, ordinal) IN (
+                         SELECT generation, ordinal FROM archive_members
+                         WHERE object_id = ?1 AND generation < ?2
+                         ORDER BY generation, ordinal LIMIT ?3
+                     )",
+                    params![object.0, generation as i64, ARCHIVE_MEMBER_BATCH as i64],
+                )?;
+                tx.commit()?;
+                Ok(n)
+            })?;
+            if deleted < ARCHIVE_MEMBER_BATCH {
+                return Ok(());
+            }
+        }
     }
 
     pub fn archive_record(&self, object: ObjectId) -> Result<Option<ArchiveRecord>> {
@@ -339,55 +519,92 @@ impl Catalog {
     /// archive support existed and left `unsupported`. Returns the number
     /// queued.
     pub fn requeue_archives(&self, source: Option<SourceId>) -> Result<u64> {
-        self.with_writer(|conn| {
+        let mut total = 0u64;
+        let mut after_object_id = i64::MIN;
+        loop {
             let exts = archive_extension_list();
-            let source_filter = match source {
-                Some(_) => "AND o.source_id = ?1",
-                None => "AND ?1 = ?1",
-            };
-            let rows: Vec<(i64, i64, i64, i64)> = conn
-                .prepare(&format!(
-                    "SELECT o.object_id, o.source_id, o.generation, o.size FROM objects o
-                     JOIN entries e ON e.object_id = o.object_id AND e.deleted_at IS NULL
-                     WHERE o.deleted_at IS NULL AND o.kind = 'file' AND lower(e.extension) IN ({exts})
-                       AND o.content_state NOT IN ('excluded')
-                       AND NOT EXISTS (SELECT 1 FROM archive_records a WHERE a.object_id = o.object_id AND a.generation = o.generation)
-                       {source_filter}"
-                ))?
-                .query_map(params![source.map(|s| s.0).unwrap_or(0)], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let mut n = 0u64;
-            for (obj, src, gen, size) in rows {
-                let object = ObjectId(obj);
-                flip_state(&tx, object, ContentState::Pending, None)?;
-                let key = NewJob::object_key(JobStage::ContentText, object, gen as u32);
-                tx.execute(
-                    "DELETE FROM jobs WHERE idempotency_key = ?1 AND state IN ('done','failed','superseded')",
-                    params![key],
-                )?;
-                if enqueue_conn(
-                    &tx,
-                    &NewJob {
-                        source_id: SourceId(src),
-                        object_id: Some(object),
-                        object_generation: gen as u32,
-                        stage: JobStage::ContentText,
-                        priority: Priority::ArchiveManifest,
-                        idempotency_key: key,
-                        payload: None,
-                        estimated_cost: size as u64,
-                    },
-                )?
-                .is_some()
-                {
-                    n += 1;
+            let (selected, queued, last_object_id) = self.with_writer(|conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let rows: Vec<(i64, i64, i64, i64)> = {
+                    let mut stmt = tx.prepare(&format!(
+                        "SELECT o.object_id, o.source_id, o.generation, o.size FROM objects o
+                         WHERE o.deleted_at IS NULL AND o.kind = 'file'
+                           AND lower(COALESCE((
+                               SELECT e.extension FROM entries e
+                               WHERE e.object_id = o.object_id AND e.deleted_at IS NULL
+                               ORDER BY e.entry_id LIMIT 1
+                           ), '')) IN ({exts})
+                           AND o.content_state NOT IN ('excluded')
+                           AND (?1 IS NULL OR o.source_id = ?1)
+                           AND o.object_id > ?2
+                           AND NOT EXISTS (
+                               SELECT 1 FROM archive_records a
+                               WHERE a.object_id = o.object_id AND a.generation = o.generation
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM jobs j
+                               WHERE j.idempotency_key = 'content_text:' || o.object_id || ':' || o.generation
+                                 AND j.state IN ('queued', 'running')
+                           )
+                         ORDER BY o.object_id LIMIT ?3"
+                    ))?;
+                    let rows = stmt
+                        .query_map(
+                            params![
+                                source.map(|s| s.0),
+                                after_object_id,
+                                ARCHIVE_REQUEUE_BATCH as i64
+                            ],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )?
+                        .collect::<rusqlite::Result<_>>()?;
+                    rows
+                };
+                let selected = rows.len();
+                let last_object_id = rows.last().map(|row| row.0);
+                let mut queued = 0u64;
+                for (obj, src, generation, size) in rows {
+                    let object = ObjectId(obj);
+                    flip_state(&tx, object, ContentState::Pending, None)?;
+                    let key = NewJob::object_key(
+                        JobStage::ContentText,
+                        object,
+                        generation as u32,
+                    );
+                    tx.execute(
+                        "DELETE FROM jobs WHERE idempotency_key = ?1 AND state IN ('done','failed','superseded')",
+                        params![key],
+                    )?;
+                    if enqueue_conn(
+                        &tx,
+                        &NewJob {
+                            source_id: SourceId(src),
+                            object_id: Some(object),
+                            object_generation: generation as u32,
+                            stage: JobStage::ContentText,
+                            priority: Priority::ArchiveManifest,
+                            idempotency_key: key,
+                            payload: None,
+                            estimated_cost: size as u64,
+                        },
+                    )?
+                    .is_some()
+                    {
+                        queued += 1;
+                    }
                 }
+                tx.commit()?;
+                Ok((selected, queued, last_object_id))
+            })?;
+            total += queued;
+            let Some(last_object_id) = last_object_id else {
+                return Ok(total);
+            };
+            after_object_id = last_object_id;
+            if selected < ARCHIVE_REQUEUE_BATCH {
+                return Ok(total);
             }
-            tx.commit()?;
-            Ok(n)
-        })
+        }
     }
 }

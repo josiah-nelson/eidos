@@ -781,14 +781,16 @@ pub(crate) fn enqueue_pending_content_conn(
         &format!(
             "INSERT OR IGNORE INTO jobs (source_id, object_id, object_generation, stage, priority, state, idempotency_key, estimated_cost, created_at, scheduled_at)
              SELECT o.source_id, o.object_id, o.generation, 'content_text',
-                    CASE WHEN lower(COALESCE(e.extension, '')) IN ({exts}) THEN {archive}
+                    CASE WHEN lower(COALESCE((
+                             SELECT e.extension FROM entries e
+                             WHERE e.object_id = o.object_id AND e.deleted_at IS NULL
+                             ORDER BY e.entry_id LIMIT 1
+                         ), '')) IN ({exts}) THEN {archive}
                          WHEN o.size < ?3 THEN 3 WHEN o.size < ?4 THEN 4 ELSE 5 END,
                     'queued', 'content_text:' || o.object_id || ':' || o.generation, o.size, ?2, ?2
              FROM objects o
-             LEFT JOIN entries e ON e.object_id = o.object_id AND e.deleted_at IS NULL
              WHERE o.source_id = ?1 AND o.deleted_at IS NULL AND o.kind = 'file' AND o.content_state IN ('pending', 'stale')
                AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.idempotency_key = 'content_text:' || o.object_id || ':' || o.generation)
-             GROUP BY o.object_id
              ORDER BY o.size ASC LIMIT ?5",
             archive = Priority::ArchiveManifest as u8
         ),
@@ -820,7 +822,8 @@ pub(crate) fn enqueue_content_for(
     }
     let ext: String = conn
         .query_row(
-            "SELECT COALESCE(extension, '') FROM entries WHERE object_id = ?1 AND deleted_at IS NULL LIMIT 1",
+            "SELECT COALESCE(extension, '') FROM entries
+             WHERE object_id = ?1 AND deleted_at IS NULL ORDER BY entry_id LIMIT 1",
             params![object.0],
             |r| r.get(0),
         )

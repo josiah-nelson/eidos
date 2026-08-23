@@ -4,7 +4,7 @@
 //! manifests survive a content reindex through `requeue_archives`.
 
 use eidos_archive::fixture::{build, Entry};
-use eidos_catalog::archive::MemberQuery;
+use eidos_catalog::archive::{ArchiveMember, MemberQuery};
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::{Catalog, NewSource};
 use eidos_content::Limits;
@@ -279,4 +279,225 @@ fn reindex_and_requeue_rebuild_manifests() {
     let rec = fx.catalog.archive_record(zip).unwrap().expect("rebuilt");
     assert_eq!(rec.member_count, 5);
     assert_eq!(fx.catalog.requeue_archives(None).unwrap(), 0);
+}
+
+#[test]
+fn stale_archive_generation_is_not_published() {
+    let fx = fixture();
+    fx.extract_all();
+    let zip = fx.object("pkg/tool.zip");
+    let original = fx.catalog.archive_record(zip).unwrap().unwrap();
+    let stale_content = fx.catalog.content_record(zip).unwrap().unwrap();
+
+    write(
+        &fx.root.join("pkg/tool.zip"),
+        &build(&[Entry::file("new.bin", &[7u8; 8_192])], b"changed", false),
+    );
+    run_scan(
+        &fx.catalog,
+        fx.source,
+        eidos_scanner::default_lister().as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    let current = fx.catalog.get_object(zip).unwrap().unwrap();
+    assert_eq!(current.generation, original.generation + 1);
+    assert_eq!(current.content_state, ContentState::Pending);
+
+    let stale_record = eidos_catalog::archive::ArchiveRecord {
+        member_count: 999,
+        reason: Some("stale publication must not land".into()),
+        ..original.clone()
+    };
+    assert!(!fx
+        .catalog
+        .store_archive(&stale_record, &[], &stale_content, None)
+        .unwrap());
+
+    assert_eq!(fx.catalog.archive_record(zip).unwrap(), Some(original));
+    let current = fx.catalog.get_object(zip).unwrap().unwrap();
+    assert_eq!(current.generation, stale_record.generation + 1);
+    assert_eq!(current.content_state, ContentState::Pending);
+}
+
+#[test]
+fn manifest_rows_persist_and_trim_across_bounded_batches() {
+    let fx = fixture();
+    fx.extract_all();
+    let zip = fx.object("pkg/tool.zip");
+    let mut rec = fx.catalog.archive_record(zip).unwrap().unwrap();
+    let content = fx.catalog.content_record(zip).unwrap().unwrap();
+    let members: Vec<ArchiveMember> = (0..2_500u32)
+        .map(|ordinal| {
+            let name = format!("member-{ordinal:04}.txt");
+            ArchiveMember {
+                ordinal,
+                path: name.clone(),
+                name: name.clone(),
+                parent: String::new(),
+                raw_name: name,
+                is_dir: false,
+                implicit: false,
+                size: 1,
+                compressed: 1,
+                method: 0,
+                crc32: ordinal,
+                modified: None,
+                encrypted: false,
+                flags: 0,
+            }
+        })
+        .collect();
+    rec.member_count = members.len() as u64;
+    rec.dir_count = 0;
+    rec.implicit_dir_count = 0;
+    rec.declared_size = members.len() as u64;
+    rec.compressed_size = members.len() as u64;
+    rec.claimed_entries = members.len() as u64;
+    assert!(fx
+        .catalog
+        .store_archive(&rec, &members, &content, None)
+        .unwrap());
+    let (_, total) = fx
+        .catalog
+        .archive_members(
+            zip,
+            &MemberQuery {
+                parent: Some(String::new()),
+                limit: 5_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(total, 2_500);
+
+    let short = &members[..3];
+    rec.member_count = short.len() as u64;
+    rec.declared_size = short.len() as u64;
+    rec.compressed_size = short.len() as u64;
+    rec.claimed_entries = short.len() as u64;
+    assert!(fx
+        .catalog
+        .store_archive(&rec, short, &content, None)
+        .unwrap());
+    let (_, total) = fx
+        .catalog
+        .archive_members(
+            zip,
+            &MemberQuery {
+                parent: Some(String::new()),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(total, 3);
+}
+
+#[test]
+fn source_requeue_processes_more_than_one_bounded_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    for n in 0..300 {
+        write(&root.join(format!("archive-{n:03}.zip")), b"not a zip");
+    }
+    let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+    let host = catalog.ensure_host("h", "windows").unwrap();
+    let source = catalog
+        .add_source(&NewSource {
+            host_id: host,
+            name: "many".into(),
+            kind: SourceKind::WindowsGeneric,
+            root_path: root.display().to_string(),
+            aliases: vec![],
+        })
+        .unwrap();
+    run_scan(
+        &catalog,
+        source,
+        eidos_scanner::default_lister().as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(catalog.requeue_archives(Some(source)).unwrap(), 300);
+    assert_eq!(catalog.requeue_archives(Some(source)).unwrap(), 0);
+    let jobs: i64 = catalog
+        .with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE source_id = ?1 AND state = 'queued'",
+                [source.0],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(jobs, 300);
+}
+
+#[test]
+fn mixed_extension_hard_link_priority_matches_rendered_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let rendered = root.join("a/plain.txt");
+    let archive_alias = root.join("z/alias.zip");
+    write(&rendered, b"ordinary text");
+    std::fs::create_dir_all(archive_alias.parent().unwrap()).unwrap();
+    std::fs::hard_link(&rendered, &archive_alias).unwrap();
+
+    let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+    let host = catalog.ensure_host("h", "windows").unwrap();
+    let source = catalog
+        .add_source(&NewSource {
+            host_id: host,
+            name: "links".into(),
+            kind: SourceKind::WindowsGeneric,
+            root_path: root.display().to_string(),
+            aliases: vec![],
+        })
+        .unwrap();
+    run_scan(
+        &catalog,
+        source,
+        eidos_scanner::default_lister().as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    let object = catalog
+        .resolve_relative(source, "a/plain.txt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        catalog
+            .resolve_relative(source, "z/alias.zip")
+            .unwrap()
+            .unwrap(),
+        object
+    );
+    let target = catalog.content_target(object).unwrap().unwrap();
+    assert!(target.path.ends_with("plain.txt") || target.path.ends_with("alias.zip"));
+    let rendered_is_archive = eidos_domain::archive::archive_format(&target.path).is_some();
+
+    assert_eq!(
+        catalog.requeue_archives(Some(source)).unwrap(),
+        u64::from(rendered_is_archive)
+    );
+    assert_eq!(
+        catalog.enqueue_pending_content(source, 100).unwrap(),
+        u64::from(!rendered_is_archive)
+    );
+    let priority: i64 = catalog
+        .with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT priority FROM jobs WHERE object_id = ?1",
+                [object.0],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    let expected = if rendered_is_archive {
+        Priority::ArchiveManifest
+    } else {
+        Priority::SmallText
+    };
+    assert_eq!(priority, expected as i64);
 }
