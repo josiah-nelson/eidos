@@ -64,6 +64,12 @@ export default function SearchPage() {
   })
   const first = results.data?.pages[0]
   const hits = useMemo(() => results.data?.pages.flatMap((p) => p.hits) ?? [], [results.data])
+  // Later pages can warn too (e.g. the index changed since the cursor was
+  // issued), so show every distinct warning from every loaded page.
+  const warnings = useMemo(
+    () => Array.from(new Set(results.data?.pages.flatMap((p) => p.warnings ?? []) ?? [])),
+    [results.data],
+  )
 
   const submit = () => set({ q: draft })
   const addClause = (clause: string) => {
@@ -175,7 +181,7 @@ export default function SearchPage() {
             {first.completeness.map((c) => (
               <CompletenessBanner key={c.source_id} c={c} />
             ))}
-            {(first.warnings ?? []).map((w, i) => (
+            {warnings.map((w, i) => (
               <div key={i} className="banner warn">
                 <span className="badge warn">warning</span>
                 <span>{w}</span>
