@@ -6,7 +6,7 @@ export type ApiInt = string;
 
 export type ActivitySourceView = { source_id: SourceId, name: string, state: SourceState, content_enabled: boolean, content_concurrency: number, content_reserved: number, content_peak_reserved: number, jobs_queued: ApiInt, jobs_running: ApiInt, jobs_failed: ApiInt, jobs_failed_bytes: ApiInt, content_states: { [key in string]: ApiInt }, content_bytes_indexed: ApiInt, reconciliation_deferred?: ReconciliationDeferral, };
 
-export type ActivityView = { content_enabled: boolean, jobs: JobCounts, content: ContentStats, archives: ArchiveStats, workers: ContentWorkersView, follower: FollowerView, content_index_documents: ApiInt, content_rebuild: RebuildStatus, admission: AdmissionView, sources: Array<ActivitySourceView>, recent_failures: Array<JobRecord>, };
+export type ActivityView = { content_enabled: boolean, jobs: JobCounts, content: ContentStats, archives: ArchiveStats, workers: ContentWorkersView, follower: FollowerView, content_index_documents: ApiInt, content_rebuild: RebuildStatus, admission: AdmissionView, catalog_writer: CatalogWriterStats, sources: Array<ActivitySourceView>, recent_failures: Array<JobRecord>, };
 
 export type AddSourceBody = { name: string, root_path: string, kind?: SourceKind | null, aliases: Array<string>, scan: boolean, };
 
@@ -27,6 +27,8 @@ export type ArchiveStats = { archives: ApiInt, members: ApiInt, declared_size: A
 export type ArchiveSummary = { container_id: ObjectId, depth: number, member_path: string, compressed_size?: ApiInt, };
 
 export type ArchiveView = { object_id: ObjectId, path: string | null, record: ArchiveRecord, members: Array<ArchiveMember>, total: ApiInt, query: MemberQuery, };
+
+export type CatalogWriterStats = { acquisitions: ApiInt, contended_acquisitions: ApiInt, waiting: ApiInt, total_wait_ms: number, max_wait_ms: number, total_hold_ms: number, max_hold_ms: number, };
 
 export type ChildRow = { entry: EntryRecord, object: ObjectRecord, aggregate: DirectoryAggregate | null, };
 

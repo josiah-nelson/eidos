@@ -25,5 +25,6 @@ getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+eidos-catalog = { workspace = true, features = ["test-utils"] }
 eidos-scanner = { workspace = true }
 eidos-query = { workspace = true }

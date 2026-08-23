@@ -180,6 +180,22 @@ native event
 Checkpoints advance only when enough durable state exists to replay or repair
 all downstream work.
 
+### Writer scheduling
+
+Every catalog writer in a service process enters through one fair gate before
+starting a SQLite write transaction. Scan enumeration is the bulk producer: it
+checks both a logical-row bound and an elapsed-time bound between every entry,
+commits when either is reached, and releases the gate with a fair handoff. This
+keeps content claims, completion records, change-feed batches, and operator
+updates responsive even for a single extremely wide directory.
+
+Publication is the deliberate exception to short batching. Tombstones,
+aggregates, generation/source state, and the optional feed checkpoint commit
+atomically. A publication failure rolls back and aborts the generation; normal
+session abandonment does the same in `Drop`, while startup recovery aborts
+generations left open by process termination. Wait and hold telemetry from the
+gate makes violations observable without weakening that publication boundary.
+
 ### Directory aggregate invariants
 
 Whatever a full reconciliation would compute is the definition; the
@@ -434,4 +450,3 @@ machine-readable results suitable for regression comparison.
 - Migration and derived-index rebuild tests
 
 No test may mutate the measured user corpus.
-

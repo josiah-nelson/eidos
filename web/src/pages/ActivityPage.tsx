@@ -244,6 +244,22 @@ export default function ActivityPage() {
             {a.follower.rebuilding_source != null ? ` · rebuilding source ${a.follower.rebuilding_source}` : ''}
           </div>
         </div>
+        <div className="stat">
+          <div className="label">Catalog writer wait</div>
+          <div className="value">{duration(a.catalog_writer.max_wait_ms)}</div>
+          <div className="sub">
+            max · {duration(a.catalog_writer.total_wait_ms)} total ·{' '}
+            {count(a.catalog_writer.contended_acquisitions)} / {count(a.catalog_writer.acquisitions)} contended ·{' '}
+            {count(a.catalog_writer.waiting)} waiting
+          </div>
+        </div>
+        <div className="stat">
+          <div className="label">Catalog writer hold</div>
+          <div className="value">{duration(a.catalog_writer.max_hold_ms)}</div>
+          <div className="sub">
+            max · {duration(a.catalog_writer.total_hold_ms)} total
+          </div>
+        </div>
       </div>
 
       {(w.last_error || a.follower.last_error) && (

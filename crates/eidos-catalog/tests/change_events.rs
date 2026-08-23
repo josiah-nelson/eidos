@@ -1345,7 +1345,9 @@ fn crash_during_replay_is_recovered_as_aborted_with_checkpoint_kept() {
         )
         .unwrap();
     // Simulate a crash between replay and publication.
-    drop(session);
+    // A real process crash skips Drop; leak the handle to leave the durable
+    // generation open for startup recovery.
+    std::mem::forget(session);
     let path = fx.catalog.path().to_path_buf();
     drop(fx.catalog);
     let reopened = Catalog::open(&path).unwrap();

@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Canonical SQLite catalog: sources, objects, entries, generations, aggregates"
 
+[features]
+test-utils = []
+
 [dependencies]
 eidos-domain = { workspace = true }
 eidos-scanner = { workspace = true }
