@@ -755,19 +755,17 @@ fn missing_file_after_a_change_commits_its_deletion() {
     );
 }
 
-#[test]
-fn old_and_new_generation_documents_coexist_without_a_stale_hit() {
-    let fx = fixture();
-    fx.extract_all();
+/// Put `logs/notes.txt` into the state where both its generations are in the
+/// content index: the new one is published without the old documents being
+/// dropped — the window a queued-but-uncommitted deletion leaves open, and
+/// the state a crash between the index commit and publication can persist.
+/// Returns `(object, old generation, new generation)`.
+fn coexisting_generations(fx: &Fx) -> (ObjectId, u32, u32) {
     let text = "rewritten notes with a brandnew token\n";
-    let obj = change_notes(&fx, text.as_bytes());
+    let obj = change_notes(fx, text.as_bytes());
     let old_gen = fx.catalog.content_record(obj).unwrap().unwrap().generation;
     let new_gen = fx.catalog.get_object(obj).unwrap().unwrap().generation;
     assert_eq!(new_gen, old_gen + 1);
-
-    // Publish the new generation without dropping the old documents — the
-    // window a queued-but-uncommitted deletion leaves open, and the state a
-    // crash between the index commit and publication can persist.
     let chunk = Chunk {
         ordinal: 0,
         byte_start: 0,
@@ -795,6 +793,14 @@ fn old_and_new_generation_documents_coexist_without_a_stale_hit() {
         1,
         "the old generation's chunk is still in the catalog"
     );
+    (obj, old_gen, new_gen)
+}
+
+#[test]
+fn old_and_new_generation_documents_coexist_without_a_stale_hit() {
+    let fx = fixture();
+    fx.extract_all();
+    coexisting_generations(&fx);
 
     for opts in [ExecOptions::default(), lazy_opts()] {
         for q in [
@@ -819,4 +825,50 @@ fn old_and_new_generation_documents_coexist_without_a_stale_hit() {
     let steps = fx.run("content:lowercase").explanation.unwrap().steps;
     let c = steps.iter().find(|s| s.stage == "content").unwrap();
     assert!(c.description.contains("older generation dropped"), "{c:?}");
+}
+
+#[test]
+fn a_stale_candidate_cut_by_truncation_is_reported_not_silent() {
+    let fx = fixture();
+    fx.extract_all();
+    coexisting_generations(&fx);
+    // Candidates are cut before their generation is known, so a truncated
+    // list can keep the superseded chunk of a file and drop the current one.
+    // `notes` is in both generations and in no other file, and only one
+    // candidate survives, so the outcome is either the file (the current
+    // chunk won the cut) or a warning that names both causes — never the
+    // superseded text presented as a hit.
+    for (mode, mut opts) in [
+        ("top-k", ExecOptions::default()),
+        ("candidates", ExecOptions::default()),
+    ] {
+        if mode == "top-k" {
+            opts.content.top_k = 1;
+        } else {
+            opts.content.max_candidates = 1;
+        }
+        let q = if mode == "top-k" {
+            "content:notes"
+        } else {
+            "content:~notes"
+        };
+        let r = fx.run_with(q, &opts, None, 50);
+        if r.hits.is_empty() {
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.contains("superseded generation")),
+                "{mode}: {:?}",
+                r.warnings
+            );
+        } else {
+            assert_eq!(sorted_names(&r), vec!["notes.txt"], "{mode}");
+            assert!(r.hits[0].snippets[0].text.contains("brandnew"), "{mode}");
+        }
+        assert!(
+            r.warnings.iter().any(|w| w.contains("subset")),
+            "{mode}: truncation is always reported: {:?}",
+            r.warnings
+        );
+    }
 }

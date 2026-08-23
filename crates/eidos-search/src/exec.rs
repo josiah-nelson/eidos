@@ -1079,6 +1079,17 @@ fn compile_content(
         verified: ret.verified,
         elapsed_ms: Some(ret.elapsed_ms),
     });
+    if stale > 0 && ret.truncated {
+        // Candidates are cut before their generation is known, so a chunk of
+        // a superseded generation can occupy the budget that the same file's
+        // current chunk would have used. The result is a subset either way
+        // (the truncation warning above says so); name the second cause.
+        ctx.warnings.push(format!(
+            "content clause \"{value}\": {stale} file(s) matched only on a superseded generation. \
+             The candidate list was truncated, so a current-generation match of theirs may have \
+             been cut with it — narrow the query"
+        ));
+    }
     let ids: Vec<ObjectId> = match &deferred {
         Some(c) => c.keys().copied().collect(),
         None => by_object.keys().copied().collect(),

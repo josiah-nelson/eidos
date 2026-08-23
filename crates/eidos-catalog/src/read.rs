@@ -171,17 +171,19 @@ impl Catalog {
         if objects.is_empty() {
             return Ok(out);
         }
+        // One prepared statement for the whole set, whatever its size: a
+        // caller validating a broad candidate list holds a pooled reader for
+        // a single scan rather than a chain of round trips.
+        let ids = serde_json::to_string(&objects.iter().map(|o| o.0).collect::<Vec<i64>>())?;
         self.with_reader(|conn| {
-            for batch in objects.chunks(500) {
-                let vars = vec!["?"; batch.len()].join(",");
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT object_id, generation FROM objects
-                     WHERE deleted_at IS NULL AND object_id IN ({vars})"
-                ))?;
-                let mut rows = stmt.query(rusqlite::params_from_iter(batch.iter().map(|o| o.0)))?;
-                while let Some(r) = rows.next()? {
-                    out.insert(ObjectId(r.get::<_, i64>(0)?), r.get::<_, i64>(1)? as u32);
-                }
+            let mut stmt = conn.prepare_cached(
+                "SELECT o.object_id, o.generation FROM json_each(?1) j
+                 JOIN objects o ON o.object_id = j.value
+                 WHERE o.deleted_at IS NULL",
+            )?;
+            let mut rows = stmt.query(params![ids])?;
+            while let Some(r) = rows.next()? {
+                out.insert(ObjectId(r.get::<_, i64>(0)?), r.get::<_, i64>(1)? as u32);
             }
             Ok(())
         })?;

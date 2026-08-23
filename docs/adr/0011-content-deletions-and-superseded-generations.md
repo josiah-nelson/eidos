@@ -57,8 +57,16 @@ re-extraction, and for any leftover document a missed deletion left behind.
   re-extraction; `state:stale` and the completeness counters remain the way
   to see that the file is waiting. This is the same trade the snippet rule
   already made, applied to the hit itself.
-- Validating candidates costs one batched catalog read per content clause,
-  keyed by object id, over the objects the clause retrieved.
+- Validating candidates costs one catalog statement per content clause (a
+  `json_each` join on the primary key), over the objects — not the chunks —
+  the clause retrieved.
+- Candidates are cut to `top_k` / `max_candidates` before their generation is
+  known, so a truncated list can keep a file's superseded chunk and drop its
+  current one, and the file is then absent. Truncation already reports the
+  result as a subset; when a stale candidate was dropped from a truncated
+  list the response also says so, naming the second cause. Returning the file
+  instead would mean returning it for text it no longer contains, which is
+  the defect this record removes.
 - Correctness no longer depends on the deletion having been committed: a
   leftover document from an earlier generation is inert because the
   generation check rejects it.
