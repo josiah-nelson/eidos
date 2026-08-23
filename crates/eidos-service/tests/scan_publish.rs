@@ -308,6 +308,10 @@ fn replay_read_failure_aborts_and_preserves_previous_truth() {
         .contains("overlapped enumeration failed"));
     assert_eq!(fx.checkpoint_usn(), Some(3), "previous checkpoint kept");
     assert!(fx.exists("a.txt"));
+    // Rows from replay batches that succeeded stay visible, like rows
+    // ingested by the enumeration itself: they are observed truth, and the
+    // `degraded` state (not row visibility) carries the incompleteness.
+    assert!(fx.exists("late.txt"));
     let gens = fx.state.catalog.list_generations(fx.sid, 10).unwrap();
     assert_eq!(
         gens.iter().find(|g| g.generation == 2).unwrap().state,

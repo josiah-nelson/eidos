@@ -503,7 +503,9 @@ fn replay_overlap(
 ///   reconciles again.
 /// - Feed or catalog failure: abort the generation; the previous published
 ///   generation and its checkpoint stay in force and the source is
-///   `degraded` with the reason.
+///   `degraded` with the reason. Rows from replay batches that already
+///   committed remain visible, like enumeration rows of any aborted
+///   generation (they are observed truth; see ADR-0003).
 pub fn replay_and_publish(
     state: &AppState,
     source_id: SourceId,

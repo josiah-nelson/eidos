@@ -51,9 +51,15 @@ publication it belongs to. Failure windows:
   checkpoint cleared, so the watcher reconciles again;
 - the feed cannot be read, or a batch cannot be applied → the generation is
   aborted; the previous published generation and its checkpoint (if any)
-  stay in force and the source is `degraded` with the reason. A watcher
-  that has to re-establish a checkpoint waits 30 s after a failed
-  reconciliation before starting another;
+  stay in force and the source is `degraded` with the reason. Rows written
+  by replay batches that did succeed remain visible, exactly like rows
+  ingested by the enumeration itself (ADR-0002: rows become visible
+  progressively; publication, not row visibility, is what the generation
+  flip guarantees). They are observed filesystem truth — rolling them back
+  would, for example, resurrect a file the feed saw deleted — and the
+  `degraded` state tells consumers the source is not complete until the
+  next reconciliation. A watcher that has to re-establish a checkpoint
+  waits 30 s after a failed reconciliation before starting another;
 - a crash during replay → crash recovery aborts the open generation exactly
   as for any interrupted scan.
 
