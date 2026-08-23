@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub struct AppState {
+    /// Bounded gate in front of expensive HTTP operations.
+    pub admission: Arc<crate::admission::Admission>,
     pub catalog: Arc<Catalog>,
     pub index: Arc<eidos_search::CatalogIndex>,
     pub content_index: Arc<eidos_search::ContentIndex>,
@@ -74,6 +76,7 @@ impl AppState {
             }
         }
         let state = Self {
+            admission: Arc::new(crate::admission::Admission::new(config.admission.clone())),
             catalog,
             index,
             content_index,
@@ -146,6 +149,9 @@ impl AppState {
     pub fn request_shutdown(&self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Shed queued expensive work at once: graceful shutdown then waits
+        // only for the operations that already hold a permit.
+        self.admission.close();
         for w in self.watchers.lock().values() {
             w.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
