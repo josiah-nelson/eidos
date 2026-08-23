@@ -2,10 +2,10 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Link, useSearchParams } from 'react-router'
-import { api, type Facet, type FacetField, type FacetValue, type Hit, type ResultMode, type SortField } from '../api'
+import { api, type FacetField, type FacetValue, type Hit, type ResultMode, type SortField } from '../api'
 import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
 import { bytes, count, duration, when } from '../format'
-import { applyClause, negate } from '../query-clause'
+import { applyFacetClick, negate, type FacetForms } from '../query-clause'
 
 const PAGE = 100
 const FILE_FACETS: FacetField[] = ['source', 'extension', 'kind', 'content_state', 'size_bucket', 'modified_bucket']
@@ -67,9 +67,9 @@ export default function SearchPage() {
   const hits = useMemo(() => results.data?.pages.flatMap((p) => p.hits) ?? [], [results.data])
 
   const submit = () => set({ q: draft })
-  /** Apply a facet clause to the query, replacing the forms it supersedes. */
-  const addClause = (clause: string, replaces: string[] = []) => {
-    const next = applyClause(draft, clause, replaces)
+  /** Refine the query with a facet value, including or excluding it. */
+  const click = (value: FacetForms, form: 'include' | 'exclude', siblings: FacetForms[]) => {
+    const next = applyFacetClick(draft, value, form, siblings)
     setDraft(next)
     set({ q: next })
   }
@@ -233,19 +233,20 @@ export default function SearchPage() {
                 <h2 style={{ marginTop: 0 }}>{f.field.replace('_', ' ')}</h2>
                 <ul className="facet-list">
                   {f.values.slice(0, 12).map((v) => {
-                    const include = v.range?.clause ?? facetClause(f.field, v.value, v.label)
-                    const exclude = v.range?.exclude ?? (include ? negate(include) : null)
+                    const forms = facetForms(f.field, v)
                     // Range buckets are disjoint, so picking one supersedes another.
-                    const others = siblingClauses(f, v)
+                    const siblings = f.values.flatMap((o) =>
+                      o !== v && o.range ? [o.range] : [],
+                    )
                     return (
                       <li key={v.value}>
-                        {include ? (
+                        {forms ? (
                           <a
                             href="#"
-                            title={`add  ${include}`}
+                            title={`add  ${forms.clause}`}
                             onClick={(e) => {
                               e.preventDefault()
-                              addClause(include, [...others, exclude ?? ''])
+                              click(forms, 'include', siblings)
                             }}
                           >
                             {v.label ?? v.value ?? '(none)'}
@@ -254,15 +255,15 @@ export default function SearchPage() {
                           <span title={v.label}>{v.label ?? v.value}</span>
                         )}
                         <span>{count(v.count)}</span>
-                        {exclude ? (
+                        {forms ? (
                           <a
                             href="#"
                             className="facet-exclude"
-                            title={`add  ${exclude}`}
+                            title={`add  ${forms.exclude}`}
                             aria-label={`exclude ${v.label ?? v.value}`}
                             onClick={(e) => {
                               e.preventDefault()
-                              addClause(exclude, [...others, include ?? ''])
+                              click(forms, 'exclude', siblings)
                             }}
                           >
                             −
@@ -285,16 +286,14 @@ export default function SearchPage() {
 }
 
 /**
- * The clauses another value of the same facet contributes, which selecting
- * `chosen` should drop. Only range buckets qualify: they partition the
- * result set, so two of them can never both hold, while two term values
- * (`ext:cs` and `ext:md`) are a legitimate — if empty — intersection the
- * user may have meant.
+ * The clauses that select and exclude one facet value. Range buckets carry
+ * them from the server; term facets get them from the value itself. `null`
+ * when the value cannot be turned into a filter at all.
  */
-function siblingClauses(facet: Facet, chosen: FacetValue): string[] {
-  return facet.values.flatMap((v) =>
-    v !== chosen && v.range ? [v.range.clause, v.range.exclude] : [],
-  )
+function facetForms(field: FacetField, v: FacetValue): FacetForms | null {
+  if (v.range) return v.range
+  const clause = facetClause(field, v.value, v.label)
+  return clause ? { clause, exclude: negate(clause) } : null
 }
 
 function facetClause(field: FacetField, value: string, label?: string): string | null {

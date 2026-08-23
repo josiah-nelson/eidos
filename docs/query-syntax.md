@@ -77,11 +77,19 @@ anything:
   clause reproduces them, and `range` is omitted — the buckets are counts
   only.
 - Clauses combine with AND like everything else, so appending one only ever
-  narrows the query. A client that appends a bucket clause should first drop
-  the clause of another bucket of the same facet, since adjacent buckets are
-  disjoint and intersecting them can only give nothing; bounds you typed
-  yourself are never rewritten, so `size:>=100` plus a `< 4 KiB` bucket
-  stays the intersection of both. The web UI follows exactly that rule.
+  narrows the query. The web UI applies a click this way, and a client
+  should do the same:
+  - Selecting a bucket drops any other bucket of the same facet, since
+    adjacent buckets are disjoint and intersecting them can only give
+    nothing, and drops exclusions of those buckets, which the selection
+    already implies.
+  - Excluding a bucket removes only its own inclusion; exclusions of
+    different buckets are independent and accumulate.
+  - Bounds you typed yourself are never rewritten: `size:>=100` plus the
+    `< 4 KiB` bucket stays the intersection of both.
+  - Because AND binds tighter than OR, a query that already contains a
+    top-level `OR` is parenthesised first, so the clause filters every
+    branch: `a OR b` becomes `(a OR b) size:<4k`.
 
 ## Semantics worth knowing
 

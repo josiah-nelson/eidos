@@ -74,7 +74,43 @@ export function applyClause(query: string, clause: string, replaces: string[] = 
     tokens = removeRun(tokens, tokenize(other))
   }
   if (indexOfRun(tokens, want) >= 0) return tokens.join(' ')
-  return [...tokens, ...want].join(' ')
+  // `AND` binds tighter than `OR`, so appending to `a OR b` would filter the
+  // last branch only. Group the query first: `(a OR b) ext:cs`.
+  const base = tokens.some((t) => t === 'OR' || t === '|') ? [`(${tokens.join(' ')})`] : tokens
+  return [...base, ...want].join(' ')
+}
+
+/** The clauses one facet value contributes: what selects it, what removes it. */
+export interface FacetForms {
+  clause: string
+  exclude: string
+}
+
+/**
+ * Apply a click on one facet value.
+ *
+ * `siblings` are the other values of the same facet that are mutually
+ * exclusive with this one — the buckets of a range facet. Two term values
+ * (`ext:cs` and `ext:md`) are not: intersecting them is empty but it is what
+ * the user asked for, so nothing is passed for them.
+ *
+ * Selecting a bucket drops any other bucket of the same facet, since
+ * intersecting disjoint buckets can only give nothing, and drops exclusions
+ * of those buckets, which the selection already implies. Excluding one
+ * removes only its own inclusion: exclusions of different buckets are
+ * independent filters and accumulate.
+ */
+export function applyFacetClick(
+  query: string,
+  value: FacetForms,
+  form: 'include' | 'exclude',
+  siblings: FacetForms[] = [],
+): string {
+  if (form === 'exclude') return applyClause(query, value.exclude, [value.clause])
+  return applyClause(query, value.clause, [
+    value.exclude,
+    ...siblings.flatMap((s) => [s.clause, s.exclude]),
+  ])
 }
 
 /** The negated form of a clause; groups it when it is more than one token. */
