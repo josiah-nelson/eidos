@@ -21,6 +21,7 @@ pub mod model;
 pub mod policy;
 pub mod projection;
 pub mod read;
+pub mod retry;
 pub mod scan;
 pub mod schema;
 
