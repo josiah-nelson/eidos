@@ -95,6 +95,15 @@ retrieved generation get no snippets rather than wrong ones.
 - Per-source concurrency (`sources.content_concurrency`, default 2) bounds
   how many workers read one volume; `sources.content_enabled` turns
   extraction off per source (queued jobs are dropped, re-enabling re-queues).
+  A worker takes one unit of that budget *inside* the claiming transaction,
+  before any job of the batch is marked `running`, and holds it in an RAII
+  reservation for the batch, so workers racing on a stale count cannot
+  oversubscribe a source and the unit comes back on an empty claim, an
+  error, cancellation, shutdown, or a panic. A source with no free capacity
+  is skipped and the next eligible source is claimed instead, so a
+  saturated HDD or share never starves the rest of the pool. Live
+  reservations and their high-water marks are reported by `GET
+  /api/activity` (`workers.concurrency`, and `content_reserved` per source).
 - Publication is two-phase: the worker writes chunks and the content record
   as `indexing`, adds documents to the index writer, and completes the job;
   the coordinator commits every 2 s or 20,000 documents and only then
