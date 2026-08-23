@@ -62,6 +62,8 @@ export type EntryId = ApiInt;
 
 export type EntryRecord = { id: EntryId, source_id: SourceId, parent_id: ObjectId | null, object_id: ObjectId, name: string, extension: string, is_virtual: boolean, first_seen_generation: ApiInt, last_seen_generation: ApiInt, deleted_at: UnixNanos | null, };
 
+export type ErrorRecord = { id: ApiInt, source_id: SourceId, object_id: ObjectId | null, generation: ApiInt | null, stage: string, kind: string, code: ApiInt, path: string, message: string, occurred_at: UnixNanos, resolved_at: UnixNanos | null, };
+
 export type ErrorsQuery = { include_resolved: boolean, limit: number, };
 
 export type ExclusionRow = { stage: string, reason: string, count: ApiInt, bytes: ApiInt, };
@@ -81,6 +83,8 @@ export type ExportNdjsonHeader = { type: "header", schema: string, query: QueryM
 export type ExportNdjsonSummary = { schema: string, type: "summary", rows_exported: ApiInt, truncated: boolean, error: string | null, };
 
 export type ExportRow = { object_id: ApiInt, entry_id: ApiInt | null, source: string, kind: string, name: string, path: string | null, extension: string, size: ApiInt, allocated_size: ApiInt, modified: string | null, created: string | null, content_state: string, hard_link_count: number, score: number | null, };
+
+export type ExtensionCount = { extension: string, count: ApiInt, bytes: ApiInt, };
 
 export type Facet = { field: FacetField, values: Array<FacetValue>, truncated: boolean, };
 

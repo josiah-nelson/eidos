@@ -87,6 +87,7 @@ fn typescript_contract() -> String {
     types.add::<crate::api::AddSourceBody>();
     types.add::<crate::api::SourceDetail>();
     types.add::<crate::api::ErrorsQuery>();
+    types.add::<eidos_catalog::ErrorRecord>();
     types.add::<crate::api::ObjectDetail>();
     types.add::<crate::api::ChildrenQuery>();
     types.add::<crate::api::ChildrenView>();
@@ -94,6 +95,7 @@ fn typescript_contract() -> String {
     types.add::<crate::api::ArchiveView>();
     types.add::<crate::api::RequeueView>();
     types.add::<crate::api::LimitQuery>();
+    types.add::<eidos_catalog::ExtensionCount>();
     types.add::<crate::api::ResolveQuery>();
     types.add::<crate::api::ResolveView>();
     types.add::<crate::api::SearchBody>();
