@@ -23,6 +23,16 @@ pub const ZSTD_LEVEL: i32 = 1;
 pub const SMALL_TEXT_LIMIT: u64 = 256 * 1024;
 pub const NORMAL_TEXT_LIMIT: u64 = 16 * 1024 * 1024;
 
+/// Priority by extension and size: containers queue as manifests behind
+/// text.
+pub fn priority_for(extension: &str, size: u64) -> Priority {
+    if eidos_domain::archive::archive_format(&format!("x.{extension}")).is_some() {
+        Priority::ArchiveManifest
+    } else {
+        priority_for_size(size)
+    }
+}
+
 pub fn priority_for_size(size: u64) -> Priority {
     if size < SMALL_TEXT_LIMIT {
         Priority::SmallText
@@ -220,40 +230,7 @@ impl Catalog {
                     ])?;
                 }
             }
-            let state_str = if publish { rec.state.as_str().to_string() } else { "indexing".to_string() };
-            tx.execute(
-                "INSERT INTO content_records (object_id, source_id, generation, extraction_version, encoding, coverage, indexed_bytes,
-                    total_bytes, chunk_count, line_count, chars, content_id, hash_complete, state, failure_class, error, reason,
-                    processed_at, elapsed_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-                 ON CONFLICT(object_id) DO UPDATE SET source_id = excluded.source_id, generation = excluded.generation,
-                    extraction_version = excluded.extraction_version, encoding = excluded.encoding, coverage = excluded.coverage,
-                    indexed_bytes = excluded.indexed_bytes, total_bytes = excluded.total_bytes, chunk_count = excluded.chunk_count,
-                    line_count = excluded.line_count, chars = excluded.chars, content_id = excluded.content_id,
-                    hash_complete = excluded.hash_complete, state = excluded.state, failure_class = excluded.failure_class,
-                    error = excluded.error, reason = excluded.reason, processed_at = excluded.processed_at, elapsed_ms = excluded.elapsed_ms",
-                params![
-                    rec.object_id.0,
-                    rec.source_id.0,
-                    rec.generation as i64,
-                    rec.extraction_version as i64,
-                    rec.encoding,
-                    rec.coverage.as_str(),
-                    rec.indexed_bytes as i64,
-                    rec.total_bytes as i64,
-                    rec.chunk_count as i64,
-                    rec.line_count as i64,
-                    rec.chars as i64,
-                    rec.content_id.map(|c| c.0.to_vec()),
-                    rec.hash_complete as i64,
-                    state_str,
-                    rec.failure_class.map(|f| f.as_str()),
-                    rec.error,
-                    rec.reason,
-                    rec.processed_at.0,
-                    rec.elapsed_ms,
-                ],
-            )?;
+            upsert_content_record(&tx, rec, publish)?;
             // Older generations' chunks are no longer needed.
             tx.execute(
                 "DELETE FROM chunks WHERE object_id = ?1 AND generation < ?2",
@@ -598,6 +575,8 @@ impl Catalog {
             }
             tx.execute("DELETE FROM content_records", [])?;
             tx.execute("DELETE FROM chunks", [])?;
+            tx.execute("DELETE FROM archive_records", [])?;
+            tx.execute("DELETE FROM archive_members", [])?;
             tx.execute(
                 "UPDATE jobs SET state = 'superseded', finished_at = ?1 WHERE stage = 'content_text' AND state IN ('queued','running')",
                 params![UnixNanos::now().0],
@@ -676,8 +655,56 @@ fn record_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ContentRecord> {
     })
 }
 
+/// Insert or replace the content record; `publish = false` records it as
+/// `indexing` until the index commit lands.
+pub(crate) fn upsert_content_record(
+    tx: &Connection,
+    rec: &ContentRecord,
+    publish: bool,
+) -> Result<()> {
+    let state_str = if publish {
+        rec.state.as_str().to_string()
+    } else {
+        "indexing".to_string()
+    };
+    tx.execute(
+        "INSERT INTO content_records (object_id, source_id, generation, extraction_version, encoding, coverage, indexed_bytes,
+            total_bytes, chunk_count, line_count, chars, content_id, hash_complete, state, failure_class, error, reason,
+            processed_at, elapsed_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+         ON CONFLICT(object_id) DO UPDATE SET source_id = excluded.source_id, generation = excluded.generation,
+            extraction_version = excluded.extraction_version, encoding = excluded.encoding, coverage = excluded.coverage,
+            indexed_bytes = excluded.indexed_bytes, total_bytes = excluded.total_bytes, chunk_count = excluded.chunk_count,
+            line_count = excluded.line_count, chars = excluded.chars, content_id = excluded.content_id,
+            hash_complete = excluded.hash_complete, state = excluded.state, failure_class = excluded.failure_class,
+            error = excluded.error, reason = excluded.reason, processed_at = excluded.processed_at, elapsed_ms = excluded.elapsed_ms",
+        params![
+            rec.object_id.0,
+            rec.source_id.0,
+            rec.generation as i64,
+            rec.extraction_version as i64,
+            rec.encoding,
+            rec.coverage.as_str(),
+            rec.indexed_bytes as i64,
+            rec.total_bytes as i64,
+            rec.chunk_count as i64,
+            rec.line_count as i64,
+            rec.chars as i64,
+            rec.content_id.map(|c| c.0.to_vec()),
+            rec.hash_complete as i64,
+            state_str,
+            rec.failure_class.map(|f| f.as_str()),
+            rec.error,
+            rec.reason,
+            rec.processed_at.0,
+            rec.elapsed_ms,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Flip an object's content state and keep aggregates/outbox consistent.
-fn flip_state(
+pub(crate) fn flip_state(
     conn: &Connection,
     object: ObjectId,
     state: ContentState,
@@ -749,15 +776,22 @@ pub(crate) fn enqueue_pending_content_conn(
     }
     let now = UnixNanos::now().0;
     let tx = conn.transaction()?;
+    let exts = crate::archive::archive_extension_list();
     let n = tx.execute(
-        "INSERT OR IGNORE INTO jobs (source_id, object_id, object_generation, stage, priority, state, idempotency_key, estimated_cost, created_at, scheduled_at)
-         SELECT o.source_id, o.object_id, o.generation, 'content_text',
-                CASE WHEN o.size < ?3 THEN 3 WHEN o.size < ?4 THEN 4 ELSE 5 END,
-                'queued', 'content_text:' || o.object_id || ':' || o.generation, o.size, ?2, ?2
-         FROM objects o
-         WHERE o.source_id = ?1 AND o.deleted_at IS NULL AND o.kind = 'file' AND o.content_state IN ('pending', 'stale')
-           AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.idempotency_key = 'content_text:' || o.object_id || ':' || o.generation)
-         ORDER BY o.size ASC LIMIT ?5",
+        &format!(
+            "INSERT OR IGNORE INTO jobs (source_id, object_id, object_generation, stage, priority, state, idempotency_key, estimated_cost, created_at, scheduled_at)
+             SELECT o.source_id, o.object_id, o.generation, 'content_text',
+                    CASE WHEN lower(COALESCE(e.extension, '')) IN ({exts}) THEN {archive}
+                         WHEN o.size < ?3 THEN 3 WHEN o.size < ?4 THEN 4 ELSE 5 END,
+                    'queued', 'content_text:' || o.object_id || ':' || o.generation, o.size, ?2, ?2
+             FROM objects o
+             LEFT JOIN entries e ON e.object_id = o.object_id AND e.deleted_at IS NULL
+             WHERE o.source_id = ?1 AND o.deleted_at IS NULL AND o.kind = 'file' AND o.content_state IN ('pending', 'stale')
+               AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.idempotency_key = 'content_text:' || o.object_id || ':' || o.generation)
+             GROUP BY o.object_id
+             ORDER BY o.size ASC LIMIT ?5",
+            archive = Priority::ArchiveManifest as u8
+        ),
         params![source.0, now, SMALL_TEXT_LIMIT as i64, NORMAL_TEXT_LIMIT as i64, limit as i64],
     )?;
     tx.commit()?;
@@ -784,6 +818,14 @@ pub(crate) fn enqueue_content_for(
     if enabled == 0 {
         return Ok(());
     }
+    let ext: String = conn
+        .query_row(
+            "SELECT COALESCE(extension, '') FROM entries WHERE object_id = ?1 AND deleted_at IS NULL LIMIT 1",
+            params![object.0],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_default();
     enqueue_conn(
         conn,
         &NewJob {
@@ -791,7 +833,7 @@ pub(crate) fn enqueue_content_for(
             object_id: Some(object),
             object_generation: generation,
             stage: JobStage::ContentText,
-            priority: priority_for_size(size),
+            priority: priority_for(&ext, size),
             idempotency_key: NewJob::object_key(JobStage::ContentText, object, generation),
             payload: None,
             estimated_cost: size,

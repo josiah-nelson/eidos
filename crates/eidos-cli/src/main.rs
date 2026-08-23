@@ -9,6 +9,7 @@
 
 mod activity;
 mod admin;
+mod archive;
 mod bench;
 mod profile;
 mod search;
@@ -43,6 +44,8 @@ enum Command {
     Bench(bench::BenchArgs),
     /// Indexing activity of the running service (queues, workers, throughput).
     Activity(activity::ActivityArgs),
+    /// Archive manifests from the running service (ZIP member inventories).
+    Archive(archive::ArchiveArgs),
 }
 
 #[derive(Args, Debug)]
@@ -78,6 +81,7 @@ fn main() -> anyhow::Result<()> {
         Command::Source(args) => admin::run(args),
         Command::Bench(args) => bench::run(args),
         Command::Activity(args) => activity::run(args),
+        Command::Archive(args) => archive::run(args),
         Command::Search(args) => {
             let code = search::run(args)?;
             if code != 0 {

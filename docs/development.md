@@ -123,6 +123,7 @@ crates/
   eidos-scanner   enumeration contracts, Windows lister, parallel walker, USN journal
   eidos-catalog   SQLite catalog: migrations, scan generations, changes, aggregates, jobs, content records
   eidos-content   sniff/decode/chunk/hash
+  eidos-archive   archive member inventories from container metadata (ZIP central directory)
   eidos-search    Tantivy catalog index, projection follower, executor
   eidos-query     parser/renderer for the query syntax
   eidos-service   Axum API, scanner/watcher/reconciler/follower threads, composition

@@ -8,9 +8,12 @@
 
 use crate::content::ContentIndex;
 use crate::Result;
-use eidos_catalog::content::ContentRecord;
+use eidos_archive::{ArchiveError, ArchiveLimits};
+use eidos_catalog::archive::{ArchiveMember, ArchiveRecord};
+use eidos_catalog::content::{ContentRecord, ContentTarget};
 use eidos_catalog::Catalog;
 use eidos_content::{extract, Chunk, Limits, EXTRACTION_VERSION};
+use eidos_domain::archive::{archive_format, ArchiveFormat};
 use eidos_domain::{ContentState, Coverage, FailureClass, ObjectId, UnixNanos};
 use std::time::Instant;
 
@@ -87,6 +90,12 @@ pub fn process_object(
     // Old chunks (any generation) go away with the same commit that adds
     // the new ones.
     index.delete_object(object);
+
+    if let Some(format) = archive_format(&target.path) {
+        if let Some(r) = process_archive(catalog, &target, format, job, started)? {
+            return Ok(r);
+        }
+    }
 
     let (source, generation) = (target.source_id, target.generation);
     // Chunks of a small file stay in `batch` and are stored in the same
@@ -166,6 +175,182 @@ pub fn process_object(
             // Unsupported (binary) and anything else terminal.
             catalog.store_content(&rec, &[], true, job)?;
             Ok(ProcessResult::Done(stats))
+        }
+    }
+}
+
+/// Manifest path for container files (ADR-0010): read the container's own
+/// directory, store members and a content record that publishes the
+/// object's state. `None` when the file is not actually a ZIP, so the
+/// caller falls back to text extraction (a misnamed text file still gets
+/// indexed; a binary one ends `unsupported` as before).
+fn process_archive(
+    catalog: &Catalog,
+    target: &ContentTarget,
+    format: ArchiveFormat,
+    job: Option<eidos_domain::JobId>,
+    started: Instant,
+) -> Result<Option<ProcessResult>> {
+    let limits = ArchiveLimits::default();
+    let (object, source, generation) = (target.object_id, target.source_id, target.generation);
+    let outcome = eidos_archive::inventory(std::path::Path::new(&target.path), &limits);
+    let content_record = |state: ContentState,
+                          coverage: Coverage,
+                          failure: Option<(FailureClass, String)>,
+                          reason: Option<String>,
+                          indexed_bytes: u64,
+                          elapsed_ms: f64| ContentRecord {
+        object_id: object,
+        source_id: source,
+        generation,
+        extraction_version: EXTRACTION_VERSION,
+        encoding: None,
+        coverage,
+        indexed_bytes,
+        total_bytes: target.size,
+        chunk_count: 0,
+        line_count: 0,
+        chars: 0,
+        content_id: None,
+        hash_complete: false,
+        state,
+        failure_class: failure.as_ref().map(|f| f.0),
+        error: failure.as_ref().map(|f| f.1.clone()),
+        reason,
+        processed_at: UnixNanos::now(),
+        elapsed_ms,
+    };
+    let stats = |state: ContentState, bytes: u64, members: u32| ProcessStats {
+        object_id: object,
+        generation,
+        state,
+        bytes,
+        chunks: members,
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+        path: target.path.clone(),
+    };
+    let base_record = |state: ContentState| ArchiveRecord {
+        object_id: object,
+        source_id: source,
+        generation,
+        format: format.as_str().to_string(),
+        member_count: 0,
+        dir_count: 0,
+        implicit_dir_count: 0,
+        suspicious_count: 0,
+        declared_size: 0,
+        compressed_size: 0,
+        claimed_entries: 0,
+        zip64: false,
+        truncated: false,
+        comment: None,
+        state,
+        error: None,
+        reason: None,
+        processed_at: UnixNanos::now(),
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+    };
+    match outcome {
+        Err(ArchiveError::NotZip) => {
+            // Remember the verdict so `requeue_archives` does not queue the
+            // file again; the text path records the content outcome.
+            let rec = ArchiveRecord {
+                reason: Some("no end-of-central-directory record; processed as text".into()),
+                ..base_record(ContentState::Unsupported)
+            };
+            catalog.store_archive_marker(&rec)?;
+            Ok(None)
+        }
+        Err(ArchiveError::Io(e)) => Ok(Some(ProcessResult::Retry {
+            class: FailureClass::Transient,
+            error: e.to_string(),
+        })),
+        Err(ArchiveError::Corrupt(msg)) => {
+            let error = format!("corrupt {} archive: {msg}", format.as_str());
+            let rec = ArchiveRecord {
+                error: Some(error.clone()),
+                ..base_record(ContentState::Failed)
+            };
+            let content = content_record(
+                ContentState::Failed,
+                Coverage::None,
+                Some((FailureClass::Corrupt, error)),
+                None,
+                0,
+                rec.elapsed_ms,
+            );
+            catalog.store_archive(&rec, &[], &content, job)?;
+            Ok(Some(ProcessResult::Done(stats(ContentState::Failed, 0, 0))))
+        }
+        Ok(inv) => {
+            let state = if inv.truncated {
+                ContentState::Partial
+            } else {
+                ContentState::Indexed
+            };
+            let mut reason = format!(
+                "{} manifest: {} members, {} directories",
+                format.as_str(),
+                inv.member_count,
+                inv.dir_count
+            );
+            if let Some(t) = &inv.truncated_reason {
+                reason.push_str("; ");
+                reason.push_str(t);
+            }
+            let rec = ArchiveRecord {
+                member_count: inv.member_count,
+                dir_count: inv.dir_count,
+                implicit_dir_count: inv.implicit_dir_count,
+                suspicious_count: inv.suspicious_count,
+                declared_size: inv.declared_size,
+                compressed_size: inv.compressed_size,
+                claimed_entries: inv.claimed_entries,
+                zip64: inv.zip64,
+                truncated: inv.truncated,
+                comment: inv.comment.clone(),
+                reason: Some(reason.clone()),
+                elapsed_ms: inv.elapsed_ms,
+                ..base_record(state)
+            };
+            let members: Vec<ArchiveMember> = inv
+                .members
+                .iter()
+                .map(|m| ArchiveMember {
+                    ordinal: m.ordinal,
+                    path: m.path.clone(),
+                    name: m.name.clone(),
+                    parent: m.parent.clone(),
+                    raw_name: m.raw_name.clone(),
+                    is_dir: m.is_dir,
+                    implicit: m.implicit,
+                    size: m.size,
+                    compressed: m.compressed,
+                    method: m.method,
+                    crc32: m.crc32,
+                    modified: m.modified,
+                    encrypted: m.encrypted,
+                    flags: m.flags,
+                })
+                .collect();
+            let content = content_record(
+                state,
+                if inv.truncated {
+                    Coverage::Prefix
+                } else {
+                    Coverage::Full
+                },
+                None,
+                Some(reason),
+                inv.bytes_read,
+                inv.elapsed_ms,
+            );
+            catalog.store_archive(&rec, &members, &content, job)?;
+            Ok(Some(ProcessResult::Done(stats(
+                state,
+                inv.bytes_read,
+                inv.member_count as u32,
+            ))))
         }
     }
 }

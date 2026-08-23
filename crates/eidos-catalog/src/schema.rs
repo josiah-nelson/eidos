@@ -291,6 +291,54 @@ ALTER TABLE sources ADD COLUMN content_enabled INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE sources ADD COLUMN content_concurrency INTEGER NOT NULL DEFAULT 2;
 "#,
     ),
+    (
+        "archive manifests: records and virtual members (ADR-0010)",
+        r#"
+CREATE TABLE archive_records (
+    object_id          INTEGER PRIMARY KEY,
+    source_id          INTEGER NOT NULL,
+    generation         INTEGER NOT NULL,
+    format             TEXT NOT NULL,
+    member_count       INTEGER NOT NULL DEFAULT 0,
+    dir_count          INTEGER NOT NULL DEFAULT 0,
+    implicit_dir_count INTEGER NOT NULL DEFAULT 0,
+    suspicious_count   INTEGER NOT NULL DEFAULT 0,
+    declared_size      INTEGER NOT NULL DEFAULT 0,
+    compressed_size    INTEGER NOT NULL DEFAULT 0,
+    claimed_entries    INTEGER NOT NULL DEFAULT 0,
+    zip64              INTEGER NOT NULL DEFAULT 0,
+    truncated          INTEGER NOT NULL DEFAULT 0,
+    comment            TEXT,
+    state              TEXT NOT NULL,
+    error              TEXT,
+    reason             TEXT,
+    processed_at       INTEGER NOT NULL,
+    elapsed_ms         REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX archive_records_source_state ON archive_records (source_id, state);
+
+CREATE TABLE archive_members (
+    object_id  INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    ordinal    INTEGER NOT NULL,
+    path       TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    parent     TEXT NOT NULL,
+    raw_name   TEXT NOT NULL,
+    is_dir     INTEGER NOT NULL,
+    implicit   INTEGER NOT NULL,
+    size       INTEGER NOT NULL,
+    compressed INTEGER NOT NULL,
+    method     INTEGER NOT NULL,
+    crc32      INTEGER NOT NULL,
+    modified   INTEGER,
+    encrypted  INTEGER NOT NULL,
+    flags      INTEGER NOT NULL,
+    PRIMARY KEY (object_id, generation, ordinal)
+) WITHOUT ROWID;
+CREATE INDEX archive_members_parent ON archive_members (object_id, generation, parent, name);
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.
@@ -324,7 +372,7 @@ mod tests {
     fn migrations_apply_once_and_are_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         let first = migrate(&mut conn).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4]);
+        assert_eq!(first, vec![1, 2, 3, 4, 5]);
         let second = migrate(&mut conn).unwrap();
         assert!(second.is_empty());
         let v: i64 = conn
