@@ -550,6 +550,8 @@ export interface ActivitySourceView {
   state: SourceState
   content_enabled: boolean
   content_concurrency: number
+  content_reserved: number
+  content_peak_reserved: number
   jobs_queued: number
   jobs_running: number
   content_states: Record<string, number>

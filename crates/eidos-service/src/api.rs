@@ -830,7 +830,7 @@ async fn set_content_policy(
         .unwrap_or(s.content_concurrency)
         .clamp(1, 64);
     st.catalog.set_content_policy(sid, enabled, concurrency)?;
-    st.content_budgets.lock().insert(sid, concurrency);
+    st.content_budgets().set(sid, concurrency);
     let s = st
         .catalog
         .get_source(sid)?
@@ -845,6 +845,10 @@ pub struct ActivitySourceView {
     pub state: eidos_domain::SourceState,
     pub content_enabled: bool,
     pub content_concurrency: u32,
+    /// Units of `content_concurrency` reserved by workers right now.
+    pub content_reserved: u32,
+    /// High-water mark of `content_reserved` since the service started.
+    pub content_peak_reserved: u32,
     pub jobs_queued: u64,
     pub jobs_running: u64,
     pub content_states: std::collections::BTreeMap<String, u64>,
@@ -880,6 +884,8 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
                 state: s.state,
                 content_enabled: s.content_enabled,
                 content_concurrency: s.content_concurrency,
+                content_reserved: st2.content_budgets().reserved(s.id),
+                content_peak_reserved: st2.content_budgets().peak_reserved(s.id),
                 jobs_queued: q.0,
                 jobs_running: q.1,
                 content_states: st2.catalog.content_state_counts(s.id)?,

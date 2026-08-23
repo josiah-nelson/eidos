@@ -205,6 +205,15 @@ Apply limits per physical volume/source so a fast NVMe and a slower HDD can make
 progress independently. Separate CPU, local-disk, network, decompression, and
 future GPU budgets.
 
+A per-source budget is only meaningful if it cannot be raced. Capacity is
+reserved atomically as part of claiming: the claim transaction offers the
+candidate source to the scheduler, which either hands back a reservation or
+declines, and only an admitted source has its jobs marked `running`. The
+reservation is an RAII guard held for the whole batch, so capacity returns on
+every exit path, including an empty claim, an error, cancellation, shutdown,
+and a panic. A source at its budget is skipped in favour of the next eligible
+one rather than blocking the pool.
+
 Retries distinguish transient source errors, unsupported content, deterministic
 parse failure, resource-limit failure, and corrupt input. Deterministic failures
 do not retry forever.
