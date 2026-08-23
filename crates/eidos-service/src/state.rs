@@ -24,6 +24,11 @@ pub struct AppState {
     pub content_enabled: AtomicBool,
     pub content_worker_count: usize,
     pub exec_opts: eidos_search::exec::ExecOptions,
+    /// Bounds and counters for `/api/search/export`.
+    pub export: crate::export::ExportLimits,
+    pub export_stats: Arc<crate::export::ExportStats>,
+    /// One permit per streaming export (see [`crate::export::ExportLimits`]).
+    pub export_gate: Arc<tokio::sync::Semaphore>,
     pub host_id: HostId,
     pub host_name: String,
     pub lister: Arc<dyn DirectoryLister>,
@@ -34,6 +39,9 @@ pub struct AppState {
     pub shutdown: Arc<AtomicBool>,
     /// Whether the reconciler may start periodic rescans on its own.
     pub auto_reconcile: bool,
+    /// A content-index rebuild from stored chunks was scheduled at open and
+    /// runs once `start_background` spawns it.
+    pub content_rebuild: bool,
 }
 
 impl AppState {
@@ -61,20 +69,40 @@ impl AppState {
             eidos_search::CatalogIndex::open(config.data_dir.join("index").join("catalog"))?;
         let content_index =
             eidos_search::ContentIndex::open(config.data_dir.join("index").join("content"))?;
-        let mut rebuild_content = false;
-        if content_index.is_fresh() {
-            // A (re)created content index holds nothing. The catalog keeps
-            // every chunk's text, so the index is rebuilt from storage in the
-            // background instead of re-reading the sources.
-            let stats = catalog.content_stats(None)?;
-            if stats.chunks > 0 {
-                tracing::warn!(
-                    chunks = stats.chunks,
-                    "content index is empty; rebuilding it from stored chunks"
-                );
-                rebuild_content = true;
-            }
+        // A (re)created content index holds nothing, and an unfinished
+        // rebuild leaves a partial one. The catalog keeps every chunk's text,
+        // so the index is rebuilt from storage in the background instead of
+        // re-reading the sources. The rebuild is *scheduled* here, before
+        // anything is advertised, so search and readiness report a partial
+        // content index from the first request; `start_background` runs it.
+        let stats = catalog.content_stats(None)?;
+        let rebuild_content = if content_index.is_rebuilding() {
+            tracing::warn!(
+                chunks = stats.chunks,
+                "a previous content index rebuild did not finish; rebuilding again"
+            );
+            true
+        } else if content_index.is_fresh() && stats.chunks > 0 {
+            tracing::warn!(
+                chunks = stats.chunks,
+                "content index is empty; rebuilding it from stored chunks"
+            );
+            true
+        } else {
+            false
+        };
+        if rebuild_content {
+            content_index.begin_rebuild(stats.chunks)?;
         }
+        // An export holds at most one admission permit at a time. When the
+        // shared gate has several slots, keep the export bound strictly below
+        // it; with a one-slot gate, export pages are non-queueing and yield to
+        // interactive waiters in Admission::run_export.
+        let mut export_limits = config.export;
+        export_limits.concurrency = export_limits
+            .concurrency
+            .min(config.admission.concurrency.saturating_sub(1))
+            .max(1);
         let state = Self {
             admission: Arc::new(crate::admission::Admission::new(config.admission.clone())),
             catalog,
@@ -85,6 +113,9 @@ impl AppState {
             content_enabled: AtomicBool::new(config.content),
             content_worker_count: config.content_workers,
             exec_opts: eidos_search::exec::ExecOptions::default(),
+            export: export_limits,
+            export_stats: Arc::new(crate::export::ExportStats::default()),
+            export_gate: Arc::new(tokio::sync::Semaphore::new(export_limits.concurrency)),
             host_id,
             host_name,
             lister: Arc::from(eidos_scanner::default_lister()),
@@ -94,19 +125,8 @@ impl AppState {
             scan_threads: config.scan_threads,
             shutdown: Arc::new(AtomicBool::new(false)),
             auto_reconcile: config.auto_reconcile,
+            content_rebuild: rebuild_content,
         };
-        if rebuild_content {
-            let catalog = state.catalog.clone();
-            let index = state.content_index.clone();
-            std::thread::Builder::new()
-                .name("content-rebuild".into())
-                .spawn(move || {
-                    if let Err(e) = index.rebuild_from_chunks(&catalog) {
-                        tracing::error!(error = %e, "content index rebuild failed");
-                    }
-                })
-                .expect("spawn content rebuild");
-        }
         Ok(state)
     }
 
@@ -132,6 +152,19 @@ impl AppState {
     /// Start change-feed watchers for every published native source and the
     /// periodic reconciler.
     pub fn start_background(self: &Arc<Self>) -> anyhow::Result<()> {
+        if self.content_rebuild {
+            // Runs under the index writer gate: content workers and the
+            // commit coordinator wait until it finishes (or fails).
+            let st = self.clone();
+            std::thread::Builder::new()
+                .name("content-rebuild".into())
+                .spawn(move || {
+                    if let Err(e) = st.content_index.run_rebuild(&st.catalog, &st.shutdown) {
+                        tracing::error!(error = %e, "content index rebuild failed");
+                    }
+                })
+                .expect("spawn content rebuild");
+        }
         for s in self.catalog.list_sources()? {
             if s.published_generation.is_some()
                 && s.kind == eidos_domain::SourceKind::WindowsLocal

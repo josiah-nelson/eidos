@@ -49,7 +49,11 @@ the catalog outbox every 500 ms (`GET /api/index` shows follower state).
 (`EIDOS_BIND`, default loopback — the API has no authentication yet and warns
 when bound elsewhere), `--web-dir` (`EIDOS_WEB_DIR`, empty for API only),
 `--scan-threads`, `--no-auto-reconcile`, `--no-content` (metadata only),
-`--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4), plus the
+`--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4),
+`--export-page-size N` (`EIDOS_EXPORT_PAGE_SIZE`, default 500) and
+`--export-max-rows N` (`EIDOS_EXPORT_MAX_ROWS`, default 100000) and
+`--export-concurrency N` (`EIDOS_EXPORT_CONCURRENCY`, default 2) — see
+[Exporting results](query-syntax.md#exporting-results) — plus the
 admission-control flags below.
 
 ### Operational limits
@@ -71,7 +75,13 @@ Beyond the queue bound, or after the queue wait, a request is answered
 `503` with `{"kind":"busy"}` and a `Retry-After` header. Past its deadline it
 is answered `504` with `{"kind":"timeout"}`. Health, activity and index
 status never enter the gate, so they stay responsive while queries saturate
-it.
+it. An export takes a permit per page rather than one for its whole stream,
+so a long export interleaves with interactive queries instead of holding a
+slot for minutes, and `--export-concurrency` bounds how many exports stream at
+once — clamped below `--max-concurrent-queries` whenever the gate has more
+than one slot. Export pages never join the shared queue and yield when
+interactive work is waiting, which preserves priority even with a one-slot
+gate. Exports past their own bound are refused with the same `503`.
 
 A deadline ends the *response*, not the query: a running SQLite or Tantivy
 call cannot be cancelled mid-call, so the permit is released by the blocking
@@ -105,6 +115,69 @@ the first crawl of a slow or remote root:
 The same controls are on the Activity and source pages of the web UI and at
 `POST /api/sources/{id}/content` / `GET /api/activity`.
 
+Transient failures (share offline, sharing violation) retry on their own with
+exponential backoff. Deterministic, corrupt, unsupported, and resource-limit
+failures are terminal on purpose: they come back only through an explicit
+operator retry, once the extractor, the limit, or the share is fixed. A retry
+covers both places a failure can live — a job left `failed` after its
+transient budget ran out, and an object whose extraction failed for good
+(the failure is on the content record and the job finished; the object goes
+back to `pending` with a fresh content job).
+
+```powershell
+.\target\release\eidos.exe content retry --source share --preview            # how many, how many bytes
+.\target\release\eidos.exe content retry --source share --class resource_limit
+.\target\release\eidos.exe content retry --source share --reason-prefix "extract:" --limit 500
+.\target\release\eidos.exe content retry 4213                                # one job id
+```
+
+Retrying keeps the diagnosis: `attempts`, `last_error`, and `failure_class`
+stay on the job, `requeue_count`/`requeued_at` record the action, and the
+automatic transient budget starts again from the requeue. A retry never
+touches a running job, never creates a second active job for one object, and
+skips objects that were deleted, superseded by a newer generation, retired,
+or whose source has content extraction disabled — the response reports
+`accepted`, `skipped`, `rejected`, and `bytes` with per-reason counts. The
+Activity page has a retry button per recent failure and a two-step bulk retry
+per source that shows the preview count before acting. The confirmation
+carries that preview's `as_of`, count, and opaque exact-set token. Failures
+that appear later wait for the next round; if an older previewed failure
+becomes ineligible, the action returns `409` and asks the operator to preview
+again instead of substituting a different pre-existing failure. The endpoints
+are `POST /api/jobs/{id}/retry` and
+`POST /api/sources/{id}/content/retry`.
+
+### Stored-text preview
+
+`GET /api/objects/{id}/content?generation=G&ordinal=N&before=B&after=A`
+returns the text the indexer stored for one object generation — the catalog's
+extraction cache, never a read of the source file, and never addressed by
+filesystem path.
+
+- `ordinal` (default 0) picks the chunk; `before`/`after` add neighbouring
+  chunks, clamped to 4 per side.
+- `generation` is optional. When it is supplied and does not match the
+  generation the stored chunks belong to, the request fails with `409` and
+  `{"kind": "stale_generation", "requested_generation", "current_generation"}`
+  so a client holding an old search hit refetches instead of rendering text
+  from a different version of the file. Search hits carry the value to send
+  as `content.generation`.
+- A successful response reports the content record's `state`, `coverage`,
+  `indexed_bytes`/`total_bytes`, `reason`, each chunk's byte and line ranges,
+  and `stale: true` when the object has moved on to a newer generation than
+  the stored text.
+- Responses are bounded: 4 neighbouring chunks per side, 256 KiB of text, and
+  4000 lines. `truncated` (per response and per chunk) says when the limits
+  cut something; `has_more_before`/`has_more_after` drive paging outwards. The
+  requested chunk is always returned (cut down if it alone is too big) and
+  neighbours only whole, so a client paging outwards steps the window rather
+  than widening it once the budget binds.
+- The blocking read goes through the same admission gate as browsing, so a
+  burst of previews cannot starve the blocking pool.
+- Text is sanitised before serialisation: C0/C1 control characters other than
+  tab, CR and LF, and bidirectional overrides, become U+FFFD (one for one, so
+  offsets still line up) and the chunk is flagged `sanitized`.
+
 Searching through the running service:
 
 ```powershell
@@ -112,6 +185,17 @@ Searching through the running service:
 .\target\release\eidos.exe search --mode directories "has:idb has:cs" --explain
 .\target\release\eidos.exe search --json "ext:dmp" | ConvertFrom-Json
 ```
+
+Exporting a whole result set (streamed from the service, never buffered):
+
+```powershell
+.\target\release\eidos.exe search "ext:dmp" --export csv --out dumps.csv
+.\target\release\eidos.exe search "ext:md mtime:>=30d" --export ndjson | Select-Object -First 5
+```
+
+`--out -` (or omitting `--out`) writes to stdout, `--export-limit N` lowers the
+row cap, and `--bom` prefixes a UTF-8 BOM for Excel. The command prints the
+match count and the cap on stderr, marking `(TRUNCATED)` when the cap bites.
 
 `EIDOS_URL` overrides the service address. Query syntax:
 [query-syntax.md](query-syntax.md).

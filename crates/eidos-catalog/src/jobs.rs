@@ -57,10 +57,16 @@ pub struct JobRecord {
     pub worker: Option<String>,
     pub last_error: Option<String>,
     pub failure_class: Option<FailureClass>,
+    /// How often an operator has requeued this job (see [`crate::retry`]).
+    #[serde(default)]
+    pub requeue_count: u32,
+    #[serde(default)]
+    pub requeued_at: Option<UnixNanos>,
 }
 
 const JOB_COLUMNS: &str = "job_id, source_id, object_id, object_generation, stage, priority, state, attempts, idempotency_key, \
-     payload, estimated_cost, created_at, scheduled_at, started_at, finished_at, worker, last_error, failure_class";
+     payload, estimated_cost, created_at, scheduled_at, started_at, finished_at, worker, last_error, failure_class, \
+     requeue_count, requeued_at";
 
 fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
     let payload: Option<String> = r.get(9)?;
@@ -85,6 +91,8 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
         failure_class: r
             .get::<_, Option<String>>(17)?
             .and_then(|s| FailureClass::parse(&s)),
+        requeue_count: r.get::<_, i64>(18)? as u32,
+        requeued_at: r.get::<_, Option<i64>>(19)?.map(UnixNanos),
     })
 }
 
@@ -99,8 +107,9 @@ pub fn enqueue_conn(conn: &Connection, job: &NewJob) -> Result<Option<JobId>> {
     if let Some((id, state)) = existing {
         if state == JobState::Failed.as_str() || state == JobState::Superseded.as_str() {
             conn.execute(
-                "UPDATE jobs SET state = 'queued', attempts = 0, scheduled_at = ?2, started_at = NULL, finished_at = NULL,
-                    last_error = NULL, failure_class = NULL, priority = ?3 WHERE job_id = ?1",
+                "UPDATE jobs SET state = 'queued', attempts = 0, retry_base_attempts = 0, scheduled_at = ?2,
+                    started_at = NULL, finished_at = NULL, last_error = NULL, failure_class = NULL, priority = ?3
+                 WHERE job_id = ?1",
                 params![id, now, job.priority as i64],
             )?;
             return Ok(Some(JobId(id)));
@@ -339,14 +348,21 @@ impl Catalog {
     }
 
     /// Record a failure. Transient failures are re-queued with exponential
-    /// backoff up to `MAX_TRANSIENT_ATTEMPTS`.
+    /// backoff up to `MAX_TRANSIENT_ATTEMPTS`. The budget counts attempts
+    /// since the last operator requeue, so `attempts` keeps the full history
+    /// while an explicit retry restores the automatic backoff schedule.
     pub fn fail_job(&self, id: JobId, class: FailureClass, error: &str) -> Result<JobState> {
         self.with_writer(|conn| {
             let now = UnixNanos::now();
-            let attempts: i64 = conn
-                .query_row("SELECT attempts FROM jobs WHERE job_id = ?1", params![id.0], |r| r.get(0))
+            let (total, base): (i64, i64) = conn
+                .query_row(
+                    "SELECT attempts, retry_base_attempts FROM jobs WHERE job_id = ?1",
+                    params![id.0],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .optional()?
                 .ok_or_else(|| CatalogError::NotFound(format!("job {id}")))?;
+            let attempts = (total - base).max(0);
             let retry = class.retryable() && (attempts as u32) < MAX_TRANSIENT_ATTEMPTS;
             let state = if retry { JobState::Queued } else { JobState::Failed };
             let backoff_s = 10i64.saturating_mul(1i64 << attempts.min(10));

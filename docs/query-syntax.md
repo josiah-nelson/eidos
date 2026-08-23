@@ -178,3 +178,112 @@ o:<consumed>;g:<index generation>;q:<query fingerprint>[;t:<total>;x:<exact>];s:
   candidates) verify results lazily in sort order: the hits you see are all
   verified, but the reported total is an upper bound (`exact: false`,
   rendered as "N+") until a page reaches the end of the result set.
+
+## Exporting results
+
+`GET|POST /api/search/export` runs the same query as `/api/search` and streams
+the whole result set. The service walks the result cursors itself, one page of
+`--export-page-size` rows (default 500) at a time, so neither the service nor
+the browser ever holds more than a page; if the client disconnects the walk
+stops on the next page. The web UI's **Export** menu and
+`eidos search --export csv|json|ndjson --out FILE` both use this endpoint.
+
+| Parameter | Meaning |
+|---|---|
+| `format` | `csv` (default), `json`, `ndjson` |
+| `q` | query text, as for `/api/search`; POST also accepts `query` (AST) |
+| `mode`, `sort`, `desc` | as for `/api/search`; `desc` and the flags below accept `1`/`0` as well as `true`/`false` |
+| `limit` | maximum rows to export; clamped to `--export-max-rows` (default 100,000) |
+| `bom` | `bom=1` prefixes a UTF-8 BOM to a CSV export so Excel detects the encoding |
+| `include_retired` | include retired sources |
+
+Each page passes through the same admission gate as `/api/search`
+(see [Operational limits](development.md#operational-limits)), taking a
+permit per page rather than one for the whole stream: an export of 100,000
+rows can run for minutes, and holding a slot that long would starve
+interactive queries. Between pages an export holds nothing, so a stalled
+client cannot pin a permit. On top of that, `--export-concurrency` (default 2,
+kept below `--max-concurrent-queries` whenever the gate has more than one
+slot) bounds how many exports stream at once. Export pages never join the
+shared queue and yield when interactive work is waiting, which preserves
+priority with a one-slot gate too. An export beyond its own bound is refused
+up front with `503` and `{"kind":"busy"}`. Snippets, facets, and the plan
+explanation are never computed for an export, so page cost does not grow with
+the number of pages.
+
+If a page cannot be fetched part-way through — the gate sheds it, the query
+times out, the service is shutting down — the export writes its footer
+(`truncated: true` with a non-null `error`) and then **fails the transfer**
+rather than ending it cleanly. A short-but-tidy file would be indistinguishable
+from a complete one in CSV, which has no envelope; aborting means every client,
+`eidos search --export` included, reports a failed download. Three response headers
+describe the bounds up front: `X-Eidos-Export-Max-Rows`, `X-Eidos-Export-Total`
+and `X-Eidos-Export-Total-Exact`. A CSV export carries no envelope, so compare
+those two numbers to detect truncation.
+
+### Columns
+
+Every format uses the same fourteen fields, in this order:
+
+`object_id`, `entry_id`, `source`, `kind`, `name`, `path`, `extension`,
+`size`, `allocated_size`, `modified`, `created`, `content_state`,
+`hard_link_count`, `score`.
+
+- `source` is the source *name*, which is unique within a catalog.
+- `modified` and `created` are RFC 3339 UTC with the full nanosecond field
+  (`2026-08-23T01:02:03.123456789Z`). Nothing is rounded.
+- `size` and `allocated_size` are the object's own bytes. In `directories`
+  mode a directory row therefore reports its entry size, not its subtree
+  total; use the API if you need aggregates.
+- `path` is verbatim, exactly as stored — no normalisation, no escaping
+  beyond what the format requires.
+- In CSV an empty cell means "not available" (`entry_id`, `path`, `modified`,
+  `created`, and `score` can all be absent); in JSON and NDJSON those fields
+  are explicit `null`s rather than omitted keys.
+
+CSV follows RFC 4180: `CRLF` line endings, a field quoted only when it
+contains a comma, a quote, `CR`, or `LF`, and embedded quotes doubled. The
+encoding is UTF-8 without a BOM unless `bom=1` is passed. Values are written
+verbatim, so a cell that begins with `=`, `+`, `-`, or `@` may be read as a
+formula by a spreadsheet application; the export never alters data to avoid
+that, because paths have to round-trip.
+
+### JSON and NDJSON envelope
+
+Both carry `"schema": "eidos-export/1"`. `format=json` is one document:
+
+```json
+{
+  "schema": "eidos-export/1",
+  "query": { "q": "ext:md", "rendered": "ext:md", "mode": "files",
+             "sort": { "field": "name", "descending": false },
+             "include_retired": false, "ast": { } },
+  "exported_at": "2026-08-23T01:02:03.123456789Z",
+  "total": { "value": 1200, "exact": true },
+  "max_rows": 100000,
+  "completeness": [ ],
+  "warnings": [ ],
+  "rows": [ ],
+  "rows_exported": 1200,
+  "truncated": false,
+  "error": null
+}
+```
+
+`rows_exported`, `truncated`, and `error` are only known when the walk ends,
+so they follow `rows` — JSON object members are unordered, and a streaming
+parser sees them last. `format=ndjson` emits the same information as lines:
+the first is the header object (`"type": "header"`, everything above except
+`rows`), then one bare row object per line, then a final
+`"type": "summary"` line with `rows_exported`, `truncated`, and `error`. Row
+lines never carry a `schema` key, so the three line kinds are easy to tell
+apart.
+
+`completeness` is the same per-source block `/api/search` returns, captured
+from the first page: a stale, degraded, or still-indexing source is visible in
+the export itself. `error` is non-null when a page failed mid-walk; the export
+then ends early with `truncated` set.
+
+Cursors are offsets into the result set, so a commit that lands between two
+pages can shift rows. An export is a snapshot only as far as the index is
+quiet; `completeness` and `total` come from its first page.

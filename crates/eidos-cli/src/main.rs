@@ -16,6 +16,7 @@ mod activity;
 mod admin;
 mod archive;
 mod bench;
+mod content;
 mod profile;
 mod search;
 
@@ -52,6 +53,8 @@ enum Command {
     Activity(activity::ActivityArgs),
     /// Archive manifests from the running service (ZIP member inventories).
     Archive(archive::ArchiveArgs),
+    /// Content job controls in the running service (retry failures).
+    Content(content::ContentArgs),
 }
 
 #[derive(Args, Debug)]
@@ -95,6 +98,15 @@ struct ServeArgs {
     /// Maximum accepted JSON request body.
     #[arg(long, env = "EIDOS_MAX_BODY_BYTES", default_value_t = 1 << 20)]
     max_body_bytes: usize,
+    /// Rows fetched per cursor step while streaming `/api/search/export`.
+    #[arg(long, env = "EIDOS_EXPORT_PAGE_SIZE", default_value_t = 500)]
+    export_page_size: u32,
+    /// Hard cap on rows a single export may emit.
+    #[arg(long, env = "EIDOS_EXPORT_MAX_ROWS", default_value_t = 100_000)]
+    export_max_rows: u64,
+    /// Exports allowed to stream at once (kept below --max-concurrent-queries).
+    #[arg(long, env = "EIDOS_EXPORT_CONCURRENCY", default_value_t = 2)]
+    export_concurrency: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -106,6 +118,7 @@ fn main() -> anyhow::Result<()> {
         Command::Bench(args) => bench::run(args),
         Command::Activity(args) => activity::run(args),
         Command::Archive(args) => archive::run(args),
+        Command::Content(args) => content::run(args),
         Command::Search(args) => {
             let code = search::run(args)?;
             if code != 0 {
@@ -136,6 +149,11 @@ fn main() -> anyhow::Result<()> {
                     search_timeout: Duration::from_millis(args.search_timeout_ms),
                     operation_timeout: Duration::from_millis(args.operation_timeout_ms),
                     max_body_bytes: args.max_body_bytes,
+                },
+                export: eidos_service::export::ExportLimits {
+                    page_size: args.export_page_size.clamp(1, 1000),
+                    max_rows: args.export_max_rows,
+                    concurrency: args.export_concurrency,
                 },
             })
         }

@@ -1,6 +1,7 @@
+import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
-import { api, type ActivitySourceView } from '../api'
+import { api, type ActivitySourceView, type RetryReport } from '../api'
 import { ErrorBox, Spinner, StateBadge } from '../components'
 import { bytes, count, duration } from '../format'
 
@@ -15,6 +16,96 @@ function StateBar({ states }: { states: Record<string, number> }) {
         <span key={k} className={`seg ${k}`} style={{ width: `${(100 * (states[k] ?? 0)) / total}%` }} />
       ))}
     </div>
+  )
+}
+
+function retrySummary(r: RetryReport): string {
+  const parts = [`${count(r.accepted)} requeued`]
+  if (r.skipped > 0) parts.push(`${count(r.skipped)} skipped (${Object.keys(r.skipped_reasons).join(', ')})`)
+  if (r.rejected > 0) parts.push(`${count(r.rejected)} rejected (${Object.keys(r.rejected_reasons).join(', ')})`)
+  return parts.join(' · ')
+}
+
+// Two-step bulk retry: the first click previews (count + bytes), the second
+// one acts. No browser dialogs. The confirmation carries the preview's
+// `as_of`, count, and exact-set confirmation token. Anything that failed in
+// between is excluded by `as_of`; if an older candidate changed, the token no
+// longer matches and the server asks for a fresh preview rather than
+// substituting work the operator was not shown.
+function BulkRetry({ s }: { s: ActivitySourceView }) {
+  const qc = useQueryClient()
+  const [preview, setPreview] = useState<RetryReport | null>(null)
+  const [done, setDone] = useState<RetryReport | null>(null)
+  const ask = useMutation({
+    mutationFn: () => api.retrySourceContent(s.source_id, { preview: true }),
+    onSuccess: (r) => {
+      setDone(null)
+      setPreview(r)
+    },
+  })
+  const apply = useMutation({
+    mutationFn: (p: RetryReport) =>
+      api.retrySourceContent(s.source_id, {
+        preview: false,
+        limit: p.accepted,
+        as_of: p.as_of,
+        confirmation: p.confirmation ?? undefined,
+      }),
+    onSuccess: (r) => {
+      setPreview(null)
+      setDone(r)
+      qc.invalidateQueries({ queryKey: ['activity'] })
+    },
+  })
+  const busy = ask.isPending || apply.isPending
+  const error = ask.error ?? apply.error
+  if (s.jobs_failed === 0 && !preview && !done) return <span className="muted">—</span>
+  return (
+    <div>
+      <div>
+        {count(s.jobs_failed)} failed{s.jobs_failed > 0 ? ` · ${bytes(s.jobs_failed_bytes)}` : ''}
+      </div>
+      {preview === null ? (
+        s.jobs_failed > 0 && (
+          <button className="btn small" disabled={busy} onClick={() => ask.mutate()}>
+            {ask.isPending ? 'checking…' : 'retry failed'}
+          </button>
+        )
+      ) : (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          <button
+            className="btn small primary"
+            disabled={busy || preview.accepted === 0}
+            onClick={() => apply.mutate(preview)}
+          >
+            {apply.isPending ? 'requeueing…' : `confirm ${count(preview.accepted)} job(s) · ${bytes(preview.bytes)}`}
+          </button>
+          <button className="btn small" disabled={busy} onClick={() => setPreview(null)}>
+            cancel
+          </button>
+        </div>
+      )}
+      {preview !== null && (preview.skipped > 0 || preview.rejected > 0) && (
+        <div className="muted small">{retrySummary(preview)}</div>
+      )}
+      {done && <div className="muted small">{retrySummary(done)}</div>}
+      {error && <div className="muted small">{error.message}</div>}
+    </div>
+  )
+}
+
+function RetryJobButton({ id }: { id: number }) {
+  const qc = useQueryClient()
+  const retry = useMutation({
+    mutationFn: () => api.retryJob(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['activity'] }),
+  })
+  if (retry.isError) return <span className="muted small">{retry.error.message}</span>
+  if (retry.data && retry.data.accepted === 0) return <span className="muted small">{retrySummary(retry.data)}</span>
+  return (
+    <button className="btn small" disabled={retry.isPending || retry.isSuccess} onClick={() => retry.mutate()}>
+      {retry.isPending ? 'retrying…' : retry.isSuccess ? 'requeued' : 'retry'}
+    </button>
   )
 }
 
@@ -73,6 +164,9 @@ function SourceRow({ s }: { s: ActivitySourceView }) {
         </div>
       </td>
       <td className="num">{bytes(s.content_bytes_indexed)}</td>
+      <td>
+        <BulkRetry s={s} />
+      </td>
     </tr>
   )
 }
@@ -163,6 +257,7 @@ export default function ActivityPage() {
             <th className="num">Running</th>
             <th>Content states</th>
             <th className="num">Indexed bytes</th>
+            <th>Failed jobs</th>
           </tr>
         </thead>
         <tbody>
@@ -213,6 +308,7 @@ export default function ActivityPage() {
                 <th>Class</th>
                 <th className="num">Attempts</th>
                 <th>Error</th>
+                <th />
               </tr>
             </thead>
             <tbody>
@@ -221,8 +317,14 @@ export default function ActivityPage() {
                   <td className="mono">{j.id}</td>
                   <td className="mono">{j.object_id != null ? <Link to={`/browse/${j.object_id}`}>#{j.object_id}</Link> : '—'}</td>
                   <td>{j.failure_class ?? ''}</td>
-                  <td className="num">{j.attempts}</td>
+                  <td className="num">
+                    {j.attempts}
+                    {j.requeue_count > 0 ? ` (${j.requeue_count}× requeued)` : ''}
+                  </td>
                   <td className="mono small">{j.last_error ?? ''}</td>
+                  <td>
+                    <RetryJobButton id={j.id} />
+                  </td>
                 </tr>
               ))}
             </tbody>

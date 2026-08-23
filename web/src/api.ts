@@ -1,5 +1,7 @@
 // Typed client for the eidos HTTP API. Shapes mirror the Rust serde output.
 
+import type { PreviewWindow } from './preview-window'
+
 export type SourceState =
   | 'new'
   | 'enumerating'
@@ -284,6 +286,7 @@ export interface Health {
   catalog_path: string
   sources: number
   running_scans: number
+  export_max_rows: number
 }
 
 // ----- search --------------------------------------------------------------
@@ -345,7 +348,14 @@ export interface Hit {
   changed?: number
   attributes: number
   hard_link_count: number
-  content: { state: ContentState; coverage: string; indexed_bytes?: number; content_id?: string; reason?: string }
+  content: {
+    state: ContentState
+    coverage: string
+    generation?: number
+    indexed_bytes?: number
+    content_id?: string
+    reason?: string
+  }
   score?: number
   snippets?: Snippet[]
   directory?: DirectorySummary
@@ -414,6 +424,19 @@ export interface SearchParams {
   explain: boolean
 }
 
+export type ExportFormat = 'csv' | 'json' | 'ndjson'
+
+/** URL of the streaming export of a query's whole result set. */
+export function exportUrl(
+  p: { q: string; mode: ResultMode; sort: SortField; desc: boolean },
+  format: ExportFormat,
+  bom = false,
+): string {
+  const qs = new URLSearchParams({ format, q: p.q, mode: p.mode, sort: p.sort, desc: String(p.desc) })
+  if (bom) qs.set('bom', '1')
+  return `/api/search/export?${qs.toString()}`
+}
+
 export interface IndexStatus {
   follower: {
     iterations: number
@@ -437,6 +460,48 @@ export interface IndexStatus {
     in_sync: boolean
   }[]
 }
+
+// ----- stored-text preview -------------------------------------------------
+
+export interface PreviewChunk {
+  ordinal: number
+  byte_start: number
+  byte_end: number
+  line_start: number
+  line_end: number
+  chars: number
+  text: string
+  truncated: boolean
+  sanitized: boolean
+}
+
+/**
+ * A window of the text the indexer stored for one object generation. Never
+ * the file on disk: the service reads it out of the catalog.
+ */
+export interface ContentPreview {
+  object_id: number
+  path: string | null
+  generation: number
+  object_generation: number
+  stale: boolean
+  state: ContentState
+  coverage: string
+  indexed_bytes: number
+  total_bytes: number
+  chunk_count: number
+  line_count: number
+  encoding: string | null
+  reason: string | null
+  requested_ordinal: number
+  chunks: PreviewChunk[]
+  has_more_before: boolean
+  has_more_after: boolean
+  truncated: boolean
+  limits: { max_neighbors: number; max_bytes: number; max_lines: number }
+}
+
+export type { PreviewWindow }
 
 export class ApiError extends Error {
   status: number
@@ -488,6 +553,15 @@ export const api = {
       `/api/objects/${id}/children?sort=${q.sort}&desc=${q.desc}&offset=${q.offset}&limit=${q.limit}&hidden=${q.hidden}`,
     ),
   extensions: (id: number, limit = 30) => request<ExtensionCount[]>(`/api/objects/${id}/extensions?limit=${limit}`),
+  contentPreview: (id: number, w: PreviewWindow) => {
+    const p = new URLSearchParams({
+      ordinal: String(w.ordinal),
+      before: String(w.before),
+      after: String(w.after),
+    })
+    if (w.generation != null) p.set('generation', String(w.generation))
+    return request<ContentPreview>(`/api/objects/${id}/content?${p.toString()}`)
+  },
   resolve: (source: number, path: string) =>
     request<{ object_id: number; path: string | null }>(
       `/api/resolve?source=${source}&path=${encodeURIComponent(path)}`,
@@ -513,6 +587,34 @@ export const api = {
   activity: () => request<ActivityView>('/api/activity'),
   setContentPolicy: (id: number, body: { enabled?: boolean; concurrency?: number }) =>
     request<SourceView>(`/api/sources/${id}/content`, { method: 'POST', body: JSON.stringify(body) }),
+  retryJob: (id: number) =>
+    request<RetryReport>(`/api/jobs/${id}/retry`, { method: 'POST', body: JSON.stringify({ preview: false }) }),
+  retrySourceContent: (
+    id: number,
+    body: {
+      class?: string
+      reason_prefix?: string
+      preview: boolean
+      limit?: number
+      as_of?: number
+      confirmation?: string
+    },
+  ) =>
+    request<RetryReport>(`/api/sources/${id}/content/retry`, { method: 'POST', body: JSON.stringify(body) }),
+}
+
+// Result of a retry action (`preview: true` counts without acting).
+export interface RetryReport {
+  preview: boolean
+  as_of: number
+  confirmation: string | null
+  accepted: number
+  skipped: number
+  rejected: number
+  bytes: number
+  skipped_reasons: Record<string, number>
+  rejected_reasons: Record<string, number>
+  job_ids: number[]
 }
 
 export interface WorkerCurrent {
@@ -570,6 +672,8 @@ export interface ActivitySourceView {
   content_peak_reserved: number
   jobs_queued: number
   jobs_running: number
+  jobs_failed: number
+  jobs_failed_bytes: number
   content_states: Record<string, number>
   content_bytes_indexed: number
 }
@@ -586,6 +690,8 @@ export interface JobRecord {
   last_error?: string | null
   failure_class?: string | null
   finished_at?: number | null
+  requeue_count: number
+  requeued_at?: number | null
 }
 
 export interface ActivityView {

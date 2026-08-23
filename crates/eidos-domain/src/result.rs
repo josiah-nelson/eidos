@@ -114,6 +114,10 @@ pub struct Hit {
 pub struct ContentSummary {
     pub state: ContentState,
     pub coverage: Coverage,
+    /// Object generation the stored chunks (and any snippets) belong to.
+    /// Address the content preview endpoint with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +131,7 @@ impl ContentSummary {
         Self {
             state: ContentState::NotApplicable,
             coverage: Coverage::None,
+            generation: None,
             indexed_bytes: None,
             content_id: None,
             reason: None,
@@ -136,6 +141,7 @@ impl ContentSummary {
         Self {
             state: ContentState::Pending,
             coverage: Coverage::None,
+            generation: None,
             indexed_bytes: None,
             content_id: None,
             reason: None,
