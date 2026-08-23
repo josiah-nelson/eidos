@@ -30,7 +30,7 @@ interface NameDialog {
 }
 
 const browserLock: SavedSearchLock = {
-  run: (name, action) => navigator.locks.request(name, () => action()),
+  run: async (name, action) => navigator.locks ? navigator.locks.request(name, () => action()) : action(),
 }
 
 export function SavedSearchControls({ state, onRun }: Props) {

@@ -586,12 +586,13 @@ table.grid tr:hover td {
   white-space: nowrap;
 }
 .saved-search-menu .menu-body {
-  --saved-menu-available: max(160px, calc(100vw - 240px));
+  --saved-menu-available: max(0px, calc(100vw - 240px));
   left: 0;
   right: auto;
   width: min(560px, var(--saved-menu-available));
   min-width: min(430px, var(--saved-menu-available));
   max-width: var(--saved-menu-available);
+  overflow-x: auto;
 }
 .saved-search-list {
   list-style: none;
@@ -602,7 +603,7 @@ table.grid tr:hover td {
 }
 .saved-search-list li {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
   gap: 12px;
   padding: 6px 4px;
