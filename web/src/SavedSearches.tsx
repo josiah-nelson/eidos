@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { createBrowserLock } from './browser-lock'
 import {
   MAX_SAVED_SEARCH_BYTES,
   SAVED_SEARCHES_STORAGE_KEY,
@@ -13,7 +14,6 @@ import {
   updateSavedSearches,
   upsertSavedSearch,
   type SavedSearch,
-  type SavedSearchLock,
   type SearchViewState,
 } from './saved-searches'
 
@@ -29,9 +29,7 @@ interface NameDialog {
   error?: string
 }
 
-const browserLock: SavedSearchLock = {
-  run: async (name, action) => navigator.locks ? navigator.locks.request(name, () => action()) : action(),
-}
+const browserLock = createBrowserLock()
 
 export function SavedSearchControls({ state, onRun }: Props) {
   const [initial] = useState(loadLocal)

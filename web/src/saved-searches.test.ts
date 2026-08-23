@@ -194,7 +194,7 @@ test('overlapping browser updates are serialized and preserve both changes', asy
     },
   }
   const lock: SavedSearchLock = {
-    run<T>(_name: string, action: () => T | Promise<T>): Promise<T> {
+    run<T>(_name: string, action: () => T): Promise<T> {
       const previous = tail
       let release = () => {}
       tail = new Promise<void>((resolve) => {
@@ -203,7 +203,7 @@ test('overlapping browser updates are serialized and preserve both changes', asy
       return (async () => {
         await previous
         try {
-          return await action()
+          return action()
         } finally {
           release()
         }

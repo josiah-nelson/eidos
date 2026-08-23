@@ -603,7 +603,7 @@ table.grid tr:hover td {
 }
 .saved-search-list li {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
   padding: 6px 4px;
@@ -654,6 +654,47 @@ table.grid tr:hover td {
 }
 .saved-search-dialog .banner {
   margin: 0;
+}
+@media (max-width: 640px) {
+  .shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+  .topbar {
+    grid-column: 1;
+    min-height: 44px;
+    padding-block: 8px;
+    flex-wrap: wrap;
+  }
+  .topbar .health {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .sidenav {
+    grid-row: 2;
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 6px 8px;
+  }
+  .sidenav .section {
+    display: none;
+  }
+  .sidenav a {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+  .main {
+    grid-row: 3;
+    padding: 12px;
+  }
+  .saved-search-menu .menu-body {
+    --saved-menu-available: calc(100vw - 24px);
+  }
+  .saved-search-list li {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 .results {
   display: grid;

@@ -38,7 +38,7 @@ export interface SavedSearchLoad {
 }
 
 export interface SavedSearchLock {
-  run<T>(name: string, action: () => T | Promise<T>): Promise<T>
+  run<T>(name: string, action: () => T): Promise<T>
 }
 
 interface SavedSearchStorage {
