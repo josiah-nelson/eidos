@@ -110,8 +110,9 @@ fn typescript_contract() -> String {
     types.add::<eidos_catalog::retry::RetryReport>();
     types.add::<crate::export::ExportGetQuery>();
     types.add::<crate::export::ExportBody>();
-    types.add::<crate::export::QueryMeta>();
-    types.add::<crate::export::ExportRow>();
+    types.add::<crate::export::ExportDocument>();
+    types.add::<crate::export::ExportNdjsonHeader>();
+    types.add::<crate::export::ExportNdjsonSummary>();
 
     types.finish()
 }

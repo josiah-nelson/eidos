@@ -188,7 +188,7 @@ struct Plan {
     meta: QueryMeta,
 }
 
-#[derive(Debug, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub(crate) struct QueryMeta {
     /// The submitted query text, when the request used `q`.
     q: Option<String>,
@@ -198,6 +198,56 @@ pub(crate) struct QueryMeta {
     sort: eidos_domain::Sort,
     include_retired: bool,
     ast: eidos_domain::Query,
+}
+
+/// Fields shared by the JSON document and the first NDJSON record.
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct ExportHeader {
+    schema: &'static str,
+    query: QueryMeta,
+    exported_at: String,
+    total: eidos_domain::TotalCount,
+    max_rows: u64,
+    completeness: Vec<eidos_domain::SourceCompleteness>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct ExportSummary {
+    rows_exported: u64,
+    truncated: bool,
+    error: Option<String>,
+}
+
+/// Complete `format=json` wire contract. The writer streams its three parts
+/// independently, but flattening keeps the generated type identical to the
+/// single object consumers receive.
+#[derive(Debug, Serialize, TS)]
+pub struct ExportDocument {
+    #[serde(flatten)]
+    header: ExportHeader,
+    rows: Vec<ExportRow>,
+    #[serde(flatten)]
+    summary: ExportSummary,
+}
+
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct ExportNdjsonHeader {
+    #[serde(rename = "type")]
+    #[ts(type = "\"header\"")]
+    record_type: &'static str,
+    #[serde(flatten)]
+    header: ExportHeader,
+}
+
+#[derive(Debug, Serialize, TS)]
+pub(crate) struct ExportNdjsonSummary {
+    schema: &'static str,
+    #[serde(rename = "type")]
+    #[ts(type = "\"summary\"")]
+    record_type: &'static str,
+    #[serde(flatten)]
+    summary: ExportSummary,
 }
 
 fn plan(
@@ -612,18 +662,23 @@ fn write_header(out: &mut Vec<u8>, p: &Plan, first: &SearchResponse) {
         return;
     }
     let ndjson = p.format == ExportFormat::Ndjson;
-    let mut head = serde_json::json!({
-        "schema": EXPORT_SCHEMA,
-        "query": p.meta,
-        "exported_at": UnixNanos::now().to_rfc3339_nanos(),
-        "total": first.total,
-        "max_rows": p.max_rows,
-        "completeness": first.completeness,
-        "warnings": first.warnings,
-    });
+    let head = ExportHeader {
+        schema: EXPORT_SCHEMA,
+        query: p.meta.clone(),
+        exported_at: UnixNanos::now().to_rfc3339_nanos(),
+        total: first.total,
+        max_rows: p.max_rows,
+        completeness: first.completeness.clone(),
+        warnings: first.warnings.clone(),
+    };
     if ndjson {
-        head["type"] = "header".into();
-        out.extend_from_slice(json_of(&head).as_bytes());
+        out.extend_from_slice(
+            json_of(&ExportNdjsonHeader {
+                record_type: "header",
+                header: head,
+            })
+            .as_bytes(),
+        );
         out.push(b'\n');
     } else {
         // Leave the envelope object open so `rows` can stream into it.
@@ -662,20 +717,25 @@ fn write_footer(
     if format == ExportFormat::Csv {
         return;
     }
-    let mut tail = serde_json::json!({
-        "rows_exported": rows,
-        "truncated": truncated,
-        "error": error,
-    });
+    let tail = ExportSummary {
+        rows_exported: rows,
+        truncated,
+        error: error.map(str::to_owned),
+    };
     if format == ExportFormat::Json {
         // Close `rows`, then merge the summary into the still-open envelope.
         let s = json_of(&tail);
         out.extend_from_slice(b"],");
         out.extend_from_slice(s.strip_prefix('{').unwrap_or(&s).as_bytes());
     } else {
-        tail["schema"] = EXPORT_SCHEMA.into();
-        tail["type"] = "summary".into();
-        out.extend_from_slice(json_of(&tail).as_bytes());
+        out.extend_from_slice(
+            json_of(&ExportNdjsonSummary {
+                schema: EXPORT_SCHEMA,
+                record_type: "summary",
+                summary: tail,
+            })
+            .as_bytes(),
+        );
     }
     out.push(b'\n');
 }

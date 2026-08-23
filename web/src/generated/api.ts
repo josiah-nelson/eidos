@@ -70,9 +70,15 @@ export type Explanation = { readable: string, steps: Array<PlanStep>, };
 
 export type ExportBody = { q?: string | null, query?: Query | null, mode: ResultMode, sort: Sort, format: ExportFormat, limit?: ApiInt | null, bom: boolean, include_retired: boolean, };
 
+export type ExportDocument = { rows: Array<ExportRow>, schema: string, query: QueryMeta, exported_at: string, total: TotalCount, max_rows: ApiInt, completeness: Array<SourceCompleteness>, warnings: Array<string>, rows_exported: ApiInt, truncated: boolean, error: string | null, };
+
 export type ExportFormat = "csv" | "json" | "ndjson";
 
 export type ExportGetQuery = { q: string, format: ExportFormat, mode: ResultMode | null, sort: SortField | null, desc: boolean, limit: ApiInt | null, bom: boolean, include_retired: boolean, };
+
+export type ExportNdjsonHeader = { type: "header", schema: string, query: QueryMeta, exported_at: string, total: TotalCount, max_rows: ApiInt, completeness: Array<SourceCompleteness>, warnings: Array<string>, };
+
+export type ExportNdjsonSummary = { schema: string, type: "summary", rows_exported: ApiInt, truncated: boolean, error: string | null, };
 
 export type ExportRow = { object_id: ApiInt, entry_id: ApiInt | null, source: string, kind: string, name: string, path: string | null, extension: string, size: ApiInt, allocated_size: ApiInt, modified: string | null, created: string | null, content_state: string, hard_link_count: number, score: number | null, };
 
