@@ -9,10 +9,11 @@ Virtual for large lists, react-router for pages. Talks to the service's
 npm ci
 npm run dev      # http://localhost:5173 with API proxy; run `eidos serve` alongside
 npm run lint     # oxlint
+npm test         # unit tests for query editing, saved searches, and preview windows
 npm run build    # tsc -b && vite build → dist/ (served by `eidos serve --web-dir web\dist`)
 ```
 
-Pages: search (query editor with live interpretation, virtualized results,
-facets, explanation), browse (tree + canvas treemap), sources (health,
+Pages: search (query editor with live interpretation, browser-local saved
+searches, canonical share links, virtualized results, facets, explanation), browse (tree + canvas treemap), sources (health,
 completeness, scans, errors, exclusions). Activity and policies pages arrive
 with milestones 4 and 5.
