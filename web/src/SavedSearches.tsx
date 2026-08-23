@@ -10,8 +10,10 @@ import {
   nameCollision,
   renameSavedSearch,
   serializeSavedSearches,
+  updateSavedSearches,
   upsertSavedSearch,
   type SavedSearch,
+  type SavedSearchLock,
   type SearchViewState,
 } from './saved-searches'
 
@@ -25,6 +27,10 @@ interface NameDialog {
   id?: string
   name: string
   error?: string
+}
+
+const browserLock: SavedSearchLock = {
+  run: (name, action) => navigator.locks.request(name, () => action()),
 }
 
 export function SavedSearchControls({ state, onRun }: Props) {
@@ -55,45 +61,47 @@ export function SavedSearchControls({ state, onRun }: Props) {
     setDialog(null)
   }
 
-  const commit = (next: SavedSearch[], message: string) => {
-    setSearches(next)
-    try {
-      localStorage.setItem(SAVED_SEARCHES_STORAGE_KEY, serializeSavedSearches(next))
-      setNotice(message)
-    } catch {
-      setNotice('The browser refused local storage; this change will not survive a restart.')
-    }
+  const commit = async (update: (latest: SavedSearch[]) => { searches: SavedSearch[]; value: string }) => {
+    const result = await updateSavedSearches(localStorage, browserLock, update)
+    setSearches(result.searches)
+    setNotice(result.value)
   }
 
-  const submitName = () => {
+  const submitName = async () => {
     if (!dialog) return
     try {
-      const latest = loadLocal().searches
-      if (dialog.kind === 'save') {
-        const result = upsertSavedSearch(latest, dialog.name, state)
-        commit(result.searches, result.replaced ? `Replaced “${result.saved.name}”.` : `Saved “${result.saved.name}”.`)
-      } else {
-        const next = renameSavedSearch(latest, dialog.id!, dialog.name)
-        commit(next, `Renamed to “${dialog.name.trim()}”.`)
-      }
+      await commit((latest) => {
+        if (dialog.kind === 'save') {
+          const result = upsertSavedSearch(latest, dialog.name, state)
+          const value = result.replaced ? `Replaced “${result.saved.name}”.` : `Saved “${result.saved.name}”.`
+          return { searches: result.searches, value }
+        }
+        return { searches: renameSavedSearch(latest, dialog.id!, dialog.name), value: `Renamed to “${dialog.name.trim()}”.` }
+      })
       closeDialog()
     } catch (error) {
       setDialog({ ...dialog, error: (error as Error).message })
     }
   }
 
-  const duplicate = (id: string) => {
+  const duplicate = async (id: string) => {
     try {
-      const result = duplicateSavedSearch(loadLocal().searches, id)
-      commit(result.searches, `Created “${result.saved.name}”.`)
+      await commit((latest) => {
+        const result = duplicateSavedSearch(latest, id)
+        return { searches: result.searches, value: `Created “${result.saved.name}”.` }
+      })
     } catch (error) {
       setNotice((error as Error).message)
     }
   }
 
-  const remove = (saved: SavedSearch) => {
+  const remove = async (saved: SavedSearch) => {
     if (!window.confirm(`Delete the saved search “${saved.name}”?`)) return
-    commit(deleteSavedSearch(loadLocal().searches, saved.id), `Deleted “${saved.name}”.`)
+    try {
+      await commit((latest) => ({ searches: deleteSavedSearch(latest, saved.id), value: `Deleted “${saved.name}”.` }))
+    } catch (error) {
+      setNotice((error as Error).message)
+    }
   }
 
   const copyLink = async () => {
@@ -120,15 +128,18 @@ export function SavedSearchControls({ state, onRun }: Props) {
     if (!file) return
     try {
       if (file.size > MAX_SAVED_SEARCH_BYTES) throw new Error('Saved-search imports must be 1 MB or smaller.')
-      const result = importSavedSearches(loadLocal().searches, await file.text())
-      const detail = [
-        `${result.imported} imported`,
-        result.renamed ? `${result.renamed} renamed to avoid conflicts` : '',
-        result.discarded ? `${result.discarded} invalid ignored` : '',
-      ]
-        .filter(Boolean)
-        .join(' · ')
-      commit(result.searches, detail)
+      const raw = await file.text()
+      await commit((latest) => {
+        const result = importSavedSearches(latest, raw)
+        const value = [
+          `${result.imported} imported`,
+          result.renamed ? `${result.renamed} renamed to avoid conflicts` : '',
+          result.discarded ? `${result.discarded} invalid ignored` : '',
+        ]
+          .filter(Boolean)
+          .join(' · ')
+        return { searches: result.searches, value }
+      })
     } catch (error) {
       setNotice((error as Error).message)
     } finally {
@@ -169,10 +180,10 @@ export function SavedSearchControls({ state, onRun }: Props) {
                       >
                         Rename
                       </button>
-                      <button type="button" className="linkish" onClick={() => duplicate(saved.id)}>
+                      <button type="button" className="linkish" onClick={() => void duplicate(saved.id)}>
                         Duplicate
                       </button>
-                      <button type="button" className="linkish danger" onClick={() => remove(saved)}>
+                      <button type="button" className="linkish danger" onClick={() => void remove(saved)}>
                         Delete
                       </button>
                     </div>
@@ -220,7 +231,7 @@ export function SavedSearchControls({ state, onRun }: Props) {
             className="form"
             onSubmit={(event) => {
               event.preventDefault()
-              submitName()
+                void submitName()
             }}
           >
             <h1 id="saved-search-title">{dialog.kind === 'save' ? 'Save this search' : 'Rename saved search'}</h1>

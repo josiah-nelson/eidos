@@ -37,6 +37,15 @@ export interface SavedSearchLoad {
   discarded: number
 }
 
+export interface SavedSearchLock {
+  run<T>(name: string, action: () => T | Promise<T>): Promise<T>
+}
+
+interface SavedSearchStorage {
+  getItem(key: string): string | null
+  setItem(key: string, value: string): void
+}
+
 const MODES = new Set<ResultMode>(['files', 'directories', 'both'])
 const SORTS = new Set<SortField>([
   'relevance',
@@ -127,7 +136,23 @@ export function loadSavedSearches(raw: string | null): SavedSearchLoad {
 }
 
 export function serializeSavedSearches(searches: SavedSearch[]): string {
-  return JSON.stringify({ version: SAVED_SEARCHES_VERSION, searches }, null, 2)
+  const raw = JSON.stringify({ version: SAVED_SEARCHES_VERSION, searches }, null, 2)
+  if (raw.length > MAX_SAVED_SEARCH_BYTES) throw new Error('Saved-search data must be 1 MB or smaller.')
+  return raw
+}
+
+/** Serialize cross-tab read/modify/write operations with the Web Locks API. */
+export function updateSavedSearches<T>(
+  storage: SavedSearchStorage,
+  lock: SavedSearchLock,
+  update: (searches: SavedSearch[]) => { searches: SavedSearch[]; value: T },
+): Promise<{ searches: SavedSearch[]; value: T }> {
+  return lock.run(`${SAVED_SEARCHES_STORAGE_KEY}.write`, () => {
+    const current = loadSavedSearches(storage.getItem(SAVED_SEARCHES_STORAGE_KEY)).searches
+    const result = update(current)
+    storage.setItem(SAVED_SEARCHES_STORAGE_KEY, serializeSavedSearches(result.searches))
+    return result
+  })
 }
 
 export function upsertSavedSearch(
@@ -217,6 +242,7 @@ export function importSavedSearches(
       state: normalizeState(saved.state),
     })
   }
+  serializeSavedSearches(next)
   return {
     searches: next,
     imported: incoming.length,

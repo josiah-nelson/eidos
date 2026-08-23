@@ -13,8 +13,10 @@ import {
   readSearchView,
   renameSavedSearch,
   serializeSavedSearches,
+  updateSavedSearches,
   upsertSavedSearch,
   type SavedSearch,
+  type SavedSearchLock,
   type SearchViewState,
 } from './saved-searches.ts'
 
@@ -175,6 +177,47 @@ test('stored documents and imports are bounded', () => {
   assert.equal(imported.searches.length, MAX_SAVED_SEARCHES)
   assert.equal(imported.imported, 1)
   assert.equal(imported.discarded, 1)
+
+  const large = { ...state, q: 'x'.repeat(520_000) }
+  const first = upsertSavedSearch([], 'Large A', large, { id: ids('large-a') }).searches
+  const second = upsertSavedSearch([], 'Large B', large, { id: ids('large-b') }).searches
+  assert.throws(() => importSavedSearches(first, serializeSavedSearches(second)), /1 MB/)
+})
+
+test('overlapping browser updates are serialized and preserve both changes', async () => {
+  let raw: string | null = null
+  let tail = Promise.resolve()
+  const storage = {
+    getItem: () => raw,
+    setItem: (_key: string, value: string) => {
+      raw = value
+    },
+  }
+  const lock: SavedSearchLock = {
+    run<T>(_name: string, action: () => T | Promise<T>): Promise<T> {
+      const previous = tail
+      let release = () => {}
+      tail = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      return (async () => {
+        await previous
+        try {
+          return await action()
+        } finally {
+          release()
+        }
+      })()
+    },
+  }
+  const save = (name: string, id: string) =>
+    updateSavedSearches(storage, lock, (latest) => {
+      const result = upsertSavedSearch(latest, name, state, { id: ids(id) })
+      return { searches: result.searches, value: id }
+    })
+
+  await Promise.all([save('From tab A', 'tab-a'), save('From tab B', 'tab-b')])
+  assert.deepEqual(loadSavedSearches(raw).searches.map((saved) => saved.id), ['tab-a', 'tab-b'])
 })
 
 test('import preserves existing searches while making names and IDs unique', () => {
