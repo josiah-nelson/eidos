@@ -158,6 +158,38 @@ impl Catalog {
         self.with_reader(|conn| get_object_conn(conn, id))
     }
 
+    /// Current generation of each live object in `objects`.
+    ///
+    /// Ids that are unknown or tombstoned are absent from the map, so a
+    /// caller validating a derived artefact (an index document, a stored
+    /// chunk) against the catalog can treat "absent" as "not current".
+    pub fn object_generations(
+        &self,
+        objects: &[ObjectId],
+    ) -> Result<std::collections::HashMap<ObjectId, u32>> {
+        let mut out = std::collections::HashMap::with_capacity(objects.len());
+        if objects.is_empty() {
+            return Ok(out);
+        }
+        // One prepared statement for the whole set, whatever its size: a
+        // caller validating a broad candidate list holds a pooled reader for
+        // a single scan rather than a chain of round trips.
+        let ids = serde_json::to_string(&objects.iter().map(|o| o.0).collect::<Vec<i64>>())?;
+        self.with_reader(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT o.object_id, o.generation FROM json_each(?1) j
+                 JOIN objects o ON o.object_id = j.value
+                 WHERE o.deleted_at IS NULL",
+            )?;
+            let mut rows = stmt.query(params![ids])?;
+            while let Some(r) = rows.next()? {
+                out.insert(ObjectId(r.get::<_, i64>(0)?), r.get::<_, i64>(1)? as u32);
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Render the current path of an object by following parent links.
     pub fn render_path(&self, id: ObjectId) -> Result<Option<String>> {
         self.with_reader(|conn| render_path_conn(conn, id))

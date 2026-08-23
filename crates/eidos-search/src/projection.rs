@@ -5,6 +5,7 @@ use crate::{CatalogIndex, Result, PROJECTION_NAME};
 use eidos_catalog::jobs::OutboxRow;
 use eidos_catalog::Catalog;
 use eidos_domain::{ObjectId, SourceId, SourceState};
+use std::collections::HashSet;
 use std::time::Instant;
 use tantivy::Term;
 
@@ -24,6 +25,30 @@ pub struct FollowStats {
     pub subtree_rebuilds: u64,
     pub last_seq: i64,
     pub elapsed_ms: f64,
+}
+
+/// Subtree roots that lie under another root of the same batch. One
+/// ancestor query per root, and none at all for the common single-root
+/// batch.
+fn nested_roots(
+    catalog: &Catalog,
+    subtrees: &[ObjectId],
+    roots: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>> {
+    let mut nested = HashSet::new();
+    if subtrees.len() < 2 {
+        return Ok(nested);
+    }
+    for root in subtrees {
+        if catalog
+            .ancestor_object_ids(*root)?
+            .iter()
+            .any(|a| roots.contains(a))
+        {
+            nested.insert(*root);
+        }
+    }
+    Ok(nested)
 }
 
 impl CatalogIndex {
@@ -111,60 +136,74 @@ impl CatalogIndex {
         Ok(out)
     }
 
-    fn reindex_object(
-        &self,
-        catalog: &Catalog,
-        object: ObjectId,
-        stats: &mut FollowStats,
-    ) -> Result<()> {
-        let f = self.fields();
-        let writer = self.writer();
-        writer.delete_term(Term::from_field_u64(f.object_id, object.0 as u64));
-        stats.documents_deleted += 1;
-        for row in catalog.projection_rows_for_object(object)? {
-            writer.add_document(document(f, &row)).map_err(|e| {
-                eidos_catalog::CatalogError::InvalidState(format!("index write: {e}"))
-            })?;
-            stats.documents_added += 1;
-        }
-        Ok(())
-    }
-
-    /// Apply outbox rows (idempotent: each object is deleted then re-added
-    /// from the catalog's current state). Commits once.
+    /// Apply outbox rows (idempotent: each affected object is deleted then
+    /// re-added from the catalog's current state). Commits once.
+    ///
+    /// Work is coalesced across the batch: every object is deleted and
+    /// reindexed exactly once, no matter how many rows name it or how many
+    /// subtrees contain it. Deletions all precede the additions, so a
+    /// subtree replacement cannot remove documents added earlier in the same
+    /// batch (Tantivy deletes only apply to documents added before them).
     pub fn apply_outbox(&self, catalog: &Catalog, rows: &[OutboxRow]) -> Result<FollowStats> {
         let started = Instant::now();
         let mut stats = FollowStats::default();
-        let mut seen = std::collections::HashSet::new();
+        let mut subtrees: Vec<ObjectId> = Vec::new();
+        let mut affected: Vec<ObjectId> = Vec::new();
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut subtree_seen: HashSet<ObjectId> = HashSet::new();
         for row in rows {
             stats.rows += 1;
             stats.last_seq = row.seq;
-            match row.op.as_str() {
-                "subtree" => {
-                    stats.subtree_rebuilds += 1;
-                    // A subtree replacement may use fresh object ids (archive
-                    // generations do), so remove documents from the old tree
-                    // by ancestry before walking the current catalog rows.
-                    self.writer().delete_term(Term::from_field_u64(
-                        self.fields().ancestors,
-                        row.object_id.0 as u64,
-                    ));
-                    // Reindex unconditionally: the ancestry deletion above
-                    // invalidates descendants already handled earlier in
-                    // this batch, so `seen` cannot suppress this rebuild.
-                    self.reindex_object(catalog, row.object_id, &mut stats)?;
-                    seen.insert(row.object_id);
-                    for d in catalog.descendant_object_ids(row.object_id)? {
-                        self.reindex_object(catalog, d, &mut stats)?;
-                        seen.insert(d);
-                    }
-                }
-                _ => {
-                    if seen.insert(row.object_id) {
-                        self.reindex_object(catalog, row.object_id, &mut stats)?;
-                    }
+            if row.op.as_str() == "subtree" {
+                stats.subtree_rebuilds += 1;
+                if subtree_seen.insert(row.object_id) {
+                    subtrees.push(row.object_id);
                 }
             }
+            if seen.insert(row.object_id) {
+                affected.push(row.object_id);
+            }
+        }
+        // Expand subtrees. A root nested inside another root of the same
+        // batch needs no walk of its own: its live descendants are a subset.
+        // Which roots those are is settled up front, from each root's
+        // ancestors, so the saving does not depend on the order the rows
+        // arrived in. Nested roots are still deleted by ancestry below,
+        // because a document orphaned by an older generation may name one of
+        // them as an ancestor without naming the outer root.
+        let nested = nested_roots(catalog, &subtrees, &subtree_seen)?;
+        for root in &subtrees {
+            if nested.contains(root) {
+                continue;
+            }
+            for d in catalog.descendant_object_ids(*root)? {
+                if seen.insert(d) {
+                    affected.push(d);
+                }
+            }
+        }
+        if !affected.is_empty() {
+            let f = self.fields();
+            let writer = self.writer();
+            // A subtree replacement may use fresh object ids (archive
+            // generations do), so remove documents of the old tree by
+            // ancestry before walking the current catalog rows.
+            for root in &subtrees {
+                writer.delete_term(Term::from_field_u64(f.ancestors, root.0 as u64));
+            }
+            for object in &affected {
+                writer.delete_term(Term::from_field_u64(f.object_id, object.0 as u64));
+                stats.documents_deleted += 1;
+            }
+            let mut added = 0u64;
+            catalog.for_each_projection_row_of(&affected, |row| {
+                writer.add_document(document(f, &row)).map_err(|e| {
+                    eidos_catalog::CatalogError::InvalidState(format!("index write: {e}"))
+                })?;
+                added += 1;
+                Ok(())
+            })?;
+            stats.documents_added += added;
         }
         if !rows.is_empty() {
             self.writer().commit()?;

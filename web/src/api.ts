@@ -352,10 +352,26 @@ export interface Hit {
   source_state: SourceState
 }
 
+/**
+ * Exact boundaries of a size or modification-time bucket plus the query text
+ * that selects or excludes it. The interval is half-open (`from` inclusive,
+ * `to` exclusive) and either end may be open. Always append `clause` /
+ * `exclude` verbatim: the bounds are informative only — times are Unix
+ * nanoseconds, which exceed the precision of a JavaScript number.
+ */
+export interface FacetRange {
+  from?: number
+  to?: number
+  clause: string
+  exclude: string
+}
+
 export interface FacetValue {
   value: string
   count: number
   label?: string
+  /** Present for range buckets the current result mode can express. */
+  range?: FacetRange
 }
 
 export interface Facet {
@@ -550,6 +566,8 @@ export interface ActivitySourceView {
   state: SourceState
   content_enabled: boolean
   content_concurrency: number
+  content_reserved: number
+  content_peak_reserved: number
   jobs_queued: number
   jobs_running: number
   content_states: Record<string, number>

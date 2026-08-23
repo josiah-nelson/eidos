@@ -180,6 +180,27 @@ native event
 Checkpoints advance only when enough durable state exists to replay or repair
 all downstream work.
 
+### Directory aggregate invariants
+
+Whatever a full reconciliation would compute is the definition; the
+incremental path must land on the same values, and tests assert that
+equality after every kind of mutation.
+
+- Counts and byte totals are per live entry of the subtree, so a hard-linked
+  file counts once under each directory that links it.
+- `newest_modified`/`oldest_modified` are the extrema of the subtree's
+  **non-directory** entries. A directory's own modification time never
+  contributes; its aggregate row carries its children's extrema instead.
+- Virtual archive members hang off their container object, which owns no
+  aggregate row, so they never reach a physical directory's totals or
+  extrema. The container counts as the one file it is.
+- Counts are a monoid, so incremental changes add signed deltas along the
+  ancestor chain. Extrema are not: when a mutation removes the entry that
+  provided a directory's extremum, that one directory is recomputed from its
+  direct children, and the walk keeps recomputing upward only while an
+  ancestor's extremum is likewise invalidated. Propagation never stops on a
+  swallowed error — a failed ancestor lookup aborts the transaction.
+
 ### Overflow or invalid checkpoint
 
 Mark the source degraded, preserve existing results as stale, reconcile the
@@ -205,9 +226,25 @@ Apply limits per physical volume/source so a fast NVMe and a slower HDD can make
 progress independently. Separate CPU, local-disk, network, decompression, and
 future GPU budgets.
 
+A per-source budget is only meaningful if it cannot be raced. Capacity is
+reserved atomically as part of claiming: the claim transaction offers the
+candidate source to the scheduler, which either hands back a reservation or
+declines, and only an admitted source has its jobs marked `running`. The
+reservation is an RAII guard held for the whole batch, so capacity returns on
+every exit path, including an empty claim, an error, cancellation, shutdown,
+and a panic. A source at its budget is skipped in favour of the next eligible
+one rather than blocking the pool.
+
 Retries distinguish transient source errors, unsupported content, deterministic
 parse failure, resource-limit failure, and corrupt input. Deterministic failures
 do not retry forever.
+
+Failures of the stores a stage writes to — a database write error, a full disk,
+an index writer error — are classified separately from failures of the input.
+They are transient by definition and retry under the same backoff, and the
+attempt discards whatever it already wrote for that object generation so no
+later commit can publish partial output. The failure reason keeps the whole
+underlying error chain (ADR-0012).
 
 Interactive requests get the same treatment at the HTTP edge: expensive
 operations (search, browse, archive listing, counts) pass through a bounded
@@ -280,7 +317,8 @@ Contains chunk documents:
 3. Resolve directory/source filters.
 4. Retrieve metadata and/or content candidates.
 5. For substring/regex clauses, intersect trigrams then verify stored text.
-6. Group chunks by current object and select diverse snippets.
+6. Group chunks by object, drop candidates whose generation the catalog has
+   superseded, and select diverse snippets from what remains.
 7. Join current paths, aggregates, and source completeness from the catalog.
 8. Return results, cursors, timing, completeness, and explanation.
 
