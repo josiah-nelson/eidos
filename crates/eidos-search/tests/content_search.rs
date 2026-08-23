@@ -9,6 +9,7 @@ use eidos_catalog::{Catalog, NewSource};
 use eidos_content::Limits;
 use eidos_domain::*;
 use eidos_query::parse;
+use eidos_search::content::ContentOpts;
 use eidos_search::exec::{search_with_content, ExecOptions};
 use eidos_search::pipeline::drain_content_jobs;
 use eidos_search::{CatalogIndex, ContentIndex};
@@ -140,17 +141,22 @@ impl Fx {
     }
 
     fn run(&self, q: &str) -> SearchResponse {
+        self.run_with(q, &ExecOptions::default(), None, 50)
+    }
+
+    fn run_with(
+        &self,
+        q: &str,
+        opts: &ExecOptions,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> SearchResponse {
         let parsed = parse(q).unwrap();
         let mut r = SearchRequest::new(parsed.query);
         r.explain = true;
-        search_with_content(
-            &self.index,
-            Some(&self.content),
-            &self.catalog,
-            &r,
-            &ExecOptions::default(),
-        )
-        .unwrap()
+        r.cursor = cursor;
+        r.limit = limit;
+        search_with_content(&self.index, Some(&self.content), &self.catalog, &r, opts).unwrap()
     }
 
     fn names(&self, q: &str) -> Vec<String> {
@@ -391,4 +397,196 @@ fn disabled_source_is_not_extracted() {
     fx.catalog.set_content_policy(fx.source, true, 2).unwrap();
     assert!(fx.extract_all() > 0);
     assert_eq!(fx.names("content:Zephyr ext:md").len(), 2);
+}
+
+/// Options that force page-driven verification for every verified clause.
+fn lazy_opts() -> ExecOptions {
+    ExecOptions {
+        content: ContentOpts {
+            lazy_min: 0,
+            ..ContentOpts::default()
+        },
+        ..ExecOptions::default()
+    }
+}
+
+fn sorted_names(r: &SearchResponse) -> Vec<String> {
+    let mut v: Vec<String> = r.hits.iter().map(|h| h.name.clone()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn page_driven_verification_returns_the_eager_results() {
+    let fx = fixture();
+    fx.extract_all();
+    let lazy = lazy_opts();
+    for q in [
+        "content:~Qz",
+        "content:~qz",
+        "content:/needle-[0-9a-f]+/",
+        "content:=\"Qz responded\"",
+        "content:~line ext:log",
+        "content:~line -name:big",
+        "content:~line content:~routine",
+        "content:~nomatchanywhere",
+    ] {
+        let eager = fx.run(q);
+        let r = fx.run_with(q, &lazy, None, 50);
+        assert_eq!(sorted_names(&r), sorted_names(&eager), "{q}");
+        assert_eq!(r.total.value, eager.total.value, "{q}");
+        assert!(
+            r.total.exact,
+            "walk finished, total exact: {q} {:?}",
+            r.total
+        );
+        assert!(
+            r.warnings.iter().all(|w| !w.contains("upper bound")),
+            "{q}: {:?}",
+            r.warnings
+        );
+        let steps = r.explanation.as_ref().unwrap().steps.clone();
+        let c = steps.iter().find(|s| s.stage == "content").unwrap();
+        if c.candidates.unwrap_or(0) > 0 {
+            assert!(c.description.contains("page-driven"), "{q}: {c:?}");
+            assert!(
+                c.verified.is_none(),
+                "{q}: nothing verified up front: {c:?}"
+            );
+        }
+        if !r.hits.is_empty() {
+            let v = steps
+                .iter()
+                .find(|s| s.stage == "verify" && s.description.starts_with("lazy:"))
+                .unwrap_or_else(|| panic!("{q}: no page walk step in {steps:?}"));
+            assert!(v.description.contains("chunks fetched"), "{q}: {v:?}");
+            assert_eq!(v.verified, Some(r.hits.len() as u64), "{q}: {v:?}");
+        }
+        // Snippets come from verified chunks on both paths.
+        for (a, b) in r.hits.iter().zip(eager.hits.iter()) {
+            let sa: Vec<&str> = a.snippets.iter().map(|s| s.text.as_str()).collect();
+            let sb: Vec<&str> = b.snippets.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(sa, sb, "{q}: snippets of {}", a.name);
+            assert!(a.snippets.iter().all(|s| !s.highlights.is_empty()), "{q}");
+        }
+    }
+}
+
+#[test]
+fn page_driven_relevance_ranks_by_matching_chunks_with_exact_order() {
+    let fx = fixture();
+    fx.extract_all();
+    // `line` is in every chunk of big.log and in one chunk of notes.txt.
+    let r = fx.run_with("content:~line", &lazy_opts(), None, 50);
+    let names: Vec<&str> = r.hits.iter().map(|h| h.name.as_str()).collect();
+    assert_eq!(names, vec!["big.log", "notes.txt"]);
+    let big = r.hits[0].score.unwrap();
+    let notes = r.hits[1].score.unwrap();
+    assert_eq!(big, 8.0, "capped at SCORE_CAP matching chunks");
+    assert_eq!(notes, 1.0);
+    // The eager path scores the same way.
+    let e = fx.run("content:~line");
+    assert_eq!(e.hits[0].score, r.hits[0].score);
+    assert_eq!(e.hits[1].score, r.hits[1].score);
+    // Verification stopped early: big.log has far more than 8 matching
+    // chunks but only SCORE_CAP of them were fetched.
+    let steps = r.explanation.unwrap().steps;
+    let v = steps
+        .iter()
+        .find(|s| s.description.starts_with("lazy:"))
+        .unwrap();
+    let fetched: usize = v
+        .description
+        .split("; ")
+        .find_map(|p| p.strip_suffix(" chunks fetched for content verification"))
+        .and_then(|n| n.parse().ok())
+        .unwrap();
+    assert!(fetched <= 16, "{v:?}");
+}
+
+#[test]
+fn page_driven_budget_exhaustion_is_reported_not_silent() {
+    let fx = fixture();
+    fx.extract_all();
+    // A budget of 3 is short for big.log's first batch of 8: the object is
+    // accepted on a partial score and the walk must still report a subset.
+    for budget in [1, 3] {
+        let mut opts = lazy_opts();
+        opts.content.max_verify = budget;
+        let r = fx.run_with("content:~line", &opts, None, 50);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("results are a subset")),
+            "budget {budget}: {:?}",
+            r.warnings
+        );
+        assert!(!r.total.exact, "budget {budget}: {:?}", r.total);
+        // Whatever was returned is verified.
+        assert!(r.hits.iter().all(|h| !h.snippets.is_empty()));
+    }
+}
+
+#[test]
+fn page_driven_relevance_ties_follow_entry_order_across_pages() {
+    let fx = fixture();
+    fx.extract_all();
+    // `Zephyr` appears once in each of two Markdown files: equal bounds,
+    // equal verified scores, so the entry-id tie-break decides the page
+    // boundary. Page one of size one must show the same file as the first
+    // row of an exhaustive run, and page two the other.
+    let lazy = lazy_opts();
+    let all = fx.run_with("content:~Zephyr ext:md", &lazy, None, 50);
+    let names: Vec<&str> = all.hits.iter().map(|h| h.name.as_str()).collect();
+    assert_eq!(names.len(), 2);
+    let p1 = fx.run_with("content:~Zephyr ext:md", &lazy, None, 1);
+    assert_eq!(p1.hits[0].name, names[0]);
+    let p2 = fx.run_with("content:~Zephyr ext:md", &lazy, p1.next_cursor.clone(), 1);
+    assert_eq!(p2.hits[0].name, names[1]);
+    assert_eq!(p1.hits[0].score, p2.hits[0].score);
+}
+
+#[test]
+fn page_driven_pagination_is_stable() {
+    let fx = fixture();
+    fx.extract_all();
+    let lazy = lazy_opts();
+    let p1 = fx.run_with("content:~line", &lazy, None, 1);
+    assert_eq!(p1.hits.len(), 1);
+    let cursor = p1.next_cursor.clone().expect("second page");
+    let p2 = fx.run_with("content:~line", &lazy, Some(cursor), 1);
+    assert_eq!(p2.hits.len(), 1);
+    assert_ne!(p1.hits[0].name, p2.hits[0].name);
+    assert!(p2.next_cursor.is_none());
+    let mut both = vec![p1.hits[0].name.clone(), p2.hits[0].name.clone()];
+    both.sort();
+    assert_eq!(both, fx.names("content:~line"));
+    // Page one of a short walk reports an upper bound; page two finished.
+    assert!(!p1.total.exact || p1.total.value == 2);
+    assert!(p2.total.exact);
+    assert_eq!(p2.total.value, 2);
+}
+
+#[test]
+fn page_driven_verification_stays_eager_inside_not_and_or() {
+    let fx = fixture();
+    fx.extract_all();
+    let lazy = lazy_opts();
+    for q in [
+        "ext:md -content:~build",
+        "ext:md (content:~build OR content:~archive)",
+    ] {
+        let eager = fx.run(q);
+        let r = fx.run_with(q, &lazy, None, 50);
+        assert_eq!(sorted_names(&r), sorted_names(&eager), "{q}");
+        let steps = r.explanation.unwrap().steps;
+        assert!(
+            steps
+                .iter()
+                .filter(|s| s.stage == "content")
+                .all(|s| !s.description.contains("page-driven")),
+            "{q}: {steps:?}"
+        );
+    }
+    assert_eq!(fx.names("ext:md -content:~build"), vec!["readme.md"]);
 }

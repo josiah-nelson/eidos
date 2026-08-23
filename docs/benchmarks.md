@@ -152,14 +152,36 @@ Reading:
   response, never silently truncated.
 - Single-word case-sensitive literals (the Q-2 pattern) are exact term
   queries on the case-preserving token field: 39 ms with no verification.
-- Content substring/regex clauses are bounded by fetching candidate chunks
+- Content substring/regex clauses were bounded by fetching candidate chunks
   from the catalog: ≈70 µs per chunk serially and only ≈2× faster across 8
   threads on this host (`eidos bench chunks`; SQLite readers do not scale
-  here while pure CPU work does 3.8×). `content:~localhost:` verifies 6.7 k
-  true-match chunks for 173 files; the regexes examine the 20 k-chunk cap.
-  Page-driven verification for content (as for names) and a faster chunk
-  store are the next steps; these two families remain above the 250 ms
-  gate.
+  here while pure CPU work does 3.8×). `content:~localhost:` verified 6.7 k
+  true-match chunks for 173 files; the regexes examined the 20 k-chunk cap.
+  See the next table for the effect of page-driven verification.
+
+## Content substring/regex after ADR-0008 (page-driven verification)
+
+Same catalog and method, later the same day. Candidate sets above 2,000
+chunks are now verified in result order only until the page (50 files) is
+filled; one query may fetch at most 20,000 chunks.
+
+| Query | before p95 | **after p95** | after p50 | total reported |
+|---|---:|---:|---:|---|
+| `content:~localhost:` | 536 ms | **123 ms** | 103 ms | 239+ (was 173, exact) |
+| `content:/[A-Z][a-z]+Exception: /c ext:log` | 655 ms | **78 ms** | | 350+ (was 55, exact) |
+| `content:/timed? ?out after \d+/` | 655 ms | 532 ms | 479 ms | 5, subset (fetch budget reached) |
+
+- Clauses whose candidates are mostly true matches now cost the page's worth
+  of chunk fetches (at most 8 per file shown) plus candidate collection; the
+  total becomes an upper bound ("239+") when the walk stops early, as for
+  name clauses.
+- A regex with only weak required literals (`out after`) must still fetch
+  candidate chunks to reject them. With five true files among tens of
+  thousands of candidates it spends the 20 k-fetch budget, reports the
+  result as a subset, and finds the same five files as before at about the
+  same cost. A faster chunk store is the remaining lever for this shape.
+- Ranked, phrase, and exact-token content queries are unaffected (p95
+  27 ms and 30 ms in this run).
 
 ## Gates status (v0.5)
 
@@ -172,4 +194,4 @@ Reading:
 | multi-GB files with bounded memory | required | 2.14 GiB at 8.6 MiB peak working set |
 | candidate content indexed | 30 min | ≈ 17 min for 28.8 GiB |
 | ordinary content query p95 | < 150 ms | 55 ms (ranked/phrase), 39 ms (exact token) |
-| selective content regex/substring p95 | < 250 ms | 536–655 ms — open (chunk fetch bound) |
+| selective content regex/substring p95 | < 250 ms | 78–123 ms after ADR-0008 (a regex with only weak literals stays fetch-budget bound at ≈530 ms and is reported as a subset) |

@@ -428,7 +428,15 @@ pub struct ContentClause {
 pub struct ContentOpts {
     /// Top-k chunks for ranked/phrase clauses.
     pub top_k: usize,
-    /// Candidate chunks examined for verified clauses.
+    /// Candidate chunks collected for a verified clause (substring, exact,
+    /// regex). Beyond this the clause is truncated and says so.
+    pub max_candidates: usize,
+    /// Candidate sets up to this size are verified eagerly (every chunk
+    /// fetched, exact totals). Larger sets are verified page-driven: objects
+    /// are verified in result order only until the page is filled.
+    pub lazy_min: usize,
+    /// Chunk fetches allowed per query during page-driven verification.
+    /// Reaching it truncates the result (reported, never silent).
     pub max_verify: usize,
 }
 
@@ -436,9 +444,20 @@ impl Default for ContentOpts {
     fn default() -> Self {
         Self {
             top_k: 5_000,
+            max_candidates: 100_000,
+            lazy_min: 2_000,
             max_verify: 20_000,
         }
     }
+}
+
+/// Matching chunks that raise an object's score; page-driven verification
+/// stops fetching an object's chunks once this many have matched.
+pub const SCORE_CAP: usize = 8;
+
+/// Object score of a verified clause: matching chunks, capped.
+pub fn object_score(matched_chunks: usize) -> f32 {
+    matched_chunks.min(SCORE_CAP) as f32
 }
 
 /// How a verified clause is matched against original chunk text; also used
@@ -588,6 +607,10 @@ pub struct Retrieval {
     pub truncated: bool,
     /// No selective term existed; every chunk in scope was a candidate.
     pub broad: bool,
+    /// `hits` are unverified candidates (score 0): the candidate set exceeded
+    /// `ContentOpts::lazy_min`, so verification is left to the executor's
+    /// page walk (`verify_object`).
+    pub deferred: bool,
     pub description: String,
     pub elapsed_ms: f64,
 }
@@ -808,9 +831,9 @@ pub fn retrieve(
             let mut list: Vec<DocAddress> = addrs.into_iter().collect();
             list.sort();
             ret.candidates = list.len() as u64;
-            if list.len() > opts.max_verify * 5 {
+            if list.len() > opts.max_candidates {
                 ret.truncated = true;
-                list.truncate(opts.max_verify * 5);
+                list.truncate(opts.max_candidates);
             }
             let mut ids = IdReader::new(&searcher);
             for a in list {
@@ -908,9 +931,9 @@ pub fn retrieve(
             let mut list: Vec<DocAddress> = addrs.into_iter().collect();
             list.sort();
             ret.candidates = list.len() as u64;
-            if list.len() > opts.max_verify {
+            if list.len() > opts.max_candidates {
                 ret.truncated = true;
-                list.truncate(opts.max_verify);
+                list.truncate(opts.max_candidates);
             }
             let mut ids = IdReader::new(&searcher);
             let mut cands: Vec<ChunkHit> = Vec::with_capacity(list.len());
@@ -918,6 +941,19 @@ pub fn retrieve(
                 cands.push(ids.read(a, 0.0)?);
             }
             let candidates_ms = tc.elapsed().as_secs_f64() * 1000.0;
+            if cands.len() > opts.lazy_min {
+                // Too many to fetch up front: hand the candidates to the
+                // executor, which verifies objects in result order only
+                // until the page is filled.
+                ret.deferred = true;
+                ret.hits = cands;
+                ret.description = format!(
+                    "{how}; {} candidate chunks, verified page-driven against stored chunk text (candidates {candidates_ms:.0} ms)",
+                    ret.candidates
+                );
+                ret.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                return Ok((ret, matcher));
+            }
             let tvf = Instant::now();
             // Verify against stored chunk text, grouped per object generation
             // and spread over a few threads (each uses a pooled reader).
@@ -981,6 +1017,76 @@ pub fn retrieve(
     }
     ret.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok((ret, matcher))
+}
+
+/// Outcome of verifying one object's candidate chunks.
+#[derive(Debug, Default)]
+pub struct ObjectVerdict {
+    /// Matching chunks in ordinal order (at most `SCORE_CAP`), with the
+    /// number of matches found in each.
+    pub matched: Vec<(eidos_catalog::content::ChunkRow, usize)>,
+    pub fetched: usize,
+    /// The fetch budget ran out before a verdict: the object is undecided.
+    pub undecided: bool,
+    /// The budget could not cover the last batch. Even when a match was
+    /// already found (the object counts, its score may be incomplete), the
+    /// caller must treat the walk as truncated.
+    pub budget_short: bool,
+}
+
+/// Page-driven verification of one object: fetch its candidate chunks in
+/// growing batches and stop as soon as `SCORE_CAP` of them match, every
+/// candidate is examined, or `budget` (remaining chunk fetches, shared
+/// across threads) is exhausted.
+pub fn verify_object(
+    catalog: &Catalog,
+    matcher: &Matcher,
+    object: ObjectId,
+    generation: u32,
+    ordinals: &[u32],
+    budget: &std::sync::atomic::AtomicUsize,
+) -> Result<ObjectVerdict> {
+    let mut v = ObjectVerdict::default();
+    let mut from = 0usize;
+    let mut batch = SCORE_CAP;
+    while from < ordinals.len() && v.matched.len() < SCORE_CAP {
+        let want = batch.min(ordinals.len() - from);
+        // Reserve from the shared budget; take what is left if short.
+        let mut got = 0usize;
+        let _ = budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |b| {
+            got = want.min(b);
+            Some(b - got)
+        });
+        if got == 0 {
+            v.undecided = true;
+            v.budget_short = true;
+            return Ok(v);
+        }
+        let keys: Vec<(ObjectId, u32, u32)> = ordinals[from..from + got]
+            .iter()
+            .map(|o| (object, generation, *o))
+            .collect();
+        from += got;
+        v.fetched += got;
+        for row in catalog.chunks_for_many(&keys)? {
+            let n = matcher.find(&row.text, 64).len();
+            if n > 0 {
+                v.matched.push((row, n));
+                if v.matched.len() >= SCORE_CAP {
+                    break;
+                }
+            }
+        }
+        if got < want {
+            // Budget exhausted mid-object: a match already found still
+            // counts, but the walk must report a subset either way.
+            v.budget_short = true;
+            v.undecided = v.matched.is_empty();
+            return Ok(v);
+        }
+        batch = (batch * 2).min(256);
+    }
+    Ok(v)
 }
 
 trait CloneBoxed {
