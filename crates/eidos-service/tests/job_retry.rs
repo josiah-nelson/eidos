@@ -88,7 +88,10 @@ fn status(rt: &tokio::runtime::Runtime, app: &axum::Router, uri: &str, body: &st
 }
 
 fn n(v: &serde_json::Value, key: &str) -> u64 {
-    v[key].as_u64().unwrap_or_else(|| panic!("{key} in {v}"))
+    v[key]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{key} in {v}"))
 }
 
 #[test]
@@ -170,7 +173,7 @@ fn retry_endpoints_requeue_a_failed_job_that_workers_then_process() {
     assert_eq!(n(&first, "bytes"), TEXT.len() as u64);
     let second = post(&rt, &app, &format!("/api/jobs/{}/retry", job.id.0), "{}");
     assert_eq!((n(&second, "accepted"), n(&second, "rejected")), (0, 1));
-    assert_eq!(second["rejected_reasons"]["queued"], 1);
+    assert_eq!(second["rejected_reasons"]["queued"], "1");
     let queued = state.catalog.job_counts(None).unwrap();
     assert_eq!((queued.queued, queued.running, queued.failed), (1, 0, 0));
     let record = state.catalog.get_job(job.id).unwrap().unwrap();

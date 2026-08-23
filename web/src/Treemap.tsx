@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
+import type { ApiInt, ApiRouteId } from './api'
 import { bytes } from './format'
 
 export interface TreemapItem {
-  id: number
+  id: ApiRouteId | -1
   label: string
   value: number
+  exactValue?: ApiInt
   isDir: boolean
   detail?: string
 }
@@ -22,7 +24,13 @@ interface Rect {
 function squarify(items: TreemapItem[], x: number, y: number, w: number, h: number): Rect[] {
   const total = items.reduce((s, i) => s + i.value, 0)
   if (total <= 0 || w <= 0 || h <= 0) return []
-  const sorted = [...items].filter((i) => i.value > 0).sort((a, b) => b.value - a.value)
+  const sorted = [...items].filter((i) => i.value > 0).sort((a, b) => {
+    if (a.exactValue != null && b.exactValue != null) {
+      const [left, right] = [BigInt(a.exactValue), BigInt(b.exactValue)]
+      if (left !== right) return left < right ? 1 : -1
+    }
+    return b.value - a.value
+  })
   const out: Rect[] = []
   let rx = x
   let ry = y
@@ -161,7 +169,7 @@ export function Treemap({ items, total }: { items: TreemapItem[]; total: number 
       onMouseLeave={() => setTip(null)}
       onClick={(e) => {
         const r = hit(e)
-        if (r && r.item.isDir && r.item.id > 0) navigate(`/browse/${r.item.id}`)
+        if (r && r.item.isDir && r.item.id !== -1) navigate(`/browse/${r.item.id}`)
       }}
       title="apparent size of direct children; click a folder to open it"
     >

@@ -9,12 +9,13 @@
 //! `{ accepted, skipped, rejected, bytes, ... }`.
 
 use crate::api::{ApiError, ApiResult};
+use crate::api_json::ApiJson;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use eidos_catalog::retry::{RetryReport, RetrySelector};
-use eidos_domain::{FailureClass, JobId, JobStage, SourceId};
+use eidos_domain::{FailureClass, JobId, JobStage, SourceId, UnixNanos};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -41,7 +42,7 @@ pub struct RetryBody {
     /// Ignore failures recorded after this instant (unix nanoseconds).
     /// A confirmation passes the `as_of` of the preview it confirms.
     #[serde(default)]
-    pub as_of: Option<i64>,
+    pub as_of: Option<UnixNanos>,
     /// Opaque exact-set digest returned by the preview being confirmed.
     #[serde(default)]
     pub confirmation: Option<String>,
@@ -69,7 +70,7 @@ async fn run(st: Arc<AppState>, sel: RetrySelector) -> ApiResult<RetryReport> {
             "operator requeued failed jobs"
         );
     }
-    Ok(Json(report))
+    Ok(ApiJson(report))
 }
 
 /// Requeue one failed job. A running job is rejected, not interrupted.
@@ -106,7 +107,7 @@ async fn retry_source_content(
         reason_prefix: body.reason_prefix.filter(|p: &String| !p.trim().is_empty()),
         preview: body.preview,
         limit: body.limit,
-        as_of: body.as_of.map(eidos_domain::UnixNanos),
+        as_of: body.as_of,
         confirmation: body.confirmation,
         ..RetrySelector::source(sid, JobStage::ContentText)
     };

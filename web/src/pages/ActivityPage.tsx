@@ -1,19 +1,20 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
-import { api, type ActivitySourceView, type RetryReport } from '../api'
+import { api, type ActivitySourceView, type ApiInt, type RetryReport } from '../api'
 import { ErrorBox, Spinner, StateBadge } from '../components'
-import { bytes, count, duration } from '../format'
+import { bytes, count, duration, integerNumber } from '../format'
 
 const STATE_ORDER = ['indexed', 'partial', 'pending', 'stale', 'failed', 'unsupported', 'excluded']
 
-function StateBar({ states }: { states: Record<string, number> }) {
-  const total = Object.values(states).reduce((a, b) => a + b, 0)
+function StateBar({ states }: { states: Record<string, ApiInt> }) {
+  const value = (key: string) => integerNumber(states[key] ?? '0')
+  const total = Object.values(states).reduce((sum, count) => sum + integerNumber(count), 0)
   if (total === 0) return <span className="muted">no files</span>
   return (
     <div className="statebar" title={STATE_ORDER.map((k) => `${k}: ${states[k] ?? 0}`).join('\n')}>
-      {STATE_ORDER.filter((k) => (states[k] ?? 0) > 0).map((k) => (
-        <span key={k} className={`seg ${k}`} style={{ width: `${(100 * (states[k] ?? 0)) / total}%` }} />
+      {STATE_ORDER.filter((k) => value(k) > 0).map((k) => (
+        <span key={k} className={`seg ${k}`} style={{ width: `${(100 * value(k)) / total}%` }} />
       ))}
     </div>
   )
@@ -21,8 +22,8 @@ function StateBar({ states }: { states: Record<string, number> }) {
 
 function retrySummary(r: RetryReport): string {
   const parts = [`${count(r.accepted)} requeued`]
-  if (r.skipped > 0) parts.push(`${count(r.skipped)} skipped (${Object.keys(r.skipped_reasons).join(', ')})`)
-  if (r.rejected > 0) parts.push(`${count(r.rejected)} rejected (${Object.keys(r.rejected_reasons).join(', ')})`)
+  if (integerNumber(r.skipped) > 0) parts.push(`${count(r.skipped)} skipped (${Object.keys(r.skipped_reasons).join(', ')})`)
+  if (integerNumber(r.rejected) > 0) parts.push(`${count(r.rejected)} rejected (${Object.keys(r.rejected_reasons).join(', ')})`)
   return parts.join(' · ')
 }
 
@@ -47,7 +48,7 @@ function BulkRetry({ s }: { s: ActivitySourceView }) {
     mutationFn: (p: RetryReport) =>
       api.retrySourceContent(s.source_id, {
         preview: false,
-        limit: p.accepted,
+        limit: integerNumber(p.accepted),
         as_of: p.as_of,
         confirmation: p.confirmation ?? undefined,
       }),
@@ -59,14 +60,14 @@ function BulkRetry({ s }: { s: ActivitySourceView }) {
   })
   const busy = ask.isPending || apply.isPending
   const error = ask.error ?? apply.error
-  if (s.jobs_failed === 0 && !preview && !done) return <span className="muted">—</span>
+  if (integerNumber(s.jobs_failed) === 0 && !preview && !done) return <span className="muted">—</span>
   return (
     <div>
       <div>
-        {count(s.jobs_failed)} failed{s.jobs_failed > 0 ? ` · ${bytes(s.jobs_failed_bytes)}` : ''}
+        {count(s.jobs_failed)} failed{integerNumber(s.jobs_failed) > 0 ? ` · ${bytes(s.jobs_failed_bytes)}` : ''}
       </div>
       {preview === null ? (
-        s.jobs_failed > 0 && (
+        integerNumber(s.jobs_failed) > 0 && (
           <button className="btn small" disabled={busy} onClick={() => ask.mutate()}>
             {ask.isPending ? 'checking…' : 'retry failed'}
           </button>
@@ -75,7 +76,7 @@ function BulkRetry({ s }: { s: ActivitySourceView }) {
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
           <button
             className="btn small primary"
-            disabled={busy || preview.accepted === 0}
+            disabled={busy || integerNumber(preview.accepted) === 0}
             onClick={() => apply.mutate(preview)}
           >
             {apply.isPending ? 'requeueing…' : `confirm ${count(preview.accepted)} job(s) · ${bytes(preview.bytes)}`}
@@ -85,7 +86,7 @@ function BulkRetry({ s }: { s: ActivitySourceView }) {
           </button>
         </div>
       )}
-      {preview !== null && (preview.skipped > 0 || preview.rejected > 0) && (
+      {preview !== null && (integerNumber(preview.skipped) > 0 || integerNumber(preview.rejected) > 0) && (
         <div className="muted small">{retrySummary(preview)}</div>
       )}
       {done && <div className="muted small">{retrySummary(done)}</div>}
@@ -94,14 +95,14 @@ function BulkRetry({ s }: { s: ActivitySourceView }) {
   )
 }
 
-function RetryJobButton({ id }: { id: number }) {
+function RetryJobButton({ id }: { id: ApiInt }) {
   const qc = useQueryClient()
   const retry = useMutation({
     mutationFn: () => api.retryJob(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['activity'] }),
   })
   if (retry.isError) return <span className="muted small">{retry.error.message}</span>
-  if (retry.data && retry.data.accepted === 0) return <span className="muted small">{retrySummary(retry.data)}</span>
+  if (retry.data && integerNumber(retry.data.accepted) === 0) return <span className="muted small">{retrySummary(retry.data)}</span>
   return (
     <button className="btn small" disabled={retry.isPending || retry.isSuccess} onClick={() => retry.mutate()}>
       {retry.isPending ? 'retrying…' : retry.isSuccess ? 'requeued' : 'retry'}
@@ -118,9 +119,10 @@ function SourceRow({ s }: { s: ActivitySourceView }) {
       qc.invalidateQueries({ queryKey: ['sources'] })
     },
   })
-  const total = Object.values(s.content_states).reduce((a, b) => a + b, 0)
-  const done = (s.content_states.indexed ?? 0) + (s.content_states.partial ?? 0)
-  const terminal = done + (s.content_states.failed ?? 0) + (s.content_states.unsupported ?? 0) + (s.content_states.excluded ?? 0)
+  const state = (key: string) => integerNumber(s.content_states[key] ?? '0')
+  const total = Object.values(s.content_states).reduce((sum, value) => sum + integerNumber(value), 0)
+  const done = state('indexed') + state('partial')
+  const terminal = done + state('failed') + state('unsupported') + state('excluded')
   return (
     <tr>
       <td>
@@ -177,7 +179,7 @@ export default function ActivityPage() {
   if (q.isError) return <ErrorBox error={q.error} />
   const a = q.data
   const w = a.workers
-  const settled = w.files_indexed + w.files_unsupported + w.files_failed
+  const settled = integerNumber(w.files_indexed) + integerNumber(w.files_unsupported) + integerNumber(w.files_failed)
   return (
     <>
       <div className="toolbar">
@@ -212,7 +214,7 @@ export default function ActivityPage() {
         <div className="stat">
           <div className="label">Bytes read this session</div>
           <div className="value">{bytes(w.bytes_read)}</div>
-          <div className="sub">{count(w.chunks_written)} chunks · uptime {duration(w.uptime_s * 1000)}</div>
+          <div className="sub">{count(w.chunks_written)} chunks · uptime {duration(integerNumber(w.uptime_s) * 1000)}</div>
         </div>
         <div className="stat">
           <div className="label">Content index</div>

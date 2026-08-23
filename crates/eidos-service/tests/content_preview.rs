@@ -169,6 +169,10 @@ fn text(v: &Value, i: usize) -> &str {
     chunks(v)[i]["text"].as_str().unwrap()
 }
 
+fn decimal(value: impl ToString) -> Value {
+    Value::String(value.to_string())
+}
+
 #[tokio::test]
 async fn serves_unicode_text_with_byte_and_line_metadata() {
     let e = Env::new(&["notes.txt"]);
@@ -210,11 +214,11 @@ async fn serves_unicode_text_with_byte_and_line_metadata() {
         assert_eq!(chunks(&v)[i]["chars"], want.chars().count() as u64);
     }
     // Ranges are the stored ones: byte ranges are contiguous, lines advance.
-    assert_eq!(chunks(&v)[0]["byte_start"], 0);
-    assert_eq!(chunks(&v)[1]["byte_start"], bodies[0].len() as u64);
-    assert_eq!(chunks(&v)[0]["line_start"], 0);
-    assert_eq!(chunks(&v)[1]["line_start"], 2);
-    assert_eq!(chunks(&v)[2]["line_start"], 3);
+    assert_eq!(chunks(&v)[0]["byte_start"], decimal(0));
+    assert_eq!(chunks(&v)[1]["byte_start"], decimal(bodies[0].len()));
+    assert_eq!(chunks(&v)[0]["line_start"], decimal(0));
+    assert_eq!(chunks(&v)[1]["line_start"], decimal(2));
+    assert_eq!(chunks(&v)[2]["line_start"], decimal(3));
 
     // Stored text is served even after the file is gone: the endpoint never
     // touches the source.
@@ -264,7 +268,7 @@ async fn truncates_a_very_long_line() {
     assert_eq!(text(&v, 0).len(), MAX_RESPONSE_BYTES);
     // The stored chunk's own metadata is preserved, not the cut length.
     assert_eq!(chunks(&v)[0]["chars"], 400_001);
-    assert_eq!(chunks(&v)[0]["byte_end"], 400_001);
+    assert_eq!(chunks(&v)[0]["byte_end"], decimal(400_001));
 }
 
 #[tokio::test]
@@ -282,8 +286,8 @@ async fn rejects_a_stale_generation_and_flags_lagging_content() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{v}");
     assert_eq!(v["kind"], "stale_generation");
-    assert_eq!(v["requested_generation"], indexed + 7);
-    assert_eq!(v["current_generation"], indexed);
+    assert_eq!(v["requested_generation"], decimal(indexed + 7));
+    assert_eq!(v["current_generation"], decimal(indexed));
     assert!(v["error"].as_str().unwrap().contains("generation"));
 
     // The file changes: the object moves on, the stored text does not.
@@ -308,7 +312,7 @@ async fn rejects_a_stale_generation_and_flags_lagging_content() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{v}");
-    assert_eq!(v["current_generation"], indexed);
+    assert_eq!(v["current_generation"], decimal(indexed));
 }
 
 #[tokio::test]

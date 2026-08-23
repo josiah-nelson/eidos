@@ -4,6 +4,7 @@
 //! carries completeness. Errors are JSON `{ "error": ..., "kind": ... }`.
 
 use crate::admission::{AdmissionError, Expensive};
+use crate::api_json::ApiJson;
 use crate::export;
 use crate::scanner::{start_scan, ScanProgressView, StartScanError};
 use crate::state::AppState;
@@ -168,7 +169,7 @@ impl IntoResponse for ApiError {
         if let Some(serde_json::Value::Object(extra)) = self.details {
             body.extend(extra);
         }
-        let body = Json(serde_json::Value::Object(body));
+        let body = ApiJson(serde_json::Value::Object(body));
         match self.retry_after_s {
             Some(s) => (self.status, [(header::RETRY_AFTER, s.to_string())], body).into_response(),
             None => (self.status, body).into_response(),
@@ -176,7 +177,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub(crate) type ApiResult<T> = Result<Json<T>, ApiError>;
+pub(crate) type ApiResult<T> = Result<ApiJson<T>, ApiError>;
 
 // ----- health --------------------------------------------------------------
 
@@ -201,7 +202,7 @@ async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
         .values()
         .filter(|p| !p.is_finished())
         .count();
-    Ok(Json(Health {
+    Ok(ApiJson(Health {
         version: env!("CARGO_PKG_VERSION"),
         schema_version: eidos_domain::SCHEMA_VERSION,
         host: st.host_name.clone(),
@@ -263,7 +264,7 @@ async fn list_sources(State(st): State<Arc<AppState>>) -> ApiResult<Vec<SourceVi
             },
         )
         .await??;
-    Ok(Json(views))
+    Ok(ApiJson(views))
 }
 
 #[derive(Deserialize)]
@@ -282,7 +283,7 @@ struct AddSourceBody {
 async fn add_source(
     State(st): State<Arc<AppState>>,
     Json(body): Json<AddSourceBody>,
-) -> Result<(StatusCode, Json<SourceView>), ApiError> {
+) -> Result<(StatusCode, ApiJson<SourceView>), ApiError> {
     if body.name.trim().is_empty() || body.root_path.trim().is_empty() {
         return Err(ApiError::bad_request("name and root_path are required"));
     }
@@ -324,7 +325,7 @@ async fn add_source(
         .catalog
         .get_source(id)?
         .ok_or_else(|| ApiError::not_found("source vanished"))?;
-    Ok((StatusCode::CREATED, Json(source_view(&st, s)?)))
+    Ok((StatusCode::CREATED, ApiJson(source_view(&st, s)?)))
 }
 
 #[derive(Serialize)]
@@ -384,19 +385,19 @@ async fn get_source(
             },
         )
         .await??;
-    Ok(Json(detail))
+    Ok(ApiJson(detail))
 }
 
 async fn scan_source(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
-) -> Result<(StatusCode, Json<ScanProgressView>), ApiError> {
+) -> Result<(StatusCode, ApiJson<ScanProgressView>), ApiError> {
     let sid = SourceId(id);
     st.catalog
         .get_source(sid)?
         .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
     match start_scan(&st, sid) {
-        Ok(p) => Ok((StatusCode::ACCEPTED, Json(p.view()))),
+        Ok(p) => Ok((StatusCode::ACCEPTED, ApiJson(p.view()))),
         Err(StartScanError::AlreadyRunning) => Err(ApiError::conflict("scan already running")),
         Err(StartScanError::Catalog(e)) => Err(e.into()),
     }
@@ -411,7 +412,7 @@ async fn cancel_scan(
         .scan_progress(sid)
         .ok_or_else(|| ApiError::not_found("no scan running"))?;
     p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    Ok(Json(p.view()))
+    Ok(ApiJson(p.view()))
 }
 
 #[derive(Deserialize)]
@@ -431,7 +432,7 @@ async fn source_errors(
     Path(id): Path<i64>,
     Query(q): Query<ErrorsQuery>,
 ) -> ApiResult<Vec<ErrorRecord>> {
-    Ok(Json(st.catalog.list_errors(
+    Ok(ApiJson(st.catalog.list_errors(
         Some(SourceId(id)),
         q.include_resolved,
         q.limit.min(5000),
@@ -442,7 +443,7 @@ async fn source_exclusions(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult<Vec<ExclusionRow>> {
-    Ok(Json(
+    Ok(ApiJson(
         st.catalog
             .exclusion_summary(SourceId(id))?
             .into_iter()
@@ -460,7 +461,7 @@ async fn source_generations(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult<Vec<ScanGenerationRecord>> {
-    Ok(Json(st.catalog.list_generations(SourceId(id), 50)?))
+    Ok(ApiJson(st.catalog.list_generations(SourceId(id), 50)?))
 }
 
 // ----- objects -------------------------------------------------------------
@@ -509,7 +510,7 @@ async fn get_object(
             },
         )
         .await??;
-    Ok(Json(detail))
+    Ok(ApiJson(detail))
 }
 
 #[derive(Deserialize)]
@@ -584,7 +585,7 @@ async fn children(
             },
         )
         .await??;
-    Ok(Json(view))
+    Ok(ApiJson(view))
 }
 
 #[derive(Deserialize)]
@@ -645,7 +646,7 @@ async fn archive(
             },
         )
         .await??;
-    Ok(Json(view))
+    Ok(ApiJson(view))
 }
 
 #[derive(Serialize)]
@@ -669,7 +670,7 @@ async fn requeue_archives(
             Ok(st.catalog.requeue_archives(Some(sid))?)
         })
         .await??;
-    Ok(Json(RequeueView { queued }))
+    Ok(ApiJson(RequeueView { queued }))
 }
 
 #[derive(Deserialize)]
@@ -692,7 +693,7 @@ async fn extensions(
             st.catalog.extension_counts(ObjectId(id), q.limit.min(1000))
         })
         .await??;
-    Ok(Json(counts))
+    Ok(ApiJson(counts))
 }
 
 #[derive(Deserialize)]
@@ -803,7 +804,7 @@ async fn run_search(st: Arc<AppState>, body: SearchBody) -> ApiResult<SearchView
         })
         .await?
         .map_err(search_error)?;
-    Ok(Json(SearchView {
+    Ok(ApiJson(SearchView {
         response,
         query,
         rendered,
@@ -910,7 +911,7 @@ async fn search_parse(Query(q): Query<ParseQuery>) -> ApiResult<ParseView> {
     let parsed = eidos_query::parse(&q.q).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let rendered = eidos_query::render(&parsed.query);
     let needs_content = parsed.query.needs_content();
-    Ok(Json(ParseView {
+    Ok(ApiJson(ParseView {
         query: parsed.query,
         rendered,
         notes: parsed.notes,
@@ -947,7 +948,7 @@ async fn set_content_policy(
         .catalog
         .get_source(sid)?
         .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
-    Ok(Json(source_view(&st, s)?))
+    Ok(ApiJson(source_view(&st, s)?))
 }
 
 #[derive(Serialize)]
@@ -1035,7 +1036,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
     })
     .await
     .map_err(|e| ApiError::bad_request(e.to_string()))??;
-    Ok(Json(view))
+    Ok(ApiJson(view))
 }
 
 #[derive(Serialize)]
@@ -1074,7 +1075,7 @@ async fn index_status(State(st): State<Arc<AppState>>) -> ApiResult<IndexStatus>
                 .unwrap_or(false),
         });
     }
-    Ok(Json(IndexStatus {
+    Ok(ApiJson(IndexStatus {
         follower: st.follower.view(&st),
         admission: st.admission.view(),
         sources,
@@ -1089,7 +1090,7 @@ async fn resolve(
         .catalog
         .resolve_relative(SourceId(q.source), &q.path)?
         .ok_or_else(|| ApiError::not_found(format!("path not in catalog: {}", q.path)))?;
-    Ok(Json(ResolveView {
+    Ok(ApiJson(ResolveView {
         object_id: id,
         path: st.catalog.render_path(id)?,
     }))

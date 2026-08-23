@@ -24,9 +24,9 @@
 
 use crate::admission::Expensive;
 use crate::api::{ApiError, ApiResult};
+use crate::api_json::ApiJson;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
-use axum::Json;
 use eidos_catalog::content::ChunkRow;
 use eidos_domain::{ContentState, Coverage, ObjectId};
 use serde::{Deserialize, Serialize};
@@ -129,7 +129,7 @@ pub async fn object_content(
             load_preview(&st, object, generation, ordinal, before, after)
         })
         .await??;
-    Ok(Json(view))
+    Ok(ApiJson(view))
 }
 
 fn load_preview(

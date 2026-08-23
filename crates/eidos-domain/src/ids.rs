@@ -11,9 +11,20 @@ use std::fmt;
 macro_rules! opaque_i64_id {
     ($(#[$doc:meta])* $name:ident, $prefix:literal) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(pub i64);
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                crate::json::i64_string::serialize(&self.0, serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                crate::json::i64_string::deserialize(deserializer).map(Self)
+            }
+        }
 
         impl $name {
             pub const fn new(v: i64) -> Self {
@@ -218,7 +229,8 @@ mod tests {
         assert_eq!(o.external(), "o:42");
         assert_eq!(ObjectId::parse_external("o:42"), Some(o));
         assert_eq!(ObjectId::parse_external("s:42"), None);
-        assert_eq!(serde_json::to_string(&o).unwrap(), "42");
+        assert_eq!(serde_json::to_string(&o).unwrap(), "\"42\"");
+        assert_eq!(serde_json::from_str::<ObjectId>("42").unwrap(), o);
     }
 
     #[test]

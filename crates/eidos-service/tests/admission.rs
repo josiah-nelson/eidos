@@ -147,7 +147,8 @@ async fn admission_view(app: &axum::Router) -> serde_json::Value {
 
 fn gauge(view: &serde_json::Value, field: &str) -> u64 {
     view[field]
-        .as_u64()
+        .as_str()
+        .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| panic!("no {field} in {view}"))
 }
 

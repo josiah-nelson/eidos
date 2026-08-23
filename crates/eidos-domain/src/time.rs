@@ -8,11 +8,20 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Nanoseconds since the Unix epoch.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
-)]
-#[serde(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct UnixNanos(pub i64);
+
+impl Serialize for UnixNanos {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        crate::json::i64_string::serialize(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UnixNanos {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::json::i64_string::deserialize(deserializer).map(Self)
+    }
+}
 
 /// Difference between the Windows epoch (1601-01-01) and the Unix epoch
 /// (1970-01-01) in 100ns ticks.
@@ -239,5 +248,18 @@ mod tests {
         assert_eq!(off.to_rfc3339(), "2026-08-22T06:00:00.000Z");
         assert!(UnixNanos::parse("not a date").is_none());
         assert!(UnixNanos::parse("2026-13-01").is_none());
+    }
+
+    #[test]
+    fn json_is_a_decimal_string_but_legacy_numbers_still_parse() {
+        let time = UnixNanos(1_700_000_000_123_456_789);
+        assert_eq!(
+            serde_json::to_string(&time).unwrap(),
+            "\"1700000000123456789\""
+        );
+        assert_eq!(
+            serde_json::from_str::<UnixNanos>("123").unwrap(),
+            UnixNanos(123)
+        );
     }
 }

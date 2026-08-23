@@ -1,9 +1,9 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
-import { api, type SourceView } from '../api'
+import { api, type ApiInt, type SourceView } from '../api'
 import { ErrorBox, Spinner, StateBadge } from '../components'
-import { ago, bytes, count, duration, rate } from '../format'
+import { ago, bytes, count, duration, integerNumber, rate } from '../format'
 
 export default function SourcesPage() {
   const qc = useQueryClient()
@@ -14,11 +14,11 @@ export default function SourcesPage() {
   })
   const [adding, setAdding] = useState(false)
   const scan = useMutation({
-    mutationFn: (id: number) => api.scanSource(id),
+    mutationFn: (id: ApiInt) => api.scanSource(id),
     onSettled: () => qc.invalidateQueries({ queryKey: ['sources'] }),
   })
   const cancel = useMutation({
-    mutationFn: (id: number) => api.cancelScan(id),
+    mutationFn: (id: ApiInt) => api.cancelScan(id),
     onSettled: () => qc.invalidateQueries({ queryKey: ['sources'] }),
   })
 
@@ -74,7 +74,7 @@ function SourceCard({
         <div className="grow">
           <div className="name">
             {source.name} <StateBadge state={source.state} />
-            {completeness.listing_errors > 0 && (
+            {integerNumber(completeness.listing_errors) > 0 && (
               <span className="badge warn" title="directories that could not be listed">
                 {count(completeness.listing_errors)} unlisted
               </span>
@@ -107,7 +107,7 @@ function SourceCard({
           <div className="muted" style={{ fontSize: 12 }}>
             Scanning… {count(scan.dirs)} dirs · {count(scan.entries)} entries · {rate(scan.entries_per_sec)} ·{' '}
             {duration(scan.elapsed_ms)}
-            {scan.errors > 0 ? ` · ${scan.errors} errors` : ''}
+            {integerNumber(scan.errors) > 0 ? ` · ${scan.errors} errors` : ''}
           </div>
           <div className="progress">
             <div className="bar" />
@@ -162,7 +162,7 @@ function SourceCard({
               </span>{' '}
               {s.watcher.live
                 ? `USN · ${count(s.watcher.events)} events in ${count(s.watcher.batches)} batches` +
-                  (s.watcher.last_batch_ms_ago != null ? ` · last ${Math.round(s.watcher.last_batch_ms_ago / 1000)}s ago` : '')
+                  (s.watcher.last_batch_ms_ago != null ? ` · last ${Math.round(integerNumber(s.watcher.last_batch_ms_ago) / 1000)}s ago` : '')
                 : (s.watcher.detail ?? '')}
             </>
           ) : source.kind === 'smb' || source.kind === 'windows_generic' ? (
@@ -177,7 +177,7 @@ function SourceCard({
             <dd>{source.state_reason}</dd>
           </>
         )}
-        {counts.open_errors > 0 && (
+        {integerNumber(counts.open_errors) > 0 && (
           <>
             <dt>Errors</dt>
             <dd>
