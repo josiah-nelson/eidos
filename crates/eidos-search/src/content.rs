@@ -192,6 +192,10 @@ pub struct ContentIndex {
     fields: ContentFields,
     /// Documents added since the last commit.
     uncommitted: AtomicU64,
+    /// Writer mutations queued since the last commit, deletions included.
+    /// A deletion adds no document, so `uncommitted` alone cannot tell the
+    /// commit coordinator that the writer holds work.
+    pending_ops: AtomicU64,
     commits: AtomicU64,
     /// Writer protocol: every ordinary mutation (`add_chunks`,
     /// `delete_object`, `delete_source`, `commit`) holds the read side; a
@@ -353,6 +357,7 @@ impl ContentIndex {
             writer: Mutex::new(writer),
             fields,
             uncommitted: AtomicU64::new(0),
+            pending_ops: AtomicU64::new(0),
             commits: AtomicU64::new(0),
             gate: parking_lot::RwLock::new(()),
             rebuild: Mutex::new(rebuild),
@@ -385,6 +390,17 @@ impl ContentIndex {
     pub fn uncommitted(&self) -> u64 {
         self.uncommitted.load(Ordering::Relaxed)
     }
+    /// Writer mutations queued since the last commit (adds and deletions).
+    pub fn pending_ops(&self) -> u64 {
+        self.pending_ops.load(Ordering::Relaxed)
+    }
+    /// Whether the writer holds mutations that a commit would publish.
+    /// A deletion-only reindex (a text file that became binary, empty,
+    /// unreadable, or unsupported) leaves `uncommitted` at zero, so commit
+    /// policies must ask this instead.
+    pub fn is_dirty(&self) -> bool {
+        self.pending_ops() > 0
+    }
     pub fn commits(&self) -> u64 {
         self.commits.load(Ordering::Relaxed)
     }
@@ -397,6 +413,7 @@ impl ContentIndex {
         let f = &self.fields;
         self.writer()
             .delete_term(Term::from_field_u64(f.object_id, object.0 as u64));
+        self.pending_ops.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn delete_source(&self, source: SourceId) -> Result<()> {
@@ -404,6 +421,7 @@ impl ContentIndex {
         let f = &self.fields;
         self.writer()
             .delete_term(Term::from_field_u64(f.source_id, source.0 as u64));
+        self.pending_ops.fetch_add(1, Ordering::Relaxed);
         // The gate is held above: commit without re-acquiring it (a queued
         // rebuild writer would otherwise block the nested read forever).
         self.commit_locked()?;
@@ -418,6 +436,9 @@ impl ContentIndex {
         generation: u32,
         chunks: &[Chunk],
     ) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
         let f = &self.fields;
         let _gate = self.gate.read();
         let writer = self.writer();
@@ -434,6 +455,8 @@ impl ContentIndex {
         }
         self.uncommitted
             .fetch_add(chunks.len() as u64, Ordering::Relaxed);
+        self.pending_ops
+            .fetch_add(chunks.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -446,11 +469,20 @@ impl ContentIndex {
 
     /// Commit without taking the gate (the caller holds it).
     fn commit_locked(&self) -> Result<u64> {
-        let n = self.uncommitted.swap(0, Ordering::Relaxed);
-        self.writer().commit()?;
+        // Cleared before the commit: a mutation that races it is counted
+        // again, which costs one extra commit but never loses one.
+        let docs = self.uncommitted.swap(0, Ordering::Relaxed);
+        let ops = self.pending_ops.swap(0, Ordering::Relaxed);
+        if let Err(e) = self.writer().commit() {
+            // The mutations are still queued in the writer; keep the index
+            // dirty so the coordinator retries instead of going quiet.
+            self.uncommitted.fetch_add(docs, Ordering::Relaxed);
+            self.pending_ops.fetch_add(ops, Ordering::Relaxed);
+            return Err(e.into());
+        }
         self.reader.reload()?;
         self.commits.fetch_add(1, Ordering::Relaxed);
-        Ok(n)
+        Ok(docs)
     }
 
     fn writer(&self) -> parking_lot::MutexGuard<'_, IndexWriter> {
@@ -561,6 +593,7 @@ impl ContentIndex {
             {
                 let writer = self.writer();
                 writer.delete_all_documents()?;
+                self.pending_ops.fetch_add(1, Ordering::Relaxed);
             }
             let f = self.fields();
             let mut docs = 0u64;

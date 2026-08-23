@@ -7,11 +7,17 @@
 //! scan, after which watching resumes from a fresh checkpoint. Sources
 //! without a live feed (SMB, generic, or journal unavailable) are rescanned
 //! periodically by the reconciler thread.
+//!
+//! The native scan sequence is checkpoint → enumerate → replay the records
+//! that overlapped enumeration into the still-open generation → publish the
+//! generation together with the checkpoint in one transaction → watch. The
+//! source stays `enumerating`/`reconciling` until that final transaction, so
+//! it is never advertised as complete while overlapping changes are pending.
 
 use crate::scanner::{self, ScanProgress};
 use crate::state::AppState;
-use eidos_catalog::changes::Checkpoint;
-use eidos_catalog::scan::ScanSummary;
+use eidos_catalog::changes::{ChangeEvent, Checkpoint};
+use eidos_catalog::scan::{PublishOptions, ScanSession, ScanSummary};
 use eidos_domain::{SourceId, SourceState, UnixNanos};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -20,6 +26,8 @@ use std::time::{Duration, Instant};
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub const DEFAULT_RECONCILE_INTERVAL_S: i64 = 6 * 3600;
+/// Minimum pause before a watcher retries a reconciliation that failed.
+pub const RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -221,7 +229,21 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                     );
                     return;
                 }
-                // Establish a checkpoint through a reconciliation scan.
+                // Establish a checkpoint through a reconciliation scan. A
+                // scan that just failed (for example its replay step) is
+                // retried after a pause rather than in a tight loop.
+                let failed_recently = state.scan_progress(source_id).is_some_and(|p| {
+                    p.result.lock().as_ref().is_some_and(|r| r.is_err())
+                        && p.finished_for().is_some_and(|d| d < RECONCILE_RETRY_DELAY)
+                });
+                if failed_recently {
+                    status.set(
+                        WatcherState::Reconciling,
+                        Some("waiting to retry after a failed reconciliation".into()),
+                    );
+                    std::thread::sleep(POLL_INTERVAL);
+                    continue;
+                }
                 status.set(
                     WatcherState::Reconciling,
                     Some("establishing checkpoint".into()),
@@ -413,9 +435,174 @@ pub fn restore_state(state: &AppState, source_id: SourceId) -> anyhow::Result<()
     Ok(())
 }
 
+/// One step of the feed that replays the changes overlapping enumeration.
+#[derive(Debug)]
+pub enum ReplayStep {
+    /// Events translated from the records up to `next_usn` (possibly none,
+    /// when every record was out of scope); the feed must be read again.
+    Batch {
+        events: Vec<ChangeEvent>,
+        next_usn: i64,
+    },
+    /// No records remain; the feed position is `next_usn`.
+    CaughtUp { next_usn: i64 },
+    /// The journal wrapped or was recreated: the pending checkpoint cannot
+    /// be continued and some overlapping changes are unrecoverable.
+    JournalInvalid,
+    /// The feed could not be read.
+    Failed(String),
+}
+
+/// Source of overlapping-change batches for [`replay_and_publish`]. The
+/// production implementation reads the USN journal; tests script it.
+pub trait OverlapFeed {
+    fn next(&mut self, next_usn: i64) -> ReplayStep;
+}
+
+enum ReplayOutcome {
+    CaughtUp { cp: UsnCheckpoint, replayed: u64 },
+    JournalInvalid { cp: UsnCheckpoint, replayed: u64 },
+    Failed(String),
+}
+
+fn replay_overlap(
+    state: &AppState,
+    source_id: SourceId,
+    mut cp: UsnCheckpoint,
+    feed: &mut dyn OverlapFeed,
+) -> ReplayOutcome {
+    let mut replayed = 0u64;
+    loop {
+        match feed.next(cp.next_usn) {
+            ReplayStep::Batch { events, next_usn } => {
+                if !events.is_empty() {
+                    match state.catalog.apply_changes(source_id, &events, None) {
+                        Ok(stats) => replayed += stats.events,
+                        Err(e) => return ReplayOutcome::Failed(format!("apply failed: {e}")),
+                    }
+                }
+                cp.next_usn = next_usn;
+            }
+            ReplayStep::CaughtUp { next_usn } => {
+                cp.next_usn = next_usn;
+                return ReplayOutcome::CaughtUp { cp, replayed };
+            }
+            ReplayStep::JournalInvalid => return ReplayOutcome::JournalInvalid { cp, replayed },
+            ReplayStep::Failed(e) => return ReplayOutcome::Failed(e),
+        }
+    }
+}
+
+/// Replay the changes that overlapped enumeration into the open `session`,
+/// then publish it with the resulting checkpoint in the same transaction.
+///
+/// - Feed caught up: publish + checkpoint atomically; the source flips from
+///   `enumerating`/`reconciling` to its complete state only here.
+/// - Journal wrapped during enumeration: publish what was enumerated, but
+///   `degraded` with the reason and without a checkpoint, so the watcher
+///   reconciles again.
+/// - Feed or catalog failure: abort the generation; the previous published
+///   generation and its checkpoint stay in force and the source is
+///   `degraded` with the reason. Rows from replay batches that already
+///   committed remain visible, like enumeration rows of any aborted
+///   generation (they are observed truth; see ADR-0003).
+pub fn replay_and_publish(
+    state: &AppState,
+    source_id: SourceId,
+    mut session: ScanSession,
+    cp: UsnCheckpoint,
+    feed: &mut dyn OverlapFeed,
+    progress: &ScanProgress,
+) -> anyhow::Result<ScanSummary> {
+    // Release the session's write lock: replay batches use the shared writer.
+    session.commit()?;
+    progress.set_phase("replaying changes");
+    let from_usn = cp.next_usn;
+    let summary = match replay_overlap(state, source_id, cp, feed) {
+        ReplayOutcome::CaughtUp { cp, replayed } => {
+            progress.set_phase("publishing");
+            let summary = session.finish_with(&PublishOptions {
+                checkpoint: Some(&cp.to_checkpoint()),
+                ..Default::default()
+            })?;
+            tracing::info!(
+                source = source_id.0,
+                generation = summary.generation,
+                replayed,
+                from_usn,
+                next_usn = cp.next_usn,
+                "overlapping changes replayed; generation published with checkpoint"
+            );
+            summary
+        }
+        ReplayOutcome::JournalInvalid { cp, replayed } => {
+            let reason =
+                "USN journal wrapped during enumeration; another reconciliation is required";
+            tracing::warn!(
+                source = source_id.0,
+                replayed,
+                from_usn,
+                next_usn = cp.next_usn,
+                reason,
+                "publishing degraded"
+            );
+            progress.set_phase("publishing");
+            session.finish_with(&PublishOptions {
+                clear_checkpoint: true,
+                degraded: Some(reason),
+                ..Default::default()
+            })?
+        }
+        ReplayOutcome::Failed(e) => {
+            let reason = format!("replaying changes that overlapped enumeration failed: {e}");
+            session.abort(&reason)?;
+            anyhow::bail!(reason);
+        }
+    };
+    progress.set_phase("done");
+    Ok(summary)
+}
+
+/// USN-journal implementation of [`OverlapFeed`].
+#[cfg(windows)]
+struct JournalFeed<'a> {
+    vol: &'a eidos_scanner::usn::VolumeHandle,
+    journal_id: u64,
+    volume_serial: u64,
+    catalog: &'a eidos_catalog::Catalog,
+    source_id: SourceId,
+    buf: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl OverlapFeed for JournalFeed<'_> {
+    fn next(&mut self, next_usn: i64) -> ReplayStep {
+        use eidos_scanner::usn::{read_journal, ReadOutcome};
+        match read_journal(self.vol, self.journal_id, next_usn, &mut self.buf) {
+            Ok(ReadOutcome::Records { records, next_usn }) => {
+                if records.is_empty() {
+                    return ReplayStep::CaughtUp { next_usn };
+                }
+                let translator = crate::usn_apply::Translator {
+                    vol: self.vol,
+                    volume_serial: self.volume_serial,
+                    catalog: self.catalog,
+                    source_id: self.source_id,
+                };
+                let (events, _) = translator.translate(&records);
+                ReplayStep::Batch { events, next_usn }
+            }
+            Ok(ReadOutcome::EntryDeleted) | Ok(ReadOutcome::JournalChanged) => {
+                ReplayStep::JournalInvalid
+            }
+            Err(e) => ReplayStep::Failed(e.to_string()),
+        }
+    }
+}
+
 /// Native scan sequence (SPEC 7.3): checkpoint → enumerate → replay →
-/// publish → watch. Falls back to a plain scan when the journal is not
-/// available.
+/// publish (with the checkpoint) → watch. Falls back to a plain scan when
+/// the journal is not available.
 pub fn native_scan_sequence(
     state: &Arc<AppState>,
     source_id: SourceId,
@@ -423,7 +610,7 @@ pub fn native_scan_sequence(
 ) -> anyhow::Result<ScanSummary> {
     #[cfg(windows)]
     {
-        use eidos_scanner::usn::{query_journal, read_journal, ReadOutcome, VolumeHandle};
+        use eidos_scanner::usn::{query_journal, VolumeHandle};
         let source = state
             .catalog
             .get_source(source_id)?
@@ -457,73 +644,22 @@ pub fn native_scan_sequence(
                 return Ok(summary);
             }
         };
-        let mut cp = UsnCheckpoint {
+        let cp = UsnCheckpoint {
             journal_id: journal.journal_id,
             next_usn: journal.next_usn,
             volume_root: vi.volume_root.clone(),
         };
         progress.set_phase("enumerating");
-        let summary = scanner::run_full_scan(state, source_id, progress)?;
-        // Replay everything that happened during enumeration.
-        progress.set_phase("replaying changes");
-        let serial = vi.volume_serial;
-        let mut buf = vec![0u8; 1024 * 1024];
-        let mut replayed = 0u64;
-        loop {
-            match read_journal(&vol, cp.journal_id, cp.next_usn, &mut buf) {
-                Ok(ReadOutcome::Records { records, next_usn }) => {
-                    if records.is_empty() {
-                        cp.next_usn = next_usn;
-                        break;
-                    }
-                    let translator = crate::usn_apply::Translator {
-                        vol: &vol,
-                        volume_serial: serial,
-                        catalog: &state.catalog,
-                        source_id,
-                    };
-                    let (events, _) = translator.translate(&records);
-                    let next = UsnCheckpoint {
-                        next_usn,
-                        ..cp.clone()
-                    };
-                    let stats = state.catalog.apply_changes(
-                        source_id,
-                        &events,
-                        Some(&next.to_checkpoint()),
-                    )?;
-                    replayed += stats.events;
-                    cp = next;
-                }
-                Ok(ReadOutcome::EntryDeleted) | Ok(ReadOutcome::JournalChanged) => {
-                    // Extremely busy volume: the journal wrapped during the
-                    // scan. Publish what we have, degraded, and let the
-                    // watcher reconcile again.
-                    let _ = state.catalog.clear_checkpoint(source_id);
-                    let _ = state.catalog.set_source_state(
-                        source_id,
-                        SourceState::Degraded,
-                        Some("USN journal wrapped during enumeration; another reconciliation is required"),
-                    );
-                    ensure_watcher(state, source_id);
-                    return Ok(summary);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "replay read failed; checkpoint kept at last applied USN");
-                    break;
-                }
-            }
-        }
-        state
-            .catalog
-            .set_checkpoint(source_id, &cp.to_checkpoint())?;
-        tracing::info!(
-            source = source_id.0,
-            replayed,
-            next_usn = cp.next_usn,
-            "checkpoint established"
-        );
-        progress.set_phase("done");
+        let session = scanner::enumerate(state, source_id, progress)?;
+        let mut feed = JournalFeed {
+            vol: &vol,
+            journal_id: cp.journal_id,
+            volume_serial: vi.volume_serial,
+            catalog: &state.catalog,
+            source_id,
+            buf: vec![0u8; 1024 * 1024],
+        };
+        let summary = replay_and_publish(state, source_id, session, cp, &mut feed, progress)?;
         ensure_watcher(state, source_id);
         Ok(summary)
     }

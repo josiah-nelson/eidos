@@ -21,8 +21,6 @@ pub struct AppState {
     /// Global content switch (`--no-content` keeps workers idle).
     pub content_enabled: AtomicBool,
     pub content_worker_count: usize,
-    /// Per-source concurrency budgets, refreshed by the coordinator.
-    pub content_budgets: Mutex<HashMap<SourceId, u32>>,
     pub exec_opts: eidos_search::exec::ExecOptions,
     pub host_id: HostId,
     pub host_name: String,
@@ -97,7 +95,6 @@ impl AppState {
             content_workers: Arc::new(crate::content_workers::ContentWorkersStatus::default()),
             content_enabled: AtomicBool::new(config.content),
             content_worker_count: config.content_workers,
-            content_budgets: Mutex::new(HashMap::new()),
             exec_opts: eidos_search::exec::ExecOptions::default(),
             host_id,
             host_name,
@@ -121,6 +118,11 @@ impl AppState {
             scans.remove(&id);
         }
         Some(p)
+    }
+
+    /// Per-source content concurrency budgets and live reservations.
+    pub fn content_budgets(&self) -> &Arc<crate::source_budget::SourceBudgets> {
+        &self.content_workers.budgets
     }
 
     pub fn watcher_status(&self, id: SourceId) -> Option<Arc<WatcherStatus>> {

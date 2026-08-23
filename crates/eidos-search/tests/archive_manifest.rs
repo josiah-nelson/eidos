@@ -625,3 +625,54 @@ fn mixed_extension_hard_link_priority_matches_rendered_path() {
     };
     assert_eq!(priority, expected as i64);
 }
+
+#[test]
+fn projection_rows_agree_between_rebuild_and_incremental_for_virtual_members() {
+    let fx = fixture();
+    fx.extract_all();
+    let mut rebuild = Vec::new();
+    fx.catalog
+        .for_each_projection_row(fx.source, |row| {
+            rebuild.push(row);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        rebuild.iter().any(|r| r.kind.is_virtual()),
+        "fixture has no virtual entries"
+    );
+
+    // A container is a path node: members render underneath it and carry it
+    // in their ancestor chain.
+    let zip = fx.object("pkg/tool.zip");
+    let zip_path = fx.catalog.render_path(zip).unwrap().unwrap();
+    let member = rebuild
+        .iter()
+        .find(|r| r.name == "mod.rs")
+        .expect("member row");
+    assert_eq!(member.path, format!(r"{zip_path}\src\lib\mod.rs"));
+    assert!(member.ancestors.contains(&zip), "{:?}", member.ancestors);
+
+    // Field for field, a rebuilt row is the row the follower's incremental
+    // path produces for the same object — old implementation and new.
+    let mut objects: Vec<ObjectId> = rebuild.iter().map(|r| r.object_id).collect();
+    objects.sort_unstable_by_key(|o| o.0);
+    objects.dedup();
+    for object in objects {
+        let reference = fx
+            .catalog
+            .reference_projection_rows_for_object(object)
+            .unwrap();
+        assert_eq!(
+            fx.catalog.projection_rows_for_object(object).unwrap(),
+            reference,
+            "batched per-object rows differ for {object:?}"
+        );
+        let rebuilt: Vec<_> = rebuild
+            .iter()
+            .filter(|r| r.object_id == object)
+            .cloned()
+            .collect();
+        assert_eq!(rebuilt, reference, "rebuild differs for {object:?}");
+    }
+}

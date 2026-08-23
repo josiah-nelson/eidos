@@ -6,8 +6,15 @@
 //! (`sources.content_concurrency`) so a slow HDD or an SMB share cannot
 //! starve NVMe sources. The coordinator also keeps the queue topped up from
 //! objects whose `content_state` is `pending`/`stale`.
+//!
+//! A worker never claims work it has not already paid for: capacity is
+//! reserved atomically inside the claiming transaction (see
+//! [`reserve_and_claim`] and [`crate::source_budget`]), and the RAII
+//! reservation is released when the batch ends, however it ends.
 
+use crate::source_budget::{SourceConcurrencyView, SourceReservation};
 use crate::state::AppState;
+use eidos_catalog::jobs::JobRecord;
 use eidos_content::Limits;
 use eidos_domain::{JobStage, ObjectId, SourceId, SourceState};
 use eidos_search::pipeline::{process_object, ProcessResult};
@@ -39,7 +46,9 @@ pub struct WorkerCurrent {
 pub struct ContentWorkersStatus {
     pub workers: AtomicUsize,
     pub current: Mutex<HashMap<String, (Instant, WorkerCurrent)>>,
-    pub running_per_source: Mutex<HashMap<SourceId, u32>>,
+    /// Per-source concurrency budgets and the reservations held against
+    /// them. Workers take capacity from here before claiming.
+    pub budgets: Arc<crate::source_budget::SourceBudgets>,
     pub files_indexed: AtomicU64,
     pub files_unsupported: AtomicU64,
     pub files_failed: AtomicU64,
@@ -62,6 +71,8 @@ pub struct ContentWorkersStatus {
 pub struct ContentWorkersView {
     pub workers: usize,
     pub current: Vec<WorkerCurrent>,
+    /// Per-source budget, live reservations, and the high-water mark.
+    pub concurrency: Vec<SourceConcurrencyView>,
     pub files_indexed: u64,
     pub files_unsupported: u64,
     pub files_failed: u64,
@@ -111,6 +122,7 @@ impl ContentWorkersStatus {
         ContentWorkersView {
             workers: self.workers.load(Ordering::Relaxed),
             current,
+            concurrency: self.budgets.snapshot(),
             files_indexed: self.files_indexed.load(Ordering::Relaxed),
             files_unsupported: self.files_unsupported.load(Ordering::Relaxed),
             files_failed: self.files_failed.load(Ordering::Relaxed),
@@ -164,6 +176,17 @@ pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
         Ok(_) => {}
         Err(e) => tracing::error!(error = %e, "requeue_unfinished_content failed"),
     }
+    // Install persisted budgets *before* the first worker can claim, or a
+    // source configured below the default would be oversubscribed for the
+    // few seconds until the coordinator's first refresh. If this fails the
+    // pool still starts, but every source stays unknown and admits nothing
+    // until the coordinator gets the policy through.
+    if let Err(e) = refresh_budgets(state) {
+        tracing::error!(
+            error = %e,
+            "loading content concurrency budgets failed; workers idle until policy loads"
+        );
+    }
     for i in 0..workers {
         let st = state.clone();
         std::thread::Builder::new()
@@ -178,18 +201,31 @@ pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
         .expect("spawn content coordinator");
 }
 
-fn saturated_sources(state: &AppState) -> Vec<SourceId> {
-    let running = state.content_workers.running_per_source.lock();
-    let budgets = state.content_budgets.lock();
-    running
-        .iter()
-        .filter(|(sid, n)| **n >= budgets.get(sid).copied().unwrap_or(2))
-        .map(|(sid, _)| *sid)
-        .collect()
-}
-
 /// Jobs claimed per worker round trip (all from one source).
 pub const CLAIM_BATCH: u32 = 16;
+
+/// Reserve one unit of a source's content budget and claim a batch from
+/// exactly that source.
+///
+/// The reservation is taken inside the claiming transaction, before any job
+/// is marked `running`, so the budget can never be oversubscribed by workers
+/// racing on a stale count. Sources with no free capacity are skipped in
+/// favour of the next eligible one, so a saturated source (an HDD pinned at
+/// one reader) does not hold up the rest of the pool.
+///
+/// `Ok(None)` means no source has due work with capacity to spare; nothing
+/// is reserved in that case. Dropping the returned guard releases the unit.
+pub fn reserve_and_claim(
+    state: &AppState,
+    worker: &str,
+    limit: u32,
+) -> eidos_catalog::Result<Option<(SourceReservation, Vec<JobRecord>)>> {
+    let budgets = state.content_workers.budgets.clone();
+    let mut admit = |source: SourceId| budgets.try_reserve(source);
+    state
+        .catalog
+        .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)
+}
 
 fn worker_loop(state: &AppState, name: &str) {
     let status = &state.content_workers;
@@ -205,113 +241,111 @@ fn worker_loop(state: &AppState, name: &str) {
             std::thread::sleep(IDLE_SLEEP);
             continue;
         }
-        let exclude = saturated_sources(state);
-        let jobs =
-            match state
-                .catalog
-                .claim_jobs(&[JobStage::ContentText], name, &exclude, CLAIM_BATCH)
-            {
-                Ok(j) if j.is_empty() => {
-                    std::thread::sleep(IDLE_SLEEP);
-                    continue;
-                }
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::error!(error = %e, "claim_jobs failed");
-                    *status.last_error.lock() = Some(e.to_string());
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
-            };
-        let source = jobs[0].source_id;
-        *status.running_per_source.lock().entry(source).or_default() += 1;
-        for job in jobs {
-            if state.shutdown.load(Ordering::Relaxed) {
-                // Leave the rest `running`; startup re-queues them.
-                break;
+        let (reservation, jobs) = match reserve_and_claim(state, name, CLAIM_BATCH) {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                std::thread::sleep(IDLE_SLEEP);
+                continue;
             }
-            let object = match job.object_id {
-                Some(o) => o,
-                None => {
-                    let _ = state.catalog.complete_job(job.id);
-                    continue;
-                }
-            };
-            let started = Instant::now();
-            status.current.lock().insert(
-                name.to_string(),
-                (
-                    started,
-                    WorkerCurrent {
-                        worker: name.to_string(),
-                        source_id: job.source_id,
-                        object_id: object,
-                        path: String::new(),
-                        size: job.estimated_cost,
-                        started_ms_ago: 0,
-                    },
-                ),
-            );
-            let result = process_object(
-                &state.catalog,
-                &state.content_index,
-                object,
-                job.object_generation,
-                &limits,
-                Some(job.id),
-            );
-            status.current.lock().remove(name);
-            let outcome = match result {
-                Ok(ProcessResult::Indexed(st)) => {
-                    status.files_indexed.fetch_add(1, Ordering::Relaxed);
-                    status.record_bytes(st.bytes);
-                    status
-                        .chunks_written
-                        .fetch_add(st.chunks as u64, Ordering::Relaxed);
-                    status.pending_publish.lock().push(object);
-                    Ok(())
-                }
-                Ok(ProcessResult::Done(st)) => {
-                    if st.state == eidos_domain::ContentState::Failed {
-                        status.files_failed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        status.files_unsupported.fetch_add(1, Ordering::Relaxed);
-                    }
-                    status.record_bytes(st.bytes);
-                    Ok(())
-                }
-                Ok(ProcessResult::Skipped(why)) => {
-                    tracing::debug!(object = object.0, why, "content job skipped");
-                    status.files_skipped.fetch_add(1, Ordering::Relaxed);
-                    state.catalog.complete_job(job.id)
-                }
-                Ok(ProcessResult::Disabled) => state.catalog.delete_job(job.id),
-                Ok(ProcessResult::Retry { class, error }) => {
-                    status.files_retried.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(object = object.0, %error, "content extraction will retry");
-                    state.catalog.fail_job(job.id, class, &error).map(|_| ())
-                }
-                Err(e) => {
-                    status.files_retried.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(object = object.0, error = %e, "content pipeline error");
-                    state
-                        .catalog
-                        .fail_job(
-                            job.id,
-                            eidos_domain::FailureClass::Transient,
-                            &e.to_string(),
-                        )
-                        .map(|_| ())
-                }
-            };
-            if let Err(e) = outcome {
-                tracing::error!(error = %e, "job bookkeeping failed");
+            Err(e) => {
+                tracing::error!(error = %e, "claim_jobs failed");
                 *status.last_error.lock() = Some(e.to_string());
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
             }
+        };
+        run_batch(state, name, &limits, jobs);
+        // Released here on every path, and while unwinding from a panic.
+        drop(reservation);
+    }
+}
+
+/// Extract one claimed batch. All jobs belong to one source, whose budget
+/// the caller holds a reservation for.
+fn run_batch(state: &AppState, name: &str, limits: &Limits, jobs: Vec<JobRecord>) {
+    let status = &state.content_workers;
+    for job in jobs {
+        if state.shutdown.load(Ordering::Relaxed) {
+            // Leave the rest `running`; startup re-queues them.
+            break;
         }
-        let mut r = status.running_per_source.lock();
-        if let Some(n) = r.get_mut(&source) {
-            *n = n.saturating_sub(1);
+        let object = match job.object_id {
+            Some(o) => o,
+            None => {
+                let _ = state.catalog.complete_job(job.id);
+                continue;
+            }
+        };
+        let started = Instant::now();
+        status.current.lock().insert(
+            name.to_string(),
+            (
+                started,
+                WorkerCurrent {
+                    worker: name.to_string(),
+                    source_id: job.source_id,
+                    object_id: object,
+                    path: String::new(),
+                    size: job.estimated_cost,
+                    started_ms_ago: 0,
+                },
+            ),
+        );
+        let result = process_object(
+            &state.catalog,
+            &state.content_index,
+            object,
+            job.object_generation,
+            limits,
+            Some(job.id),
+        );
+        status.current.lock().remove(name);
+        let outcome = match result {
+            Ok(ProcessResult::Indexed(st)) => {
+                status.files_indexed.fetch_add(1, Ordering::Relaxed);
+                status.record_bytes(st.bytes);
+                status
+                    .chunks_written
+                    .fetch_add(st.chunks as u64, Ordering::Relaxed);
+                status.pending_publish.lock().push(object);
+                Ok(())
+            }
+            Ok(ProcessResult::Done(st)) => {
+                if st.state == eidos_domain::ContentState::Failed {
+                    status.files_failed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    status.files_unsupported.fetch_add(1, Ordering::Relaxed);
+                }
+                status.record_bytes(st.bytes);
+                Ok(())
+            }
+            Ok(ProcessResult::Skipped(why)) => {
+                tracing::debug!(object = object.0, why, "content job skipped");
+                status.files_skipped.fetch_add(1, Ordering::Relaxed);
+                state.catalog.complete_job(job.id)
+            }
+            Ok(ProcessResult::Disabled) => state.catalog.delete_job(job.id),
+            Ok(ProcessResult::Retry { class, error }) => {
+                status.files_retried.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(object = object.0, %error, "content extraction will retry");
+                state.catalog.fail_job(job.id, class, &error).map(|_| ())
+            }
+            Err(e) => {
+                status.files_retried.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(object = object.0, error = %e, "content pipeline error");
+                state
+                    .catalog
+                    .fail_job(
+                        job.id,
+                        eidos_domain::FailureClass::Transient,
+                        &e.to_string(),
+                    )
+                    .map(|_| ())
+            }
+        };
+        if let Err(e) = outcome {
+            tracing::error!(error = %e, "job bookkeeping failed");
+            *status.last_error.lock() = Some(e.to_string());
         }
     }
 }
@@ -331,8 +365,12 @@ fn coordinator_loop(state: &AppState) {
         let pending = status.pending_publish.lock().len();
         // A rebuild owns the writer; commits resume when it is done.
         let rebuilding = state.content_index.is_rebuilding();
+        // `is_dirty`, not `uncommitted`: a reindex that produced no chunks
+        // (the file turned binary, empty, unreadable, or unsupported) queues
+        // only a deletion, and its old chunks stay searchable until it is
+        // committed.
         if !rebuilding
-            && (pending > 0 || uncommitted > 0)
+            && (pending > 0 || state.content_index.is_dirty())
             && (last_commit.elapsed() >= COMMIT_INTERVAL || uncommitted >= COMMIT_DOCS)
         {
             if let Err(e) = commit_and_publish(state) {
@@ -388,9 +426,7 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
     let status = &state.content_workers;
     let by_source = state.catalog.jobs_by_source(JobStage::ContentText)?;
     let mut total = 0;
-    let mut budgets = HashMap::new();
-    for s in state.catalog.list_sources()? {
-        budgets.insert(s.id, s.content_concurrency);
+    for s in refresh_budgets(state)? {
         if !s.content_enabled
             || s.published_generation.is_none()
             || matches!(s.state, SourceState::Retired | SourceState::Offline)
@@ -407,7 +443,20 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
         }
         total += n;
     }
-    *state.content_budgets.lock() = budgets;
     status.enqueued.fetch_add(total, Ordering::Relaxed);
     Ok(total)
+}
+
+/// Load every source's `content_concurrency` into the reservation table and
+/// return the sources. Live reservations are preserved, so this is safe to
+/// call while workers are running; it is called once before the pool starts
+/// and again on every enqueue interval.
+pub fn refresh_budgets(state: &AppState) -> anyhow::Result<Vec<eidos_catalog::SourceRecord>> {
+    let sources = state.catalog.list_sources()?;
+    let budgets: HashMap<SourceId, u32> = sources
+        .iter()
+        .map(|s| (s.id, s.content_concurrency))
+        .collect();
+    state.content_workers.budgets.set_all(&budgets);
+    Ok(sources)
 }

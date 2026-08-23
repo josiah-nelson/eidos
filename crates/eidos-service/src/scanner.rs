@@ -2,7 +2,7 @@
 
 use crate::state::AppState;
 use crate::watcher;
-use eidos_catalog::scan::{ScanKind, ScanSummary};
+use eidos_catalog::scan::{ScanKind, ScanSession, ScanSummary};
 use eidos_domain::{SourceId, SourceKind};
 use eidos_scanner::WalkOptions;
 use parking_lot::Mutex;
@@ -41,7 +41,7 @@ pub struct ScanProgressView {
 }
 
 impl ScanProgress {
-    fn new(source_id: SourceId) -> Self {
+    pub fn new(source_id: SourceId) -> Self {
         Self {
             source_id,
             started: Instant::now(),
@@ -163,6 +163,20 @@ pub fn run_full_scan(
     source_id: SourceId,
     progress: &ScanProgress,
 ) -> anyhow::Result<ScanSummary> {
+    let session = enumerate(state, source_id, progress)?;
+    progress.set_phase("publishing");
+    Ok(session.finish()?)
+}
+
+/// Open a generation and stream the source's directory tree into it. The
+/// returned session is still open: the caller replays overlapping change
+/// feed records into it (native sources) and then publishes or aborts it.
+/// Ingest failures and cancellation abort the generation here.
+pub fn enumerate(
+    state: &Arc<AppState>,
+    source_id: SourceId,
+    progress: &ScanProgress,
+) -> anyhow::Result<ScanSession> {
     let source = state
         .catalog
         .get_source(source_id)?
@@ -234,5 +248,5 @@ pub fn run_full_scan(
         session.abort("scan cancelled")?;
         anyhow::bail!("scan cancelled");
     }
-    Ok(session.finish()?)
+    Ok(session)
 }

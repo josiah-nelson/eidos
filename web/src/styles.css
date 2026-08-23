@@ -516,6 +516,20 @@ table.grid tr:hover td {
   padding: 2px 0;
   font-variant-numeric: tabular-nums;
 }
+.facet-list li > a:first-child {
+  overflow-wrap: anywhere;
+}
+.facet-exclude {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0 3px;
+  border-radius: 3px;
+  line-height: 1;
+}
+.facet-exclude:hover {
+  color: var(--accent);
+  background: var(--panel-2);
+}
 .facet-list li .bar {
   grid-column: 1 / -1;
   height: 3px;
