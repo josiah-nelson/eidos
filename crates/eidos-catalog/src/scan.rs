@@ -375,6 +375,9 @@ impl ScanSession {
                     (ex.generation, ex.content_state.as_str())
                 };
                 let content_state = content_state.to_string();
+                if content_changed {
+                    crate::archive::retire_virtual_tree(&self.conn, ex.id, UnixNanos::now().0)?;
+                }
                 self.conn
                     .prepare_cached(
                         "UPDATE objects SET size = ?2, allocated = ?3, attributes = ?4, created = ?5, modified = ?6, changed = ?7,

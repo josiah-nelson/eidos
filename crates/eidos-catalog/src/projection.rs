@@ -71,7 +71,8 @@ impl DirMap {
         let mut parents = HashMap::new();
         let mut stmt = conn.prepare_cached(
             "SELECT e.object_id, e.parent_id, e.name FROM entries e JOIN objects o ON o.object_id = e.object_id
-             WHERE e.source_id = ?1 AND e.deleted_at IS NULL AND o.deleted_at IS NULL AND o.kind = 'directory'",
+             WHERE e.source_id = ?1 AND e.deleted_at IS NULL AND o.deleted_at IS NULL
+               AND o.kind IN ('directory', 'virtual_directory')",
         )?;
         let rows = stmt.query_map(params![source_id.0], |r| {
             Ok((
@@ -183,7 +184,7 @@ impl Catalog {
                 let parent: Option<i64> = r.get(2)?;
                 let name: String = r.get(3)?;
                 let kind: String = r.get(5)?;
-                let is_dir = kind == ObjectKind::Directory.as_str();
+                let is_dir = ObjectKind::parse(&kind).is_some_and(ObjectKind::is_directory_like);
                 let (path, ancestors) = if is_dir {
                     dirs.dir(object_id)
                 } else {
@@ -226,7 +227,7 @@ impl Catalog {
                 let parent: Option<i64> = r.get(2)?;
                 let kind: String = r.get(5)?;
                 let (path, ancestors) = path_and_ancestors(conn, object, parent)?;
-                let exts = if kind == ObjectKind::Directory.as_str() {
+                let exts = if ObjectKind::parse(&kind).is_some_and(ObjectKind::is_directory_like) {
                     desc_extensions(conn, object.0)?
                 } else {
                     Vec::new()

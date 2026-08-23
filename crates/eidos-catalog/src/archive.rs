@@ -4,11 +4,12 @@
 //! budgets, and activity views carry archives without a second pipeline.
 
 use crate::content::{flip_state, upsert_content_record, ContentRecord};
-use crate::jobs::{enqueue_conn, NewJob};
+use crate::jobs::{enqueue_conn, outbox_append_conn, NewJob};
 use crate::{Catalog, Result};
 use eidos_domain::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArchiveRecord {
@@ -115,12 +116,18 @@ fn archive_generation_is_current(conn: &Connection, rec: &ArchiveRecord) -> Resu
 fn archive_generation_is_published(conn: &Connection, rec: &ArchiveRecord) -> Result<bool> {
     Ok(conn
         .query_row(
-            "SELECT 1 FROM archive_records WHERE object_id = ?1 AND generation = ?2",
+            "SELECT (member_count + implicit_dir_count) = (
+                 SELECT COUNT(*) FROM objects v
+                 WHERE v.archive_container_id = archive_records.object_id
+                   AND v.archive_generation = archive_records.generation
+                   AND v.deleted_at IS NULL
+             )
+             FROM archive_records WHERE object_id = ?1 AND generation = ?2",
             params![rec.object_id.0, rec.generation as i64],
-            |_| Ok(()),
+            |r| r.get::<_, bool>(0),
         )
         .optional()?
-        .is_some())
+        .unwrap_or(false))
 }
 
 fn insert_archive_members(
@@ -152,6 +159,86 @@ fn insert_archive_members(
             m.flags as i64,
         ])?;
     }
+    Ok(())
+}
+
+fn virtual_member_count(rec: &ArchiveRecord) -> Result<u32> {
+    u32::try_from(
+        rec.member_count
+            .checked_add(rec.implicit_dir_count)
+            .ok_or_else(|| {
+                crate::CatalogError::InvalidState("archive virtual-member count overflow".into())
+            })?,
+    )
+    .map_err(|_| {
+        crate::CatalogError::InvalidState("archive has more than u32::MAX virtual members".into())
+    })
+}
+
+fn member_depth(member: &ArchiveMember) -> usize {
+    member.path.bytes().filter(|b| *b == b'/').count()
+}
+
+/// Tombstone every materialized member owned by a container. Callers decide
+/// whether a source-generation rebuild or a subtree outbox row publishes the
+/// change. Archive records remain as generation-bound processing history.
+pub(crate) fn retire_virtual_tree(
+    conn: &Connection,
+    container: ObjectId,
+    now: i64,
+) -> Result<(u64, u64)> {
+    let entries = conn.execute(
+        "UPDATE entries SET deleted_at = ?2
+         WHERE is_virtual = 1 AND deleted_at IS NULL AND object_id IN (
+             SELECT object_id FROM objects WHERE archive_container_id = ?1
+         )",
+        params![container.0, now],
+    )? as u64;
+    conn.execute(
+        "DELETE FROM directory_extension_counts WHERE object_id IN (
+             SELECT object_id FROM objects WHERE archive_container_id = ?1
+         )",
+        params![container.0],
+    )?;
+    conn.execute(
+        "DELETE FROM directory_aggregates WHERE object_id IN (
+             SELECT object_id FROM objects WHERE archive_container_id = ?1
+         )",
+        params![container.0],
+    )?;
+    let objects = conn.execute(
+        "UPDATE objects SET deleted_at = ?2
+         WHERE archive_container_id = ?1 AND deleted_at IS NULL",
+        params![container.0, now],
+    )? as u64;
+    Ok((entries, objects))
+}
+
+/// Make the staged generation live and retire the previous virtual tree.
+/// The single subtree outbox row lets projections replace old object ids by
+/// ancestry instead of emitting one row per archive member.
+fn publish_virtual_tree(conn: &Connection, rec: &ArchiveRecord) -> Result<()> {
+    let now = UnixNanos::now().0;
+    retire_virtual_tree(conn, rec.object_id, now)?;
+    conn.execute(
+        "UPDATE objects SET deleted_at = NULL
+         WHERE archive_container_id = ?1 AND archive_generation = ?2",
+        params![rec.object_id.0, rec.generation as i64],
+    )?;
+    conn.execute(
+        "UPDATE entries SET deleted_at = NULL WHERE is_virtual = 1 AND object_id IN (
+             SELECT object_id FROM objects
+             WHERE archive_container_id = ?1 AND archive_generation = ?2
+         )",
+        params![rec.object_id.0, rec.generation as i64],
+    )?;
+    outbox_append_conn(
+        conn,
+        rec.source_id,
+        rec.object_id,
+        "subtree",
+        rec.generation as i64,
+    )?;
     Ok(())
 }
 
@@ -203,6 +290,262 @@ fn upsert_archive_record(tx: &rusqlite::Connection, rec: &ArchiveRecord) -> Resu
 }
 
 impl Catalog {
+    /// Stage real object/entry rows for a manifest without exposing them to
+    /// readers. Directories are ordered before descendants; duplicate paths
+    /// remain distinct entries, with the first directory owning children.
+    fn stage_virtual_tree(&self, rec: &ArchiveRecord, members: &[ArchiveMember]) -> Result<bool> {
+        let mut ordered: Vec<&ArchiveMember> = members.iter().collect();
+        ordered.sort_by_key(|m| (member_depth(m), !m.is_dir, m.ordinal));
+        let mut directories: HashMap<&str, ObjectId> = HashMap::new();
+
+        for batch in ordered.chunks(ARCHIVE_MEMBER_BATCH) {
+            let stored = self.with_writer(|conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                if !archive_generation_is_current(&tx, rec)? {
+                    return Ok(false);
+                }
+                let scan_generation: i64 = tx.query_row(
+                    "SELECT COALESCE(published_generation, 0) FROM sources WHERE source_id = ?1",
+                    params![rec.source_id.0],
+                    |r| r.get(0),
+                )?;
+                for member in batch {
+                    let parent = if member.parent.is_empty() {
+                        rec.object_id
+                    } else {
+                        directories
+                            .get(member.parent.as_str())
+                            .copied()
+                            .ok_or_else(|| {
+                                crate::CatalogError::InvalidState(format!(
+                                    "archive member {} has no directory row for parent {:?}",
+                                    member.ordinal, member.parent
+                                ))
+                            })?
+                    };
+                    let existing = tx
+                        .query_row(
+                            "SELECT object_id FROM objects
+                             WHERE archive_container_id = ?1 AND archive_generation = ?2
+                               AND archive_member_ordinal = ?3",
+                            params![
+                                rec.object_id.0,
+                                rec.generation as i64,
+                                member.ordinal as i64
+                            ],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()?;
+                    let kind = if member.is_dir {
+                        ObjectKind::VirtualDirectory
+                    } else {
+                        ObjectKind::VirtualFile
+                    };
+                    let attributes = if member.is_dir {
+                        FileAttributes::DIRECTORY
+                    } else {
+                        0
+                    };
+                    let object = match existing {
+                        Some(id) => {
+                            tx.execute(
+                                "UPDATE objects SET source_id = ?2, kind = ?3, generation = ?4,
+                                     size = ?5, allocated = 0, attributes = ?6, modified = ?7,
+                                     content_state = 'not_applicable', last_seen_generation = ?8,
+                                     deleted_at = ?9 WHERE object_id = ?1",
+                                params![
+                                    id,
+                                    rec.source_id.0,
+                                    kind.as_str(),
+                                    rec.generation as i64,
+                                    member.size as i64,
+                                    attributes as i64,
+                                    member.modified.map(|t| t.0),
+                                    scan_generation,
+                                    rec.processed_at.0,
+                                ],
+                            )?;
+                            ObjectId(id)
+                        }
+                        None => {
+                            tx.execute(
+                                "INSERT INTO objects (source_id, kind, identity_confidence,
+                                     generation, size, allocated, attributes, modified, link_count,
+                                     content_state, first_seen_generation, last_seen_generation,
+                                     deleted_at, archive_container_id, archive_generation,
+                                     archive_member_ordinal)
+                                 VALUES (?1, ?2, 'path_derived', ?3, ?4, 0, ?5, ?6, 1,
+                                     'not_applicable', ?7, ?7, ?8, ?9, ?3, ?10)",
+                                params![
+                                    rec.source_id.0,
+                                    kind.as_str(),
+                                    rec.generation as i64,
+                                    member.size as i64,
+                                    attributes as i64,
+                                    member.modified.map(|t| t.0),
+                                    scan_generation,
+                                    rec.processed_at.0,
+                                    rec.object_id.0,
+                                    member.ordinal as i64,
+                                ],
+                            )?;
+                            ObjectId(tx.last_insert_rowid())
+                        }
+                    };
+                    let extension = if member.is_dir {
+                        String::new()
+                    } else {
+                        extension_of(&member.name)
+                    };
+                    let entry = tx
+                        .query_row(
+                            "SELECT entry_id FROM entries WHERE object_id = ?1 AND is_virtual = 1",
+                            params![object.0],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()?;
+                    match entry {
+                        Some(entry) => {
+                            tx.execute(
+                                "UPDATE entries SET source_id = ?2, parent_id = ?3, name = ?4,
+                                     name_folded = ?5, extension = ?6, last_seen_generation = ?7,
+                                     deleted_at = ?8 WHERE entry_id = ?1",
+                                params![
+                                    entry,
+                                    rec.source_id.0,
+                                    parent.0,
+                                    member.name,
+                                    crate::policy::fold(&member.name),
+                                    extension,
+                                    scan_generation,
+                                    rec.processed_at.0,
+                                ],
+                            )?;
+                        }
+                        None => {
+                            tx.execute(
+                                "INSERT INTO entries (source_id, parent_id, object_id, name,
+                                     name_folded, extension, is_virtual, first_seen_generation,
+                                     last_seen_generation, deleted_at)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8)",
+                                params![
+                                    rec.source_id.0,
+                                    parent.0,
+                                    object.0,
+                                    member.name,
+                                    crate::policy::fold(&member.name),
+                                    extension,
+                                    scan_generation,
+                                    rec.processed_at.0,
+                                ],
+                            )?;
+                        }
+                    }
+                    if member.is_dir {
+                        directories.entry(&member.path).or_insert(object);
+                    }
+                }
+                tx.commit()?;
+                Ok(true)
+            })?;
+            if !stored {
+                self.discard_staged_virtual_tree(rec)?;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn discard_staged_virtual_tree(&self, rec: &ArchiveRecord) -> Result<()> {
+        loop {
+            let deleted = self.with_writer(|conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                if archive_generation_is_published(&tx, rec)? {
+                    return Ok(0);
+                }
+                tx.execute(
+                    "DELETE FROM entries WHERE is_virtual = 1 AND object_id IN (
+                         SELECT object_id FROM objects
+                         WHERE archive_container_id = ?1 AND archive_generation = ?2
+                           AND deleted_at IS NOT NULL
+                         ORDER BY archive_member_ordinal LIMIT ?3
+                     )",
+                    params![
+                        rec.object_id.0,
+                        rec.generation as i64,
+                        ARCHIVE_MEMBER_BATCH as i64
+                    ],
+                )?;
+                let deleted = tx.execute(
+                    "DELETE FROM objects WHERE object_id IN (
+                         SELECT object_id FROM objects
+                         WHERE archive_container_id = ?1 AND archive_generation = ?2
+                           AND deleted_at IS NOT NULL
+                         ORDER BY archive_member_ordinal LIMIT ?3
+                     )",
+                    params![
+                        rec.object_id.0,
+                        rec.generation as i64,
+                        ARCHIVE_MEMBER_BATCH as i64
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(deleted)
+            })?;
+            if deleted < ARCHIVE_MEMBER_BATCH {
+                return Ok(());
+            }
+        }
+    }
+
+    fn trim_staged_virtual_tail(&self, rec: &ArchiveRecord, first_ordinal: u32) -> Result<bool> {
+        loop {
+            let (current, deleted) = self.with_writer(|conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                if !archive_generation_is_current(&tx, rec)? {
+                    return Ok((false, 0));
+                }
+                tx.execute(
+                    "DELETE FROM entries WHERE is_virtual = 1 AND object_id IN (
+                         SELECT object_id FROM objects WHERE archive_container_id = ?1
+                           AND archive_generation = ?2 AND archive_member_ordinal >= ?3
+                         ORDER BY archive_member_ordinal LIMIT ?4
+                     )",
+                    params![
+                        rec.object_id.0,
+                        rec.generation as i64,
+                        first_ordinal as i64,
+                        ARCHIVE_MEMBER_BATCH as i64
+                    ],
+                )?;
+                let deleted = tx.execute(
+                    "DELETE FROM objects WHERE object_id IN (
+                         SELECT object_id FROM objects WHERE archive_container_id = ?1
+                           AND archive_generation = ?2 AND archive_member_ordinal >= ?3
+                         ORDER BY archive_member_ordinal LIMIT ?4
+                     )",
+                    params![
+                        rec.object_id.0,
+                        rec.generation as i64,
+                        first_ordinal as i64,
+                        ARCHIVE_MEMBER_BATCH as i64
+                    ],
+                )?;
+                tx.commit()?;
+                Ok((true, deleted))
+            })?;
+            if !current {
+                return Ok(false);
+            }
+            if deleted < ARCHIVE_MEMBER_BATCH {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Store a manifest and its members with the content record that
     /// publishes the object's content state. Member rows are staged in
     /// bounded transactions; the final record publication is atomic and
@@ -235,7 +578,6 @@ impl Catalog {
         let member_count = u32::try_from(members.len()).map_err(|_| {
             crate::CatalogError::InvalidState("archive has more than u32::MAX members".into())
         })?;
-
         // The parser is deterministic for an object generation. A duplicate
         // retry must not stage over or trim the member set that readers are
         // already using for that same generation.
@@ -262,6 +604,13 @@ impl Catalog {
             Some(true) => return Ok(true),
             Some(false) => {}
         }
+        if member_count != virtual_member_count(rec)? {
+            return Err(crate::CatalogError::InvalidState(format!(
+                "archive record describes {} virtual members but {} were supplied",
+                virtual_member_count(rec)?,
+                member_count
+            )));
+        }
 
         for batch in members.chunks(ARCHIVE_MEMBER_BATCH) {
             let stored = self.with_writer(|conn| {
@@ -286,12 +635,20 @@ impl Catalog {
             self.discard_unpublished_archive_members(rec)?;
             return Ok(false);
         }
+        if !self.stage_virtual_tree(rec, members)?
+            || !self.trim_staged_virtual_tail(rec, member_count)?
+        {
+            self.discard_unpublished_archive_members(rec)?;
+            self.discard_staged_virtual_tree(rec)?;
+            return Ok(false);
+        }
 
         let stored = self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if !archive_generation_is_current(&tx, rec)? {
                 return Ok(false);
             }
+            publish_virtual_tree(&tx, rec)?;
             upsert_archive_record(&tx, rec)?;
             upsert_content_record(&tx, content, true)?;
             // A container that was text in an earlier generation keeps no chunks.
@@ -311,6 +668,7 @@ impl Catalog {
         })?;
         if !stored {
             self.discard_unpublished_archive_members(rec)?;
+            self.discard_staged_virtual_tree(rec)?;
             return Ok(false);
         }
 
@@ -342,11 +700,15 @@ impl Catalog {
             self.discard_unpublished_archive_members(rec)?;
             return Ok(false);
         }
+        if !self.trim_staged_virtual_tail(rec, 0)? {
+            return Ok(false);
+        }
         let stored = self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if !archive_generation_is_current(&tx, rec)? {
                 return Ok(false);
             }
+            publish_virtual_tree(&tx, rec)?;
             upsert_archive_record(&tx, rec)?;
             tx.commit()?;
             Ok(true)
@@ -590,9 +952,22 @@ impl Catalog {
                            AND o.content_state NOT IN ('excluded')
                            AND (?1 IS NULL OR o.source_id = ?1)
                            AND o.object_id > ?2
-                           AND NOT EXISTS (
-                               SELECT 1 FROM archive_records a
-                               WHERE a.object_id = o.object_id AND a.generation = o.generation
+                           AND (
+                               NOT EXISTS (
+                                   SELECT 1 FROM archive_records a
+                                   WHERE a.object_id = o.object_id AND a.generation = o.generation
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM archive_records a
+                                   WHERE a.object_id = o.object_id AND a.generation = o.generation
+                                     AND a.member_count + a.implicit_dir_count > 0
+                                     AND NOT EXISTS (
+                                         SELECT 1 FROM objects v
+                                         WHERE v.archive_container_id = o.object_id
+                                           AND v.archive_generation = o.generation
+                                           AND v.deleted_at IS NULL
+                                     )
+                               )
                            )
                            AND NOT EXISTS (
                                SELECT 1 FROM jobs j

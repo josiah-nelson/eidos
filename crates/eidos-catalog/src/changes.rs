@@ -448,8 +448,13 @@ impl<'a> Applier<'a> {
                         snap.link_count.max(1) as i64,
                     ])?;
                 if content_changed {
+                    let (entries, objects) =
+                        crate::archive::retire_virtual_tree(self.tx, ex.id, self.now)?;
+                    self.stats.entries_tombstoned += entries;
+                    self.stats.objects_tombstoned += objects;
                     self.record_policy(ex.id, decision)?;
                     self.outbox(ex.id, "content", generation)?;
+                    self.outbox(ex.id, "subtree", generation)?;
                     if state == ContentState::Pending {
                         crate::content::enqueue_content_for(
                             self.tx,
@@ -781,7 +786,12 @@ impl<'a> Applier<'a> {
             None => return Ok(()),
         };
         let mut victims = vec![id];
-        if kind == ObjectKind::Directory.as_str() {
+        // Files normally have no descendants, but archive containers own a
+        // virtual subtree and must cascade just like physical directories.
+        if kind == ObjectKind::Directory.as_str()
+            || kind == ObjectKind::File.as_str()
+            || kind == ObjectKind::VirtualDirectory.as_str()
+        {
             let desc: Vec<i64> = self
                 .tx
                 .prepare_cached(
