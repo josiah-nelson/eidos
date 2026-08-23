@@ -22,6 +22,7 @@
 //!   overrides, become U+FFFD) and returned as JSON strings, so a client that
 //!   renders it as a text node cannot be affected by its contents.
 
+use crate::admission::Expensive;
 use crate::api::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
@@ -29,8 +30,7 @@ use axum::Json;
 use eidos_catalog::content::ChunkRow;
 use eidos_domain::{ContentState, Coverage, ObjectId};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, LazyLock};
-use tokio::sync::Semaphore;
+use std::sync::Arc;
 
 /// Neighbouring chunks per side. Requests above this are clamped, not
 /// rejected: the response reports what it actually contains.
@@ -39,17 +39,6 @@ pub const MAX_NEIGHBORS: u32 = 4;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 /// Lines of text per response.
 pub const MAX_RESPONSE_LINES: usize = 4_000;
-
-/// Previews in flight. Each one holds a blocking thread and decompresses up
-/// to `2 * MAX_NEIGHBORS + 1` chunks, so the endpoint is admitted rather than
-/// left to fan out across the whole runtime.
-///
-/// The permit is *owned* and moved into the blocking task, not held by the
-/// handler future: a client that disconnects mid-request drops the future
-/// while the blocking catalog read is still running, and a borrowed permit
-/// would be released there — letting aborted requests pile blocking work up
-/// past this bound.
-static SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 
 #[derive(Debug, Deserialize)]
 pub struct PreviewQuery {
@@ -122,25 +111,24 @@ pub struct PreviewView {
 }
 
 /// Stored text around one chunk of one object generation.
+///
+/// A preview decompresses up to `2 * MAX_NEIGHBORS + 1` chunks on a blocking
+/// thread, so it goes through the same admission gate as browsing: the permit
+/// is owned by the blocking closure, which keeps a client that disconnects
+/// mid-request from releasing it while the catalog read is still running.
 pub async fn object_content(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
     Query(q): Query<PreviewQuery>,
 ) -> ApiResult<PreviewView> {
-    let permit = SLOTS
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::internal("preview admission closed"))?;
     let (before, after) = (q.before.min(MAX_NEIGHBORS), q.after.min(MAX_NEIGHBORS));
     let (object, generation, ordinal) = (ObjectId(id), q.generation, q.ordinal);
-    let view = tokio::task::spawn_blocking(move || {
-        // Held until the blocking read finishes, even if the caller is gone.
-        let _permit = permit;
-        load_preview(&st, object, generation, ordinal, before, after)
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
+    let gate = st.admission.clone();
+    let view = gate
+        .run(Expensive::Browse, move || {
+            load_preview(&st, object, generation, ordinal, before, after)
+        })
+        .await??;
     Ok(Json(view))
 }
 

@@ -126,7 +126,12 @@ filesystem path.
   the stored text.
 - Responses are bounded: 4 neighbouring chunks per side, 256 KiB of text, and
   4000 lines. `truncated` (per response and per chunk) says when the limits
-  cut something; `has_more_before`/`has_more_after` drive paging outwards.
+  cut something; `has_more_before`/`has_more_after` drive paging outwards. The
+  requested chunk is always returned (cut down if it alone is too big) and
+  neighbours only whole, so a client paging outwards steps the window rather
+  than widening it once the budget binds.
+- The blocking read goes through the same admission gate as browsing, so a
+  burst of previews cannot starve the blocking pool.
 - Text is sanitised before serialisation: C0/C1 control characters other than
   tab, CR and LF, and bidirectional overrides, become U+FFFD (one for one, so
   offsets still line up) and the chunk is flagged `sanitized`.
