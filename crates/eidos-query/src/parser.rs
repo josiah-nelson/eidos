@@ -958,6 +958,13 @@ fn parse_duration_ns(s: &str) -> Option<i64> {
 /// `>D`, `>=D`, `<D`, `<=D`, `D..E`, `D`, `7d`, `today`
 pub fn parse_time_range(s: &str, now: UnixNanos) -> Option<(Option<UnixNanos>, Option<UnixNanos>)> {
     let s = s.trim();
+    // Exact half-open range emitted by the renderer. Unlike `A..B`, the
+    // upper timestamp is already exclusive and must not expand to the end of
+    // its displayed date/time granularity.
+    if let Some((a, b)) = s.split_once(",<") {
+        let a = a.strip_prefix(">=")?;
+        return Some((Some(date_span(a, now)?.0), Some(date_span(b, now)?.0)));
+    }
     if let Some(v) = s.strip_prefix(">=") {
         return Some((Some(date_span(v, now)?.0), None));
     }

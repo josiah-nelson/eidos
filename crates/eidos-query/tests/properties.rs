@@ -49,6 +49,9 @@ fn leaf() -> impl Strategy<Value = String> {
         1 => (0u64..=u32::MAX as u64).prop_map(|v| format!("size:>={v}")),
         1 => prop::collection::vec("[a-z0-9]{1,8}", 1..5)
             .prop_map(|v| format!("ext:{}", v.join(","))),
+        1 => Just("in:fixture".to_string()),
+        1 => Just("attr:hidden,system".to_string()),
+        1 => Just("mtime:2026-01-01..2026-01-03".to_string()),
     ]
 }
 

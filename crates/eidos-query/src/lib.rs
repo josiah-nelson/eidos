@@ -216,7 +216,10 @@ pub fn render(q: &Query) -> String {
                 case_sensitive,
             } => out.push(match mode {
                 PathMode::Exact => format!("path:={}", quoted(value)),
-                PathMode::Prefix => format!("path:{}", quoted(value)),
+                // `path:value` is a substring unless `value` looks absolute;
+                // quoted `in:value` is unambiguously a path prefix for every
+                // spelling, including numeric and relative paths.
+                PathMode::Prefix => format!("in:{}", quoted(value)),
                 PathMode::Glob => format!("path:{}", quoted(value)),
                 PathMode::Regex => format!(
                     "path:/{}/{}",
@@ -274,11 +277,16 @@ pub fn render(q: &Query) -> String {
                 out.push(time_range_text(key, after.map(day), before.map(day)));
             }
             Query::Attributes { all_of, none_of } => {
+                let required: Vec<&str> = (0..32u32)
+                    .map(|bit| 1u32 << bit)
+                    .filter(|mask| all_of & mask != 0)
+                    .map(attr_name)
+                    .collect();
+                if !required.is_empty() {
+                    out.push(format!("attr:{}", required.join(",")));
+                }
                 for bit in 0..32u32 {
                     let m = 1u32 << bit;
-                    if all_of & m != 0 {
-                        out.push(format!("attr:{}", attr_name(m)));
-                    }
                     if none_of & m != 0 {
                         out.push(format!("-attr:{}", attr_name(m)));
                     }
@@ -342,7 +350,9 @@ pub fn render(q: &Query) -> String {
 /// and would move the boundary when re-parsed.
 fn time_range_text(key: &str, after: Option<String>, before: Option<String>) -> String {
     match (after, before) {
-        (Some(a), Some(b)) => format!("{key}:>={a} {key}:<{b}"),
+        // Keep a bounded range in one clause so formatting and reparsing do
+        // not turn one `Query::Time` node into an implicit conjunction.
+        (Some(a), Some(b)) => format!("{key}:>={a},<{b}"),
         (Some(a), None) => format!("{key}:>={a}"),
         (None, Some(b)) => format!("{key}:<{b}"),
         (None, None) => format!("{key}:*"),
@@ -435,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_associative_groups_round_trip_without_flattening() {
+    fn parser_outputs_round_trip_without_changing_the_ast() {
         for input in [
             "",
             "*",
@@ -453,6 +463,9 @@ mod tests {
             "ranked:~fixture",
             r#"ranked:"/fm.txt""#,
             "path_ranked:fixture",
+            "in:fixture",
+            "attr:hidden,system",
+            "mtime:2026-01-01..2026-01-03",
         ] {
             let parsed = parse(input).unwrap();
             let rendered = render(&parsed.query);
