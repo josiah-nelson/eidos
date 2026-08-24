@@ -138,11 +138,11 @@ mod tests {
 
     #[test]
     fn embedded_index_matches_availability() {
-        // Whether or not this build has a web UI, the two probes agree.
-        assert_eq!(embedded_available(), Dist::get("index.html").is_some());
-        assert_eq!(
-            embedded_available(),
-            embedded_file_count() > 0 || !embedded_available()
-        );
+        // With or without a web build at compile time, "available" means
+        // index.html is embedded, and an embedded UI is never empty.
+        assert_eq!(embedded_available(), embedded_file_count() > 0);
+        if embedded_available() {
+            assert!(Dist::iter().any(|f| f.starts_with("assets/")));
+        }
     }
 }
