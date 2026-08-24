@@ -82,6 +82,15 @@
     <Property Id="EIDOS_START_MENU" Value="1" Secure="yes" />
     <Property Id="EIDOS_REMOVE_DATA" Secure="yes" />
 
+    <!-- A property passed empty on the command line (PROP="") clears the
+         default above; restore the defaults so an empty value never leaks
+         into the service registration or the shortcuts. -->
+    <SetProperty Id="EIDOS_BIND" Action="DefaultBind" Value="127.0.0.1" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_BIND" />
+    <SetProperty Id="EIDOS_PORT" Action="DefaultPort" Value="7700" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_PORT" />
+    <SetProperty Id="EIDOS_SERVICE_ACCOUNT_KIND" Action="DefaultAccountKind" Value="local-system" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_SERVICE_ACCOUNT_KIND" />
+    <SetProperty Id="EIDOS_START_SERVICE" Action="DefaultStartService" Value="1" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_START_SERVICE" />
+    <SetProperty Id="EIDOS_START_MENU" Action="DefaultStartMenu" Value="1" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_START_MENU" />
+
     <!-- Account name for the SCM; empty means LocalSystem. -->
     <SetProperty Id="EIDOS_SERVICE_ACCOUNT" Value="NT AUTHORITY\LocalService" Before="CostInitialize" Sequence="both"
                  Condition="EIDOS_SERVICE_ACCOUNT_KIND=&quot;local-service&quot;" />

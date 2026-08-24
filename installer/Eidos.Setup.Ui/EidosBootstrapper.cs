@@ -24,6 +24,14 @@ namespace Eidos.Setup
         protected override void Run()
         {
             this.Engine.Log(LogLevel.Standard, "eidos setup UI starting");
+
+            // NAME=value pairs on the command line set the bundle's
+            // overridable variables (EIDOS_PORT=7700 ...); the engine leaves
+            // that to the bootstrapper application.
+            var data = new BootstrapperApplicationData();
+            var parsed = this.Command.ParseCommandLine();
+            parsed.SetOverridableVariables(data.Bundle.OverridableVariables, this.Engine);
+
             Model = new SetupModel(this);
             Dispatcher = Dispatcher.CurrentDispatcher;
             Model.Dispatcher = Dispatcher;

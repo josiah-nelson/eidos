@@ -11,7 +11,8 @@
     eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_DATA=1
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
   <Bundle Id="Eidos.Indexer.Setup"
           Name="eidos"
@@ -25,6 +26,7 @@
           DisableModify="no">
 
     <bal:Condition Condition="VersionNT64" Message="eidos requires 64-bit Windows 10 or later." />
+    <util:RegistrySearchRef Id="NETFRAMEWORK45" />
 
     <!-- Choices made in the UI, or given on the command line for /quiet. -->
     <Variable Name="EIDOS_SCOPE" Value="" bal:Overridable="yes" />
@@ -49,20 +51,41 @@
     </BootstrapperApplication>
 
     <Chain>
-      <PackageGroupRef Id="NetFx472WebAsPrereq" />
+      <!--
+        .NET Framework 4.7.2 for the setup UI, installed by the prerequisite
+        BA only when missing (Windows 10 1803+ / Server 2019+ ship it). This
+        is WixToolset.Netfx.wixext's NetFx472Web package with Cache="keep":
+        the library's Cache="remove" makes the engine try to clean a
+        per-machine cache from a per-user install, which logs an error.
+      -->
+      <ExePackage Id="NetFx472Web"
+                  CacheId="NetFx472Web_ABDCA79AF9DD48A0EA702AD45260B3C03093FB4B"
+                  InstallArguments="/q /norestart /log &quot;[NetFx472WebLog].html&quot;"
+                  PerMachine="yes" Permanent="yes" Vital="yes" Protocol="netfx4" Cache="keep"
+                  LogPathVariable="NetFx472WebLog"
+                  DetectCondition="NETFRAMEWORK45 &gt;= 461808"
+                  bal:PrereqPackage="yes" bal:PrereqLicenseUrl="https://referencesource.microsoft.com/license.html">
+        <ExePackagePayload Name="redist\NDP472-KB4054531-Web.exe"
+                           DownloadUrl="https://go.microsoft.com/fwlink/?LinkId=863262"
+                           ProductName="Microsoft .NET Framework 4.7.2"
+                           Description="Microsoft .NET Framework 4.7.2 Setup"
+                           CertificatePublicKey="F49F9B33E25E33CCA0BFB15A62B7C29FFAB3880B"
+                           CertificateThumbprint="ABDCA79AF9DD48A0EA702AD45260B3C03093FB4B"
+                           Size="1405792" Version="4.7.3081.0" />
+      </ExePackage>
 
       <MsiPackage Id="EidosMsi" SourceFile="$(var.MsiPath)" Vital="yes" Compressed="yes" Visible="no">
-        <MsiProperty Name="EIDOS_INSTALLDIR" Value="[EIDOS_INSTALLDIR]" Condition="EIDOS_INSTALLDIR &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_DATADIR" Value="[EIDOS_DATADIR]" Condition="EIDOS_DATADIR &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_BIND" Value="[EIDOS_BIND]" Condition="EIDOS_BIND &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_PORT" Value="[EIDOS_PORT]" Condition="EIDOS_PORT &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_SERVICE_ACCOUNT_KIND" Value="[EIDOS_SERVICE_ACCOUNT_KIND]" Condition="EIDOS_SERVICE_ACCOUNT_KIND &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_SERVICE_DOMAIN" Value="[EIDOS_SERVICE_DOMAIN]" Condition="EIDOS_SERVICE_DOMAIN &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_SERVICE_USER" Value="[EIDOS_SERVICE_USER]" Condition="EIDOS_SERVICE_USER &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_SERVICE_PASSWORD" Value="[EIDOS_SERVICE_PASSWORD]" Condition="EIDOS_SERVICE_PASSWORD &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_START_SERVICE" Value="[EIDOS_START_SERVICE]" Condition="EIDOS_START_SERVICE &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_START_MENU" Value="[EIDOS_START_MENU]" Condition="EIDOS_START_MENU &lt;&gt; &quot;&quot;" />
-        <MsiProperty Name="EIDOS_REMOVE_DATA" Value="[EIDOS_REMOVE_DATA]" Condition="EIDOS_REMOVE_DATA &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_INSTALLDIR" Value="[EIDOS_INSTALLDIR]" Condition="EIDOS_INSTALLDIR" />
+        <MsiProperty Name="EIDOS_DATADIR" Value="[EIDOS_DATADIR]" Condition="EIDOS_DATADIR" />
+        <MsiProperty Name="EIDOS_BIND" Value="[EIDOS_BIND]" Condition="EIDOS_BIND" />
+        <MsiProperty Name="EIDOS_PORT" Value="[EIDOS_PORT]" Condition="EIDOS_PORT" />
+        <MsiProperty Name="EIDOS_SERVICE_ACCOUNT_KIND" Value="[EIDOS_SERVICE_ACCOUNT_KIND]" Condition="EIDOS_SERVICE_ACCOUNT_KIND" />
+        <MsiProperty Name="EIDOS_SERVICE_DOMAIN" Value="[EIDOS_SERVICE_DOMAIN]" Condition="EIDOS_SERVICE_DOMAIN" />
+        <MsiProperty Name="EIDOS_SERVICE_USER" Value="[EIDOS_SERVICE_USER]" Condition="EIDOS_SERVICE_USER" />
+        <MsiProperty Name="EIDOS_SERVICE_PASSWORD" Value="[EIDOS_SERVICE_PASSWORD]" Condition="EIDOS_SERVICE_PASSWORD" />
+        <MsiProperty Name="EIDOS_START_SERVICE" Value="[EIDOS_START_SERVICE]" Condition="EIDOS_START_SERVICE" />
+        <MsiProperty Name="EIDOS_START_MENU" Value="[EIDOS_START_MENU]" Condition="EIDOS_START_MENU" />
+        <MsiProperty Name="EIDOS_REMOVE_DATA" Value="[EIDOS_REMOVE_DATA]" Condition="EIDOS_REMOVE_DATA" />
       </MsiPackage>
     </Chain>
   </Bundle>

@@ -1,12 +1,39 @@
 # eidos Windows installer
 
-WiX v7 authoring for the eidos setup. `Eidos.Msi` is the Windows Installer
-package; the bootstrapper bundle (setup `.exe` with the guided UI) wraps it.
+WiX v7 authoring for the eidos setup:
+
+| Project | Output | Role |
+|---|---|---|
+| `Eidos.Msi` | `eidos.msi` | The Windows Installer package (dual-scope) |
+| `Eidos.Setup.Ui` | `eidos-setup-ui.exe` | The guided UI: a .NET Framework 4.7.2 WPF bootstrapper application |
+| `Eidos.Bundle` | `eidos-setup.exe` | The product: Burn engine + UI + MSI (+ .NET prerequisite) |
 
 ```powershell
-.\installer\build.ps1              # web UI + release eidos.exe + installer\out\eidos.msi
+.\installer\build.ps1              # web UI + release eidos.exe + installer\out\{eidos.msi,eidos-setup.exe}
 .\installer\build.ps1 -SkipWeb -SkipRust
 ```
+
+## The setup (`eidos-setup.exe`)
+
+Double-click for the guided install: scope (just me / all users as a
+service), program and data folders, port and listen address, service
+account, options, then progress and a launch button. Run it again (or use
+Settings › Apps) for repair or removal; removal offers to delete the data
+folder and shows its size. A newer installed version is reported, an older
+one is upgraded in place with settings and data kept.
+
+Unattended:
+
+```powershell
+eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_PORT=7700 EIDOS_SERVICE_ACCOUNT_KIND=local-service
+eidos-setup.exe /passive                           # progress only, per-user defaults
+eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_DATA=1
+eidos-setup.exe /log setup.log ...                 # explicit log path
+```
+
+Every `EIDOS_*` MSI property listed below is also a bundle variable that a
+`NAME=value` argument overrides; `EIDOS_SCOPE` (`perUser` | `perMachine`)
+selects the scope without the UI. Logs go to `%TEMP%\eidos_*.log`.
 
 Requirements: Node.js, Rust, and a .NET SDK (8 or later). WiX itself is
 restored from NuGet (`WixToolset.Sdk/7.0.0`); the Open Source Maintenance Fee
