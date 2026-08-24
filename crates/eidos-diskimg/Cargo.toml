@@ -12,3 +12,6 @@ eidos-domain = { workspace = true }
 ntfs = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+zstd = { workspace = true }
