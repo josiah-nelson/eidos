@@ -304,7 +304,15 @@ pub fn read_journal_wait(
     if cancel.is_cancelled() {
         return Err(UsnError::Cancelled);
     }
-    read_journal_opts(vol, journal_id, start_usn, buf, Some(cancel))
+    let outcome = read_journal_opts(vol, journal_id, start_usn, buf, Some(cancel))?;
+    // DeviceIoControl may complete synchronously, in which case the wait on
+    // the cancellation event is bypassed. Never hand that batch to the
+    // caller after a concurrent shutdown/remove request has won the race.
+    if cancel.is_cancelled() {
+        Err(UsnError::Cancelled)
+    } else {
+        Ok(outcome)
+    }
 }
 
 fn read_journal_opts(

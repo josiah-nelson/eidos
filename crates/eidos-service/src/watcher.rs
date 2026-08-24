@@ -91,7 +91,7 @@ impl WatcherStatus {
     }
 
     pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Release);
         #[cfg(windows)]
         self.journal_cancel.cancel();
     }
@@ -307,6 +307,13 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             &status.journal_cancel,
         ) {
             Ok(ReadOutcome::Records { records, next_usn }) => {
+                // The cancellation may arrive after the scanner's final
+                // check but before this thread regains control. Discard the
+                // completed batch rather than mutate a stopped source.
+                if status.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
+                    stop(&status, "cancelled".into());
+                    return;
+                }
                 io_failures = 0;
                 if records.is_empty() {
                     if next_usn != cp.next_usn {
@@ -423,6 +430,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 }
             }
             Ok(ReadOutcome::EntryDeleted) | Ok(ReadOutcome::JournalChanged) => {
+                if status.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
+                    stop(&status, "cancelled".into());
+                    return;
+                }
                 let reason = "USN journal overflowed or was recreated; reconciling".to_string();
                 tracing::warn!(source = source_id.0, reason, "change feed invalid");
                 let _ =
