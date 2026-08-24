@@ -336,6 +336,8 @@ crates/
   eidos-scanner   enumeration, Windows fast paths, generic walking, USN journal
   eidos-catalog   canonical SQLite catalog, generations, changes, aggregates, jobs
   eidos-content   bounded sniffing, decoding, line-aware chunking, BLAKE3
+  eidos-archive   bounded archive manifests and virtual-member inventories
+  eidos-sync      deterministic fleet sync core, fencing, compaction, anti-entropy
   eidos-search    catalog and content indexes, planning, verification, execution
   eidos-query     query syntax parser and renderer
   eidos-service   HTTP API, watchers, reconciliation, and composition

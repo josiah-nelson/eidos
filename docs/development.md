@@ -67,6 +67,20 @@ fit while memory stays bounded. Minimize a failure with `cargo fuzz tmin`, add
 the minimized input to the corresponding corpus, and preserve its behavior in
 a normal Rust regression test.
 
+### Deterministic sync soak
+
+The ordinary suite runs focused `eidos-sync` fault storms. The scheduled
+`sync DST soak` workflow runs one million release-mode protocol universes,
+uploads versioned replay expressions for failures, and opens one deduplicated
+issue per recorded failing seed. Run the same gate locally with:
+
+```powershell
+cargo run --locked --release -p eidos-sync --bin dst-soak -- 1_000_000 sync-soak-failures.jsonl
+```
+
+The third optional argument caps recorded failures (default 20) so a broad
+regression cannot create an issue storm.
+
 ### HTTP integer contract
 
 Public schema version 2 represents every Rust `i64`/`u64` in ordinary JSON
@@ -407,6 +421,7 @@ crates/
   eidos-catalog   SQLite catalog: migrations, scan generations, changes, aggregates, jobs, content records
   eidos-content   sniff/decode/chunk/hash
   eidos-archive   archive member inventories from container metadata (ZIP central directory)
+  eidos-sync      deterministic sync simulation, fenced shipper/applier, Merkle repair
   eidos-search    Tantivy catalog index, projection follower, executor
   eidos-query     parser/renderer for the query syntax
   eidos-service   Axum API, scanner/watcher/reconciler/follower threads, composition
