@@ -372,6 +372,29 @@ ALTER TABLE jobs ADD COLUMN retry_base_attempts INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX jobs_failed ON jobs (source_id, stage, failure_class) WHERE state = 'failed';
 "#,
     ),
+    (
+        "interaction events (data collection only)",
+        r#"
+-- What a search presented and what the person did next. Never the query
+-- text: `query_hash` is a stable digest of the normalized query and
+-- `query_shape` a coarse label, so a session can be studied without the
+-- catalog becoming a log of what anyone searched for.
+CREATE TABLE interaction_events (
+    id             INTEGER PRIMARY KEY,
+    ts             INTEGER NOT NULL,
+    query_hash     TEXT NOT NULL,
+    query_shape    TEXT NOT NULL,
+    object_id      INTEGER,
+    source_id      INTEGER,
+    presented_rank INTEGER,
+    action         TEXT NOT NULL,
+    session_id     TEXT NOT NULL
+);
+-- Retention prunes by age and the row cap deletes the oldest ids; both walk
+-- this index instead of the table.
+CREATE INDEX interaction_events_ts ON interaction_events (ts);
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.
@@ -405,7 +428,7 @@ mod tests {
     fn migrations_apply_once_and_are_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         let first = migrate(&mut conn).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         let second = migrate(&mut conn).unwrap();
         assert!(second.is_empty());
         let v: i64 = conn
