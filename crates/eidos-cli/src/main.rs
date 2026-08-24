@@ -18,6 +18,7 @@ mod admin;
 mod archive;
 mod bench;
 mod content;
+mod detach;
 mod logging;
 mod profile;
 mod search;
@@ -86,6 +87,10 @@ pub struct ServeArgs {
     /// when there is a console). The service always logs here.
     #[arg(long, env = "EIDOS_LOG_DIR")]
     pub log_dir: Option<PathBuf>,
+    /// Start the service in the background (no console window) and return
+    /// once it answers; does nothing if it is already running there.
+    #[arg(long)]
+    pub detach: bool,
     /// Enumeration worker threads per scan.
     #[arg(long, default_value_t = 8)]
     pub scan_threads: usize,
@@ -228,6 +233,9 @@ impl ServeArgs {
         if self.no_content {
             v.push("--no-content".into());
         }
+        if self.detach {
+            v.push("--detach".into());
+        }
         v
     }
 }
@@ -267,6 +275,9 @@ fn main() -> anyhow::Result<()> {
         Command::Serve(args) => {
             let args = args.normalized();
             warn_if_exposed(args.bind);
+            if args.detach {
+                return detach::start(&args);
+            }
             eidos_service::run(args.service_config())
         }
     }

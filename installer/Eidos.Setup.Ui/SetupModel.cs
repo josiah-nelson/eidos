@@ -117,7 +117,7 @@ namespace Eidos.Setup
             this.BrowseDataDirCommand = new RelayCommand(_ => this.Browse(false));
             this.VerifyAccountCommand = new RelayCommand(_ => this.VerifyAccount(), _ => this.Account == AccountKind.User);
             this.OpenLogCommand = new RelayCommand(_ => Native.ShellOpen(this.LogPath));
-            this.OpenEidosCommand = new RelayCommand(_ => Native.ShellOpen(this.Url));
+            this.OpenEidosCommand = new RelayCommand(_ => Native.ShellOpen(this.LaunchUrl));
             this.OpenLicenseCommand = new RelayCommand(_ => Native.ShellOpen("https://www.gnu.org/licenses/agpl-3.0.html"));
         }
 
@@ -277,7 +277,7 @@ namespace Eidos.Setup
             {
                 if (this.Set(ref this.perMachine, value))
                 {
-                    this.Raise(nameof(this.PerUser), nameof(this.PrimaryLabel), nameof(this.ElevationNote), nameof(this.SummaryText));
+                    this.Raise(nameof(this.PerUser), nameof(this.PrimaryLabel), nameof(this.ElevationNote), nameof(this.SummaryText), nameof(this.StartLabel));
                     this.ApplyScopeDefaults();
                 }
             }
@@ -329,7 +329,7 @@ namespace Eidos.Setup
                 if (this.Set(ref this.bind, (value ?? "").Trim()))
                 {
                     this.Validation = null;
-                    this.Raise(nameof(this.BindWarning), nameof(this.Url), nameof(this.UrlNote), nameof(this.SummaryText));
+                    this.Raise(nameof(this.BindWarning), nameof(this.Url),nameof(this.SummaryText));
                 }
             }
         }
@@ -348,12 +348,16 @@ namespace Eidos.Setup
                 if (this.Set(ref this.port, (value ?? "").Trim()))
                 {
                     this.Validation = null;
-                    this.Raise(nameof(this.Url), nameof(this.UrlNote), nameof(this.SummaryText));
+                    this.Raise(nameof(this.Url),nameof(this.SummaryText));
                 }
             }
         }
 
-        public string Url
+        /// <summary>The address as chosen, shown verbatim.</summary>
+        public string Url => $"http://{(string.IsNullOrEmpty(this.bind) ? "127.0.0.1" : this.bind)}:{this.port}/";
+
+        /// <summary>What a browser on this computer opens: a wildcard bind is reached on loopback.</summary>
+        public string LaunchUrl
         {
             get
             {
@@ -361,13 +365,6 @@ namespace Eidos.Setup
                 return $"http://{host}:{this.port}/";
             }
         }
-
-        /// <summary>What the URL means for the chosen listen address.</summary>
-        public string UrlNote => this.bind == "0.0.0.0" || this.bind == "::"
-            ? $"on this computer, and on every network adapter at port {this.port}"
-            : this.bind == "127.0.0.1" || this.bind == "::1" || string.IsNullOrEmpty(this.bind)
-                ? "on this computer only"
-                : "on that adapter only";
 
         public AccountKind Account
         {
@@ -437,6 +434,9 @@ namespace Eidos.Setup
         }
 
         public bool StartService { get => this.startService; set { if (this.Set(ref this.startService, value)) this.Raise(nameof(this.SummaryText)); } }
+        public string StartLabel => this.PerMachine
+            ? "Start the service now and whenever Windows starts"
+            : "Start eidos now and whenever you sign in";
         public bool StartMenu { get => this.startMenu; set { if (this.Set(ref this.startMenu, value)) this.Raise(nameof(this.SummaryText)); } }
         public bool LaunchAfter { get => this.launchAfter; set { if (this.Set(ref this.launchAfter, value)) this.Raise(nameof(this.PrimaryLabel)); } }
         public bool RemoveData { get => this.removeData; set => this.Set(ref this.removeData, value); }
@@ -465,6 +465,10 @@ namespace Eidos.Setup
                         : this.accountUser;
                     lines += $"\nService account:\t{acct}\nStart service:\t{(this.startService ? "now and at every boot" : "later, by hand")}";
                 }
+                else
+                {
+                    lines += $"\nStart eidos:\t{(this.startService ? "now and at every sign-in" : "from the Start menu")}";
+                }
                 lines += $"\nStart menu:\t{(this.startMenu ? "eidos shortcuts" : "none")}";
                 return lines;
             }
@@ -478,7 +482,11 @@ namespace Eidos.Setup
         public bool RestartRequired { get => this.restartRequired; private set => this.Set(ref this.restartRequired, value); }
         public string SuccessText => this.plannedAction == LaunchAction.Uninstall
             ? (this.removeData ? "The program and its data were removed." : $"The program was removed. Your indexed data is still in {this.dataDir}; delete that folder if you no longer want it.")
-            : $"eidos is running at {this.Url}.\n{(this.PerMachine ? "The service starts with Windows." : "Use the Start menu entry \"Start eidos\" to run it; it stops when you sign out.")}";
+            : this.PerMachine
+                ? $"eidos is running at {this.Url}.\nThe service starts with Windows."
+                : this.startService
+                    ? $"eidos is running at {this.Url}.\nIt runs in the background and starts again when you sign in."
+                    : $"eidos is installed. \"Start eidos\" in the Start menu runs it in the background at {this.Url}.";
 
         public bool Canceled
         {
@@ -538,7 +546,7 @@ namespace Eidos.Setup
                 case Page.Success:
                     if (this.plannedAction != LaunchAction.Uninstall && this.launchAfter)
                     {
-                        Native.ShellOpen(this.Url);
+                        Native.ShellOpen(this.LaunchUrl);
                     }
                     EidosBootstrapper.View?.Close();
                     break;
@@ -764,13 +772,13 @@ namespace Eidos.Setup
                 e.SetVariableString("EIDOS_BIND", this.bind, false);
                 e.SetVariableString("EIDOS_PORT", this.port, false);
                 e.SetVariableString("EIDOS_START_MENU", this.startMenu ? "1" : "0", false);
+                e.SetVariableString("EIDOS_START_SERVICE", this.startService ? "1" : "0", false);
                 if (this.PerMachine)
                 {
                     var kind = this.account == AccountKind.LocalSystem ? "local-system"
                         : this.account == AccountKind.LocalService ? "local-service"
                         : this.account == AccountKind.NetworkService ? "network-service" : "user";
                     e.SetVariableString("EIDOS_SERVICE_ACCOUNT_KIND", kind, false);
-                    e.SetVariableString("EIDOS_START_SERVICE", this.startService ? "1" : "0", false);
                     if (this.account == AccountKind.User)
                     {
                         var name = this.accountUser;
@@ -945,6 +953,12 @@ namespace Eidos.Setup
             this.RestartRequired = e.Restart != ApplyRestart.None;
             if (e.Status >= 0)
             {
+                if (this.plannedAction != LaunchAction.Uninstall && !this.PerMachine && this.startService)
+                {
+                    // Per-user has no service: start the background process
+                    // now (the Run entry does it at the next sign-in).
+                    this.StartPerUserProcess();
+                }
                 this.State = SetupState.Applied;
                 this.Page = Page.Success;
                 if (this.ba.Command.Display != Display.Full)
@@ -964,6 +978,42 @@ namespace Eidos.Setup
                 }
             }
             this.Requery();
+        }
+
+        /// <summary>
+        /// `eidos serve --detach` launches the background process and returns
+        /// once /api/health answers (or if something already answers there).
+        /// </summary>
+        private void StartPerUserProcess()
+        {
+            try
+            {
+                var exe = Path.Combine(this.installDir, "eidos.exe");
+                var data = this.dataDir.TrimEnd('\\');
+                var args = $"serve --detach --data-dir \"{data}\" --log-dir \"{Path.Combine(data, "logs")}\" --bind {this.bind}:{this.port}";
+                this.ProgressMessage = "Starting eidos…";
+                using (var p = new System.Diagnostics.Process())
+                {
+                    p.StartInfo.FileName = exe;
+                    p.StartInfo.Arguments = args;
+                    p.StartInfo.UseShellExecute = false;
+                    p.StartInfo.CreateNoWindow = true;
+                    p.StartInfo.RedirectStandardOutput = true;
+                    p.StartInfo.RedirectStandardError = true;
+                    p.Start();
+                    var output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                    p.WaitForExit(90_000);
+                    this.Engine.Log(LogLevel.Standard, "eidos serve --detach: " + output.Trim());
+                    if (p.ExitCode != 0)
+                    {
+                        this.ErrorMessage = output.Trim();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                this.Engine.Log(LogLevel.Error, "starting eidos: " + ex.Message);
+            }
         }
 
         private void Fail(int status, string message)

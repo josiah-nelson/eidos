@@ -52,8 +52,13 @@ file installs either
   the data directory. The service is started at the end of the install;
   a failed start rolls the install back.
 - **per-user** (no elevation): `%LocalAppData%\Programs\eidos`, data in
-  `%LocalAppData%\eidos`, no service; a *Start eidos* shortcut runs the
-  indexer in a console.
+  `%LocalAppData%\eidos`, no service. eidos runs as a background process
+  of the signed-in user (`eidos serve --detach`: no window, logs in the data
+  folder): started by the setup, at every sign-in through an HKCU `Run`
+  entry when *start automatically* is chosen, and by the *Start eidos*
+  shortcut. Upgrade and uninstall close a running `eidos.exe` first
+  (`util:CloseApplication`; the catalog is crash-safe) so files and, on
+  request, the data can be removed.
 
 Both scopes write the chosen paths and port to `HKMU\Software\eidos` so
 repair, upgrade and uninstall find the same directories, and add an `eidos`

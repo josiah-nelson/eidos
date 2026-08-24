@@ -244,9 +244,20 @@
       <RegistryValue Root="HKCU" Key="Software\eidos" Name="StartMenuServe" Type="integer" Value="1" KeyPath="yes" />
       <Shortcut Id="StartEidos" Name="Start eidos" Description="Run the eidos indexer for this user"
                 Target="[INSTALLFOLDER]eidos.exe" WorkingDirectory="INSTALLFOLDER"
-                Arguments="serve --data-dir &quot;[DATAFOLDER].&quot; --log-dir &quot;[LOGFOLDER].&quot; --bind [EIDOS_BIND]:[EIDOS_PORT]"
+                Arguments="serve --detach --data-dir &quot;[DATAFOLDER].&quot; --log-dir &quot;[LOGFOLDER].&quot; --bind [EIDOS_BIND]:[EIDOS_PORT]"
                 Icon="eidos.ico" />
     </Component>
+
+    <!-- Per-user "start automatically": run in the background at sign-in. -->
+    <Component Id="UserAutostart" Directory="INSTALLFOLDER" Condition="NOT ALLUSERS=1 AND EIDOS_START_SERVICE=1">
+      <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="eidos" Type="string" KeyPath="yes"
+                     Value="&quot;[INSTALLFOLDER]eidos.exe&quot; serve --detach --data-dir &quot;[DATAFOLDER].&quot; --log-dir &quot;[LOGFOLDER].&quot; --bind [EIDOS_BIND]:[EIDOS_PORT]" />
+    </Component>
+
+    <!-- Per-user has no service to stop: end a running eidos.exe before
+         files (and, on request, the data) are removed or replaced. The
+         catalog is crash-safe, so termination loses nothing durable. -->
+    <util:CloseApplication Id="CloseEidos" Target="eidos.exe" CloseMessage="yes" TerminateProcess="0" Timeout="10" RebootPrompt="no" Condition="NOT ALLUSERS=1" />
 
     <!-- ===== firewall (only when reachable beyond loopback) ============== -->
 

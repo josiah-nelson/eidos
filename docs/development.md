@@ -120,6 +120,12 @@ and is set by the release workflow. `--web-dir web\dist` serves the UI from
 disk instead (edit-refresh during UI work) and `--no-web` serves the API
 only.
 
+`serve --detach` starts the same service as a background process of the
+current user (no console window, logs under `--log-dir`, defaulting to
+`<data-dir>\logs`), waits until `/api/health` answers, prints the URL, and
+returns; it does nothing when something already answers there. This is the
+per-user counterpart of the Windows service below.
+
 ### Windows service
 
 ```powershell

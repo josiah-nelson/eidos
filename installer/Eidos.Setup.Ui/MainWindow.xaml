@@ -153,7 +153,7 @@
         <StackPanel Orientation="Horizontal">
           <TextBox Width="90" Text="{Binding Port, UpdateSourceTrigger=PropertyChanged}" />
           <TextBlock Margin="12,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource Muted}">
-            <Run Text="eidos will open at " /><Run Text="{Binding Url, Mode=OneWay}" FontFamily="Consolas" /><Run Text=" " /><Run Text="{Binding UrlNote, Mode=OneWay}" />
+            <Run Text="eidos will open at " /><Run Text="{Binding Url, Mode=OneWay}" FontFamily="Consolas" />
           </TextBlock>
         </StackPanel>
         <Expander Header="Advanced: listen address" Margin="0,16,0,0" FontSize="13" Foreground="{StaticResource Ink}" HorizontalContentAlignment="Stretch">
@@ -201,7 +201,7 @@
         <Border Background="#F6F3FC" CornerRadius="4" Padding="14,10">
           <TextBlock FontFamily="Consolas" FontSize="12.5" Text="{Binding SummaryText}" />
         </Border>
-        <CheckBox IsChecked="{Binding StartService}" Content="Start the service now and whenever Windows starts" Visibility="{Binding PerMachine, Converter={StaticResource Vis}}" />
+        <CheckBox IsChecked="{Binding StartService}" Content="{Binding StartLabel}" />
         <CheckBox IsChecked="{Binding StartMenu}" Content="Add eidos to the Start menu" />
         <CheckBox IsChecked="{Binding LaunchAfter}" Content="Open eidos in the browser when setup finishes" />
         <TextBlock Foreground="{StaticResource Warn}" Margin="0,16,0,0" Text="{Binding ElevationNote}" />
