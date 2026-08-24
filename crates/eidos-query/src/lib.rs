@@ -39,6 +39,19 @@ use eidos_domain::{PathMode, Query, SizeField, TextField, TextMode, TimeField};
 /// Render an AST as readable text (not necessarily re-parseable for every
 /// clause, but close to the input syntax).
 pub fn render(q: &Query) -> String {
+    fn quoted(v: &str) -> String {
+        let mut out = String::with_capacity(v.len() + 2);
+        out.push('"');
+        for c in v.chars() {
+            if matches!(c, '\\' | '"') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+        out
+    }
+
     fn size(v: u64) -> String {
         const U: [&str; 5] = ["", "k", "M", "G", "T"];
         let mut f = v as f64;
@@ -72,7 +85,7 @@ pub fn render(q: &Query) -> String {
                         let mut v = Vec::new();
                         go(c, &mut v);
                         let s = v.join(" ");
-                        if matches!(c, Query::Or { .. }) {
+                        if matches!(c, Query::And { .. } | Query::Or { .. }) {
                             format!("({s})")
                         } else {
                             s
@@ -88,7 +101,7 @@ pub fn render(q: &Query) -> String {
                         let mut v = Vec::new();
                         go(c, &mut v);
                         let s = v.join(" ");
-                        if matches!(c, Query::And { .. }) {
+                        if matches!(c, Query::And { .. } | Query::Or { .. }) {
                             format!("({s})")
                         } else {
                             s
@@ -101,11 +114,10 @@ pub fn render(q: &Query) -> String {
                 let mut v = Vec::new();
                 go(clause, &mut v);
                 let s = v.join(" ");
-                if s.contains(' ') {
-                    out.push(format!("-({s})"));
-                } else {
-                    out.push(format!("-{s}"));
-                }
+                // Always retain the unary boundary. `-0` is an ordinary
+                // numeric-looking term in the parser, not negation, and
+                // nested Boolean expressions also need their grouping.
+                out.push(format!("-({s})"));
             }
             Query::Text {
                 field,
@@ -119,9 +131,11 @@ pub fn render(q: &Query) -> String {
                     TextField::Path => "path:",
                     TextField::Content => "content:",
                 };
-                let quoted = |v: &str| {
-                    if v.contains(' ') || v.contains('"') {
-                        format!("\"{}\"", v.replace('"', "\\\""))
+                let bare_or_quoted = |v: &str| {
+                    if v.chars()
+                        .any(|c| c.is_whitespace() || matches!(c, '(' | ')'))
+                    {
+                        quoted(v)
                     } else {
                         v.to_string()
                     }
@@ -129,13 +143,17 @@ pub fn render(q: &Query) -> String {
                 let s = match mode {
                     TextMode::Ranked => {
                         if *field == TextField::Name {
-                            quoted(value)
+                            bare_or_quoted(value)
                         } else {
-                            format!("{prefix}{}", quoted(value))
+                            format!("{prefix}{}", bare_or_quoted(value))
                         }
                     }
-                    TextMode::Phrase => format!("{prefix}\"{value}\""),
-                    TextMode::Proximity => format!("{prefix}\"{value}\"~{slop}"),
+                    TextMode::Phrase if *field == TextField::Name => quoted(value),
+                    TextMode::Phrase => format!("{prefix}{}", quoted(value)),
+                    TextMode::Proximity if *field == TextField::Name => {
+                        format!("{}~{slop}", quoted(value))
+                    }
+                    TextMode::Proximity => format!("{prefix}{}~{slop}", quoted(value)),
                     TextMode::Exact => {
                         if *case_sensitive {
                             format!("{prefix}={}", quoted(value))
@@ -181,23 +199,16 @@ pub fn render(q: &Query) -> String {
                 mode,
                 value,
                 case_sensitive,
-            } => {
-                let q = if value.contains(' ') {
-                    format!("\"{value}\"")
-                } else {
-                    value.clone()
-                };
-                out.push(match mode {
-                    PathMode::Exact => format!("path:={q}"),
-                    PathMode::Prefix => format!("path:{q}"),
-                    PathMode::Glob => format!("path:{q}"),
-                    PathMode::Regex => format!(
-                        "path:/{}/{}",
-                        value.replace('/', "\\/"),
-                        if *case_sensitive { "c" } else { "" }
-                    ),
-                })
-            }
+            } => out.push(match mode {
+                PathMode::Exact => format!("path:={}", quoted(value)),
+                PathMode::Prefix => format!("path:{}", quoted(value)),
+                PathMode::Glob => format!("path:{}", quoted(value)),
+                PathMode::Regex => format!(
+                    "path:/{}/{}",
+                    value.replace('/', "\\/"),
+                    if *case_sensitive { "c" } else { "" }
+                ),
+            }),
             Query::DescendantOf {
                 directory,
                 max_depth,
@@ -406,6 +417,15 @@ mod tests {
             parse("-(a b)").unwrap().query,
             parse("NOT (a b)").unwrap().query
         );
+    }
+
+    #[test]
+    fn nested_associative_groups_round_trip_without_flattening() {
+        for input in ["", "*", "(a (b c))", "(a OR (b OR c))", "-(0)"] {
+            let parsed = parse(input).unwrap();
+            let rendered = render(&parsed.query);
+            assert_eq!(parse(&rendered).unwrap().query, parsed.query, "{rendered}");
+        }
     }
 
     #[test]

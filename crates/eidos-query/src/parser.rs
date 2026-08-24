@@ -8,8 +8,8 @@
 //! ```
 
 use eidos_domain::{
-    ContentState, HostId, ObjectId, ObjectKind, PathMode, Query, SizeField, SourceId, TextField,
-    TextMode, TimeField, UnixNanos,
+    ContentState, HostId, ObjectId, ObjectKind, PathMode, Query, QueryLimits, SizeField, SourceId,
+    TextField, TextMode, TimeField, UnixNanos,
 };
 use serde::{Deserialize, Serialize};
 
@@ -72,8 +72,16 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, ParseError> {
                 let mut closed = false;
                 while i < chars.len() {
                     if chars[i] == '\\' && i + 1 < chars.len() {
-                        word.push(chars[i + 1]);
-                        i += 2;
+                        if matches!(chars[i + 1], '\\' | '"') {
+                            word.push(chars[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        // Backslashes in quoted Windows/UNC paths are
+                        // ordinary characters unless they escape a quote or
+                        // another backslash.
+                        word.push('\\');
+                        i += 1;
                         continue;
                     }
                     if chars[i] == '"' {
@@ -144,6 +152,7 @@ struct Parser {
     pos: usize,
     notes: Vec<String>,
     now: UnixNanos,
+    max_depth: usize,
 }
 
 /// Parse query text into the typed AST.
@@ -153,12 +162,26 @@ pub fn parse(input: &str) -> Result<ParsedQuery, ParseError> {
 
 /// Parse with an explicit "now" (for relative dates; used by tests).
 pub fn parse_at(input: &str, now: UnixNanos) -> Result<ParsedQuery, ParseError> {
+    let limits = QueryLimits::default();
+    // A valid textual query can carry `max_clauses` values of up to
+    // `max_text_len` bytes plus modest syntax overhead. Bound the tokenizer
+    // before it duplicates the input into `Vec<char>` and token strings.
+    let max_input_len = limits
+        .max_clauses
+        .saturating_mul(limits.max_text_len.saturating_add(32));
+    if input.len() > max_input_len {
+        return Err(ParseError {
+            message: format!("query text is too long ({} > {max_input_len})", input.len()),
+            position: 0,
+        });
+    }
     let toks = tokenize(input)?;
     let mut p = Parser {
         toks,
         pos: 0,
         notes: Vec::new(),
         now,
+        max_depth: limits.max_depth,
     };
     if p.toks.is_empty() {
         return Ok(ParsedQuery {
@@ -166,7 +189,7 @@ pub fn parse_at(input: &str, now: UnixNanos) -> Result<ParsedQuery, ParseError> 
             notes: vec!["empty query matches everything".into()],
         });
     }
-    let q = p.expr()?;
+    let q = p.expr(1)?;
     if p.pos < p.toks.len() {
         let position = match &p.toks[p.pos] {
             Tok::LParen(i) | Tok::RParen(i) | Tok::Word(i, _) => *i,
@@ -176,6 +199,10 @@ pub fn parse_at(input: &str, now: UnixNanos) -> Result<ParsedQuery, ParseError> 
             position,
         });
     }
+    q.validate(&limits).map_err(|e| ParseError {
+        message: e.to_string(),
+        position: 0,
+    })?;
     Ok(ParsedQuery {
         query: q,
         notes: p.notes,
@@ -191,15 +218,15 @@ impl Parser {
         matches!(self.peek(), Some(Tok::Word(_, s)) if s == w)
     }
 
-    fn expr(&mut self) -> Result<Query, ParseError> {
-        self.or()
+    fn expr(&mut self, depth: usize) -> Result<Query, ParseError> {
+        self.or(depth)
     }
 
-    fn or(&mut self) -> Result<Query, ParseError> {
-        let mut parts = vec![self.and()?];
+    fn or(&mut self, depth: usize) -> Result<Query, ParseError> {
+        let mut parts = vec![self.and(depth)?];
         while self.is_word("OR") || self.is_word("|") {
             self.pos += 1;
-            parts.push(self.and()?);
+            parts.push(self.and(depth)?);
         }
         Ok(if parts.len() == 1 {
             parts.pop().expect("one")
@@ -208,7 +235,7 @@ impl Parser {
         })
     }
 
-    fn and(&mut self) -> Result<Query, ParseError> {
+    fn and(&mut self, depth: usize) -> Result<Query, ParseError> {
         let mut parts = Vec::new();
         loop {
             match self.peek() {
@@ -218,7 +245,7 @@ impl Parser {
                     self.pos += 1;
                     continue;
                 }
-                _ => parts.push(self.unary()?),
+                _ => parts.push(self.unary(depth)?),
             }
         }
         if parts.is_empty() {
@@ -238,11 +265,25 @@ impl Parser {
         })
     }
 
-    fn unary(&mut self) -> Result<Query, ParseError> {
+    fn unary(&mut self, depth: usize) -> Result<Query, ParseError> {
+        if depth > self.max_depth {
+            return Err(ParseError {
+                message: format!(
+                    "query syntax nesting depth {depth} exceeds limit {}",
+                    self.max_depth
+                ),
+                position: self
+                    .peek()
+                    .map(|t| match t {
+                        Tok::LParen(i) | Tok::RParen(i) | Tok::Word(i, _) => *i,
+                    })
+                    .unwrap_or(0),
+            });
+        }
         match self.peek().cloned() {
             Some(Tok::LParen(pos)) => {
                 self.pos += 1;
-                let inner = self.expr()?;
+                let inner = self.expr(depth + 1)?;
                 match self.peek() {
                     Some(Tok::RParen(_)) => {
                         self.pos += 1;
@@ -263,7 +304,7 @@ impl Parser {
             // conjunction.
             Some(Tok::Word(_, w)) if w == "NOT" || w == "!" || w == "-" => {
                 self.pos += 1;
-                Ok(Query::not(self.unary()?))
+                Ok(Query::not(self.unary(depth + 1)?))
             }
             Some(Tok::Word(pos, w)) => {
                 self.pos += 1;
@@ -283,6 +324,9 @@ impl Parser {
     }
 
     fn term(&mut self, pos: usize, raw: &str) -> Result<Query, ParseError> {
+        if raw == "*" {
+            return Ok(Query::All);
+        }
         if raw.starts_with('"') || raw.starts_with('/') {
             return self.text_clause(TextField::Name, raw, true, pos);
         }

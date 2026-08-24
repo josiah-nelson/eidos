@@ -1,0 +1,2 @@
+c(?:timed?|timeout) after \d+
+prefix timed after 27 suffix

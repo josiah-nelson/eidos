@@ -32,6 +32,41 @@ Tests never touch user data: every integration test builds its own fixture
 under a `tempfile::tempdir()`. USN-journal tests need an elevated session
 and skip themselves otherwise.
 
+### Property and fuzz tests
+
+Normal `cargo test` runs deterministic, shrinking property suites for query
+parse/render round trips, AST limits, Unicode trigram candidate soundness, and
+cursor encoding/decoding. Their RNG seeds are fixed in source so local and CI
+runs exercise the same baseline cases. When a generated case exposes a bug,
+keep the minimized input as a named ordinary regression test before removing
+the generated failure file.
+
+The libFuzzer targets cover arbitrary bounded UTF-8 at the parser and regex
+planner entry points. `cargo-fuzz` requires nightly Rust, LLVM sanitizers, and
+an x86-64 or AArch64 Unix-like host; the scheduled GitHub workflow supplies a
+short deterministic smoke budget and uploads `fuzz/artifacts` on failure.
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz --version 0.13.2 --locked
+
+# Five-minute local passes over the checked-in seed corpora.
+cargo +nightly fuzz run query_parser fuzz/corpus/query_parser -- \
+  -seed=3771723815 -max_len=16384 -max_total_time=300 -timeout=5 -rss_limit_mb=2048
+cargo +nightly fuzz run regex_plan fuzz/corpus/regex_plan -- \
+  -seed=3771730215 -max_len=5122 -max_total_time=300 -timeout=5 -rss_limit_mb=2048
+
+# Longer exploratory run: omit -seed for new paths and raise the time budget.
+cargo +nightly fuzz run regex_plan fuzz/corpus/regex_plan -- \
+  -max_len=5122 -max_total_time=3600 -timeout=5 -rss_limit_mb=2048
+```
+
+The target-side caps mirror the production regex/text limits (1,024/4,096
+bytes); parser fuzzing permits up to 16 KiB so Boolean syntax and many clauses
+fit while memory stays bounded. Minimize a failure with `cargo fuzz tmin`, add
+the minimized input to the corresponding corpus, and preserve its behavior in
+a normal Rust regression test.
+
 ### HTTP integer contract
 
 Public schema version 2 represents every Rust `i64`/`u64` in ordinary JSON
