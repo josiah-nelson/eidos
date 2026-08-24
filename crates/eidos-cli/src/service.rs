@@ -218,7 +218,12 @@ fn cmd_install(name: &str, args: InstallArgs) -> anyhow::Result<()> {
         executable_path: exe.clone(),
         launch_arguments: launch,
         dependencies: vec![],
-        account_name: account_name.clone().map(OsString::from),
+        // Named explicitly: for ChangeServiceConfig a NULL account means
+        // "keep the current one", which would leave a previous account in
+        // place on --replace.
+        account_name: Some(OsString::from(
+            account_name.clone().unwrap_or_else(|| "LocalSystem".into()),
+        )),
         account_password: password.map(OsString::from),
     };
 
