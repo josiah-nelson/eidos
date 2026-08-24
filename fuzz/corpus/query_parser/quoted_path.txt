@@ -1,0 +1,1 @@
+path:="C:\fixture\folder with spaces\file.txt"

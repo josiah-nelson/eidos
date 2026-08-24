@@ -108,6 +108,8 @@ fn typescript_contract() -> String {
     types.add::<crate::api::IndexStatus>();
     types.add::<crate::content_preview::PreviewQuery>();
     types.add::<crate::content_preview::PreviewView>();
+    types.add::<crate::interactions_api::InteractionBatch>();
+    types.add::<crate::interactions_api::InteractionAck>();
     types.add::<crate::retry_api::RetryBody>();
     types.add::<eidos_catalog::retry::RetryReport>();
     types.add::<crate::export::ExportGetQuery>();

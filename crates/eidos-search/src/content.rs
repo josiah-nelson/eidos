@@ -1080,7 +1080,10 @@ pub fn retrieve(
             let tc = Instant::now();
             let (cand_q, how): (Box<dyn TQuery>, String) = match clause.mode {
                 TextMode::Regex => {
-                    let plan = crate::regex_plan::TrigramPlan::for_regex(&clause.value);
+                    let plan = crate::regex_plan::TrigramPlan::for_regex_with_case(
+                        &clause.value,
+                        clause.case_sensitive,
+                    );
                     match plan.query(&|t| term_text(f.trigrams, t)) {
                         Some(q) => (
                             q,

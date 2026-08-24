@@ -1,0 +1,71 @@
+name: fuzz
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/fuzz.yml"
+      - "Cargo.lock"
+      - "crates/eidos-domain/**"
+      - "crates/eidos-query/**"
+      - "crates/eidos-search/**"
+      - "fuzz/**"
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: bounded parser and regex fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      CARGO_FUZZ_VERSION: 0.13.2
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: nightly
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: "fuzz -> target"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+
+      - name: Build fuzz targets
+        run: cargo fuzz build
+
+      - name: Run deterministic smoke budgets
+        shell: bash
+        run: |
+          seconds=20
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            seconds=60
+          fi
+          cargo fuzz run query_parser fuzz/corpus/query_parser -- \
+            -seed=3771723815 -max_len=16384 -max_total_time="$seconds" \
+            -timeout=5 -rss_limit_mb=2048
+          cargo fuzz run regex_plan fuzz/corpus/regex_plan -- \
+            -seed=3771730215 -max_len=5122 -max_total_time="$seconds" \
+            -timeout=5 -rss_limit_mb=2048
+
+      - name: Upload minimized failure inputs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-artifacts-${{ github.sha }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
