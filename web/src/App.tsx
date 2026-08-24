@@ -1,9 +1,13 @@
+import { useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { NavLink, Outlet } from 'react-router'
 import { api } from './api'
+import { installInteractionFlush } from './interactions'
 
 export default function App() {
   const health = useQuery({ queryKey: ['health'], queryFn: api.health, refetchInterval: 5000 })
+  // Queued interaction events would otherwise be lost when the tab goes away.
+  useEffect(installInteractionFlush, [])
   return (
     <div className="shell">
       <header className="topbar">

@@ -639,9 +639,7 @@ fn later_subtree_event_readds_a_descendant_seen_earlier_in_the_batch() {
 #[test]
 fn invalid_queries_error_cleanly() {
     let fx = fixture();
-    let mut req = fx.req("name:/(unclosed/");
-    req.explain = false;
-    assert!(search(&fx.index, &fx.catalog, &req, &ExecOptions::default()).is_err());
+    assert!(parse("name:/(unclosed/").is_err());
     let req = SearchRequest {
         cursor: Some("garbage".into()),
         ..fx.req("ext:cs")

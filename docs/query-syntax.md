@@ -26,7 +26,7 @@ editable.
 | `ext:` | `ext:cs`, `ext:cs,idb`, `ext:none` | case-insensitive, no dot; `none` = no extension |
 | `kind:` | `kind:file`, `kind:dir`, `kind:reparse` | |
 | `size:` / `alloc:` | `size:>1M`, `size:<=4k`, `size:1M..10M`, `size:=0` | binary units k/M/G/T |
-| `mtime:` / `ctime:` | `mtime:>=2026-01-01`, `mtime:7d`, `mtime:2026-02`, `mtime:2026-01-01..2026-03-01`, `mtime:today` | dates are UTC days/months/years; relative: `m h d w mo y` |
+| `mtime:` / `ctime:` | `mtime:>=2026-01-01`, `mtime:7d`, `mtime:2026-02`, `mtime:2026-01-01..2026-03-01`, `mtime:>=2026-01-01T00:00:00Z,<2026-02-01T00:00:00Z`, `mtime:today` | dates are UTC days/months/years; relative: `m h d w mo y`; `>=A,<B` is an exact half-open range used by the editable rendering |
 | `state:` | `state:pending`, `state:excluded,failed` | content-processing state |
 | `has:` | `has:idb`, `has:cs>=3`, `has:log:10..100` | directory contains N files with that extension anywhere beneath (use Directories mode) |
 | `files:` | `files:>1000` | directory descendant file count |
@@ -34,7 +34,7 @@ editable.
 | `subtree_mtime:` | `subtree_mtime:>=2026-01-01`, `subtree_mtime:7d` | newest modification time anywhere beneath a directory (same date forms as `mtime:`) |
 | `attr:` | `attr:hidden`, `attr:hidden,system`, `-attr:reparse` | readonly hidden system archive temporary sparse reparse compressed offline encrypted |
 | `source:` | `source:G`, `source:G,R`, `source:2` | configured source name or id |
-| `in:` | `in:o:123`, `in:o:123~2` | under an object id (optional max depth) |
+| `in:` | `in:o:123`, `in:o:123~2`, `in:"relative\path"` | under an object id (optional max depth), or a quoted path prefix |
 | `content:` | `content:zephyr`, `content:"build 4.2"`, `content:=ErrCode`, `content:~Err`, `content:/re/`, `content:/re/c` | literal text of indexed files. Plain value: tokenised phrase (case-insensitive; one word = term); `=` whole word, case-sensitive; `~` substring, case-sensitive; `/re/` regex (case-insensitive unless `/c`). Exact, substring, and regex clauses are verified against the stored original text and return line-aware snippets |
 
 ## Result mode and sort

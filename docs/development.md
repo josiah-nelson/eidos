@@ -32,6 +32,41 @@ Tests never touch user data: every integration test builds its own fixture
 under a `tempfile::tempdir()`. USN-journal tests need an elevated session
 and skip themselves otherwise.
 
+### Property and fuzz tests
+
+Normal `cargo test` runs deterministic, shrinking property suites for query
+parse/render round trips, AST limits, Unicode trigram candidate soundness, and
+cursor encoding/decoding. Their RNG seeds are fixed in source so local and CI
+runs exercise the same baseline cases. When a generated case exposes a bug,
+keep the minimized input as a named ordinary regression test before removing
+the generated failure file.
+
+The libFuzzer targets cover arbitrary bounded UTF-8 at the parser and regex
+planner entry points. `cargo-fuzz` requires nightly Rust, LLVM sanitizers, and
+an x86-64 or AArch64 Unix-like host; the scheduled GitHub workflow supplies a
+short deterministic smoke budget and uploads `fuzz/artifacts` on failure.
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz --version 0.13.2 --locked
+
+# Five-minute local passes over the checked-in seed corpora.
+cargo +nightly fuzz run query_parser fuzz/corpus/query_parser -- \
+  -seed=3771723815 -max_len=16384 -max_total_time=300 -timeout=5 -rss_limit_mb=2048
+cargo +nightly fuzz run regex_plan fuzz/corpus/regex_plan -- \
+  -seed=3771730215 -max_len=5122 -max_total_time=300 -timeout=5 -rss_limit_mb=2048
+
+# Longer exploratory run: omit -seed for new paths and raise the time budget.
+cargo +nightly fuzz run regex_plan fuzz/corpus/regex_plan -- \
+  -max_len=5122 -max_total_time=3600 -timeout=5 -rss_limit_mb=2048
+```
+
+The target-side caps mirror the production regex/text limits (1,024/4,096
+bytes); parser fuzzing permits up to 16 KiB so Boolean syntax and many clauses
+fit while memory stays bounded. Minimize a failure with `cargo fuzz tmin`, add
+the minimized input to the corresponding corpus, and preserve its behavior in
+a normal Rust regression test.
+
 ### HTTP integer contract
 
 Public schema version 2 represents every Rust `i64`/`u64` in ordinary JSON
@@ -283,6 +318,36 @@ match count and the cap on stderr, marking `(TRUNCATED)` when the cap bites.
 
 `EIDOS_URL` overrides the service address. Query syntax:
 [query-syntax.md](query-syntax.md).
+
+### Interaction capture
+
+`POST /api/interactions` records what a search presented and what happened to
+it — `presented`, `opened_preview`, `opened_file`, `copied_path`, `exported` —
+into the catalog's `interaction_events` table. It is data collection only:
+nothing reads the table back on the search path, and no ranking, ordering, or
+response depends on whether an event was recorded, refused, or dropped.
+
+- **No query text is stored.** A client posts the query it ran; the service
+  parses it, stores a digest of its canonical rendering (`query_hash`) and a
+  coarse label (`query_shape`: `metadata`, `name`, `content_ranked`,
+  `content_regex`), and discards the text. The digest groups the events of one
+  query; it is not an anonymity guarantee, since a guessed query can be hashed
+  and compared.
+- **The service stamps the time.** A client clock cannot place rows outside the
+  retention window.
+- **Growth is bounded.** Events older than 90 days are deleted, and the oldest
+  rows beyond 1,000,000 are deleted. Retention runs inside the insert
+  transaction every 32nd batch and once at startup.
+- **Requests are cheap and refusable.** At most 500 events per request (larger
+  is `400 bad_request`); the response is returned before the write happens, and
+  when too many batches are already waiting on the catalog writer the batch is
+  dropped and the response says so (`{"accepted": 0, "dropped": n}`).
+
+The web UI queues events per tab session and flushes them every two seconds and
+when the page is hidden; failures are silently discarded. `eidos search` posts
+one `presented` batch for the hits it printed, with a short deadline and no
+retry, so scripted use never blocks. `EIDOS_NO_INTERACTIONS` turns the CLI's
+capture off.
 
 ## Benchmarks
 

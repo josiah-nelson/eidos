@@ -1,0 +1,1 @@
+ranked:ext:txt path_ranked:fixture ranked:"/fm.txt"

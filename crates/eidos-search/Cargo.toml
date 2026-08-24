@@ -28,3 +28,4 @@ tempfile = { workspace = true }
 eidos-catalog = { workspace = true, features = ["test-utils"] }
 eidos-scanner = { workspace = true }
 eidos-query = { workspace = true }
+proptest = "1.11.0"

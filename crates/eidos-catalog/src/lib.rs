@@ -16,6 +16,7 @@ pub mod aggregates;
 pub mod archive;
 pub mod changes;
 pub mod content;
+pub mod interactions;
 pub mod jobs;
 pub mod model;
 pub mod policy;
@@ -58,6 +59,9 @@ pub struct Catalog {
     writer_coordination: Arc<WriterCoordination>,
     readers: crossbeam_channel::Receiver<Connection>,
     readers_return: crossbeam_channel::Sender<Connection>,
+    /// Batches recorded by [`Catalog::record_interactions`]; every Nth one
+    /// enforces interaction retention in the same transaction.
+    interaction_batches: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -201,6 +205,7 @@ impl Catalog {
             writer_coordination: Arc::new(WriterCoordination::default()),
             readers: rx,
             readers_return: tx,
+            interaction_batches: AtomicU64::new(0),
         }))
     }
 

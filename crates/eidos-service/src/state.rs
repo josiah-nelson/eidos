@@ -61,6 +61,10 @@ pub struct AppState {
     pub export_stats: Arc<crate::export::ExportStats>,
     /// One permit per streaming export (see [`crate::export::ExportLimits`]).
     pub export_gate: Arc<tokio::sync::Semaphore>,
+    /// One permit per interaction batch waiting on the catalog writer. The
+    /// capture endpoint answers without waiting for the write, so this is what
+    /// keeps a burst of clients from queueing unboundedly behind a scan.
+    pub interaction_writes: Arc<tokio::sync::Semaphore>,
     pub host_id: HostId,
     pub host_name: String,
     pub lister: Arc<dyn DirectoryLister>,
@@ -103,6 +107,17 @@ impl AppState {
             tracing::warn!(
                 requeued = requeued_unfinished_content,
                 "re-queued content records left `indexing` by a previous process"
+            );
+        }
+        // Interaction capture bounds itself from its own insert path, but a
+        // service that is restarted often may never reach that point; one
+        // prune at startup makes the bound hold regardless.
+        let pruned_interactions = catalog
+            .prune_interactions(eidos_catalog::interactions::InteractionRetention::default())?;
+        if pruned_interactions > 0 {
+            tracing::info!(
+                pruned = pruned_interactions,
+                "pruned interaction events past their retention bounds"
             );
         }
         let startup_recovery = StartupRecovery {
@@ -163,6 +178,9 @@ impl AppState {
             export: export_limits,
             export_stats: Arc::new(crate::export::ExportStats::default()),
             export_gate: Arc::new(tokio::sync::Semaphore::new(export_limits.concurrency)),
+            interaction_writes: Arc::new(tokio::sync::Semaphore::new(
+                crate::interactions_api::MAX_PENDING_INTERACTION_WRITES,
+            )),
             host_id,
             host_name,
             lister: Arc::from(eidos_scanner::default_lister()),
