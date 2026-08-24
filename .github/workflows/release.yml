@@ -84,6 +84,9 @@ jobs:
           npm run build
 
       - name: Build Windows executable
+        # The web UI is embedded in the executable; refuse to build without it.
+        env:
+          EIDOS_REQUIRE_WEB: "1"
         run: cargo build --locked --release --bin eidos
 
       - name: Sign Windows executable with Azure Artifact Signing

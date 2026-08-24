@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Standalone service composition: HTTP API, background scans, lifecycle"
+build = "build.rs"
 
 [dependencies]
 eidos-domain = { workspace = true }
@@ -24,6 +25,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 ts-rs = { workspace = true }
 parking_lot = { workspace = true }
+rust-embed = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

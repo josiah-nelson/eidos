@@ -3,6 +3,7 @@
 //! - `profile`: read-only corpus profiler (Milestone 0)
 //! - `source add|list|scan`: in-process catalog administration (Milestone 1)
 //! - `serve`: HTTP API + web UI (Milestone 1+)
+//! - `service install|start|stop|status|uninstall`: Windows service (M5)
 //!
 //! Search commands (Milestone 3) talk to the running service so the CLI and
 //! web UI share one query contract.
@@ -17,8 +18,11 @@ mod admin;
 mod archive;
 mod bench;
 mod content;
+mod logging;
 mod profile;
 mod search;
+#[cfg(windows)]
+mod service;
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -43,8 +47,11 @@ enum Command {
     Profile(profile::ProfileArgs),
     /// Manage catalog sources in-process.
     Source(admin::SourceArgs),
-    /// Run the service (HTTP API and web UI).
+    /// Run the service in the foreground (HTTP API and web UI).
     Serve(ServeArgs),
+    /// Install, control, or run eidos as a Windows service.
+    #[cfg(windows)]
+    Service(service::ServiceArgs),
     /// Search through the running service (same API and schema as the web UI).
     Search(search::SearchArgs),
     /// Benchmarks over an existing data directory.
@@ -57,61 +64,175 @@ enum Command {
     Content(content::ContentArgs),
 }
 
-#[derive(Args, Debug)]
-struct ServeArgs {
+/// Everything that configures a running service. Shared by `serve`
+/// (foreground) and `service install|run` (the same flags are stored on the
+/// service's command line).
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ServeArgs {
     /// Data directory holding catalog.db and indexes.
     #[arg(long, env = "EIDOS_DATA_DIR", default_value = "data")]
-    data_dir: PathBuf,
+    pub data_dir: PathBuf,
     /// Listen address. Keep on loopback unless the network is trusted.
     #[arg(long, env = "EIDOS_BIND", default_value = "127.0.0.1:7700")]
-    bind: std::net::SocketAddr,
-    /// Built web UI directory (web/dist). Pass an empty string for API only.
-    #[arg(long, env = "EIDOS_WEB_DIR", default_value = "web/dist")]
-    web_dir: String,
+    pub bind: std::net::SocketAddr,
+    /// Serve the web UI from this directory instead of the copy embedded in
+    /// the executable.
+    #[arg(long, env = "EIDOS_WEB_DIR", conflicts_with = "no_web")]
+    pub web_dir: Option<PathBuf>,
+    /// API only: serve no web UI.
+    #[arg(long)]
+    pub no_web: bool,
+    /// Write logs to daily files in this directory (in addition to stderr
+    /// when there is a console). The service always logs here.
+    #[arg(long, env = "EIDOS_LOG_DIR")]
+    pub log_dir: Option<PathBuf>,
     /// Enumeration worker threads per scan.
     #[arg(long, default_value_t = 8)]
-    scan_threads: usize,
+    pub scan_threads: usize,
     /// Disable automatic periodic rescans of sources without a change feed.
     #[arg(long)]
-    no_auto_reconcile: bool,
+    pub no_auto_reconcile: bool,
     /// Do not extract or index file content (metadata only).
     #[arg(long)]
-    no_content: bool,
+    pub no_content: bool,
     /// Content extraction threads (per-source budgets apply on top).
     #[arg(long, env = "EIDOS_CONTENT_WORKERS", default_value_t = 4)]
-    content_workers: usize,
+    pub content_workers: usize,
     /// Expensive API operations (search, browse, counts) admitted at once.
     #[arg(long, env = "EIDOS_MAX_CONCURRENT_QUERIES", default_value_t = 4)]
-    max_concurrent_queries: usize,
+    pub max_concurrent_queries: usize,
     /// Requests allowed to wait for a free slot before load is shed (503).
     #[arg(long, env = "EIDOS_QUERY_QUEUE_DEPTH", default_value_t = 32)]
-    query_queue_depth: usize,
+    pub query_queue_depth: usize,
     /// How long a queued request waits for a free slot before it is shed.
     #[arg(long, env = "EIDOS_QUERY_QUEUE_WAIT_MS", default_value_t = 5_000)]
-    query_queue_wait_ms: u64,
+    pub query_queue_wait_ms: u64,
     /// Response deadline for search (the query itself runs to completion).
     #[arg(long, env = "EIDOS_SEARCH_TIMEOUT_MS", default_value_t = 30_000)]
-    search_timeout_ms: u64,
+    pub search_timeout_ms: u64,
     /// Response deadline for the other expensive operations.
     #[arg(long, env = "EIDOS_OPERATION_TIMEOUT_MS", default_value_t = 60_000)]
-    operation_timeout_ms: u64,
+    pub operation_timeout_ms: u64,
     /// Maximum accepted JSON request body.
     #[arg(long, env = "EIDOS_MAX_BODY_BYTES", default_value_t = 1 << 20)]
-    max_body_bytes: usize,
+    pub max_body_bytes: usize,
     /// Rows fetched per cursor step while streaming `/api/search/export`.
     #[arg(long, env = "EIDOS_EXPORT_PAGE_SIZE", default_value_t = 500)]
-    export_page_size: u32,
+    pub export_page_size: u32,
     /// Hard cap on rows a single export may emit.
     #[arg(long, env = "EIDOS_EXPORT_MAX_ROWS", default_value_t = 100_000)]
-    export_max_rows: u64,
+    pub export_max_rows: u64,
     /// Exports allowed to stream at once (kept below --max-concurrent-queries).
     #[arg(long, env = "EIDOS_EXPORT_CONCURRENCY", default_value_t = 2)]
-    export_concurrency: usize,
+    pub export_concurrency: usize,
+}
+
+impl ServeArgs {
+    pub fn service_config(&self) -> eidos_service::ServiceConfig {
+        eidos_service::ServiceConfig {
+            data_dir: self.data_dir.clone(),
+            bind: self.bind,
+            web_dir: self.web_dir.clone(),
+            embedded_web: !self.no_web,
+            scan_threads: self.scan_threads,
+            auto_reconcile: !self.no_auto_reconcile,
+            content: !self.no_content,
+            content_workers: self.content_workers,
+            admission: eidos_service::admission::AdmissionConfig {
+                concurrency: self.max_concurrent_queries.max(1),
+                queue_depth: self.query_queue_depth,
+                queue_wait: Duration::from_millis(self.query_queue_wait_ms),
+                search_timeout: Duration::from_millis(self.search_timeout_ms),
+                operation_timeout: Duration::from_millis(self.operation_timeout_ms),
+                max_body_bytes: self.max_body_bytes,
+            },
+            export: eidos_service::export::ExportLimits {
+                page_size: self.export_page_size.clamp(1, 1000),
+                max_rows: self.export_max_rows,
+                concurrency: self.export_concurrency,
+            },
+        }
+    }
+
+    /// Render these arguments back into a command line (`--flag value`
+    /// pairs) so they can be stored verbatim on a service registration.
+    /// Every field is emitted explicitly: the service must not depend on the
+    /// environment or defaults of a future version.
+    pub fn to_command_line(&self) -> Vec<std::ffi::OsString> {
+        let mut v: Vec<std::ffi::OsString> = Vec::new();
+        let mut kv = |k: &str, val: std::ffi::OsString| {
+            v.push(k.into());
+            v.push(val);
+        };
+        kv("--data-dir", self.data_dir.clone().into());
+        kv("--bind", self.bind.to_string().into());
+        if let Some(dir) = &self.web_dir {
+            kv("--web-dir", dir.clone().into());
+        }
+        if let Some(dir) = &self.log_dir {
+            kv("--log-dir", dir.clone().into());
+        }
+        kv("--scan-threads", self.scan_threads.to_string().into());
+        kv("--content-workers", self.content_workers.to_string().into());
+        kv(
+            "--max-concurrent-queries",
+            self.max_concurrent_queries.to_string().into(),
+        );
+        kv(
+            "--query-queue-depth",
+            self.query_queue_depth.to_string().into(),
+        );
+        kv(
+            "--query-queue-wait-ms",
+            self.query_queue_wait_ms.to_string().into(),
+        );
+        kv(
+            "--search-timeout-ms",
+            self.search_timeout_ms.to_string().into(),
+        );
+        kv(
+            "--operation-timeout-ms",
+            self.operation_timeout_ms.to_string().into(),
+        );
+        kv("--max-body-bytes", self.max_body_bytes.to_string().into());
+        kv(
+            "--export-page-size",
+            self.export_page_size.to_string().into(),
+        );
+        kv("--export-max-rows", self.export_max_rows.to_string().into());
+        kv(
+            "--export-concurrency",
+            self.export_concurrency.to_string().into(),
+        );
+        if self.no_web {
+            v.push("--no-web".into());
+        }
+        if self.no_auto_reconcile {
+            v.push("--no-auto-reconcile".into());
+        }
+        if self.no_content {
+            v.push("--no-content".into());
+        }
+        v
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    init_tracing(&cli.log, cli.log_json);
+    // The service host initialises logging itself (file only; there is no
+    // console) once the SCM has handed it the start request.
+    #[cfg(windows)]
+    if let Command::Service(args) = &cli.command {
+        if args.is_run() {
+            return service::run(args.clone(), cli.log.clone(), cli.log_json);
+        }
+    }
+    let _log_guard = match &cli.command {
+        Command::Serve(args) => {
+            logging::init(&cli.log, cli.log_json, args.log_dir.as_deref(), true)
+        }
+        _ => logging::init(&cli.log, cli.log_json, None, true),
+    };
     match cli.command {
         Command::Profile(args) => profile::run(args),
         Command::Source(args) => admin::run(args),
@@ -119,6 +240,8 @@ fn main() -> anyhow::Result<()> {
         Command::Activity(args) => activity::run(args),
         Command::Archive(args) => archive::run(args),
         Command::Content(args) => content::run(args),
+        #[cfg(windows)]
+        Command::Service(args) => service::run(args, cli.log, cli.log_json),
         Command::Search(args) => {
             let code = search::run(args)?;
             if code != 0 {
@@ -127,50 +250,85 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Serve(args) => {
-            if !args.bind.ip().is_loopback() {
-                tracing::warn!(bind = %args.bind, "binding beyond loopback: the API has no authentication in v0.5");
-            }
-            eidos_service::run(eidos_service::ServiceConfig {
-                data_dir: args.data_dir,
-                bind: args.bind,
-                web_dir: if args.web_dir.is_empty() {
-                    None
-                } else {
-                    Some(PathBuf::from(args.web_dir))
-                },
-                scan_threads: args.scan_threads,
-                auto_reconcile: !args.no_auto_reconcile,
-                content: !args.no_content,
-                content_workers: args.content_workers,
-                admission: eidos_service::admission::AdmissionConfig {
-                    concurrency: args.max_concurrent_queries.max(1),
-                    queue_depth: args.query_queue_depth,
-                    queue_wait: Duration::from_millis(args.query_queue_wait_ms),
-                    search_timeout: Duration::from_millis(args.search_timeout_ms),
-                    operation_timeout: Duration::from_millis(args.operation_timeout_ms),
-                    max_body_bytes: args.max_body_bytes,
-                },
-                export: eidos_service::export::ExportLimits {
-                    page_size: args.export_page_size.clamp(1, 1000),
-                    max_rows: args.export_max_rows,
-                    concurrency: args.export_concurrency,
-                },
-            })
+            warn_if_exposed(args.bind);
+            eidos_service::run(args.service_config())
         }
     }
 }
 
-fn init_tracing(filter: &str, json: bool) {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-    let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
-    let registry = tracing_subscriber::registry().with(env_filter);
-    if json {
-        registry
-            .with(fmt::layer().json().with_writer(std::io::stderr))
-            .init();
-    } else {
-        registry
-            .with(fmt::layer().with_writer(std::io::stderr).with_target(false))
-            .init();
+fn warn_if_exposed(bind: std::net::SocketAddr) {
+    if !bind.ip().is_loopback() {
+        tracing::warn!(bind = %bind, "binding beyond loopback: the API has no authentication in v0.5");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> ServeArgs {
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+        Wrap::try_parse_from(std::iter::once("x").chain(args.iter().copied()))
+            .expect("parse")
+            .serve
+    }
+
+    #[test]
+    fn command_line_round_trips_every_field() {
+        let original = parse(&[
+            "--data-dir",
+            r"C:\ProgramData\eidos data",
+            "--bind",
+            "127.0.0.1:7711",
+            "--web-dir",
+            r"C:\Program Files\eidos\web",
+            "--log-dir",
+            r"C:\ProgramData\eidos\logs",
+            "--scan-threads",
+            "3",
+            "--no-auto-reconcile",
+            "--no-content",
+            "--content-workers",
+            "2",
+            "--max-concurrent-queries",
+            "5",
+            "--query-queue-depth",
+            "7",
+            "--query-queue-wait-ms",
+            "11",
+            "--search-timeout-ms",
+            "13",
+            "--operation-timeout-ms",
+            "17",
+            "--max-body-bytes",
+            "19",
+            "--export-page-size",
+            "23",
+            "--export-max-rows",
+            "29",
+            "--export-concurrency",
+            "31",
+        ]);
+        let line = original.to_command_line();
+        let strs: Vec<String> = line
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let refs: Vec<&str> = strs.iter().map(String::as_str).collect();
+        assert_eq!(parse(&refs), original);
+        // Defaults survive too, and `--no-web` is carried.
+        let plain = parse(&["--no-web"]);
+        let strs: Vec<String> = plain
+            .to_command_line()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let refs: Vec<&str> = strs.iter().map(String::as_str).collect();
+        assert_eq!(parse(&refs), plain);
+        assert!(refs.contains(&"--no-web"));
     }
 }
