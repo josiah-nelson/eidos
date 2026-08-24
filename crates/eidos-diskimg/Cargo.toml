@@ -8,5 +8,7 @@ description = "Read-only inventory of NTFS filesystems inside VHDX disk images, 
 
 [dependencies]
 crc32fast = { workspace = true }
+eidos-domain = { workspace = true }
+ntfs = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

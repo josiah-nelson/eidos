@@ -47,6 +47,7 @@ tantivy = "0.26"
 blake3 = "1.8"
 getrandom = "0.4"
 crc32fast = "1.5"
+ntfs = "0.4"
 clap = { version = "4.6", features = ["derive", "env"] }
 regex = "1.13"
 regex-syntax = "0.8"
