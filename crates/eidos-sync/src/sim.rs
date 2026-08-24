@@ -506,8 +506,30 @@ impl<M: Clone + std::fmt::Debug> Simulation<M> {
     ) -> Result<(), Violation> {
         if !self.started {
             self.started = true;
-            for node in 0..self.nodes.len() {
-                self.callback(node, |n, env| n.on_start(env))?;
+            // A lifecycle event at time zero defines the node's initial
+            // process state. Let that event perform (or suppress) startup so
+            // an immediate crash cannot create phantom durable writes or
+            // messages before the modeled process ever ran.
+            let lifecycle_at_zero: Vec<bool> = (0..self.nodes.len())
+                .map(|node| {
+                    self.plan.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            FaultEvent::Crash {
+                                node: event_node,
+                                at_ns: 0
+                            } | FaultEvent::Restart {
+                                node: event_node,
+                                at_ns: 0
+                            } if *event_node == node
+                        )
+                    })
+                })
+                .collect();
+            for (node, managed_by_event) in lifecycle_at_zero.into_iter().enumerate() {
+                if !managed_by_event {
+                    self.callback(node, |n, env| n.on_start(env))?;
+                }
             }
             self.check(invariants)?;
         }

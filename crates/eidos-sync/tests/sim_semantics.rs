@@ -122,6 +122,25 @@ fn run_until_is_resumable_and_starts_nodes_once() {
 }
 
 #[test]
+fn time_zero_crash_precedes_initial_startup() {
+    let mut plan = FaultPlan::benign();
+    plan.events.push(FaultEvent::Crash { node: 0, at_ns: 0 });
+    plan.events.push(FaultEvent::Restart { node: 0, at_ns: 5 });
+    let factories: Vec<NodeFactory<Msg>> =
+        vec![Box::new(|| Box::new(CountingNode { timer_ns: None }) as _)];
+    let mut sim = Simulation::new(2, plan, factories).unwrap();
+
+    sim.run_until(0, 10, &mut empty_invariants()).unwrap();
+    assert!(
+        sim.durable(0, "counts").is_none(),
+        "a time-zero crash must suppress the initial startup callback"
+    );
+
+    sim.run_until(5, 10, &mut empty_invariants()).unwrap();
+    assert_eq!(counts(&sim, 0).starts, 1);
+}
+
+#[test]
 fn standalone_restart_discards_ram_and_cancels_old_timers() {
     let mut plan = FaultPlan::benign();
     plan.events.push(FaultEvent::Restart { node: 0, at_ns: 5 });
