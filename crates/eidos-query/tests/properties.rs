@@ -163,6 +163,35 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 4_096,
+        rng_seed: RngSeed::Fixed(0xe1d0_a027),
+        max_shrink_iters: 40_000,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn arbitrary_accepted_utf8_round_trips(
+        chars in prop::collection::vec(any::<char>(), 0..192),
+    ) {
+        let input: String = chars.into_iter().collect();
+        if let Ok(parsed) = parse_at(&input, NOW) {
+            let rendered = render(&parsed.query);
+            let reparsed = parse_at(&rendered, NOW).unwrap_or_else(|error| {
+                panic!("rendered query did not parse: {input:?} -> {rendered:?}: {error}")
+            });
+            prop_assert_eq!(
+                reparsed.query,
+                parsed.query,
+                "{:?} -> {:?}",
+                input,
+                rendered
+            );
+        }
+    }
+}
+
 #[test]
 fn quoted_backslashes_and_phrases_are_normal_regressions() {
     for input in [
