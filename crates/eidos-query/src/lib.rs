@@ -133,7 +133,7 @@ pub fn render(q: &Query) -> String {
                 };
                 let bare_or_quoted = |v: &str| {
                     if v.chars()
-                        .any(|c| c.is_whitespace() || matches!(c, '(' | ')'))
+                        .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"'))
                     {
                         quoted(v)
                     } else {
@@ -142,10 +142,18 @@ pub fn render(q: &Query) -> String {
                 };
                 let s = match mode {
                     TextMode::Ranked => {
-                        if *field == TextField::Name {
-                            bare_or_quoted(value)
+                        let value = bare_or_quoted(value);
+                        if value.starts_with('"') {
+                            let explicit = match field {
+                                TextField::Name => "ranked:",
+                                TextField::Path => "path_ranked:",
+                                TextField::Content => "content_ranked:",
+                            };
+                            format!("{explicit}{value}")
+                        } else if *field == TextField::Name {
+                            value
                         } else {
-                            format!("{prefix}{}", bare_or_quoted(value))
+                            format!("{prefix}{value}")
                         }
                     }
                     TextMode::Phrase if *field == TextField::Name => quoted(value),
@@ -421,7 +429,15 @@ mod tests {
 
     #[test]
     fn nested_associative_groups_round_trip_without_flattening() {
-        for input in ["", "*", "(a (b c))", "(a OR (b OR c))", "-(0)"] {
+        for input in [
+            "",
+            "*",
+            "(a (b c))",
+            "(a OR (b OR c))",
+            "-(0)",
+            r#"fixture_field:"alpha beta""#,
+            r#"content:alpha" beta""#,
+        ] {
             let parsed = parse(input).unwrap();
             let rendered = render(&parsed.query);
             assert_eq!(parse(&rendered).unwrap().query, parsed.query, "{rendered}");

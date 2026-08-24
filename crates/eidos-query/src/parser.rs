@@ -496,6 +496,27 @@ impl Parser {
             position: pos,
         };
         Ok(Some(match field {
+            "ranked" | "name_ranked" => Query::Text {
+                field: TextField::Name,
+                mode: TextMode::Ranked,
+                value: unquote(value),
+                case_sensitive: false,
+                slop: 0,
+            },
+            "path_ranked" => Query::Text {
+                field: TextField::Path,
+                mode: TextMode::Ranked,
+                value: unquote(value),
+                case_sensitive: false,
+                slop: 0,
+            },
+            "content_ranked" => Query::Text {
+                field: TextField::Content,
+                mode: TextMode::Ranked,
+                value: unquote(value),
+                case_sensitive: false,
+                slop: 0,
+            },
             "name" | "n" | "file" => self.text_clause(TextField::Name, value, false, pos)?,
             "content" | "text" | "body" => {
                 self.text_clause(TextField::Content, value, false, pos)?
