@@ -6,8 +6,6 @@ import {
   api,
   exportUrl,
   type ApiInt,
-  type CoverageEnvelope,
-  type CoverageReason,
   type ExportFormat,
   type FacetField,
   type FacetValue,
@@ -17,6 +15,7 @@ import {
   type SortField,
 } from '../api'
 import { ContentBadge, CoverageBanners, ErrorBox } from '../components'
+import { mergeCoverage } from '../coverage'
 import { ContentPreviewPanel } from '../ContentPreview'
 import { bytes, count, duration, when } from '../format'
 import { PresentationLog, track } from '../interactions'
@@ -98,33 +97,7 @@ export default function SearchPage() {
   // the banner merges every page's envelope: full only if every page was
   // full, with distinct reasons unioned (per source from that source's
   // entries) and watermarks from the newest page.
-  const coverage = useMemo<CoverageEnvelope | undefined>(() => {
-    const pages = results.data?.pages
-    if (!pages || pages.length === 0) return undefined
-    const key = (r: CoverageReason) => `${r.kind}|${r.severity}|${r.detail}`
-    const distinct = (reasons: CoverageReason[]): CoverageReason[] => {
-      const seen = new Set<string>()
-      return reasons.filter((r) => {
-        const k = key(r)
-        if (seen.has(k)) return false
-        seen.add(k)
-        return true
-      })
-    }
-    const latest = pages[pages.length - 1]
-    return {
-      full: pages.every((p) => p.coverage.full),
-      degraded: distinct(pages.flatMap((p) => p.coverage.degraded ?? [])),
-      sources: latest.coverage.sources.map((s) => ({
-        ...s,
-        degraded: distinct(
-          pages.flatMap(
-            (p) => p.coverage.sources.find((x) => x.source_id === s.source_id)?.degraded ?? [],
-          ),
-        ),
-      })),
-    }
-  }, [results.data])
+  const coverage = useMemo(() => mergeCoverage(results.data?.pages ?? []), [results.data])
 
   // Record the hits of every page of results this query returned, once per
   // distinct set of hits. A page is the unit the server rendered; the same
