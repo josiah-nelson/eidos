@@ -466,6 +466,8 @@ mod tests {
             r#"ranked:"a~/b""#,
             r#"ranked:"a=i/b""#,
             "*.MiXeD",
+            "*.-",
+            "*.NoNe",
             "in:fixture",
             "attr:hidden,system",
             "mtime:2026-01-01..2026-01-03",

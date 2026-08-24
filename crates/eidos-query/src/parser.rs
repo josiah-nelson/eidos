@@ -485,6 +485,8 @@ impl Parser {
             if field == TextField::Name {
                 if let Some(ext) = value.strip_prefix("*.") {
                     if !ext.is_empty()
+                        && ext != "-"
+                        && !ext.eq_ignore_ascii_case("none")
                         && ext
                             .chars()
                             .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
@@ -1152,6 +1154,18 @@ mod tests {
                 values: vec!["cs".into()]
             }
         );
+        for reserved in ["*.-", "*.none", "*.NoNe"] {
+            assert!(
+                matches!(
+                    q(reserved),
+                    Query::Text {
+                        mode: TextMode::Regex,
+                        ..
+                    }
+                ),
+                "{reserved} must remain a glob rather than changing meaning through ext:"
+            );
+        }
         assert_eq!(
             q("setup?.cs"),
             Query::Text {
