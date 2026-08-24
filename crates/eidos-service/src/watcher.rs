@@ -26,9 +26,6 @@ use std::time::{Duration, Instant};
 use ts_rs::TS;
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
-/// How long a drained journal read blocks in the kernel waiting for new
-/// records before returning empty so the loop can check for cancellation.
-pub const JOURNAL_WAIT: Duration = Duration::from_secs(1);
 pub const DEFAULT_RECONCILE_INTERVAL_S: i64 = 6 * 3600;
 /// Minimum pause before a watcher retries a reconciliation that failed.
 pub const RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -42,7 +39,6 @@ pub enum WatcherState {
     Stopped,
 }
 
-#[derive(Debug)]
 pub struct WatcherStatus {
     pub source_id: SourceId,
     pub cancel: AtomicBool,
@@ -55,6 +51,8 @@ pub struct WatcherStatus {
     pub last_usn: AtomicI64,
     last_batch: Mutex<Option<Instant>>,
     last_apply_ms: AtomicU64,
+    #[cfg(windows)]
+    journal_cancel: eidos_scanner::usn::JournalCancellation,
 }
 
 #[derive(Debug, Clone, serde::Serialize, TS)]
@@ -86,7 +84,16 @@ impl WatcherStatus {
             last_usn: AtomicI64::new(0),
             last_batch: Mutex::new(None),
             last_apply_ms: AtomicU64::new(0),
+            #[cfg(windows)]
+            journal_cancel: eidos_scanner::usn::JournalCancellation::new()
+                .expect("create journal cancellation event"),
         }
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        #[cfg(windows)]
+        self.journal_cancel.cancel();
     }
 
     pub fn set(&self, s: WatcherState, detail: Option<String>) {
@@ -148,7 +155,7 @@ pub fn ensure_watcher(state: &Arc<AppState>, source_id: SourceId) -> Arc<Watcher
 
 pub fn stop_watcher(state: &AppState, source_id: SourceId) {
     if let Some(w) = state.watchers.lock().get(&source_id) {
-        w.cancel.store(true, Ordering::Relaxed);
+        w.request_cancel();
     }
 }
 
@@ -269,7 +276,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             }
         };
         if vol.is_none() {
-            match VolumeHandle::open(&cp.volume_root) {
+            match VolumeHandle::open_waitable(&cp.volume_root) {
                 Ok(v) => vol = Some(v),
                 Err(e) => {
                     io_failures += 1;
@@ -290,10 +297,15 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             }
         }
         let v = vol.as_ref().expect("opened");
-        // Block in the kernel until records arrive (or one second passes so
-        // cancellation/shutdown stay responsive). Change latency is the
-        // journal wake-up, not a poll interval.
-        match read_journal_wait(v, cp.journal_id, cp.next_usn, &mut buf, JOURNAL_WAIT) {
+        // Block until either records arrive or the persistent cancellation
+        // event is signaled. No timing window can lose a shutdown request.
+        match read_journal_wait(
+            v,
+            cp.journal_id,
+            cp.next_usn,
+            &mut buf,
+            &status.journal_cancel,
+        ) {
             Ok(ReadOutcome::Records { records, next_usn }) => {
                 io_failures = 0;
                 if records.is_empty() {
@@ -326,8 +338,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         }
                     }
                     status.set(WatcherState::Live, None);
-                    // No sleep: the next read blocks in the kernel until
-                    // records arrive or JOURNAL_WAIT elapses.
+                    // No sleep: the next read blocks until records arrive.
                     continue;
                 }
                 let started = Instant::now();
@@ -446,6 +457,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                     .catalog
                     .set_source_state(source_id, source.state, Some(&reason));
                 stop(&status, reason);
+                return;
+            }
+            Err(UsnError::Cancelled) => {
+                stop(&status, "cancelled".into());
                 return;
             }
             Err(UsnError::Io(e)) => {

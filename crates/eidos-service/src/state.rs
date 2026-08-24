@@ -267,7 +267,7 @@ impl AppState {
         // only for the operations that already hold a permit.
         self.admission.close();
         for w in self.watchers.lock().values() {
-            w.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            w.request_cancel();
         }
         for p in self.scans.lock().values() {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);

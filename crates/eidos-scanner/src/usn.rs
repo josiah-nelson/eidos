@@ -17,23 +17,29 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
-    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_JOURNAL_DELETE_IN_PROGRESS,
-    ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE, ERROR_NOT_FOUND, ERROR_NO_MORE_FILES,
-    GENERIC_READ, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING,
+    ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE,
+    ERROR_NOT_FOUND, ERROR_NO_MORE_FILES, GENERIC_READ, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ExtendedFileIdType, FileAttributeTagInfo, FileBasicInfo, FileIdInfo,
     FileStandardInfo, FindClose, FindFirstFileNameW, FindNextFileNameW,
     GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OpenFileById, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128,
-    FILE_ID_DESCRIPTOR, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, OPEN_EXISTING,
+    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_OVERLAPPED, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Ioctl::{
     FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1, USN_JOURNAL_DATA_V2,
     USN_RECORD_V2, USN_RECORD_V3,
 };
-use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE,
+};
+use windows_sys::Win32::System::IO::{
+    CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED,
+};
 
 pub use windows_sys::Win32::System::Ioctl::{
     USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_EXTEND,
@@ -52,6 +58,8 @@ pub enum UsnError {
     AccessDenied,
     #[error("USN journal not supported on this volume")]
     Unsupported,
+    #[error("USN journal read cancelled")]
+    Cancelled,
     #[error("{0}")]
     Io(ScanError),
 }
@@ -65,6 +73,16 @@ pub struct VolumeHandle {
 impl VolumeHandle {
     /// `volume_root` is the drive root such as `G:\`.
     pub fn open(volume_root: &str) -> Result<VolumeHandle, UsnError> {
+        Self::open_with_flags(volume_root, 0)
+    }
+
+    /// Open a volume for an overlapped journal read that can wait on a
+    /// cancellation event as well as journal activity.
+    pub fn open_waitable(volume_root: &str) -> Result<VolumeHandle, UsnError> {
+        Self::open_with_flags(volume_root, FILE_FLAG_OVERLAPPED)
+    }
+
+    fn open_with_flags(volume_root: &str, flags: u32) -> Result<VolumeHandle, UsnError> {
         let letter = volume_root.trim_end_matches('\\');
         let device = format!("\\\\.\\{letter}");
         let mut wide: Vec<u16> = std::ffi::OsStr::new(&device).encode_wide().collect();
@@ -77,7 +95,7 @@ impl VolumeHandle {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                0,
+                flags,
                 std::ptr::null_mut(),
             )
         };
@@ -105,6 +123,45 @@ impl VolumeHandle {
 
     pub fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
         self.handle.0
+    }
+}
+
+/// Manual-reset event used to interrupt an overlapped journal read.
+pub struct JournalCancellation {
+    event: Handle,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: kernel event handles are designed for cross-thread signaling. The
+// owned handle remains alive for every waiter through the shared status value.
+unsafe impl Send for JournalCancellation {}
+unsafe impl Sync for JournalCancellation {}
+
+impl JournalCancellation {
+    pub fn new() -> std::io::Result<Self> {
+        // SAFETY: default security, manual reset, initially nonsignaled, no name.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self {
+                event: Handle(event),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        // SAFETY: `event` is a live manual-reset event.
+        unsafe {
+            SetEvent(self.event.0);
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -233,19 +290,21 @@ pub fn read_journal(
     read_journal_opts(vol, journal_id, start_usn, buf, None)
 }
 
-/// Like [`read_journal`], but when the journal is drained the call blocks in
-/// the kernel until at least one new record arrives or `wait` elapses
-/// (`BytesToWaitFor`/`Timeout` on `FSCTL_READ_USN_JOURNAL`), returning empty
-/// records on timeout. This is the push-style feed: change latency becomes
-/// the ioctl wake-up rather than a poll interval.
+/// Like [`read_journal`], but when the journal is drained the call remains
+/// blocked in the kernel until at least one new record arrives or another
+/// thread signals `cancel`. This is the push-style
+/// feed: change latency becomes the ioctl wake-up rather than a poll interval.
 pub fn read_journal_wait(
     vol: &VolumeHandle,
     journal_id: u64,
     start_usn: i64,
     buf: &mut [u8],
-    wait: std::time::Duration,
+    cancel: &JournalCancellation,
 ) -> Result<ReadOutcome, UsnError> {
-    read_journal_opts(vol, journal_id, start_usn, buf, Some(wait))
+    if cancel.is_cancelled() {
+        return Err(UsnError::Cancelled);
+    }
+    read_journal_opts(vol, journal_id, start_usn, buf, Some(cancel))
 }
 
 fn read_journal_opts(
@@ -253,24 +312,43 @@ fn read_journal_opts(
     journal_id: u64,
     start_usn: i64,
     buf: &mut [u8],
-    wait: Option<std::time::Duration>,
+    cancel: Option<&JournalCancellation>,
 ) -> Result<ReadOutcome, UsnError> {
     let req = READ_USN_JOURNAL_DATA_V1 {
         StartUsn: start_usn,
         ReasonMask: 0xFFFF_FFFF,
         ReturnOnlyOnClose: 0,
-        // Timeout is in seconds; 0 with nonzero BytesToWaitFor would wait
-        // indefinitely, so waiting reads always pass at least one second and
-        // rely on the caller's loop for cancellation checks.
-        Timeout: wait.map(|w| w.as_secs().max(1)).unwrap_or(0),
-        BytesToWaitFor: u64::from(wait.is_some()),
+        // With BytesToWaitFor nonzero, Windows repeats a nonzero Timeout until
+        // records exist; it is not a deadline. Use the documented cancellable
+        // indefinite mode and let the owner cancel the I/O on shutdown.
+        Timeout: 0,
+        BytesToWaitFor: u64::from(cancel.is_some()),
         UsnJournalID: journal_id,
         MinMajorVersion: 2,
         MaxMajorVersion: 3,
     };
     let mut returned: u32 = 0;
+    let io_event = if cancel.is_some() {
+        // SAFETY: default security, manual reset, initially nonsignaled, no name.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(usn_error(
+                unsafe { GetLastError() },
+                "CreateEventW(journal read)",
+                &vol.root,
+            ));
+        }
+        Some(Handle(event))
+    } else {
+        None
+    };
+    let mut overlapped = OVERLAPPED::default();
+    if let Some(event) = &io_event {
+        overlapped.hEvent = event.0;
+    }
     // SAFETY: input/output buffers sized as declared; the kernel writes at
-    // most `buf.len()` bytes.
+    // most `buf.len()` bytes. The event and OVERLAPPED value remain alive
+    // until completion or cancellation has itself completed.
     let ok = unsafe {
         DeviceIoControl(
             vol.raw(),
@@ -280,23 +358,50 @@ fn read_journal_opts(
             buf.as_mut_ptr() as *mut _,
             buf.len() as u32,
             &mut returned,
-            std::ptr::null_mut(),
+            if cancel.is_some() {
+                &mut overlapped
+            } else {
+                std::ptr::null_mut()
+            },
         )
     };
     if ok == 0 {
         // SAFETY: trivially safe.
         let code = unsafe { GetLastError() };
-        return match code {
-            ERROR_JOURNAL_ENTRY_DELETED => Ok(ReadOutcome::EntryDeleted),
-            ERROR_INVALID_PARAMETER => Ok(ReadOutcome::JournalChanged),
-            // EOF: drained (non-waiting read). WAIT_TIMEOUT: a waiting read's
-            // window elapsed with no new records; both mean "nothing yet".
-            ERROR_HANDLE_EOF | WAIT_TIMEOUT => Ok(ReadOutcome::Records {
-                records: Vec::new(),
-                next_usn: start_usn,
-            }),
-            _ => Err(usn_error(code, "FSCTL_READ_USN_JOURNAL", &vol.root)),
-        };
+        if code == ERROR_IO_PENDING {
+            let cancel = cancel.expect("only overlapped reads can be pending");
+            let handles = [io_event.as_ref().expect("event").0, cancel.event.0];
+            // SAFETY: both handles stay live for this wait; wait for either
+            // journal completion or the manual-reset cancellation event.
+            match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) } {
+                WAIT_OBJECT_0 => {
+                    // SAFETY: the I/O event is signaled; retrieve its result.
+                    if unsafe { GetOverlappedResult(vol.raw(), &overlapped, &mut returned, 0) } == 0
+                    {
+                        return read_failure(unsafe { GetLastError() }, start_usn, &vol.root);
+                    }
+                }
+                value if value == WAIT_OBJECT_0 + 1 => {
+                    // SAFETY: cancel this exact operation, then wait for its
+                    // completion before its buffer and OVERLAPPED are dropped.
+                    unsafe {
+                        CancelIoEx(vol.raw(), &overlapped);
+                        GetOverlappedResult(vol.raw(), &overlapped, &mut returned, 1);
+                    }
+                    return Err(UsnError::Cancelled);
+                }
+                WAIT_FAILED => {
+                    return Err(usn_error(
+                        unsafe { GetLastError() },
+                        "WaitForMultipleObjects(journal read)",
+                        &vol.root,
+                    ));
+                }
+                _ => unreachable!("two-handle wait returned an invalid index"),
+            }
+        } else {
+            return read_failure(code, start_usn, &vol.root);
+        }
     }
     let returned = returned as usize;
     if returned < 8 {
@@ -320,6 +425,18 @@ fn read_journal_opts(
         off += len;
     }
     Ok(ReadOutcome::Records { records, next_usn })
+}
+
+fn read_failure(code: u32, start_usn: i64, root: &str) -> Result<ReadOutcome, UsnError> {
+    match code {
+        ERROR_JOURNAL_ENTRY_DELETED => Ok(ReadOutcome::EntryDeleted),
+        ERROR_INVALID_PARAMETER => Ok(ReadOutcome::JournalChanged),
+        ERROR_HANDLE_EOF => Ok(ReadOutcome::Records {
+            records: Vec::new(),
+            next_usn: start_usn,
+        }),
+        _ => Err(usn_error(code, "FSCTL_READ_USN_JOURNAL", root)),
+    }
 }
 
 unsafe fn parse_record(buf: &[u8], off: usize) -> Result<(usize, Option<UsnRecord>), UsnError> {
@@ -746,20 +863,22 @@ mod tests {
             Some(r) => r,
             None => return,
         };
-        let vol = match VolumeHandle::open(&root) {
+        let query_volume = match VolumeHandle::open(&root) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("skipping USN test: {e}");
                 return;
             }
         };
-        let info = match query_journal(&vol) {
+        let info = match query_journal(&query_volume) {
             Ok(i) => i,
             Err(e) => {
                 eprintln!("skipping USN test: {e}");
                 return;
             }
         };
+        let vol = VolumeHandle::open_waitable(&root).unwrap();
+        let cancel = JournalCancellation::new().unwrap();
         // A writer that fires while the waiting read is blocked in the
         // kernel. The volume is shared, so any process's records also wake
         // the read — the assertion is only that it returns promptly with
@@ -774,20 +893,12 @@ mod tests {
         });
         let mut buf = vec![0u8; 256 * 1024];
         let started = std::time::Instant::now();
-        let outcome = read_journal_wait(
-            &vol,
-            info.journal_id,
-            info.next_usn,
-            &mut buf,
-            std::time::Duration::from_secs(10),
-        )
-        .unwrap();
+        let outcome =
+            read_journal_wait(&vol, info.journal_id, info.next_usn, &mut buf, &cancel).unwrap();
         writer.join().unwrap();
         match outcome {
             ReadOutcome::Records { records, next_usn } => {
-                // Either woken by records (ours or a bystander's) well before
-                // the 10 s window, or — only if the volume was totally idle —
-                // an empty timeout return, which the 10 s bound rules out.
+                // Woken by records (ours or a bystander's), not a timer.
                 assert!(
                     !records.is_empty() || next_usn != info.next_usn,
                     "waiting read returned empty without advancing"
@@ -799,5 +910,35 @@ mod tests {
             }
             other => panic!("unexpected outcome {other:?}"),
         }
+    }
+
+    #[test]
+    fn presignalled_cancellation_prevents_a_waiting_read() {
+        let root = match temp_volume_root() {
+            Some(r) => r,
+            None => return,
+        };
+        let query_volume = match VolumeHandle::open(&root) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skipping USN test: {e}");
+                return;
+            }
+        };
+        let info = match query_journal(&query_volume) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("skipping USN test: {e}");
+                return;
+            }
+        };
+        let vol = VolumeHandle::open_waitable(&root).unwrap();
+        let cancel = JournalCancellation::new().unwrap();
+        cancel.cancel();
+        let mut buf = vec![0u8; 256 * 1024];
+        let started = std::time::Instant::now();
+        let outcome = read_journal_wait(&vol, info.journal_id, info.next_usn, &mut buf, &cancel);
+        assert!(matches!(outcome, Err(UsnError::Cancelled)));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
     }
 }
