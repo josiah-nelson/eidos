@@ -111,6 +111,44 @@ impl Fx {
 }
 
 #[test]
+fn coverage_envelope_states_full_and_degrades_offline() {
+    let fx = fixture();
+    // Healthy periodic source, metadata query: the answer is full and each
+    // source carries a watermark.
+    let r = fx.run("ext:cs");
+    assert!(r.coverage.full, "{:?}", r.coverage);
+    assert_eq!(r.coverage.sources.len(), 1);
+    assert!(r.coverage.sources[0].degraded.is_empty());
+    assert!(
+        r.coverage.sources[0].watermark.is_some(),
+        "a scanned source is authoritative as of its last scan"
+    );
+
+    // The source drops offline: same hits, but the envelope reports it as an
+    // info-grade, first-class state with remediation — never an error.
+    fx.catalog
+        .set_source_state(fx.source, SourceState::Offline, Some("unreachable"))
+        .unwrap();
+    let r = fx.run("ext:cs");
+    assert!(!r.hits.is_empty(), "results are preserved while offline");
+    assert!(!r.coverage.full);
+    let reasons = &r.coverage.sources[0].degraded;
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert_eq!(reasons[0].kind, CoverageKind::Offline);
+    assert_eq!(reasons[0].severity, CoverageSeverity::Info);
+    assert!(reasons[0].remediation.is_some());
+
+    // Stale is likewise info-grade with a refresh remediation.
+    fx.catalog
+        .set_source_state(fx.source, SourceState::Stale, None)
+        .unwrap();
+    let r = fx.run("ext:cs");
+    let reasons = &r.coverage.sources[0].degraded;
+    assert_eq!(reasons[0].kind, CoverageKind::Stale);
+    assert_eq!(reasons[0].severity, CoverageSeverity::Info);
+}
+
+#[test]
 fn index_build_counts_and_completeness() {
     let fx = fixture();
     let r = fx.run("");
@@ -494,10 +532,14 @@ fn follower_applies_catalog_changes() {
         .unwrap();
     let r = fx.run("ext:cs");
     assert!(
-        r.warnings.iter().any(|w| w.contains("not yet reflected")),
+        r.coverage
+            .degraded
+            .iter()
+            .any(|d| d.kind == CoverageKind::IndexLag),
         "{:?}",
-        r.warnings
+        r.coverage
     );
+    assert!(!r.coverage.full);
     let (_, follow) = fx.index.follow_once(&fx.catalog, 100).unwrap();
     assert!(follow.unwrap().documents_added >= 1);
     assert!(fx.names("ext:cs").contains(&"Incremental.cs".to_string()));

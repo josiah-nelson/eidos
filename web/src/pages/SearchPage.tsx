@@ -14,7 +14,7 @@ import {
   type SearchResponse,
   type SortField,
 } from '../api'
-import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
+import { ContentBadge, CoverageBanners, ErrorBox } from '../components'
 import { ContentPreviewPanel } from '../ContentPreview'
 import { bytes, count, duration, when } from '../format'
 import { applyFacetClick, negate, type FacetForms } from '../query-clause'
@@ -211,9 +211,7 @@ export default function SearchPage() {
       {first && (
         <div className="results">
           <div className="results-main">
-            {first.completeness.map((c) => (
-              <CompletenessBanner key={c.source_id} c={c} />
-            ))}
+            <CoverageBanners coverage={first.coverage} />
             {warnings.map((w, i) => (
               <div key={i} className="banner warn">
                 <span className="badge warn">warning</span>

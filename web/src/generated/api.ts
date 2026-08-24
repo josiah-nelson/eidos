@@ -56,6 +56,14 @@ export type CountPolicy = "auto" | "exact" | "none";
 
 export type Coverage = "full" | "prefix" | "tail" | "sample" | "none";
 
+export type CoverageEnvelope = { full: boolean, degraded?: Array<CoverageReason>, sources: Array<SourceCoverage>, };
+
+export type CoverageKind = "offline" | "stale" | "degraded_feed" | "enumerating" | "reconciling" | "not_scanned" | "not_indexed" | "index_lag" | "content_pending" | "content_failed" | "listing_errors" | "truncated" | "timeout" | "generation_reset" | "content_not_replicated";
+
+export type CoverageReason = { kind: CoverageKind, severity: CoverageSeverity, detail: string, remediation?: string, };
+
+export type CoverageSeverity = "info" | "warning" | "error";
+
 export type DirectoryAggregate = { object_id: ObjectId, file_count: ApiInt, dir_count: ApiInt, logical_bytes: ApiInt, allocated_bytes: ApiInt, newest_modified: UnixNanos | null, oldest_modified: UnixNanos | null, content_pending: ApiInt, content_indexed: ApiInt, content_failed: ApiInt, content_excluded: ApiInt, generation: ApiInt, complete: boolean, };
 
 export type DirectorySummary = { file_count: ApiInt, directory_count: ApiInt, logical_bytes: ApiInt, allocated_bytes: ApiInt, newest_modified?: UnixNanos, oldest_modified?: UnixNanos, extension_counts?: { [key in string]: ApiInt }, complete: boolean, };
@@ -196,7 +204,7 @@ export type SearchBody = { q?: string | null, query?: Query | null, mode: Result
 
 export type SearchGetQuery = { q: string, mode: ResultMode | null, sort: SortField | null, desc: boolean, limit: number, cursor: string | null, explain: boolean, facets: string, count: CountPolicy, };
 
-export type SearchView = { query: Query, rendered: string, notes?: Array<string>, schema_version: number, hits: Array<Hit>, next_cursor?: string, total: TotalCount, timing: Timing, completeness: Array<SourceCompleteness>, explanation?: Explanation, facets?: Array<Facet>, warnings?: Array<string>, };
+export type SearchView = { query: Query, rendered: string, notes?: Array<string>, schema_version: number, hits: Array<Hit>, next_cursor?: string, total: TotalCount, timing: Timing, completeness: Array<SourceCompleteness>, coverage: CoverageEnvelope, explanation?: Explanation, facets?: Array<Facet>, warnings?: Array<string>, };
 
 export type SizeField = "logical" | "allocated";
 
@@ -211,6 +219,8 @@ export type SourceCompleteness = { source_id: SourceId, name: string, state: Sou
 export type SourceConcurrencyView = { source_id: SourceId, budget: number, reserved: number, peak_reserved: number, };
 
 export type SourceCounts = { objects: ApiInt, entries: ApiInt, directories: ApiInt, files: ApiInt, logical_bytes: ApiInt, allocated_bytes: ApiInt, content_pending: ApiInt, content_indexed: ApiInt, content_failed: ApiInt, content_excluded: ApiInt, content_unsupported: ApiInt, open_errors: ApiInt, };
+
+export type SourceCoverage = { source_id: SourceId, name: string, watermark?: UnixNanos, degraded?: Array<CoverageReason>, };
 
 export type SourceDetail = { generations: Array<ScanGeneration>, root_aggregate: DirectoryAggregate | null, exclusions: Array<ExclusionRow>, source: SourceRecord, counts: SourceCounts, completeness: SourceCompleteness, scan?: ScanProgress, watcher?: WatcherView, reconciliation_deferred?: ReconciliationDeferral, };
 

@@ -7,6 +7,7 @@
 pub mod archive;
 pub mod bench;
 pub mod classify;
+pub mod coverage;
 pub mod ids;
 pub mod json;
 pub mod query;
@@ -15,6 +16,7 @@ pub mod state;
 pub mod time;
 
 pub use classify::*;
+pub use coverage::*;
 pub use ids::*;
 pub use query::*;
 pub use result::*;

@@ -190,6 +190,30 @@ fn print_table(v: &SearchView, q: &str) {
             );
         }
     }
+    if r.coverage.full {
+        println!("coverage: full");
+    } else {
+        println!("coverage: degraded");
+        let response_level = r.coverage.degraded.iter().map(|d| (None, d));
+        let per_source = r
+            .coverage
+            .sources
+            .iter()
+            .flat_map(|s| s.degraded.iter().map(move |d| (Some(s.name.as_str()), d)));
+        for (source, d) in response_level.chain(per_source) {
+            println!(
+                "    [{}] {}{}: {}{}",
+                d.severity,
+                source.map(|s| format!("{s} ")).unwrap_or_default(),
+                d.kind,
+                d.detail,
+                d.remediation
+                    .as_ref()
+                    .map(|r| format!(" — {r}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
     println!("sources:");
     for c in &r.completeness {
         println!(
