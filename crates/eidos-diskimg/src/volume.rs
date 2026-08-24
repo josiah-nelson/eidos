@@ -28,6 +28,11 @@ use std::io::{Read, Seek};
 /// Record numbers below this are NTFS's own reserved metafiles.
 const FIRST_USER_RECORD: u64 = 16;
 const ROOT_RECORD: u64 = KnownNtfsFileRecordNumber::RootDirectory as u64;
+/// Fresh NTFS volumes place `$Extend` children and other implementation
+/// records above the formally reserved 0..16 range. Retain a small fixed
+/// allowance for those records so a tiny output budget can still reach user
+/// entries; the cache remains bounded by this plus `max_members`.
+const RETAINED_SYSTEM_HEADROOM: u64 = 64;
 
 /// What one NTFS partition yielded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,7 +78,18 @@ pub struct VolumeReport {
     /// single sequence of data runs.
     pub inexact_allocation_count: u64,
     pub outcome: Outcome,
-    pub truncated_reason: Option<String>,
+    /// Every independently observed reason this volume is partial.
+    pub partial_reasons: Vec<String>,
+}
+
+impl VolumeReport {
+    fn mark_partial(&mut self, reason: impl Into<String>) {
+        self.outcome = Outcome::Partial;
+        let reason = reason.into();
+        if !self.partial_reasons.contains(&reason) {
+            self.partial_reasons.push(reason);
+        }
+    }
 }
 
 /// One MFT record's raw facts, before paths are reconstructed.
@@ -214,6 +230,19 @@ fn file_names<R: Read + Seek>(file: &NtfsFile<'_>, fs: &mut R) -> Result<Option<
     Ok(Some(ParsedNames { links, fallback }))
 }
 
+/// Keep retained hard-link metadata within the same image-wide allowance as
+/// emitted members. Returns whether any links had to be discarded.
+fn cap_retained_links(links: &mut Vec<Link>, retained: &mut u64, limit: u64) -> bool {
+    let available = limit.saturating_sub(*retained);
+    let original = links.len();
+    let keep = usize::try_from(available)
+        .unwrap_or(usize::MAX)
+        .min(original);
+    links.truncate(keep);
+    *retained = retained.saturating_add(links.len() as u64);
+    keep != original
+}
+
 /// Logical and on-disk size of the unnamed `$DATA` stream.
 ///
 /// The `$FILE_NAME` copies of these sizes are only refreshed when a name
@@ -349,7 +378,7 @@ fn resolve(
                 current = parent_link.parent;
                 expected_sequence = parent_link.parent_sequence;
             }
-            None => {
+            _ => {
                 flags |= flag::ORPHAN;
                 let segment = format!("(orphan {current})");
                 bytes = bytes.saturating_add(segment.len() + 1);
@@ -386,6 +415,7 @@ fn is_metafile_link(
         return true;
     }
     let mut chain = Vec::new();
+    let mut seen = HashSet::new();
     let mut current = link.parent;
     let mut expected_sequence = link.parent_sequence;
     let verdict = loop {
@@ -395,6 +425,9 @@ fn is_metafile_link(
             break false;
         }
         let identity = (current, expected_sequence);
+        if !seen.insert(identity) {
+            break false;
+        }
         if let Some(&known) = memo.get(&identity) {
             break known;
         }
@@ -467,17 +500,15 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
         allocated_size: 0,
         inexact_allocation_count: 0,
         outcome: Outcome::Complete,
-        truncated_reason: None,
+        partial_reasons: Vec::new(),
     };
     if dirty {
-        report.outcome = Outcome::Partial;
-        report.truncated_reason = Some(
-            "NTFS volume is dirty; uncommitted filesystem changes may not be represented".into(),
+        report.mark_partial(
+            "NTFS volume is dirty; uncommitted filesystem changes may not be represented",
         );
     }
     if label_unreadable {
-        report.outcome = Outcome::Partial;
-        report.truncated_reason = Some("NTFS volume name is unreadable".into());
+        report.mark_partial("NTFS volume name is unreadable");
     }
 
     let mft = ntfs
@@ -485,32 +516,36 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
         .map_err(|e| DiskImageError::Ntfs(format!("$MFT is unreadable: {e}")))?;
     let record_size = ntfs.file_record_size().max(1) as u64;
     let cluster = ntfs.cluster_size().max(1) as u64;
-    report.mft_records = data_extent(&mft, fs, cluster)
+    let mft_size = data_extent(&mft, fs, cluster)
         .map_err(|e| DiskImageError::Ntfs(format!("$MFT data is unreadable: {e}")))?
         .ok_or_else(|| DiskImageError::Ntfs("$MFT has no unnamed data stream".into()))?
-        .size
-        / record_size;
+        .size;
+    report.mft_records = mft_size / record_size;
+    if mft_size % record_size != 0 {
+        report.mark_partial(format!(
+            "$MFT length {mft_size} is not a multiple of its {record_size}-byte record size"
+        ));
+    }
     drop(mft);
 
     let scan = report.mft_records.min(limits.max_mft_records);
     if scan < report.mft_records {
-        report.outcome = Outcome::Partial;
-        report.truncated_reason = Some(format!(
+        report.mark_partial(format!(
             "MFT record limit ({}) reached; the volume holds {}",
             limits.max_mft_records, report.mft_records
         ));
     }
 
     let mut records: HashMap<u64, Record> = HashMap::new();
+    let retained_record_limit = remaining_members.saturating_add(RETAINED_SYSTEM_HEADROOM);
+    let retained_link_limit = remaining_members.saturating_add(RETAINED_SYSTEM_HEADROOM);
+    let mut retained_links = 0u64;
     for number in 0..scan {
-        if records.len() as u64 >= *remaining_members {
-            report.outcome = Outcome::Partial;
-            report.truncated_reason.get_or_insert_with(|| {
-                format!(
-                    "aggregate member limit ({}) reached after {number} MFT records",
-                    limits.max_members
-                )
-            });
+        if records.len() as u64 >= retained_record_limit || retained_links >= retained_link_limit {
+            report.mark_partial(format!(
+                "aggregate member limit ({}) reached while retaining named records and hard links after {number} MFT records",
+                limits.max_members
+            ));
             break;
         }
         report.scanned_records += 1;
@@ -550,6 +585,12 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
                 link.name = format!("(unnamed record {number})");
             }
         }
+        if cap_retained_links(&mut links, &mut retained_links, retained_link_limit) {
+            report.mark_partial(format!(
+                "aggregate member limit ({}) reached while retaining hard links at MFT record {number}",
+                limits.max_members
+            ));
+        }
         let is_dir = file.is_directory();
         let extent = if is_dir {
             DataExtent {
@@ -573,9 +614,6 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
         };
         let info = file.info();
         let fallback_metadata = info.is_err();
-        if fallback_metadata {
-            report.fallback_metadata_count += links.len() as u64;
-        }
         let info = info.ok();
         records.insert(
             number,
@@ -599,24 +637,11 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
     }
 
     if report.unreadable_records != 0 {
-        report.outcome = Outcome::Partial;
-        report.truncated_reason.get_or_insert_with(|| {
-            format!(
-                "{} MFT records could not be decoded",
-                report.unreadable_records
-            )
-        });
+        report.mark_partial(format!(
+            "{} MFT records could not be decoded",
+            report.unreadable_records
+        ));
     }
-    if report.fallback_metadata_count != 0 {
-        report.outcome = Outcome::Partial;
-        report.truncated_reason.get_or_insert_with(|| {
-            format!(
-                "{} members use stale fallback timestamps",
-                report.fallback_metadata_count
-            )
-        });
-    }
-
     let mut memo: HashMap<(u64, u16), bool> = HashMap::new();
     let mut seen: HashSet<u64> = HashSet::new();
     let mut numbers: Vec<u64> = records.keys().copied().collect();
@@ -634,29 +659,29 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
                 continue;
             }
             if *remaining_members == 0 {
-                report.outcome = Outcome::Partial;
-                report.truncated_reason.get_or_insert_with(|| {
-                    format!("aggregate member limit ({}) reached", limits.max_members)
-                });
+                report.mark_partial(format!(
+                    "aggregate member limit ({}) reached",
+                    limits.max_members
+                ));
                 break 'records;
             }
             let (path, flags) = match resolve(number, link, &records, limits, &mut seen) {
                 Some(Resolved::Path(path, flags)) => (path, flags),
                 Some(Resolved::TooDeep) | Some(Resolved::TooLong) => {
                     report.skipped_deep += 1;
-                    report.outcome = Outcome::Partial;
-                    report.truncated_reason.get_or_insert_with(|| {
-                        format!(
-                            "path budget (depth {}, {} bytes) reached at MFT record {number}",
-                            limits.max_path_depth, limits.max_path_bytes
-                        )
-                    });
+                    report.mark_partial(format!(
+                        "path budget (depth {}, {} bytes) reached at MFT record {number}",
+                        limits.max_path_depth, limits.max_path_bytes
+                    ));
                     continue;
                 }
                 None => continue,
             };
             if flags != 0 {
                 report.suspicious_count += 1;
+            }
+            if raw.fallback_metadata {
+                report.fallback_metadata_count += 1;
             }
             let (parent, name) = match path.rsplit_once('/') {
                 Some((p, n)) => (p.to_string(), n.to_string()),
@@ -711,6 +736,12 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
         if metafile {
             report.metafile_count += 1;
         }
+    }
+    if report.fallback_metadata_count != 0 {
+        report.mark_partial(format!(
+            "{} members use stale fallback timestamps",
+            report.fallback_metadata_count
+        ));
     }
     Ok(report)
 }
@@ -818,6 +849,21 @@ mod tests {
     }
 
     #[test]
+    fn retained_hard_links_share_the_member_memory_budget() {
+        let template = record("link", ROOT_RECORD).links.pop().unwrap();
+        let mut links = vec![template; 80];
+        let mut retained = 60;
+        assert!(cap_retained_links(&mut links, &mut retained, 64));
+        assert_eq!(links.len(), 4);
+        assert_eq!(retained, 64);
+
+        let mut next = vec![record("next", ROOT_RECORD).links.pop().unwrap()];
+        assert!(cap_retained_links(&mut next, &mut retained, 64));
+        assert!(next.is_empty());
+        assert_eq!(retained, 64);
+    }
+
+    #[test]
     fn paths_are_rebuilt_from_parent_references() {
         let limits = DiskImageLimits::default();
         let records = tree(&[
@@ -904,6 +950,16 @@ mod tests {
                 assert_eq!(flags, flag::ORPHAN);
             }
             _ => panic!("stale root reference did not resolve as an orphan"),
+        }
+
+        let mut nameless = tree(&[(45, "child", 46), (46, "parent", ROOT_RECORD)]);
+        nameless.get_mut(&46).unwrap().links.clear();
+        match resolve_one(45, &nameless, &limits) {
+            Some(Resolved::Path(path, flags)) => {
+                assert_eq!(path, "(orphan 46)/child");
+                assert_eq!(flags, flag::ORPHAN);
+            }
+            _ => panic!("nameless parent did not resolve as an orphan"),
         }
     }
 
@@ -1006,5 +1062,17 @@ mod tests {
         records.get_mut(&24).unwrap().links[0].parent_sequence = 2;
         memo.clear();
         assert!(!metafile(24, &records, &mut memo));
+
+        // Corrupt ancestry cycles terminate even when the configured depth
+        // cap is effectively unbounded.
+        let cycle = tree(&[(40, "a", 41), (41, "b", 40)]);
+        let link = &cycle[&40].links[0];
+        assert!(!is_metafile_link(
+            40,
+            link,
+            &cycle,
+            &mut HashMap::new(),
+            usize::MAX
+        ));
     }
 }
