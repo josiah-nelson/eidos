@@ -28,7 +28,7 @@ pub mod schema;
 
 pub use model::*;
 
-use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
+use parking_lot::{ArcMutexGuard, Condvar, Mutex, RawMutex};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,6 +74,10 @@ pub(crate) struct WriterCoordination {
     max_wait_ns: AtomicU64,
     total_hold_ns: AtomicU64,
     max_hold_ns: AtomicU64,
+    /// Bumped after every writer permit is released; waiters (the index
+    /// follower) block on it instead of sleep-polling the outbox.
+    write_seq: Mutex<u64>,
+    write_signal: Condvar,
 }
 
 impl WriterCoordination {
@@ -97,6 +101,24 @@ impl WriterCoordination {
             guard: Some(guard),
             acquired_at: Instant::now(),
         }
+    }
+
+    fn bump_write_seq(&self) {
+        let mut seq = self.write_seq.lock();
+        *seq += 1;
+        self.write_signal.notify_all();
+    }
+
+    fn current_write_seq(&self) -> u64 {
+        *self.write_seq.lock()
+    }
+
+    fn wait_for_write(&self, last_seen: u64, timeout: std::time::Duration) -> u64 {
+        let mut seq = self.write_seq.lock();
+        if *seq == last_seen {
+            self.write_signal.wait_for(&mut seq, timeout);
+        }
+        *seq
     }
 
     fn view(&self) -> CatalogWriterStats {
@@ -130,6 +152,9 @@ impl Drop for WriterPermit {
         if let Some(guard) = self.guard.take() {
             ArcMutexGuard::unlock_fair(guard);
         }
+        // Signal after the gate is released so a woken waiter can acquire
+        // a reader immediately and observe this permit's committed writes.
+        self.coordination.bump_write_seq();
     }
 }
 
@@ -211,6 +236,22 @@ impl Catalog {
 
     pub fn writer_stats(&self) -> CatalogWriterStats {
         self.writer_coordination.view()
+    }
+
+    /// Sequence number bumped after every completed writer transaction
+    /// (shared-writer and coordinated scan batches alike). Pair with
+    /// [`Catalog::wait_for_write`] to react to catalog changes without
+    /// sleep-polling.
+    pub fn write_seq(&self) -> u64 {
+        self.writer_coordination.current_write_seq()
+    }
+
+    /// Block until a writer transaction completes after the one observed at
+    /// `last_seen`, or until `timeout` elapses. Returns the current sequence
+    /// (equal to `last_seen` on timeout). Spurious wakeups are permitted:
+    /// callers re-check their actual condition (e.g. outbox contents).
+    pub fn wait_for_write(&self, last_seen: u64, timeout: std::time::Duration) -> u64 {
+        self.writer_coordination.wait_for_write(last_seen, timeout)
     }
 
     /// Run `f` with a pooled read-only connection.
@@ -311,5 +352,37 @@ mod tests {
         assert!(after.max_wait_ms > 0.0);
         assert!(after.total_hold_ms >= after.max_hold_ms);
         assert!(after.max_hold_ms > 0.0);
+    }
+
+    #[test]
+    fn write_signal_wakes_waiter_and_times_out_idle() {
+        let coordination = Arc::new(WriterCoordination::default());
+        let seen = coordination.current_write_seq();
+
+        // Idle: the wait expires and the sequence is unchanged.
+        let started = Instant::now();
+        assert_eq!(
+            coordination.wait_for_write(seen, Duration::from_millis(50)),
+            seen
+        );
+        assert!(started.elapsed() >= Duration::from_millis(40));
+
+        // A permit released on another thread wakes the waiter early.
+        let signaling = coordination.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(signaling.acquire());
+        });
+        let woken = coordination.wait_for_write(seen, Duration::from_secs(10));
+        assert!(woken > seen);
+        writer.join().unwrap();
+
+        // A write that happened before the wait returns immediately.
+        let started = Instant::now();
+        assert_eq!(
+            coordination.wait_for_write(seen, Duration::from_secs(10)),
+            woken
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

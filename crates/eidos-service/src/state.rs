@@ -284,8 +284,13 @@ impl AppState {
         // Shed queued expensive work at once: graceful shutdown then waits
         // only for the operations that already hold a permit.
         self.admission.close();
-        for w in self.watchers.lock().values() {
-            w.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Do not hold the registry lock while cancellation waits for an
+        // in-flight watcher mutation to finish. The mutation may start a
+        // recovery scan, and shutdown should not introduce a lock-order
+        // dependency between those independent registries.
+        let watchers: Vec<_> = self.watchers.lock().values().cloned().collect();
+        for w in watchers {
+            w.request_cancel();
         }
         for p in self.scans.lock().values() {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);

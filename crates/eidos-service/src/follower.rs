@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ts_rs::TS;
 
+/// Fallback wake-up interval. The follower is event-driven — every completed
+/// catalog writer transaction signals it — so this only bounds staleness if a
+/// signal is ever missed.
 pub const FOLLOW_INTERVAL: Duration = Duration::from_millis(500);
 pub const FOLLOW_BATCH: u32 = 2000;
 
@@ -95,6 +98,14 @@ pub fn follow_once(state: &AppState) -> anyhow::Result<()> {
 }
 
 pub fn spawn_follower(state: &Arc<AppState>) {
+    spawn_follower_with_fallback(state, FOLLOW_INTERVAL);
+}
+
+/// Spawn the follower with an explicit fallback interval. Visibility is
+/// driven by the catalog's write signal; the fallback only bounds staleness
+/// if a signal is missed (tests pass a long interval to prove the signal
+/// path alone delivers visibility).
+pub fn spawn_follower_with_fallback(state: &Arc<AppState>, fallback: Duration) {
     let st = state.clone();
     std::thread::Builder::new()
         .name("index-follower".into())
@@ -102,13 +113,21 @@ pub fn spawn_follower(state: &Arc<AppState>) {
             if st.shutdown.load(Ordering::Relaxed) {
                 return;
             }
+            // Observe the write sequence before draining: a write landing
+            // while this iteration runs makes the wait below return at once,
+            // so nothing that happened mid-drain is left waiting.
+            let seen = st.catalog.write_seq();
             if let Err(e) = follow_once(&st) {
                 tracing::error!(error = %e, "index follower iteration failed");
                 *st.follower.last_error.lock() = Some(e.to_string());
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
-            std::thread::sleep(FOLLOW_INTERVAL);
+            // A batch-limited drain leaves rows pending: loop immediately.
+            if st.catalog.outbox_pending().unwrap_or(0) > 0 {
+                continue;
+            }
+            st.catalog.wait_for_write(seen, fallback);
         })
         .expect("spawn follower");
 }

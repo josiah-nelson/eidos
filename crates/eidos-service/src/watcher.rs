@@ -39,10 +39,12 @@ pub enum WatcherState {
     Stopped,
 }
 
-#[derive(Debug)]
 pub struct WatcherStatus {
     pub source_id: SourceId,
     pub cancel: AtomicBool,
+    /// Serialises cancellation with watcher-owned catalog mutations. Once
+    /// `request_cancel` returns, no later watcher mutation can begin.
+    mutation_gate: Mutex<()>,
     state: Mutex<(WatcherState, Option<String>)>,
     pub started: Instant,
     pub batches: AtomicU64,
@@ -52,6 +54,8 @@ pub struct WatcherStatus {
     pub last_usn: AtomicI64,
     last_batch: Mutex<Option<Instant>>,
     last_apply_ms: AtomicU64,
+    #[cfg(windows)]
+    journal_cancel: eidos_scanner::usn::JournalCancellation,
 }
 
 #[derive(Debug, Clone, serde::Serialize, TS)]
@@ -74,6 +78,7 @@ impl WatcherStatus {
         Self {
             source_id,
             cancel: AtomicBool::new(false),
+            mutation_gate: Mutex::new(()),
             state: Mutex::new((WatcherState::Starting, None)),
             started: Instant::now(),
             batches: AtomicU64::new(0),
@@ -83,6 +88,25 @@ impl WatcherStatus {
             last_usn: AtomicI64::new(0),
             last_batch: Mutex::new(None),
             last_apply_ms: AtomicU64::new(0),
+            #[cfg(windows)]
+            journal_cancel: eidos_scanner::usn::JournalCancellation::new()
+                .expect("create journal cancellation event"),
+        }
+    }
+
+    pub fn request_cancel(&self) {
+        let _mutation = self.mutation_gate.lock();
+        self.cancel.store(true, Ordering::Release);
+        #[cfg(windows)]
+        self.journal_cancel.cancel();
+    }
+
+    fn mutation_guard<'a>(&'a self, state: &AppState) -> Option<parking_lot::MutexGuard<'a, ()>> {
+        let guard = self.mutation_gate.lock();
+        if self.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(guard)
         }
     }
 
@@ -144,8 +168,9 @@ pub fn ensure_watcher(state: &Arc<AppState>, source_id: SourceId) -> Arc<Watcher
 }
 
 pub fn stop_watcher(state: &AppState, source_id: SourceId) {
-    if let Some(w) = state.watchers.lock().get(&source_id) {
-        w.cancel.store(true, Ordering::Relaxed);
+    let watcher = state.watchers.lock().get(&source_id).cloned();
+    if let Some(w) = watcher {
+        w.request_cancel();
     }
 }
 
@@ -173,7 +198,7 @@ impl UsnCheckpoint {
 
 #[cfg(windows)]
 fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStatus>) {
-    use eidos_scanner::usn::{read_journal, ReadOutcome, UsnError, VolumeHandle};
+    use eidos_scanner::usn::{read_journal_wait, ReadOutcome, UsnError, VolumeHandle};
 
     let mut buf = vec![0u8; 1024 * 1024];
     let mut vol: Option<VolumeHandle> = None;
@@ -183,7 +208,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
         status.set(WatcherState::Stopped, Some(reason));
     };
     loop {
-        if status.cancel.load(Ordering::Relaxed) || state.shutdown.load(Ordering::Relaxed) {
+        if status.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
             stop(&status, "cancelled".into());
             return;
         }
@@ -245,7 +270,14 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                     std::thread::sleep(POLL_INTERVAL);
                     continue;
                 }
-                match scanner::start_feed_recovery_scan(&state, source_id, UnixNanos::now()) {
+                let recovery = {
+                    let Some(_mutation) = status.mutation_guard(&state) else {
+                        stop(&status, "cancelled".into());
+                        return;
+                    };
+                    scanner::start_feed_recovery_scan(&state, source_id, UnixNanos::now())
+                };
+                match recovery {
                     Ok(scanner::AutomaticScanOutcome::Started(_)) => {
                         status.set(
                             WatcherState::Reconciling,
@@ -266,11 +298,15 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             }
         };
         if vol.is_none() {
-            match VolumeHandle::open(&cp.volume_root) {
+            match VolumeHandle::open_waitable(&cp.volume_root) {
                 Ok(v) => vol = Some(v),
                 Err(e) => {
                     io_failures += 1;
                     if io_failures == 5 {
+                        let Some(_mutation) = status.mutation_guard(&state) else {
+                            stop(&status, "cancelled".into());
+                            return;
+                        };
                         let _ = state.catalog.set_source_state(
                             source_id,
                             SourceState::Offline,
@@ -287,8 +323,23 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             }
         }
         let v = vol.as_ref().expect("opened");
-        match read_journal(v, cp.journal_id, cp.next_usn, &mut buf) {
+        // Block until either records arrive or the persistent cancellation
+        // event is signaled. No timing window can lose a shutdown request.
+        match read_journal_wait(
+            v,
+            cp.journal_id,
+            cp.next_usn,
+            &mut buf,
+            &status.journal_cancel,
+        ) {
             Ok(ReadOutcome::Records { records, next_usn }) => {
+                // The cancellation may arrive after the scanner's final
+                // check but before this thread regains control. Discard the
+                // completed batch rather than mutate a stopped source.
+                if status.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
+                    stop(&status, "cancelled".into());
+                    return;
+                }
                 io_failures = 0;
                 if records.is_empty() {
                     if next_usn != cp.next_usn {
@@ -296,11 +347,18 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                             next_usn,
                             ..cp.clone()
                         };
-                        match state.catalog.advance_feed_checkpoint(
-                            source_id,
-                            &cp.to_checkpoint(),
-                            &next_cp.to_checkpoint(),
-                        ) {
+                        let advance = {
+                            let Some(_mutation) = status.mutation_guard(&state) else {
+                                stop(&status, "cancelled".into());
+                                return;
+                            };
+                            state.catalog.advance_feed_checkpoint(
+                                source_id,
+                                &cp.to_checkpoint(),
+                                &next_cp.to_checkpoint(),
+                            )
+                        };
+                        match advance {
                             Ok(true) => {
                                 status.last_usn.store(next_usn, Ordering::Relaxed);
                             }
@@ -320,7 +378,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         }
                     }
                     status.set(WatcherState::Live, None);
-                    std::thread::sleep(POLL_INTERVAL);
+                    // No sleep: the next read blocks until records arrive.
                     continue;
                 }
                 let started = Instant::now();
@@ -363,10 +421,16 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 };
                 let expected_cp = cp.to_checkpoint();
                 let next_cp = new_cp.to_checkpoint();
-                match state
-                    .catalog
-                    .apply_feed_changes(source_id, &events, &expected_cp, &next_cp)
-                {
+                let apply = {
+                    let Some(_mutation) = status.mutation_guard(&state) else {
+                        stop(&status, "cancelled".into());
+                        return;
+                    };
+                    state
+                        .catalog
+                        .apply_feed_changes(source_id, &events, &expected_cp, &next_cp)
+                };
+                match apply {
                     Ok(Some(astats)) => {
                         status.batches.fetch_add(1, Ordering::Relaxed);
                         status.events.fetch_add(astats.events, Ordering::Relaxed);
@@ -388,6 +452,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                             "applied change batch"
                         );
                         if source.state == SourceState::Offline {
+                            let Some(_mutation) = status.mutation_guard(&state) else {
+                                stop(&status, "cancelled".into());
+                                return;
+                            };
                             let _ = restore_state(&state, source_id);
                         }
                     }
@@ -405,16 +473,28 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 }
             }
             Ok(ReadOutcome::EntryDeleted) | Ok(ReadOutcome::JournalChanged) => {
+                if status.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
+                    stop(&status, "cancelled".into());
+                    return;
+                }
                 let reason = "USN journal overflowed or was recreated; reconciling".to_string();
                 tracing::warn!(source = source_id.0, reason, "change feed invalid");
-                let _ =
-                    state
-                        .catalog
-                        .set_source_state(source_id, SourceState::Degraded, Some(&reason));
-                let _ = state.catalog.clear_checkpoint(source_id);
+                let recovery = {
+                    let Some(_mutation) = status.mutation_guard(&state) else {
+                        stop(&status, "cancelled".into());
+                        return;
+                    };
+                    let _ = state.catalog.set_source_state(
+                        source_id,
+                        SourceState::Degraded,
+                        Some(&reason),
+                    );
+                    let _ = state.catalog.clear_checkpoint(source_id);
+                    scanner::start_feed_recovery_scan(&state, source_id, UnixNanos::now())
+                };
                 status.set(WatcherState::Reconciling, Some(reason));
                 vol = None;
-                match scanner::start_feed_recovery_scan(&state, source_id, UnixNanos::now()) {
+                match recovery {
                     Ok(scanner::AutomaticScanOutcome::Started(_)) => {
                         status.reconciles.fetch_add(1, Ordering::Relaxed);
                     }
@@ -434,11 +514,21 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             }
             Err(e @ (UsnError::NotActive | UsnError::AccessDenied | UsnError::Unsupported)) => {
                 let reason = format!("{e}; falling back to periodic reconciliation");
-                let _ = state.catalog.clear_checkpoint(source_id);
-                let _ = state
-                    .catalog
-                    .set_source_state(source_id, source.state, Some(&reason));
+                {
+                    let Some(_mutation) = status.mutation_guard(&state) else {
+                        stop(&status, "cancelled".into());
+                        return;
+                    };
+                    let _ = state.catalog.clear_checkpoint(source_id);
+                    let _ = state
+                        .catalog
+                        .set_source_state(source_id, source.state, Some(&reason));
+                }
                 stop(&status, reason);
+                return;
+            }
+            Err(UsnError::Cancelled) => {
+                stop(&status, "cancelled".into());
                 return;
             }
             Err(UsnError::Io(e)) => {
@@ -446,6 +536,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 tracing::warn!(source = source_id.0, error = %e, failures = io_failures, "journal read failed");
                 vol = None;
                 if io_failures >= 5 {
+                    let Some(_mutation) = status.mutation_guard(&state) else {
+                        stop(&status, "cancelled".into());
+                        return;
+                    };
                     let _ = state.catalog.set_source_state(
                         source_id,
                         SourceState::Offline,
@@ -790,6 +884,32 @@ fn reconcile_tick_at(state: &Arc<AppState>, now: UnixNanos) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::WatcherStatus;
+    use eidos_domain::SourceId;
+    use std::sync::atomic::Ordering;
+    use std::sync::{mpsc, Arc};
+
+    #[test]
+    fn cancellation_waits_for_an_inflight_watcher_mutation() {
+        let status = Arc::new(WatcherStatus::new(SourceId(1)));
+        let mutation = status.mutation_gate.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let cancelling = status.clone();
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            cancelling.request_cancel();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(!status.cancel.load(Ordering::Acquire));
+        drop(mutation);
+        thread.join().unwrap();
+        assert!(status.cancel.load(Ordering::Acquire));
+    }
 }
 
 #[cfg(test)]
