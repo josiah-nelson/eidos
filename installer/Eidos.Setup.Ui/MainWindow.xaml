@@ -153,11 +153,11 @@
         <StackPanel Orientation="Horizontal">
           <TextBox Width="90" Text="{Binding Port, UpdateSourceTrigger=PropertyChanged}" />
           <TextBlock Margin="12,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource Muted}">
-            <Run Text="eidos will open at " /><Run Text="{Binding Url, Mode=OneWay}" FontFamily="Consolas" />
+            <Run Text="eidos will open at " /><Run Text="{Binding Url, Mode=OneWay}" FontFamily="Consolas" /><Run Text=" " /><Run Text="{Binding UrlNote, Mode=OneWay}" />
           </TextBlock>
         </StackPanel>
-        <Expander Header="Advanced: listen address" Margin="0,16,0,0" FontSize="13" Foreground="{StaticResource Ink}">
-          <StackPanel Margin="20,8,0,0">
+        <Expander Header="Advanced: listen address" Margin="0,16,0,0" FontSize="13" Foreground="{StaticResource Ink}" HorizontalContentAlignment="Stretch">
+          <StackPanel Margin="20,8,0,0" HorizontalAlignment="Stretch">
             <TextBlock Foreground="{StaticResource Muted}" FontSize="12">
               127.0.0.1 keeps eidos reachable only from this computer. 0.0.0.0 answers on every network adapter; a specific address answers on that adapter only.
             </TextBlock>
@@ -171,10 +171,8 @@
 
     <DataTemplate x:Key="Account">
       <StackPanel>
-        <RadioButton GroupName="acct" IsChecked="{Binding IsLocalSystem}" Content="LocalSystem (local disks only)" />
-        <RadioButton GroupName="acct" IsChecked="{Binding IsLocalService}" Content="Local Service (least privilege)" />
-        <RadioButton GroupName="acct" IsChecked="{Binding IsNetworkService}" Content="Network Service" />
-        <RadioButton GroupName="acct" IsChecked="{Binding IsUserAccount}" Content="This Windows account (needed for network shares)" />
+        <RadioButton GroupName="acct" IsChecked="{Binding IsLocalSystem}" Content="The system account (local disks only)" />
+        <RadioButton GroupName="acct" IsChecked="{Binding IsUserAccount}" Content="A Windows account (needed for network shares)" />
         <Grid Margin="24,8,0,0" IsEnabled="{Binding IsUserAccount}">
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="Auto" />
@@ -292,7 +290,7 @@
     </Border>
 
     <!-- page -->
-    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Padding="32,16,32,16">
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="32,16,32,16">
       <ContentControl Style="{StaticResource PageHost}" Focusable="False" />
     </ScrollViewer>
 

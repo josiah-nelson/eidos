@@ -98,6 +98,7 @@ namespace Eidos.Setup
             ba.DetectBegin += this.OnDetectBegin;
             ba.DetectRelatedBundle += this.OnDetectRelatedBundle;
             ba.DetectComplete += this.OnDetectComplete;
+            ba.PlanPackageBegin += this.OnPlanPackageBegin;
             ba.PlanComplete += this.OnPlanComplete;
             ba.ApplyBegin += this.OnApplyBegin;
             ba.Progress += this.OnProgress;
@@ -328,7 +329,7 @@ namespace Eidos.Setup
                 if (this.Set(ref this.bind, (value ?? "").Trim()))
                 {
                     this.Validation = null;
-                    this.Raise(nameof(this.BindWarning), nameof(this.Url), nameof(this.SummaryText));
+                    this.Raise(nameof(this.BindWarning), nameof(this.Url), nameof(this.UrlNote), nameof(this.SummaryText));
                 }
             }
         }
@@ -347,7 +348,7 @@ namespace Eidos.Setup
                 if (this.Set(ref this.port, (value ?? "").Trim()))
                 {
                     this.Validation = null;
-                    this.Raise(nameof(this.Url), nameof(this.SummaryText));
+                    this.Raise(nameof(this.Url), nameof(this.UrlNote), nameof(this.SummaryText));
                 }
             }
         }
@@ -360,6 +361,13 @@ namespace Eidos.Setup
                 return $"http://{host}:{this.port}/";
             }
         }
+
+        /// <summary>What the URL means for the chosen listen address.</summary>
+        public string UrlNote => this.bind == "0.0.0.0" || this.bind == "::"
+            ? $"on this computer, and on every network adapter at port {this.port}"
+            : this.bind == "127.0.0.1" || this.bind == "::1" || string.IsNullOrEmpty(this.bind)
+                ? "on this computer only"
+                : "on that adapter only";
 
         public AccountKind Account
         {
@@ -389,10 +397,6 @@ namespace Eidos.Setup
                 {
                     case AccountKind.LocalSystem:
                         return "Full access to every local drive. No network identity: mapped drives and \\\\server\\share paths are not visible, so only local disks can be indexed.";
-                    case AccountKind.LocalService:
-                        return "Least privilege. Sees local files that Everyone can read; the data folder is granted explicitly. Anonymous on the network.";
-                    case AccountKind.NetworkService:
-                        return "Least privilege locally; presents the computer's identity on the network, which works for shares that trust this computer's account.";
                     case AccountKind.User:
                         return "Runs as you (or another user). The service sees exactly what that account can open, including network shares it has access to. The password is stored by Windows for the service, never by eidos.";
                     default:
@@ -849,6 +853,18 @@ namespace Eidos.Setup
                 this.Page = Page.Welcome;
             }
             this.Requery();
+        }
+
+        private void OnPlanPackageBegin(object sender, PlanPackageBeginEventArgs e)
+        {
+            // The .NET Framework prerequisite exists for the fallback BA that
+            // runs when this UI cannot start. If we are running, it is
+            // satisfied: leave it out of the plan so a per-user install never
+            // touches the per-machine package cache (which needs elevation).
+            if (e.PackageId.StartsWith("NetFx", StringComparison.OrdinalIgnoreCase))
+            {
+                e.State = RequestState.None;
+            }
         }
 
         private void OnPlanComplete(object sender, PlanCompleteEventArgs e)
