@@ -7,15 +7,21 @@
 
 #[cfg(test)]
 mod fixture;
+pub mod partition;
 pub mod vhdx;
 
 use serde::{Deserialize, Serialize};
 
+pub use partition::{Partition, PartitionScheme};
 pub use vhdx::{ParentLocator, PayloadKind, VhdxDisk, VhdxInfo};
 
 /// Resource budgets applied while opening one image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskImageLimits {
+    /// Partition-table entries examined.
+    pub max_partitions: usize,
+    /// GPT partition-array bytes checksummed before entries are trusted.
+    pub max_partition_table_bytes: u64,
     /// Region-table entries accepted (the VHDX specification's own cap).
     pub max_region_entries: u32,
     /// Metadata-table entries accepted (likewise).
@@ -32,6 +38,8 @@ pub struct DiskImageLimits {
 impl Default for DiskImageLimits {
     fn default() -> Self {
         Self {
+            max_partitions: 128,
+            max_partition_table_bytes: 16 * 1024 * 1024,
             max_region_entries: 2047,
             max_metadata_entries: 2047,
             max_virtual_size: 64 << 40,

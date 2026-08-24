@@ -7,5 +7,6 @@ license.workspace = true
 description = "Read-only inventory of NTFS filesystems inside VHDX disk images, without booting them"
 
 [dependencies]
+crc32fast = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
