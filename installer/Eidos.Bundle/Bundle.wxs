@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  eidos-setup.exe: the guided installer.
+
+  The bundle owns the user experience (installer\Eidos.Setup.Ui) and drives
+  eidos.msi, a dual-scope package: the UI decides per-user or per-machine and
+  passes every choice through the variables below. The same variables are
+  overridable from the command line for unattended installs:
+
+    eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_PORT=7700
+    eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_DATA=1
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+
+  <Bundle Id="Eidos.Indexer.Setup"
+          Name="eidos"
+          Manufacturer="eidos"
+          Version="$(var.Version)"
+          IconSourceFile="..\Eidos.Msi\eidos.ico"
+          AboutUrl="https://github.com/josiah-nelson/eidos"
+          HelpUrl="https://github.com/josiah-nelson/eidos/blob/main/docs/overview.md"
+          Condition="VersionNT64"
+          Compressed="yes"
+          DisableModify="no">
+
+    <bal:Condition Condition="VersionNT64" Message="eidos requires 64-bit Windows 10 or later." />
+
+    <!-- Choices made in the UI, or given on the command line for /quiet. -->
+    <Variable Name="EIDOS_SCOPE" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_INSTALLDIR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_DATADIR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_BIND" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_PORT" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_SERVICE_ACCOUNT_KIND" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_SERVICE_DOMAIN" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_SERVICE_USER" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_SERVICE_PASSWORD" Value="" Hidden="yes" bal:Overridable="yes" />
+    <Variable Name="EIDOS_START_SERVICE" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_START_MENU" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_REMOVE_DATA" Value="" bal:Overridable="yes" />
+
+    <BootstrapperApplication SourceFile="$(var.BaDir)\eidos-setup-ui.exe">
+      <Payload SourceFile="$(var.BaDir)\eidos-setup-ui.exe.config" />
+      <Payload SourceFile="$(var.BaDir)\WixToolset.BootstrapperApplicationApi.dll" />
+      <Payload SourceFile="$(var.BaDir)\mbanative.dll" />
+      <!-- Runs only if the UI cannot start (no .NET Framework 4.7.2): installs it, then retries. -->
+      <bal:WixPrerequisiteBootstrapperApplication />
+    </BootstrapperApplication>
+
+    <Chain>
+      <PackageGroupRef Id="NetFx472WebAsPrereq" />
+
+      <MsiPackage Id="EidosMsi" SourceFile="$(var.MsiPath)" Vital="yes" Compressed="yes" Visible="no">
+        <MsiProperty Name="EIDOS_INSTALLDIR" Value="[EIDOS_INSTALLDIR]" Condition="EIDOS_INSTALLDIR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_DATADIR" Value="[EIDOS_DATADIR]" Condition="EIDOS_DATADIR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_BIND" Value="[EIDOS_BIND]" Condition="EIDOS_BIND &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_PORT" Value="[EIDOS_PORT]" Condition="EIDOS_PORT &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_SERVICE_ACCOUNT_KIND" Value="[EIDOS_SERVICE_ACCOUNT_KIND]" Condition="EIDOS_SERVICE_ACCOUNT_KIND &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_SERVICE_DOMAIN" Value="[EIDOS_SERVICE_DOMAIN]" Condition="EIDOS_SERVICE_DOMAIN &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_SERVICE_USER" Value="[EIDOS_SERVICE_USER]" Condition="EIDOS_SERVICE_USER &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_SERVICE_PASSWORD" Value="[EIDOS_SERVICE_PASSWORD]" Condition="EIDOS_SERVICE_PASSWORD &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_START_SERVICE" Value="[EIDOS_START_SERVICE]" Condition="EIDOS_START_SERVICE &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_START_MENU" Value="[EIDOS_START_MENU]" Condition="EIDOS_START_MENU &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_REMOVE_DATA" Value="[EIDOS_REMOVE_DATA]" Condition="EIDOS_REMOVE_DATA &lt;&gt; &quot;&quot;" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

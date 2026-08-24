@@ -59,3 +59,24 @@ Step "dotnet build Eidos.Msi" {
         -p:Version=$msiVersion -p:BinDir=$binDir -p:OutDir="$out\"
 }
 Write-Host "MSI: $out\eidos.msi" -ForegroundColor Green
+
+# The setup UI (.NET Framework 4.7.2 WPF bootstrapper application).
+$baDir = Join-Path $PSScriptRoot "Eidos.Setup.Ui\bin\$Configuration\net472"
+Step "dotnet build Eidos.Setup.Ui" {
+    dotnet build (Join-Path $PSScriptRoot "Eidos.Setup.Ui\Eidos.Setup.Ui.csproj") `
+        -c $Configuration -nologo -v minimal -p:Version=$msiVersion
+}
+foreach ($required in @("eidos-setup-ui.exe", "WixToolset.BootstrapperApplicationApi.dll", "mbanative.dll")) {
+    if (-not (Test-Path (Join-Path $baDir $required))) { throw "setup UI build is missing $required in $baDir" }
+}
+
+# The bundle: eidos-setup.exe = Burn engine + UI + eidos.msi.
+foreach ($stale in @("Eidos.Bundle\obj", "Eidos.Bundle\bin")) {
+    Remove-Item -Recurse -Force (Join-Path $PSScriptRoot $stale) -ErrorAction SilentlyContinue
+}
+Step "dotnet build Eidos.Bundle" {
+    dotnet build (Join-Path $PSScriptRoot "Eidos.Bundle\Eidos.Bundle.wixproj") `
+        -c $Configuration -nologo -v minimal `
+        -p:Version=$msiVersion -p:MsiPath="$out\eidos.msi" -p:BaDir=$baDir -p:OutDir="$out\"
+}
+Write-Host "Setup: $out\eidos-setup.exe" -ForegroundColor Green
