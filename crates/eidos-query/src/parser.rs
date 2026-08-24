@@ -137,6 +137,12 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, ParseError> {
                     word.push(chars[i]);
                     i += 1;
                 }
+                if i < chars.len() && !chars[i].is_whitespace() && !matches!(chars[i], '(' | ')') {
+                    return Err(ParseError {
+                        message: "unexpected characters after regex flags".into(),
+                        position: i,
+                    });
+                }
                 continue;
             }
             word.push(c);
@@ -1060,11 +1066,15 @@ mod tests {
 
     #[test]
     fn invalid_regex_is_rejected_during_parse() {
-        // Minimized hosted-fuzz input: the token shape used its final slash as
-        // a delimiter and left the actual pattern with an unmatched `\`.
-        let error = parse("//\0\0\0.C:ҍ\\/.fi").unwrap_err();
+        let error = parse("name:/(unclosed/").unwrap_err();
         assert!(error.message.contains("invalid regex"), "{error}");
-        assert!(parse(r#"//\/.fi"#).is_err());
+
+        // Minimized hosted-fuzz inputs that previously let bytes after one
+        // closed regex make `text_clause` reinterpret a later slash as the
+        // delimiter. Regex flags are now the only bytes allowed before the
+        // token boundary.
+        assert!(parse("//\0\0\0.C:ҍ\\/.fi").is_err());
+        assert!(parse(r#"/na//\/\\/.fi"#).is_err());
     }
 
     #[test]
