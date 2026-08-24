@@ -386,6 +386,21 @@ impl Parser {
                 let pattern = &rest[..end];
                 let flags = &rest[end + 1..];
                 let cs = flags.contains('c');
+                let max_regex_len = QueryLimits::default().max_regex_len;
+                if pattern.len() > max_regex_len {
+                    return Err(ParseError {
+                        message: format!("regex is too long ({} > {max_regex_len})", pattern.len()),
+                        position: pos,
+                    });
+                }
+                regex::RegexBuilder::new(pattern)
+                    .case_insensitive(!cs)
+                    .size_limit(1 << 20)
+                    .build()
+                    .map_err(|error| ParseError {
+                        message: format!("invalid regex: {error}"),
+                        position: pos,
+                    })?;
                 return Ok(Query::Text {
                     field,
                     mode: TextMode::Regex,
@@ -1041,6 +1056,15 @@ mod tests {
                 names: vec!["G".into()]
             }
         );
+    }
+
+    #[test]
+    fn invalid_regex_is_rejected_during_parse() {
+        // Minimized hosted-fuzz input: the token shape used its final slash as
+        // a delimiter and left the actual pattern with an unmatched `\`.
+        let error = parse("//\0\0\0.C:ҍ\\/.fi").unwrap_err();
+        assert!(error.message.contains("invalid regex"), "{error}");
+        assert!(parse(r#"//\/.fi"#).is_err());
     }
 
     #[test]
