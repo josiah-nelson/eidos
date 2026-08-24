@@ -132,8 +132,10 @@ pub fn render(q: &Query) -> String {
                     TextField::Content => "content:",
                 };
                 let bare_or_quoted = |v: &str| {
-                    if v.chars()
-                        .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"'))
+                    if v.starts_with('-')
+                        || matches!(v, "NOT" | "!" | "OR" | "|" | "AND" | "&&")
+                        || v.chars()
+                            .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"'))
                     {
                         quoted(v)
                     } else {
@@ -438,6 +440,7 @@ mod tests {
             r#"fixture_field:"alpha beta""#,
             r#"content:alpha" beta""#,
             r#"C:\fixture\file?.txt"#,
+            "--fixture",
         ] {
             let parsed = parse(input).unwrap();
             let rendered = render(&parsed.query);
