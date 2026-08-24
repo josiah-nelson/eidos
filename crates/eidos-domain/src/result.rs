@@ -22,6 +22,10 @@ pub struct SearchResponse {
     pub timing: Timing,
     /// One entry per source in scope, always present.
     pub completeness: Vec<SourceCompleteness>,
+    /// Typed summary of everything that degraded this answer. Clients branch
+    /// on this; `completeness` carries the raw per-source facts.
+    #[serde(default)]
+    pub coverage: crate::coverage::CoverageEnvelope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub explanation: Option<Explanation>,
@@ -345,6 +349,7 @@ mod tests {
             },
             timing: Timing::default(),
             completeness: vec![mk(true, false)],
+            coverage: crate::coverage::CoverageEnvelope::default(),
             explanation: None,
             facets: vec![],
             warnings: vec![],

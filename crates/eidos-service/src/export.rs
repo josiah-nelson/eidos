@@ -208,6 +208,7 @@ pub(crate) struct ExportHeader {
     exported_at: String,
     total: eidos_domain::TotalCount,
     max_rows: u64,
+    coverage: eidos_domain::CoverageEnvelope,
     completeness: Vec<eidos_domain::SourceCompleteness>,
     warnings: Vec<String>,
 }
@@ -382,6 +383,7 @@ async fn start(st: Arc<AppState>, p: Plan) -> Result<Response, ApiError> {
     let first = fetch_page(&st, &p.req).await?;
 
     let total = first.total;
+    let coverage_full = first.coverage.full;
     let format = p.format;
     let max_rows = p.max_rows;
     // Capacity 1: the producer may prepare at most one page beyond the one the
@@ -417,6 +419,12 @@ async fn start(st: Arc<AppState>, p: Plan) -> Result<Response, ApiError> {
     h.insert(
         "x-eidos-export-total-exact",
         HeaderValue::from_static(if total.exact { "true" } else { "false" }),
+    );
+    // CSV has no metadata envelope, and the CLI must be able to decide its
+    // completeness exit status without buffering JSON/NDJSON bodies.
+    h.insert(
+        "x-eidos-export-coverage-full",
+        HeaderValue::from_static(if coverage_full { "true" } else { "false" }),
     );
     Ok(resp)
 }
@@ -478,6 +486,7 @@ async fn produce(
     let mut emitted: u64 = 0;
     let mut truncated = false;
     let mut error: Option<String> = None;
+    let coverage = first.coverage.clone();
     let mut page = first;
     let mut cancelled = false;
     loop {
@@ -508,8 +517,20 @@ async fn produce(
         let mut req = p.req.clone();
         req.cursor = Some(cursor);
         match fetch_page(&st, &req).await {
-            Ok(next) if next.hits.is_empty() => break,
-            Ok(next) => page = next,
+            Ok(next) => {
+                if coverage_contract_changed(&coverage, &next.coverage) {
+                    let message =
+                        "search coverage changed while the export was streaming".to_owned();
+                    tracing::error!(error = %message, "export walk ended early");
+                    error = Some(message);
+                    truncated = true;
+                    break;
+                }
+                if next.hits.is_empty() {
+                    break;
+                }
+                page = next;
+            }
             Err(e) => {
                 tracing::error!(error = %e.message, "export walk ended early");
                 error = Some(e.message);
@@ -544,6 +565,27 @@ async fn produce(
     } else {
         st.export_stats.cancelled.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Coverage is part of the export header and cannot be revised once the body
+/// starts streaming. Watermarks for healthy sources naturally advance between
+/// pages, but source membership and every degradation fact must stay stable;
+/// otherwise a completed download would misstate what corpus it represents.
+fn coverage_contract_changed(
+    initial: &eidos_domain::CoverageEnvelope,
+    next: &eidos_domain::CoverageEnvelope,
+) -> bool {
+    initial.full != next.full
+        || initial.degraded != next.degraded
+        || initial.sources.len() != next.sources.len()
+        || initial.sources.iter().any(|source| {
+            next.sources
+                .iter()
+                .find(|candidate| candidate.source_id == source.source_id)
+                .is_none_or(|candidate| {
+                    candidate.name != source.name || candidate.degraded != source.degraded
+                })
+        })
 }
 
 // ----- rows ----------------------------------------------------------------
@@ -668,6 +710,7 @@ fn write_header(out: &mut Vec<u8>, p: &Plan, first: &SearchResponse) {
         exported_at: UnixNanos::now().to_rfc3339_nanos(),
         total: first.total,
         max_rows: p.max_rows,
+        coverage: first.coverage.clone(),
         completeness: first.completeness.clone(),
         warnings: first.warnings.clone(),
     };

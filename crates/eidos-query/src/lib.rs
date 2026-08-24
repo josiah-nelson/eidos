@@ -240,6 +240,11 @@ pub fn render(q: &Query) -> String {
                     .iter()
                     .map(|v| if v.is_empty() {
                         "none".to_string()
+                    } else if v
+                        .chars()
+                        .any(|c| c.is_whitespace() || matches!(c, '\\' | '"' | '(' | ')'))
+                    {
+                        quoted(v)
                     } else {
                         v.clone()
                     })
@@ -273,7 +278,10 @@ pub fn render(q: &Query) -> String {
                     TimeField::Changed => "chtime",
                     TimeField::Accessed => "atime",
                 };
-                let day = |t: eidos_domain::UnixNanos| t.to_rfc3339();
+                // Rendering is a lossless AST round trip. Millisecond text
+                // would collapse sub-millisecond exclusive bounds produced
+                // by relative queries such as `mtime:0m`.
+                let day = |t: eidos_domain::UnixNanos| t.to_rfc3339_nanos();
                 out.push(time_range_text(key, after.map(day), before.map(day)));
             }
             Query::Attributes { all_of, none_of } => {
@@ -471,6 +479,7 @@ mod tests {
             "in:fixture",
             "attr:hidden,system",
             "mtime:2026-01-01..2026-01-03",
+            "fixtuxtr e:r\"kure_fieldC:Lctu\\\\\\f2ile?.txt\nd:\"alph\u{17}\u{5}ſſUa",
         ] {
             let parsed = parse(input).unwrap();
             let rendered = render(&parsed.query);
@@ -515,7 +524,16 @@ mod tests {
         let q = parse("mtime:>=2026-08-16 mtime:<2026-08-23").unwrap().query;
         assert_eq!(
             render(&q),
-            "mtime:>=2026-08-16T00:00:00.000Z mtime:<2026-08-23T00:00:00.000Z"
+            "mtime:>=2026-08-16T00:00:00.000000000Z mtime:<2026-08-23T00:00:00.000000000Z"
         );
+    }
+
+    #[test]
+    fn relative_time_ranges_keep_sub_millisecond_bounds() {
+        let now = eidos_domain::UnixNanos(1_787_000_000_000_000_000);
+        let q = parser::parse_at("in:fmi m m:0m", now).unwrap().query;
+        let rendered = render(&q);
+        assert!(rendered.contains(".000000001Z"), "{rendered}");
+        assert_eq!(parser::parse_at(&rendered, now).unwrap().query, q);
     }
 }

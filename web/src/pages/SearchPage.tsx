@@ -14,7 +14,8 @@ import {
   type SearchResponse,
   type SortField,
 } from '../api'
-import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
+import { ContentBadge, CoverageBanners, ErrorBox } from '../components'
+import { mergeCoverage } from '../coverage'
 import { ContentPreviewPanel } from '../ContentPreview'
 import { bytes, count, duration, when } from '../format'
 import { PresentationLog, track } from '../interactions'
@@ -91,6 +92,12 @@ export default function SearchPage() {
     () => Array.from(new Set(results.data?.pages.flatMap((p) => p.warnings ?? []) ?? [])),
     [results.data],
   )
+  // Coverage can also degrade on a later page (a source dropping offline
+  // mid-walk, lag appearing). The rendered rows span every loaded page, so
+  // the banner merges every page's envelope: full only if every page was
+  // full, with distinct reasons unioned (per source from that source's
+  // entries) and watermarks from the newest page.
+  const coverage = useMemo(() => mergeCoverage(results.data?.pages ?? []), [results.data])
 
   // Record the hits of every page of results this query returned, once per
   // distinct set of hits. A page is the unit the server rendered; the same
@@ -253,9 +260,7 @@ export default function SearchPage() {
       {first && (
         <div className="results">
           <div className="results-main">
-            {first.completeness.map((c) => (
-              <CompletenessBanner key={c.source_id} c={c} />
-            ))}
+            {coverage && <CoverageBanners coverage={coverage} />}
             {warnings.map((w, i) => (
               <div key={i} className="banner warn">
                 <span className="badge warn">warning</span>

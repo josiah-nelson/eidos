@@ -1,8 +1,9 @@
 //! `eidos search` — runs a query against the running service over HTTP so the
 //! CLI and the web UI share one query contract and result schema.
 //!
-//! Exit status: 0 = complete results; 2 = results returned but at least one
-//! in-scope source is incomplete/stale/offline; 1 = error.
+//! Exit status: 0 = full coverage (nothing degraded the answer); 2 = results
+//! returned but coverage is degraded (offline/stale/unscanned source, index
+//! lag, truncated totals, content backlog for a content query); 1 = error.
 
 use anyhow::Context;
 use clap::Args;
@@ -121,12 +122,11 @@ pub fn run(args: SearchArgs) -> anyhow::Result<i32> {
         print_table(&view, &q);
     }
     record_presented(&agent, &args.url, &q, &view.response);
-    let needs_content = view.response.hits.iter().any(|h| !h.snippets.is_empty());
-    Ok(if view.response.all_sources_complete(needs_content) {
-        0
-    } else {
-        2
-    })
+    // The typed envelope is the completeness contract: anything that degraded
+    // this answer — including index lag or a truncated total that the legacy
+    // per-source flags never reflected — must fail scripts that ask for
+    // complete results.
+    Ok(if view.response.coverage.full { 0 } else { 2 })
 }
 
 fn print_table(v: &SearchView, q: &str) {
@@ -189,6 +189,30 @@ fn print_table(v: &SearchView, q: &str) {
                 "    {:<28} {:>8}{clause}",
                 val.label.clone().unwrap_or_else(|| val.value.clone()),
                 val.count
+            );
+        }
+    }
+    if r.coverage.full {
+        println!("coverage: full");
+    } else {
+        println!("coverage: degraded");
+        let response_level = r.coverage.degraded.iter().map(|d| (None, d));
+        let per_source = r
+            .coverage
+            .sources
+            .iter()
+            .flat_map(|s| s.degraded.iter().map(move |d| (Some(s.name.as_str()), d)));
+        for (source, d) in response_level.chain(per_source) {
+            println!(
+                "    [{}] {}{}: {}{}",
+                d.severity,
+                source.map(|s| format!("{s} ")).unwrap_or_default(),
+                d.kind,
+                d.detail,
+                d.remediation
+                    .as_ref()
+                    .map(|r| format!(" — {r}"))
+                    .unwrap_or_default()
             );
         }
     }
@@ -353,6 +377,7 @@ fn export(args: &SearchArgs, q: &str) -> anyhow::Result<i32> {
     let total = header("x-eidos-export-total");
     let exact = header("x-eidos-export-total-exact");
     let cap = header("x-eidos-export-max-rows");
+    let coverage_full = header("x-eidos-export-coverage-full");
     if status >= 400 {
         let text = resp.body_mut().read_to_string()?;
         let err: ApiErr = serde_json::from_str(&text).unwrap_or(ApiErr {
@@ -392,21 +417,57 @@ fn export(args: &SearchArgs, q: &str) -> anyhow::Result<i32> {
             return Ok(1);
         }
     }
-    if let (Some(total), Some(cap)) = (total.as_deref(), cap.as_deref()) {
-        let truncated = total
-            .parse::<u64>()
-            .ok()
-            .zip(cap.parse::<u64>().ok())
-            .is_some_and(|(t, c)| t > c);
+    let truncated = match (total.as_deref(), cap.as_deref()) {
+        (Some(total), Some(cap)) => {
+            let truncated = total
+                .parse::<u64>()
+                .ok()
+                .zip(cap.parse::<u64>().ok())
+                .is_some_and(|(t, c)| t > c);
+            eprintln!(
+                "matched {total}{} result(s); export cap {cap}{}",
+                if exact.as_deref() == Some("false") {
+                    "+"
+                } else {
+                    ""
+                },
+                if truncated { " (TRUNCATED)" } else { "" }
+            );
+            truncated
+        }
+        _ => false,
+    };
+    let full = coverage_full.as_deref() == Some("true");
+    if !full {
         eprintln!(
-            "matched {total}{} result(s); export cap {cap}{}",
-            if exact.as_deref() == Some("false") {
-                "+"
+            "coverage: degraded{}",
+            if coverage_full.is_none() {
+                " (server did not provide the coverage contract)"
             } else {
                 ""
-            },
-            if truncated { " (TRUNCATED)" } else { "" }
+            }
         );
     }
-    Ok(0)
+    Ok(export_exit_code(full, truncated))
+}
+
+fn export_exit_code(coverage_full: bool, truncated: bool) -> i32 {
+    if coverage_full && !truncated {
+        0
+    } else {
+        2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_exit_code;
+
+    #[test]
+    fn export_requires_full_coverage_and_the_complete_row_set() {
+        assert_eq!(export_exit_code(true, false), 0);
+        assert_eq!(export_exit_code(false, false), 2);
+        assert_eq!(export_exit_code(true, true), 2);
+        assert_eq!(export_exit_code(false, true), 2);
+    }
 }

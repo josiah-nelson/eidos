@@ -2467,13 +2467,10 @@ pub fn search_with_content(
         opts,
     )?;
     let join_ms = t2.elapsed().as_secs_f64() * 1000.0;
-    let mut completeness = completeness_for(
-        catalog,
-        &in_scope.iter().map(|s| s.id).collect::<Vec<_>>(),
-        &mut warnings,
-    )?;
-    if let Some(reason) = content_index.and_then(|c| c.content_incomplete_reason()) {
-        warnings.push(reason);
+    let (mut completeness, index_lag) =
+        completeness_for(catalog, &in_scope.iter().map(|s| s.id).collect::<Vec<_>>())?;
+    let content_index_rebuilding = content_index.and_then(|c| c.content_incomplete_reason());
+    if content_index_rebuilding.is_some() {
         for c in completeness.iter_mut() {
             c.content_complete = false;
         }
@@ -2502,6 +2499,16 @@ pub fn search_with_content(
     } else {
         None
     };
+    let coverage = CoverageEnvelope::derive(
+        &completeness,
+        &ResponseSignals {
+            index_lag,
+            content_query: has_content,
+            content_index_rebuilding,
+            total_is_bound: !total_exact,
+        },
+        UnixNanos::now(),
+    );
     Ok(SearchResponse {
         schema_version: SCHEMA_VERSION,
         hits,
@@ -2519,6 +2526,7 @@ pub fn search_with_content(
             join_ms,
         },
         completeness,
+        coverage,
         explanation: if req.explain {
             Some(Explanation {
                 readable: ctx.readable.join(" AND "),
@@ -3000,11 +3008,12 @@ fn bound_eq(returned: Option<&serde_json::Value>, want: Option<i64>) -> bool {
     }
 }
 
+/// Per-source completeness for the sources in scope, plus the number of
+/// outbox rows the index follower has not applied yet (index lag).
 fn completeness_for(
     catalog: &Catalog,
     scope: &[SourceId],
-    warnings: &mut Vec<String>,
-) -> Result<Vec<SourceCompleteness>> {
+) -> Result<(Vec<SourceCompleteness>, u64)> {
     let mut out = Vec::new();
     let pending_outbox = catalog.outbox_pending()?;
     for sid in scope {
@@ -3029,12 +3038,7 @@ fn completeness_for(
         }
         out.push(c);
     }
-    if pending_outbox > 0 {
-        warnings.push(format!(
-            "{pending_outbox} catalog changes are not yet reflected in the search index"
-        ));
-    }
-    Ok(out)
+    Ok((out, pending_outbox))
 }
 
 /// Attribute names accepted by the query syntax.

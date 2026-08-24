@@ -1,5 +1,13 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type ApiRouteId, type ContentState, type SourceCompleteness, type SourceState } from './api'
+import {
+  api,
+  type ApiRouteId,
+  type ContentState,
+  type CoverageEnvelope,
+  type CoverageReason,
+  type SourceCompleteness,
+  type SourceState,
+} from './api'
 import { ago, count, humanState, integerNumber } from './format'
 
 export function StateBadge({ state }: { state: SourceState }) {
@@ -31,6 +39,48 @@ export function ContentBadge({ state }: { state: ContentState }) {
               : ''
   if (state === 'not_applicable') return <span className="muted">—</span>
   return <span className={`badge ${cls}`}>{humanState(state)}</span>
+}
+
+/**
+ * Typed coverage envelope for search answers: one banner per degradation,
+ * severity-graded, with remediation. A full answer states so explicitly —
+ * the UI never infers completeness from the absence of banners.
+ */
+export function CoverageBanners({ coverage }: { coverage: CoverageEnvelope }) {
+  if (coverage.full) {
+    const names = coverage.sources.map((s) => s.name).join(', ')
+    return (
+      <div className="banner ok">
+        <span className="badge ok">coverage: full</span>
+        <span>Every source in scope ({names}) was fully consulted for this answer.</span>
+      </div>
+    )
+  }
+  const rows: { source?: string; reason: CoverageReason }[] = [
+    ...(coverage.degraded ?? []).map((reason) => ({ reason })),
+    ...coverage.sources.flatMap((s) => (s.degraded ?? []).map((reason) => ({ source: s.name, reason }))),
+  ]
+  return (
+    <>
+      {rows.map(({ source, reason }, i) => {
+        const cls = reason.severity === 'error' ? 'bad' : reason.severity === 'warning' ? 'warn' : 'accent'
+        return (
+          <div key={i} className={`banner ${reason.severity === 'info' ? '' : cls}`.trim()}>
+            <span className={`badge ${cls}`}>{humanState(reason.kind)}</span>
+            <span>
+              {source ? (
+                <>
+                  <strong>{source}</strong>:{' '}
+                </>
+              ) : null}
+              {reason.detail}
+              {reason.remediation ? <span className="muted"> — {reason.remediation}</span> : null}
+            </span>
+          </div>
+        )
+      })}
+    </>
+  )
 }
 
 /**

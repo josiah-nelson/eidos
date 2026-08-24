@@ -174,6 +174,10 @@ async fn csv_quotes_commas_quotes_newlines_and_unicode() {
     );
     assert_eq!(header(&headers, "x-eidos-export-total"), Some("3"));
     assert_eq!(header(&headers, "x-eidos-export-max-rows"), Some("100000"));
+    assert_eq!(
+        header(&headers, "x-eidos-export-coverage-full"),
+        Some("true")
+    );
     assert!(!body.starts_with('\u{feff}'), "no BOM unless asked for");
 
     let records = parse_csv(&body);
@@ -282,10 +286,19 @@ async fn envelope_carries_completeness_of_stale_and_partial_sources() {
         .unwrap();
     let app = eidos_service::api::router(state.clone(), None);
 
-    let (status, _, body) = get(&app, "/api/search/export?format=json&q=ext:txt").await;
+    let (status, headers, body) = get(&app, "/api/search/export?format=json&q=ext:txt").await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-eidos-export-coverage-full"),
+        Some("false")
+    );
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["schema"], "eidos-export/2");
+    assert_eq!(doc["coverage"]["full"], false);
+    assert_eq!(
+        doc["coverage"]["sources"][0]["degraded"][0]["kind"],
+        "stale"
+    );
     let c = &doc["completeness"][0];
     assert_eq!(c["state"], "stale");
     assert_eq!(c["metadata_complete"], false);
@@ -322,6 +335,7 @@ async fn json_and_ndjson_share_one_versioned_row_schema() {
     assert!(doc["exported_at"].as_str().unwrap().ends_with('Z'));
     assert!(doc["total"]["value"].is_string());
     assert!(doc["max_rows"].is_string());
+    assert_eq!(doc["coverage"]["full"], true);
     assert!(doc["warnings"].is_array());
     let rows = doc["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
@@ -350,6 +364,7 @@ async fn json_and_ndjson_share_one_versioned_row_schema() {
     let head: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(head["schema"], "eidos-export/2");
     assert_eq!(head["type"], "header");
+    assert_eq!(head["coverage"]["full"], true);
     assert!(head["completeness"].is_array());
     let row: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(row, rows[0], "NDJSON rows equal the JSON document's rows");
@@ -588,6 +603,70 @@ async fn a_failed_page_aborts_the_body() {
     assert_eq!(summary["type"], "summary");
     assert_eq!(summary["truncated"], true);
     assert!(summary["error"].is_string(), "{summary}");
+    assert_eq!(state.export_stats.failed.load(Ordering::Relaxed), 1);
+}
+
+/// Coverage is written before the first row, so a later page may not silently
+/// weaken it. The stream must fail instead of producing a complete-looking
+/// export whose header still claims full coverage.
+#[tokio::test]
+async fn coverage_degradation_between_pages_aborts_the_body() {
+    let e = env(|root| {
+        for i in 0..600 {
+            std::fs::write(root.join(format!("f{i:04}.txt")), b"x").unwrap();
+        }
+    });
+    let state = open_state(
+        &e,
+        ExportLimits {
+            page_size: 5,
+            max_rows: 100_000,
+            concurrency: 2,
+        },
+    );
+    let sid = scan(&state, &e);
+    let app = eidos_service::api::router(state.clone(), None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/search/export?format=ndjson&q=ext:txt&sort=name")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()["x-eidos-export-coverage-full"], "true");
+    let mut body = resp.into_body();
+    body.frame().await.unwrap().unwrap();
+    state
+        .catalog
+        .set_source_state(sid, SourceState::Stale, Some("feed lost"))
+        .unwrap();
+
+    let mut text = String::new();
+    let mut failed = false;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(f) => text.push_str(&String::from_utf8_lossy(&f.into_data().unwrap())),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        failed,
+        "the body ended cleanly after coverage degraded:\n{text}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(text.lines().next_back().unwrap()).unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["truncated"], true);
+    assert_eq!(
+        summary["error"],
+        "search coverage changed while the export was streaming"
+    );
     assert_eq!(state.export_stats.failed.load(Ordering::Relaxed), 1);
 }
 

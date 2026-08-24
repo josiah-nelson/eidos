@@ -157,10 +157,14 @@ fn lost_index_is_rebuilt_before_readiness_and_restart_is_clean() {
     assert_eq!(r.hits.len(), 0);
     assert!(!r.all_sources_complete(true));
     assert!(
-        r.warnings.iter().any(|w| w.contains("being rebuilt")),
+        r.coverage
+            .degraded
+            .iter()
+            .any(|d| d.detail.contains("being rebuilt")),
         "{:?}",
-        r.warnings
+        r.coverage
     );
+    assert!(!r.coverage.full);
 
     state.start_background().unwrap();
     assert!(wait_until(Duration::from_secs(30), || !state
@@ -283,11 +287,12 @@ fn rebuild_failure_is_visible_and_retried_at_the_next_start() {
     let r = search(&state, "content:alpha");
     assert!(!r.all_sources_complete(true));
     assert!(
-        r.warnings
+        r.coverage
+            .degraded
             .iter()
-            .any(|w| w.contains("rebuild failed") && w.contains("disk full")),
+            .any(|d| d.detail.contains("rebuild failed") && d.detail.contains("disk full")),
         "{:?}",
-        r.warnings
+        r.coverage
     );
     stop(state);
 

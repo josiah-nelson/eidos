@@ -212,7 +212,8 @@ explanation are never computed for an export, so page cost does not grow with
 the number of pages.
 
 If a page cannot be fetched part-way through — the gate sheds it, the query
-times out, the service is shutting down — the export writes its footer
+times out, the service is shutting down — or its coverage contract changes
+after the header was sent, the export writes its footer
 (`truncated: true` with a non-null `error`) and then **fails the transfer**
 rather than ending it cleanly. A short-but-tidy file would be indistinguishable
 from a complete one in CSV, which has no envelope; aborting means every client,
@@ -262,6 +263,7 @@ Both carry `"schema": "eidos-export/2"`. `format=json` is one document. All
   "exported_at": "2026-08-23T01:02:03.123456789Z",
   "total": { "value": "1200", "exact": true },
   "max_rows": "100000",
+  "coverage": { "full": true, "degraded": [ ], "sources": [ ] },
   "completeness": [ ],
   "warnings": [ ],
   "rows": [ ],
@@ -280,10 +282,17 @@ the first is the header object (`"type": "header"`, everything above except
 lines never carry a `schema` key, so the three line kinds are easy to tell
 apart.
 
-`completeness` is the same per-source block `/api/search` returns, captured
-from the first page: a stale, degraded, or still-indexing source is visible in
-the export itself. `error` is non-null when a page failed mid-walk; the export
-then ends early with `truncated` set.
+All export formats also return `X-Eidos-Export-Coverage-Full`; CSV clients use
+that header because CSV has no metadata envelope. The CLI exits with status 2
+when coverage is degraded or the export row cap truncates the result set.
+
+`coverage` and `completeness` are the same per-source facts `/api/search`
+returns, captured from the first page: a stale, degraded, or still-indexing
+source is visible in the export itself. If source membership or a degradation
+fact changes on a later page, the service fails the transfer instead of
+letting the already-streamed header become a false completeness claim.
+`error` is non-null when a page failed or coverage changed mid-walk; the
+export then ends early with `truncated` set.
 
 Cursors are offsets into the result set, so a commit that lands between two
 pages can shift rows. An export is a snapshot only as far as the index is
