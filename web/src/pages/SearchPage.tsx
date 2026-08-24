@@ -17,6 +17,7 @@ import {
 import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
 import { ContentPreviewPanel } from '../ContentPreview'
 import { bytes, count, duration, when } from '../format'
+import { track } from '../interactions'
 import { applyFacetClick, negate, type FacetForms } from '../query-clause'
 import { SavedSearchControls } from '../SavedSearches'
 import { PAGE_SIZES, canonicalSearchParams, readSearchView } from '../saved-searches'
@@ -90,6 +91,42 @@ export default function SearchPage() {
     () => Array.from(new Set(results.data?.pages.flatMap((p) => p.warnings ?? []) ?? [])),
     [results.data],
   )
+
+  // Record the hits of every page of results this query returned, once each.
+  // A page is the unit the server rendered, so a page that arrives twice (a
+  // refetch of the same cursor) is reported once, and re-running the query
+  // reports it again as the new presentation it is.
+  const reported = useRef({ key: '', pages: 0 })
+  useEffect(() => {
+    const pages = results.data?.pages
+    if (!pages) return
+    const key = `${q}|${mode}|${sort}|${desc}|${pageSize}`
+    if (reported.current.key !== key) reported.current = { key, pages: 0 }
+    let rank = 0
+    for (const [index, page] of pages.entries()) {
+      if (index >= reported.current.pages) {
+        track(
+          ...page.hits.map((h, i) => ({
+            action: 'presented' as const,
+            q,
+            object_id: h.object_id,
+            source_id: h.source_id,
+            presented_rank: rank + i,
+          })),
+        )
+      }
+      rank += page.hits.length
+    }
+    reported.current.pages = pages.length
+  }, [results.data, q, mode, sort, desc, pageSize])
+
+  const openPreview = (target: PreviewTarget) => {
+    track({ action: 'opened_preview', q, object_id: target.objectId })
+    setPreview(target)
+  }
+  const copiedPath = (hit: Hit) =>
+    track({ action: 'copied_path', q, object_id: hit.object_id, source_id: hit.source_id })
+  const exported = () => track({ action: 'exported', q })
 
   const submit = () => set({ q: draft })
   /** Refine the query with a facet value, including or excluding it. */
@@ -233,7 +270,7 @@ export default function SearchPage() {
                   {showPlan ? 'Hide plan' : 'Explain'}
                 </button>
               )}
-              <ExportMenu q={q} mode={mode} sort={sort} desc={desc} page={first} />
+              <ExportMenu q={q} mode={mode} sort={sort} desc={desc} page={first} onExport={exported} />
             </div>
             {showPlan && first.explanation && (
               <div className="card" style={{ marginBottom: 8 }}>
@@ -263,7 +300,8 @@ export default function SearchPage() {
               hasMore={results.hasNextPage ?? false}
               fetching={results.isFetchingNextPage}
               fetchMore={() => results.fetchNextPage()}
-              onPreview={setPreview}
+              onPreview={openPreview}
+              onCopyPath={copiedPath}
             />
           </div>
           <aside className="side">
@@ -354,18 +392,21 @@ function ExportMenu({
   sort,
   desc,
   page,
+  onExport,
 }: {
   q: string
   mode: ResultMode
   sort: SortField
   desc: boolean
   page: SearchResponse
+  onExport: () => void
 }) {
   const health = useQuery({ queryKey: ['health'], queryFn: api.health, staleTime: 60_000 })
   const cap = health.data?.export_max_rows
   const [copied, setCopied] = useState('')
   const href = (format: ExportFormat, bom = false) => exportUrl({ q, mode, sort, desc }, format, bom)
   const copyPage = async () => {
+    onExport()
     try {
       await navigator.clipboard.writeText(JSON.stringify(page, null, 2))
       setCopied('Copied')
@@ -381,16 +422,16 @@ function ExportMenu({
           Streams every matching row{cap ? ` · up to ${count(cap)} rows` : ''}
           {page.total.value > (cap ?? Infinity) ? ' · this query would be truncated' : ''}
         </div>
-        <a href={href('csv')} download>
+        <a href={href('csv')} download onClick={onExport}>
           CSV
         </a>
-        <a href={href('csv', true)} download>
+        <a href={href('csv', true)} download onClick={onExport}>
           CSV with BOM (Excel)
         </a>
-        <a href={href('json')} download>
+        <a href={href('json')} download onClick={onExport}>
           JSON
         </a>
-        <a href={href('ndjson')} download>
+        <a href={href('ndjson')} download onClick={onExport}>
           NDJSON (one row per line)
         </a>
         <button type="button" className="btn small" onClick={copyPage}>
@@ -423,6 +464,7 @@ function HitTable({
   fetching,
   fetchMore,
   onPreview,
+  onCopyPath,
 }: {
   hits: Hit[]
   mode: ResultMode
@@ -430,6 +472,8 @@ function HitTable({
   fetching: boolean
   fetchMore: () => void
   onPreview: (t: PreviewTarget) => void
+  /** The path text of a row was copied to the clipboard. */
+  onCopyPath: (h: Hit) => void
 }) {
   const parentRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -483,7 +527,10 @@ function HitTable({
                 {h.hard_link_count > 1 && <span className="badge info">{h.hard_link_count} links</span>}
                 {h.directory && !h.directory.complete && <span className="badge warn">incomplete</span>}
               </div>
-              <div className="col mono muted" title={h.path}>
+              {/* Copying a path is how a result leaves this page for a shell,
+                  an editor, or a ticket. The native copy event observes that
+                  without adding a control or changing what the row does. */}
+              <div className="col mono muted" title={h.path} onCopy={() => onCopyPath(h)}>
                 {parent}
               </div>
               <div className="col num">{bytes(isDir ? h.directory?.logical_bytes : h.size)}</div>

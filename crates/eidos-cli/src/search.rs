@@ -9,6 +9,7 @@ use clap::Args;
 use eidos_domain::{ResultMode, SearchResponse, SortField};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Args, Debug)]
 pub struct SearchArgs {
@@ -119,6 +120,7 @@ pub fn run(args: SearchArgs) -> anyhow::Result<i32> {
     } else {
         print_table(&view, &q);
     }
+    record_presented(&agent, &args.url, &q, &view.response);
     let needs_content = view.response.hits.iter().any(|h| !h.snippets.is_empty());
     Ok(if view.response.all_sources_complete(needs_content) {
         0
@@ -233,6 +235,63 @@ fn print_table(v: &SearchView, q: &str) {
     if let Some(c) = &r.next_cursor {
         println!("next: --cursor {c}");
     }
+}
+
+/// Events one request may carry; the service refuses a larger batch.
+const MAX_INTERACTION_BATCH: usize = 500;
+/// A scripted `eidos search` must never wait on capture.
+const INTERACTION_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Report the hits this invocation printed to `/api/interactions`, so CLI use
+/// is visible in the same data as web use.
+///
+/// Best effort in every direction: no retry, a short deadline, errors dropped,
+/// and nothing about the search changes whether it succeeds. `EIDOS_NO_INTERACTIONS`
+/// turns it off.
+fn record_presented(agent: &ureq::Agent, url: &str, q: &str, response: &SearchResponse) {
+    if response.hits.is_empty() || std::env::var_os("EIDOS_NO_INTERACTIONS").is_some() {
+        return;
+    }
+    let session_id = session_id();
+    let events: Vec<serde_json::Value> = response
+        .hits
+        .iter()
+        .take(MAX_INTERACTION_BATCH)
+        .enumerate()
+        .map(|(rank, h)| {
+            serde_json::json!({
+                "session_id": session_id,
+                "action": "presented",
+                "q": q,
+                "object_id": h.object_id,
+                "source_id": h.source_id,
+                "presented_rank": rank as u32,
+            })
+        })
+        .collect();
+    let _ = agent
+        .post(format!("{}/api/interactions", url.trim_end_matches('/')))
+        .config()
+        .timeout_global(Some(INTERACTION_TIMEOUT))
+        .build()
+        .send_json(serde_json::json!({ "events": events }));
+}
+
+/// A fresh opaque id per invocation. It groups the hits of one run and nothing
+/// else: it is not derived from the user, the machine, or the query.
+fn session_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    // The per-process random keys of `RandomState` carry the entropy; the
+    // clock and the pid only keep two runs of one process apart.
+    hasher.write_u32(std::process::id());
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    );
+    format!("cli-{:016x}", hasher.finish())
 }
 
 /// Percent-encode a query-string value (RFC 3986 unreserved set kept as-is).

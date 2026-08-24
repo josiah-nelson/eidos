@@ -284,6 +284,36 @@ match count and the cap on stderr, marking `(TRUNCATED)` when the cap bites.
 `EIDOS_URL` overrides the service address. Query syntax:
 [query-syntax.md](query-syntax.md).
 
+### Interaction capture
+
+`POST /api/interactions` records what a search presented and what happened to
+it — `presented`, `opened_preview`, `opened_file`, `copied_path`, `exported` —
+into the catalog's `interaction_events` table. It is data collection only:
+nothing reads the table back on the search path, and no ranking, ordering, or
+response depends on whether an event was recorded, refused, or dropped.
+
+- **No query text is stored.** A client posts the query it ran; the service
+  parses it, stores a digest of its canonical rendering (`query_hash`) and a
+  coarse label (`query_shape`: `metadata`, `name`, `content_ranked`,
+  `content_regex`), and discards the text. The digest groups the events of one
+  query; it is not an anonymity guarantee, since a guessed query can be hashed
+  and compared.
+- **The service stamps the time.** A client clock cannot place rows outside the
+  retention window.
+- **Growth is bounded.** Events older than 90 days are deleted, and the oldest
+  rows beyond 1,000,000 are deleted. Retention runs inside the insert
+  transaction every 32nd batch and once at startup.
+- **Requests are cheap and refusable.** At most 500 events per request (larger
+  is `400 bad_request`); the response is returned before the write happens, and
+  when too many batches are already waiting on the catalog writer the batch is
+  dropped and the response says so (`{"accepted": 0, "dropped": n}`).
+
+The web UI queues events per tab session and flushes them every two seconds and
+when the page is hidden; failures are silently discarded. `eidos search` posts
+one `presented` batch for the hits it printed, with a short deadline and no
+retry, so scripted use never blocks. `EIDOS_NO_INTERACTIONS` turns the CLI's
+capture off.
+
 ## Benchmarks
 
 Benchmark commands are explicit and read-only. They append one JSON line per
