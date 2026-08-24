@@ -606,6 +606,70 @@ async fn a_failed_page_aborts_the_body() {
     assert_eq!(state.export_stats.failed.load(Ordering::Relaxed), 1);
 }
 
+/// Coverage is written before the first row, so a later page may not silently
+/// weaken it. The stream must fail instead of producing a complete-looking
+/// export whose header still claims full coverage.
+#[tokio::test]
+async fn coverage_degradation_between_pages_aborts_the_body() {
+    let e = env(|root| {
+        for i in 0..600 {
+            std::fs::write(root.join(format!("f{i:04}.txt")), b"x").unwrap();
+        }
+    });
+    let state = open_state(
+        &e,
+        ExportLimits {
+            page_size: 5,
+            max_rows: 100_000,
+            concurrency: 2,
+        },
+    );
+    let sid = scan(&state, &e);
+    let app = eidos_service::api::router(state.clone(), None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/search/export?format=ndjson&q=ext:txt&sort=name")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()["x-eidos-export-coverage-full"], "true");
+    let mut body = resp.into_body();
+    body.frame().await.unwrap().unwrap();
+    state
+        .catalog
+        .set_source_state(sid, SourceState::Stale, Some("feed lost"))
+        .unwrap();
+
+    let mut text = String::new();
+    let mut failed = false;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(f) => text.push_str(&String::from_utf8_lossy(&f.into_data().unwrap())),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        failed,
+        "the body ended cleanly after coverage degraded:\n{text}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(text.lines().next_back().unwrap()).unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["truncated"], true);
+    assert_eq!(
+        summary["error"],
+        "search coverage changed while the export was streaming"
+    );
+    assert_eq!(state.export_stats.failed.load(Ordering::Relaxed), 1);
+}
+
 /// Exports are bounded on their own so a burst of them cannot occupy the
 /// whole admission gate and shed interactive search.
 #[tokio::test]
