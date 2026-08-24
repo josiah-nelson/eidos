@@ -456,7 +456,6 @@ mod tests {
             r#"content:alpha" beta""#,
             r#"C:\fixture\file?.txt"#,
             "--fixture",
-            "-/fm.txt",
             "ranked:ext:txt",
             "ranked:*",
             "ranked:=fixture",

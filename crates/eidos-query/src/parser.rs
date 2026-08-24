@@ -64,7 +64,11 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, ParseError> {
             let prev = chars.get(i.wrapping_sub(1)).copied();
             let at_value_start = i == start
                 || matches!(prev, Some(':') | Some('=') | Some('~'))
-                || (matches!(prev, Some('i')) && i >= 2 && chars[i - 2] == '=');
+                || (matches!(prev, Some('i')) && i >= 2 && chars[i - 2] == '=')
+                // A compact unary negation is stripped by `unary`; lex its
+                // regex body now rather than letting `term` reinterpret an
+                // unstructured word later.
+                || (i == start + 1 && chars[start] == '-');
             if c == '"' {
                 // Quoted segment.
                 word.push('"');
@@ -1082,6 +1086,8 @@ mod tests {
         // token boundary.
         assert!(parse("//\0\0\0.C:ҍ\\/.fi").is_err());
         assert!(parse(r#"/na//\/\\/.fi"#).is_err());
+        assert!(parse("-/fm.txt").is_err());
+        assert!(parse("-/ft,\0\\/-//\0\0f\0\0\u{1}").is_err());
     }
 
     #[test]
