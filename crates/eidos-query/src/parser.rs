@@ -337,10 +337,21 @@ impl Parser {
                 || raw[2..].starts_with('/')
                 || raw.starts_with("\\\\"))
         {
-            self.notes
-                .push(format!("\"{raw}\" interpreted as a path prefix"));
+            let mode = if raw.contains('*') || raw.contains('?') {
+                PathMode::Glob
+            } else {
+                PathMode::Prefix
+            };
+            self.notes.push(format!(
+                "\"{raw}\" interpreted as a path {}",
+                if mode == PathMode::Glob {
+                    "glob"
+                } else {
+                    "prefix"
+                }
+            ));
             return Ok(Query::Path {
-                mode: PathMode::Prefix,
+                mode,
                 value: raw.replace('/', "\\"),
                 case_sensitive: false,
             });

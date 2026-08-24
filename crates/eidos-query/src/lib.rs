@@ -437,6 +437,7 @@ mod tests {
             "-(0)",
             r#"fixture_field:"alpha beta""#,
             r#"content:alpha" beta""#,
+            r#"C:\fixture\file?.txt"#,
         ] {
             let parsed = parse(input).unwrap();
             let rendered = render(&parsed.query);
