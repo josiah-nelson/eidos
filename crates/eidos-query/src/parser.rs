@@ -933,7 +933,12 @@ fn date_span(s: &str, now: UnixNanos) -> Option<(UnixNanos, UnixNanos)> {
         let b = UnixNanos::parse(&format!("{:04}-01-01", y + 1))?;
         return Some((a, b));
     }
-    if s.len() == 7 && digits_only(&s[..4]) && &s[4..5] == "-" && digits_only(&s[5..]) {
+    let bytes = s.as_bytes();
+    if bytes.len() == 7
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..].iter().all(u8::is_ascii_digit)
+    {
         let y: i64 = s[..4].parse().ok()?;
         let m: i64 = s[5..].parse().ok()?;
         let a = UnixNanos::parse(&format!("{y:04}-{m:02}-01"))?;
@@ -1079,6 +1084,13 @@ mod tests {
                 names: vec!["G".into()]
             }
         );
+    }
+
+    #[test]
+    fn month_shape_checks_do_not_slice_through_utf8() {
+        let now = UnixNanos(1_787_000_000_000_000_000);
+        assert_eq!(date_span("0\0東cO", now), None);
+        assert!(parse_at("= :mf m:0\0東cO", now).is_err());
     }
 
     #[test]
