@@ -52,6 +52,15 @@ pub fn render(q: &Query) -> String {
         out
     }
 
+    fn ranked_bare_safe(v: &str) -> bool {
+        !v.is_empty()
+            && !v.starts_with(['-', '/', '\\', '=', '~'])
+            && !matches!(v, "NOT" | "!" | "OR" | "|" | "AND" | "&&")
+            && !v
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"' | ':' | '*' | '?'))
+    }
+
     fn size(v: u64) -> String {
         const U: [&str; 5] = ["", "k", "M", "G", "T"];
         let mut f = v as f64;
@@ -131,31 +140,27 @@ pub fn render(q: &Query) -> String {
                     TextField::Path => "path:",
                     TextField::Content => "content:",
                 };
-                let bare_or_quoted = |v: &str| {
-                    if v.starts_with('-')
-                        || matches!(v, "NOT" | "!" | "OR" | "|" | "AND" | "&&")
-                        || v.chars()
-                            .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"'))
-                    {
-                        quoted(v)
-                    } else {
-                        v.to_string()
-                    }
-                };
                 let s = match mode {
                     TextMode::Ranked => {
-                        let value = bare_or_quoted(value);
-                        if value.starts_with('"') {
+                        let implicit_is_ranked = match field {
+                            TextField::Name | TextField::Content => ranked_bare_safe(value),
+                            // `path:value` is substring mode, so a ranked path
+                            // always needs its unambiguous internal spelling.
+                            TextField::Path => false,
+                        };
+                        if implicit_is_ranked {
+                            if *field == TextField::Name {
+                                value.clone()
+                            } else {
+                                format!("{prefix}{value}")
+                            }
+                        } else {
                             let explicit = match field {
                                 TextField::Name => "ranked:",
                                 TextField::Path => "path_ranked:",
                                 TextField::Content => "content_ranked:",
                             };
-                            format!("{explicit}{value}")
-                        } else if *field == TextField::Name {
-                            value
-                        } else {
-                            format!("{prefix}{value}")
+                            format!("{explicit}{}", quoted(value))
                         }
                     }
                     TextMode::Phrase if *field == TextField::Name => quoted(value),
@@ -441,6 +446,13 @@ mod tests {
             r#"content:alpha" beta""#,
             r#"C:\fixture\file?.txt"#,
             "--fixture",
+            "-/fm.txt",
+            "ranked:ext:txt",
+            "ranked:*",
+            "ranked:=fixture",
+            "ranked:~fixture",
+            r#"ranked:"/fm.txt""#,
+            "path_ranked:fixture",
         ] {
             let parsed = parse(input).unwrap();
             let rendered = render(&parsed.query);
