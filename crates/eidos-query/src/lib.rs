@@ -54,11 +54,11 @@ pub fn render(q: &Query) -> String {
 
     fn ranked_bare_safe(v: &str) -> bool {
         !v.is_empty()
-            && !v.starts_with(['-', '/', '\\', '=', '~'])
+            && !v.starts_with(['-', '/', '\\'])
             && !matches!(v, "NOT" | "!" | "OR" | "|" | "AND" | "&&")
-            && !v
-                .chars()
-                .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"' | ':' | '*' | '?'))
+            && !v.chars().any(|c| {
+                c.is_whitespace() || matches!(c, '(' | ')' | '"' | ':' | '*' | '?' | '=' | '~')
+            })
     }
 
     fn size(v: u64) -> String {
@@ -463,6 +463,10 @@ mod tests {
             "ranked:~fixture",
             r#"ranked:"/fm.txt""#,
             "path_ranked:fixture",
+            r#"ranked:"a=/b""#,
+            r#"ranked:"a~/b""#,
+            r#"ranked:"a=i/b""#,
+            "*.MiXeD",
             "in:fixture",
             "attr:hidden,system",
             "mtime:2026-01-01..2026-01-03",

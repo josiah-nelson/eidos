@@ -488,7 +488,7 @@ impl Parser {
                         self.notes
                             .push(format!("\"{value}\" interpreted as extension {ext}"));
                         return Ok(Query::Extension {
-                            values: vec![ext.to_string()],
+                            values: vec![ext.to_ascii_lowercase()],
                         });
                     }
                 }
