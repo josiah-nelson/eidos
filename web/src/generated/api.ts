@@ -118,6 +118,12 @@ export type IndexSourceState = { source_id: SourceId, name: string, published_ge
 
 export type IndexStatus = { follower: FollowerView, admission: AdmissionView, sources: Array<IndexSourceState>, };
 
+export type InteractionAck = { accepted: number, dropped: number, };
+
+export type InteractionBatch = { events: Array<InteractionEventBody>, };
+
+export type InteractionEventBody = { session_id: string, action: string, q?: string | null, object_id?: ObjectId | null, source_id?: SourceId | null, presented_rank?: number | null, };
+
 export type JobCounts = { by_stage: { [key in string]: { [key in string]: ApiInt } }, queued: ApiInt, running: ApiInt, failed: ApiInt, oldest_queued_age_ms: ApiInt | null, };
 
 export type JobId = ApiInt;
