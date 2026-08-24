@@ -6,6 +6,7 @@ members = [
     "crates/eidos-scanner",
     "crates/eidos-content",
     "crates/eidos-archive",
+    "crates/eidos-diskimg",
     "crates/eidos-search",
     "crates/eidos-query",
     "crates/eidos-service",
@@ -23,6 +24,7 @@ repository = "https://github.com/josiah-nelson/eidos"
 eidos-domain = { path = "crates/eidos-domain" }
 eidos-catalog = { path = "crates/eidos-catalog" }
 eidos-archive = { path = "crates/eidos-archive" }
+eidos-diskimg = { path = "crates/eidos-diskimg" }
 eidos-scanner = { path = "crates/eidos-scanner" }
 eidos-content = { path = "crates/eidos-content" }
 eidos-search = { path = "crates/eidos-search" }
