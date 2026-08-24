@@ -8,6 +8,8 @@
     only for older hosts.
   -->
   <PropertyGroup>
+    <!-- WixToolset.BootstrapperApplicationApi enforces the WiX v7 OSMF EULA gesture too. -->
+    <AcceptEula>wix7</AcceptEula>
     <TargetFramework>net472</TargetFramework>
     <OutputType>WinExe</OutputType>
     <AssemblyName>eidos-setup-ui</AssemblyName>
