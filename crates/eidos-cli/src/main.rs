@@ -252,9 +252,9 @@ fn main() -> anyhow::Result<()> {
     }
     let _log_guard = match &cli.command {
         Command::Serve(args) => {
-            logging::init(&cli.log, cli.log_json, args.log_dir.as_deref(), true)
+            logging::init(&cli.log, cli.log_json, args.log_dir.as_deref(), true)?
         }
-        _ => logging::init(&cli.log, cli.log_json, None, true),
+        _ => logging::init(&cli.log, cli.log_json, None, true)?,
     };
     match cli.command {
         Command::Profile(args) => profile::run(args),

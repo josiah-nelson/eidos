@@ -40,6 +40,7 @@ const ERROR_SERVICE_EXISTS: i32 = 1073;
 const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: i32 = 1063;
 const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
 const ERROR_SERVICE_NEVER_STARTED: u32 = 1077;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
 
 #[derive(Args, Debug, Clone)]
 pub struct ServiceArgs {
@@ -193,24 +194,11 @@ fn cmd_install(name: &str, args: InstallArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("creating log directory {}", log_dir.display()))?;
 
-    if let Some(account) = &account_name {
-        if args.account == Account::User {
+    // Credentials are checked before anything is registered or granted.
+    if args.account == Account::User {
+        if let (Some(account), Some(pw)) = (&account_name, &password) {
             let (domain, user) = split_account(account);
-            if let Some(pw) = &password {
-                validate_credentials(&domain, &user, pw)?;
-            }
-            grant_logon_as_service(account)
-                .with_context(|| format!("granting 'Log on as a service' to {account}"))?;
-            println!("granted 'Log on as a service' to {account}");
-        }
-        if !args.no_acl {
-            for dir in [&serve.data_dir, &log_dir] {
-                grant_modify(dir, account)?;
-            }
-            println!(
-                "granted Modify on {} to {account}",
-                serve.data_dir.display()
-            );
+            validate_credentials(&domain, &user, pw)?;
         }
     }
 
@@ -243,7 +231,8 @@ fn cmd_install(name: &str, args: InstallArgs) -> anyhow::Result<()> {
     let access = ServiceAccess::CHANGE_CONFIG
         | ServiceAccess::QUERY_STATUS
         | ServiceAccess::QUERY_CONFIG
-        | ServiceAccess::START;
+        | ServiceAccess::START
+        | ServiceAccess::DELETE;
     let (service, replaced) = match manager.create_service(&info, access) {
         Ok(s) => (s, false),
         Err(e) if os_error(&e) == Some(ERROR_SERVICE_EXISTS) => {
@@ -300,6 +289,30 @@ fn cmd_install(name: &str, args: InstallArgs) -> anyhow::Result<()> {
         .set_preshutdown_timeout(Duration::from_secs(180))
         .map_err(describe)?;
 
+    // Rights and ACLs are granted only once the registration exists, so a
+    // refused or half-configured registration never leaves widened
+    // privileges behind; if a grant fails, a registration this command
+    // created is removed again.
+    if let Some(account) = &account_name {
+        let granted = grant_account_access(
+            account,
+            args.account == Account::User,
+            !args.no_acl,
+            &[&serve.data_dir, &log_dir],
+        );
+        if let Err(e) = granted {
+            if !replaced {
+                let _ = service.delete();
+                return Err(e.context(format!(
+                    "service '{name}' was not installed (registration rolled back)"
+                )));
+            }
+            return Err(e.context(format!(
+                "service '{name}' registration was updated but the account grants failed"
+            )));
+        }
+    }
+
     println!(
         "{} service '{name}' ({})",
         if replaced { "updated" } else { "installed" },
@@ -319,6 +332,28 @@ fn cmd_install(name: &str, args: InstallArgs) -> anyhow::Result<()> {
         cmd_start(name, WaitArgs { timeout: 120 })?;
     } else {
         println!("start it with: eidos service start");
+    }
+    Ok(())
+}
+
+/// Grant what a non-LocalSystem service account needs: the logon right (for a
+/// named account) and Modify on the directories it writes.
+fn grant_account_access(
+    account: &str,
+    named_user: bool,
+    acl: bool,
+    dirs: &[&Path],
+) -> anyhow::Result<()> {
+    if named_user {
+        grant_logon_as_service(account)
+            .with_context(|| format!("granting 'Log on as a service' to {account}"))?;
+        println!("granted 'Log on as a service' to {account}");
+    }
+    if acl {
+        for dir in dirs {
+            grant_modify(dir, account)?;
+            println!("granted Modify on {} to {account}", dir.display());
+        }
     }
     Ok(())
 }
@@ -737,8 +772,37 @@ fn run_as_service(
 
 fn service_main(_arguments: Vec<OsString>) {
     let ctx = RUN.get().expect("run context set before dispatch");
-    let _log_guard = logging::init(&ctx.log_filter, ctx.log_json, Some(&ctx.log_dir), false);
+    // The log file is the service's only output. If the configured
+    // directory cannot be used, fall back to the temp directory (so the
+    // reason is written somewhere), and if even that fails, stop with
+    // ERROR_PATH_NOT_FOUND so `eidos service status` says why.
+    let mut log_problem = None;
+    let _log_guard = match logging::init(&ctx.log_filter, ctx.log_json, Some(&ctx.log_dir), false) {
+        Ok(g) => g,
+        Err(primary) => {
+            let fallback = std::env::temp_dir().join("eidos-service-logs");
+            match logging::init(&ctx.log_filter, ctx.log_json, Some(&fallback), false) {
+                Ok(g) => {
+                    log_problem = Some(format!("{primary:#}; logging to {}", fallback.display()));
+                    g
+                }
+                Err(_) => {
+                    if let Ok(h) = service_control_handler::register(&ctx.name, |_| {
+                        ServiceControlHandlerResult::NotImplemented
+                    }) {
+                        let mut st = status(ServiceState::Stopped, 0, 0);
+                        st.exit_code = ServiceExitCode::Win32(ERROR_PATH_NOT_FOUND);
+                        let _ = h.set_service_status(st);
+                    }
+                    return;
+                }
+            }
+        }
+    };
     tracing::info!(name = %ctx.name, version = env!("CARGO_PKG_VERSION"), "service starting");
+    if let Some(problem) = log_problem {
+        tracing::error!(%problem, "configured log directory is unusable");
+    }
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let stop_tx = Arc::new(Mutex::new(Some(stop_tx)));
