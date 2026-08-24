@@ -145,7 +145,9 @@ Deliverables:
 - policies/settings UI
 - exclusions/errors/activity views
 - search bookmarks or basic saved-query persistence if inexpensive
-- packaging as a Windows service plus local web application
+- packaging as a Windows service plus local web application, with the
+  portable no-install mode sequenced immediately after the packaging
+  session (see [§7](#7-distribution-surfaces), PT-1)
 
 Exit gates:
 
@@ -183,6 +185,10 @@ Product statement:
 - Preserve offline sources until explicit age-out/retirement.
 - Add remote file-open/download routing.
 - Add fleet/source/backlog web screens.
+- Add Explorer right-click verbs ("search this folder", "show duplicates /
+  similar here") routed to the local agent, falling back to a portable
+  session when no agent owns the path (see [§7](#7-distribution-surfaces),
+  PT-2).
 
 Gate: Q-1, Q-2, and Q-7 work across multiple Windows agents including one
 offline-preserved agent.
@@ -319,3 +325,56 @@ Do not settle these by preference alone:
 
 Record consequential choices as ADRs under `docs/adr/` during implementation.
 
+## 7. Distribution surfaces
+
+Added 2026-08-24. Eidos must be reachable where the files are — a folder open
+in Explorer, a share just mounted, a machine that cannot be installed on —
+without a service install, an account, or a persistent catalog. These are
+entry points over the existing engine: they add no second scanner, catalog, or
+search implementation, and they do not relax the completeness-reporting or
+read-only-source rules.
+
+### 7.1 PT-1 Portable quick-index mode
+
+Targeted for the first release after the v0.5 packaging work.
+
+- A single self-contained `eidos.exe` that takes one directory, indexes it
+  into a scratch data directory, and opens a simplified desktop search
+  surface over the same API and result contract as the full web UI.
+- Defaults: ephemeral catalog beside the binary or in a temporary directory,
+  loopback-only bind on an ephemeral port, no service registration, no
+  registry or Start-menu writes, no auto-start, content indexing enabled
+  under a conservative byte budget.
+- The simplified surface is a single-source lane of the existing web
+  application — no fleet, policy, or service-management screens — not a
+  second front end.
+
+Gate: on a clean Windows host with no installation, indexing a mid-size
+directory and running the Q-1, Q-2, and Q-4 cases against it works end to
+end; removing the one folder removes everything the session wrote, verified
+by a leftover-artifact audit.
+
+### 7.2 PT-2 Explorer shell integration
+
+Targeted for v1, alongside the agent.
+
+- Right-click a folder, or the Explorer background, for "Search this folder
+  with eidos" and "Show duplicates / similar here".
+- The verb hands off to the running agent when one already owns that path and
+  falls back to a portable session when none does.
+- Windows 11 requires a packaged sparse-identity `IExplorerCommand` for the
+  modern menu; the legacy verb remains the Windows 10 path. Registration is
+  opt-in at install time and cleanly removable.
+
+Gate: the verb resolves the clicked path through catalog identity rather than
+command-line string construction, works for UNC and long paths, and degrades
+to a clear message rather than an error when the folder lies outside every
+indexed source.
+
+### 7.3 PT-3 Coexistence and single-writer safety
+
+Lands with PT-1. One index writer per data directory stays an invariant: a
+portable session never attaches to an installed service's data directory,
+detects an existing owner and refuses with an actionable message, and releases
+its own lock after a crash. Portable results are labeled as a scratch index so
+they are never mistaken for full or fleet coverage.
