@@ -1,11 +1,35 @@
 # Releasing
 
-Published GitHub releases receive a Windows x86-64 package built by
-`.github/workflows/release.yml`. The workflow builds the Rust executable and
-web UI, signs `eidos.exe` with Azure Artifact Signing, verifies the Authenticode
-signature and timestamp, and uploads the ZIP and its SHA-256 checksum to the
-release. A signing or verification failure prevents any assets from being
-uploaded.
+Published GitHub releases receive a signed Windows x86-64 installer built by
+`.github/workflows/release.yml`:
+
+- `eidos-<tag>-setup.exe` — the guided installer (Burn bundle with the setup
+  UI and the MSI); this is what people download.
+- `eidos-<tag>.msi` — the bare package for administrators and unattended
+  installs (`msiexec /i ... ALLUSERS=1 EIDOS_PORT=7700`).
+- `.sha256` checksums for both.
+
+The workflow builds the web UI, the Rust executable (with the UI embedded),
+the setup UI, the MSI and the bundle, and signs every executable piece with
+Azure Artifact Signing in the order the Windows Installer and Burn require:
+
+1. `eidos.exe` and `eidos-setup-ui.exe` (before they are bound into the MSI
+   and bundle);
+2. `eidos.msi`;
+3. the Burn engine, detached from the bundle with `wix burn detach`, then
+   reattached with `wix burn reattach` — this is what the UAC prompt and
+   Programs and Features show for repair/uninstall;
+4. the finished `eidos-<tag>-setup.exe`.
+
+Every signature and timestamp is verified with `Get-AuthenticodeSignature`
+before any asset is uploaded; a failure anywhere uploads nothing. See
+`installer/README.md` for the authoring and `installer/build.ps1` for the
+stages the workflow calls (`-SkipMsi`, `-SkipUi`, `-SkipBundle`).
+
+CI (`ci.yml`, job `installer`) builds the same MSI/UI/bundle from a debug
+executable on every pull request, installs it silently per-user on the
+runner, checks `/api/health`, uninstalls with data removal, and keeps the
+unsigned `eidos-setup.exe` as a workflow artifact for manual testing.
 
 ## Azure and GitHub configuration
 
@@ -51,17 +75,19 @@ gh workflow run release.yml --ref main
 gh run watch
 ```
 
-A manual run uploads the signed package as a seven-day workflow artifact and
-does not alter a GitHub release. Inspect the downloaded executable with:
+A manual run uploads the signed installer and MSI as a seven-day workflow
+artifact and does not alter a GitHub release. Inspect the downloaded files
+with:
 
 ```powershell
-Get-AuthenticodeSignature .\eidos.exe | Format-List Status,StatusMessage,SignerCertificate
+Get-AuthenticodeSignature .\eidos-manual-abc1234-setup.exe | Format-List Status,StatusMessage,SignerCertificate
 ```
 
 To publish, create a release for the desired tag. The `release: published`
-event builds that tagged revision and uploads assets named
-`eidos-<tag>-windows-x86_64.zip` and
-`eidos-<tag>-windows-x86_64.zip.sha256`.
+event builds that tagged revision and uploads the assets. The version inside
+the installer comes from the workspace `version` in `Cargo.toml` with any
+pre-release suffix removed (Windows Installer versions are numeric), so bump
+it before tagging; a same-version rebuild is not a major upgrade.
 
 Client-secret authentication is supported by the Artifact Signing action and
 matches the currently provisioned repository secrets. OpenID Connect is the
