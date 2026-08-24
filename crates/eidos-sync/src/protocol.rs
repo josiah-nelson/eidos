@@ -20,6 +20,7 @@ pub const CURSOR_STATE_KEY: &str = "sync/cursors";
 
 const TICK: u32 = 1;
 pub const DEFAULT_TICK_NS: u64 = 20_000_000;
+const MAX_ADMISSION_ALARMS: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalMutation {
@@ -570,6 +571,7 @@ pub enum AdmissionAlarm {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CursorState {
     pub sources: BTreeMap<SourceId, AdmissionState>,
+    /// Distinct admission failures, retaining the newest bounded window.
     pub alarms: Vec<AdmissionAlarm>,
 }
 
@@ -615,6 +617,18 @@ impl Applier {
         env.send(to, SyncMsg::Rejected { source, reason });
     }
 
+    fn record_alarm(&mut self, env: &mut dyn Env<SyncMsg>, alarm: AdmissionAlarm) {
+        if self.cursors.alarms.contains(&alarm) {
+            return;
+        }
+        if self.cursors.alarms.len() >= MAX_ADMISSION_ALARMS {
+            let stale = self.cursors.alarms.len() - MAX_ADMISSION_ALARMS + 1;
+            self.cursors.alarms.drain(..stale);
+        }
+        self.cursors.alarms.push(alarm);
+        self.persist_cursors(env);
+    }
+
     fn on_hello(
         &mut self,
         env: &mut dyn Env<SyncMsg>,
@@ -651,12 +665,14 @@ impl Applier {
                 applied_seq,
                 offered_seq,
             } => {
-                self.cursors.alarms.push(AdmissionAlarm::SequenceRewind {
-                    source,
-                    applied_seq,
-                    offered_seq,
-                });
-                self.persist_cursors(env);
+                self.record_alarm(
+                    env,
+                    AdmissionAlarm::SequenceRewind {
+                        source,
+                        applied_seq,
+                        offered_seq,
+                    },
+                );
                 self.reject(
                     env,
                     from,
@@ -670,12 +686,14 @@ impl Applier {
                 current_epoch,
                 offered_epoch,
             } => {
-                self.cursors.alarms.push(AdmissionAlarm::RetiredEpoch {
-                    source,
-                    current_epoch,
-                    offered_epoch,
-                });
-                self.persist_cursors(env);
+                self.record_alarm(
+                    env,
+                    AdmissionAlarm::RetiredEpoch {
+                        source,
+                        current_epoch,
+                        offered_epoch,
+                    },
+                );
                 self.reject(
                     env,
                     from,
@@ -1157,6 +1175,60 @@ pub fn no_lost_tombstones(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::{Clock, Fs, SimFs, SimTime, Timers, Transport};
+
+    #[derive(Default)]
+    struct RecordingFs {
+        inner: SimFs,
+        fsyncs: usize,
+    }
+
+    impl Fs for RecordingFs {
+        fn write(&mut self, key: &str, value: Vec<u8>) {
+            self.inner.write(key, value);
+        }
+
+        fn fsync(&mut self, key: &str) {
+            self.fsyncs += 1;
+            self.inner.fsync(key);
+        }
+
+        fn read(&self, key: &str) -> Option<&[u8]> {
+            self.inner.read(key)
+        }
+
+        fn write_atomic(&mut self, writes: Vec<(String, Vec<u8>)>) {
+            self.inner.write_atomic(writes);
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingEnv {
+        fs: RecordingFs,
+        sent: Vec<(NodeId, SyncMsg)>,
+    }
+
+    impl Clock for RecordingEnv {
+        fn now(&self) -> SimTime {
+            SimTime(0)
+        }
+    }
+
+    impl Transport<SyncMsg> for RecordingEnv {
+        fn send(&mut self, to: NodeId, msg: SyncMsg) {
+            self.sent.push((to, msg));
+        }
+    }
+
+    impl Timers for RecordingEnv {
+        fn set_timer(&mut self, _after_ns: u64, _timer: u32) {}
+    }
+
+    impl Env<SyncMsg> for RecordingEnv {
+        fn fs(&mut self) -> &mut dyn Fs {
+            &mut self.fs
+        }
+    }
 
     fn mutation(object: i64, generation: u64, value: Option<&[u8]>) -> LocalMutation {
         LocalMutation {
@@ -1218,5 +1290,39 @@ mod tests {
         outbox.acknowledge(2, 2).unwrap();
         assert!(!outbox.rows().contains_key(&ObjectId::new(1)));
         assert_eq!(outbox.compacted_through, 2);
+    }
+
+    #[test]
+    fn repeated_rejection_is_durable_once_and_alarm_history_is_bounded() {
+        let source = SourceId::new(7);
+        let epoch = SourceEpoch::random_v4(1, 2);
+        let mut admission = AdmissionState::new(source, epoch);
+        admission.applied((MAX_ADMISSION_ALARMS + 10) as u64);
+        let mut applier = Applier::new(true);
+        applier.cursors.sources.insert(source, admission);
+        let mut env = RecordingEnv::default();
+
+        for _ in 0..100 {
+            applier.on_hello(&mut env, 3, source, epoch, 9, 0);
+        }
+        assert_eq!(applier.cursors.alarms.len(), 1);
+        assert_eq!(env.fs.fsyncs, 1, "identical alarms must not rewrite state");
+        assert_eq!(
+            env.sent.len(),
+            100,
+            "every retry still receives a rejection"
+        );
+
+        for offered_seq in 0..(MAX_ADMISSION_ALARMS as u64 + 5) {
+            applier.on_hello(&mut env, 3, source, epoch, offered_seq, 0);
+        }
+        assert_eq!(applier.cursors.alarms.len(), MAX_ADMISSION_ALARMS);
+        assert!(matches!(
+            applier.cursors.alarms.last(),
+            Some(AdmissionAlarm::SequenceRewind {
+                offered_seq,
+                ..
+            }) if *offered_seq == MAX_ADMISSION_ALARMS as u64 + 4
+        ));
     }
 }
