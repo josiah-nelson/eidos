@@ -250,24 +250,26 @@ These numbers are reference measurements, not universal guarantees. Hardware, st
 
 ## Quick start
 
-Eidos does not yet have a packaged release. Building the current Windows development version requires:
+Download `eidos-<version>-setup.exe` from the
+[releases page](https://github.com/josiah-nelson/eidos/releases) and run
+it. The setup installs eidos either for you alone (no administrator rights;
+it runs in the background while you are signed in) or for the whole
+computer as a Windows service, asks where the program and its data should
+live and which port to use, and opens the web interface when it finishes.
+[docs/installing.md](docs/installing.md) covers every option, unattended
+installs, upgrades and removal.
 
-- Rust stable with the MSVC target;
-- Visual Studio Build Tools with the Windows SDK;
-- Node.js 24 or newer.
-
-See [docs/development.md](docs/development.md) for the complete development environment.
+Building from source requires Rust stable with the MSVC target, Visual
+Studio Build Tools with the Windows SDK, and Node.js 24 or newer; see
+[docs/development.md](docs/development.md).
 
 ```powershell
-cargo build --release
-cd web
-npm ci
-npm run build
-cd ..
+cd web; npm ci; npm run build; cd ..
+cargo build --release              # the web UI is embedded in eidos.exe
 
 # Register a source and start the API and web UI.
 .\target\release\eidos.exe source add projects D:\Projects
-.\target\release\eidos.exe serve --data-dir data --web-dir web\dist
+.\target\release\eidos.exe serve --data-dir data
 ```
 
 The web UI will be available at `http://127.0.0.1:7700`.
