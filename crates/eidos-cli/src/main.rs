@@ -128,6 +128,21 @@ pub struct ServeArgs {
 }
 
 impl ServeArgs {
+    /// Normalise the directory arguments: drop `.` components and trailing
+    /// separators. Windows Installer directory properties end in a
+    /// backslash, which would escape a closing quote on a command line, so
+    /// the installer writes `"[DIR]."`; this makes that spelling equal to
+    /// the plain path everywhere the value is shown or joined.
+    pub fn normalized(mut self) -> Self {
+        fn clean(p: &std::path::Path) -> PathBuf {
+            p.components().collect()
+        }
+        self.data_dir = clean(&self.data_dir);
+        self.log_dir = self.log_dir.as_deref().map(clean);
+        self.web_dir = self.web_dir.as_deref().map(clean);
+        self
+    }
+
     pub fn service_config(&self) -> eidos_service::ServiceConfig {
         eidos_service::ServiceConfig {
             data_dir: self.data_dir.clone(),
@@ -250,6 +265,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Serve(args) => {
+            let args = args.normalized();
             warn_if_exposed(args.bind);
             eidos_service::run(args.service_config())
         }
@@ -330,5 +346,22 @@ mod tests {
         let refs: Vec<&str> = strs.iter().map(String::as_str).collect();
         assert_eq!(parse(&refs), plain);
         assert!(refs.contains(&"--no-web"));
+    }
+
+    #[test]
+    fn normalizes_installer_style_directories() {
+        let args = parse(&[
+            "--data-dir",
+            r"C:\ProgramData\eidos\.",
+            "--log-dir",
+            r"C:\ProgramData\eidos\logs\.",
+        ])
+        .normalized();
+        assert_eq!(args.data_dir, PathBuf::from(r"C:\ProgramData\eidos"));
+        assert_eq!(
+            args.log_dir,
+            Some(PathBuf::from(r"C:\ProgramData\eidos\logs"))
+        );
+        assert_eq!(args.web_dir, None);
     }
 }

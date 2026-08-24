@@ -2,6 +2,9 @@
 /target
 /web/node_modules
 /web/dist
+/installer/**/bin/
+/installer/**/obj/
+/installer/out/
 
 # Local runtime state (catalog, indexes) and raw benchmark output
 /data

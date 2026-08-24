@@ -714,6 +714,7 @@ fn run_as_service(
     log_filter: String,
     log_json: bool,
 ) -> anyhow::Result<()> {
+    let serve = serve.normalized();
     let log_dir = serve
         .log_dir
         .clone()
