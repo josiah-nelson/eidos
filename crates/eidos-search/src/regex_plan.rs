@@ -50,7 +50,19 @@ impl TrigramPlan {
     /// Plan for a regex pattern; `All` when it cannot be narrowed (or does
     /// not parse — the matcher reports syntax errors).
     pub fn for_regex(pattern: &str) -> TrigramPlan {
-        match regex_syntax::parse(pattern) {
+        Self::for_regex_with_case(pattern, true)
+    }
+
+    /// Plan for the verifier's effective case mode. Feeding the mode into the
+    /// HIR parser is required for Unicode simple-case-fold equivalences such
+    /// as Greek sigma/final-sigma; otherwise a required trigram could exclude
+    /// text that the case-insensitive verifier accepts.
+    pub fn for_regex_with_case(pattern: &str, case_sensitive: bool) -> TrigramPlan {
+        match regex_syntax::ParserBuilder::new()
+            .case_insensitive(!case_sensitive)
+            .build()
+            .parse(pattern)
+        {
             Ok(h) => analyze(&h).finish(),
             Err(_) => TrigramPlan::All,
         }
@@ -569,9 +581,68 @@ fn analyze(h: &Hir) -> Info {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, RngSeed};
+    use std::collections::BTreeSet;
 
     fn plan(p: &str) -> String {
         TrigramPlan::for_regex(p).to_string()
+    }
+
+    fn candidate_accepts(plan: &TrigramPlan, text: &str) -> bool {
+        let indexed: BTreeSet<String> = trigrams(text).into_iter().collect();
+        fn accepts(plan: &TrigramPlan, indexed: &BTreeSet<String>) -> bool {
+            match plan {
+                TrigramPlan::All => true,
+                TrigramPlan::Lit(literal) => trigrams(literal)
+                    .into_iter()
+                    .all(|term| indexed.contains(&term)),
+                TrigramPlan::And(parts) => parts.iter().all(|p| accepts(p, indexed)),
+                TrigramPlan::Or(parts) => parts.iter().any(|p| accepts(p, indexed)),
+            }
+        }
+        accepts(plan, &indexed)
+    }
+
+    fn unicode_piece() -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<char>(), 1..8).prop_map(|v| v.into_iter().collect())
+    }
+
+    fn regex_with_witness() -> impl Strategy<Value = (String, String)> {
+        prop::collection::vec((unicode_piece(), 0u8..5, any::<bool>()), 1..7).prop_map(|parts| {
+            let mut pattern = String::new();
+            let mut witness = String::new();
+            for (literal, shape, take_primary) in parts {
+                let escaped = regex::escape(&literal);
+                match shape {
+                    0 => {
+                        pattern.push_str(&escaped);
+                        witness.push_str(&literal);
+                    }
+                    1 => {
+                        pattern.push_str(&format!("(?:{escaped})?"));
+                        if take_primary {
+                            witness.push_str(&literal);
+                        }
+                    }
+                    2 => {
+                        pattern.push_str(&format!("(?:{escaped}|fixture)"));
+                        witness.push_str(if take_primary { &literal } else { "fixture" });
+                    }
+                    3 => {
+                        pattern.push_str(&format!("(?:{escaped}){{2,4}}"));
+                        witness.push_str(&literal);
+                        witness.push_str(&literal);
+                    }
+                    _ => {
+                        pattern.push_str(&format!("{escaped}.*tail"));
+                        witness.push_str(&literal);
+                        witness.push_str(" middle tail");
+                    }
+                }
+            }
+            (pattern, witness)
+        })
     }
 
     #[test]
@@ -614,6 +685,14 @@ mod tests {
     }
 
     #[test]
+    fn external_case_mode_keeps_unicode_equivalents_sound() {
+        let insensitive = TrigramPlan::for_regex_with_case("abcσdef", false);
+        assert_eq!(insensitive.to_string(), r#""abcςdef" | "abcσdef""#);
+        let sensitive = TrigramPlan::for_regex_with_case("abcσdef", true);
+        assert_eq!(sensitive.to_string(), r#""abcσdef""#);
+    }
+
+    #[test]
     fn bounded_repetition_and_set_limits() {
         assert_eq!(plan(r"(ab){2}c"), r#""ababc""#);
         assert_eq!(plan(r"x{3,}"), r#""xxx""#);
@@ -650,5 +729,59 @@ mod tests {
             r#""abcd""#
         );
         assert_eq!(TrigramPlan::Lit("abcd".into()).term_count(), 2);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 768,
+            rng_seed: RngSeed::Fixed(0xe1d0_2727),
+            max_shrink_iters: 20_000,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn substring_candidates_are_a_superset_for_unicode_text(
+            prefix in unicode_piece(),
+            needle in unicode_piece(),
+            suffix in unicode_piece(),
+        ) {
+            let text = format!("{prefix}{needle}{suffix}");
+            let plan = TrigramPlan::all_literals([needle.as_str()]);
+            prop_assert!(
+                candidate_accepts(&plan, &text),
+                "{} rejected {:?}",
+                plan,
+                text
+            );
+        }
+
+        #[test]
+        fn regex_candidates_are_a_superset_of_verified_matches(
+            (pattern, witness) in regex_with_witness(),
+            case_sensitive in any::<bool>(),
+            change_case in any::<bool>(),
+        ) {
+            let witness = if !case_sensitive && change_case {
+                witness.to_uppercase()
+            } else {
+                witness
+            };
+            let text = format!("prefix {witness} suffix");
+            let regex = regex::RegexBuilder::new(&pattern)
+                .case_insensitive(!case_sensitive)
+                .size_limit(1 << 20)
+                .build()
+                .expect("generated regex is valid");
+            if regex.is_match(&text) {
+                let plan = TrigramPlan::for_regex_with_case(&pattern, case_sensitive);
+                prop_assert!(
+                    candidate_accepts(&plan, &text),
+                    "candidate false negative: /{}/ on {:?} planned as {}",
+                    pattern,
+                    text,
+                    plan
+                );
+            }
+        }
     }
 }

@@ -1,0 +1,1 @@
+(name:"alpha beta" OR content:~"Gamma") -ext:tmp

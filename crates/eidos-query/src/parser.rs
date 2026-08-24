@@ -8,8 +8,8 @@
 //! ```
 
 use eidos_domain::{
-    ContentState, HostId, ObjectId, ObjectKind, PathMode, Query, SizeField, SourceId, TextField,
-    TextMode, TimeField, UnixNanos,
+    ContentState, HostId, ObjectId, ObjectKind, PathMode, Query, QueryLimits, SizeField, SourceId,
+    TextField, TextMode, TimeField, UnixNanos,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +64,11 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, ParseError> {
             let prev = chars.get(i.wrapping_sub(1)).copied();
             let at_value_start = i == start
                 || matches!(prev, Some(':') | Some('=') | Some('~'))
-                || (matches!(prev, Some('i')) && i >= 2 && chars[i - 2] == '=');
+                || (matches!(prev, Some('i')) && i >= 2 && chars[i - 2] == '=')
+                // A compact unary negation is stripped by `unary`; lex its
+                // regex body now rather than letting `term` reinterpret an
+                // unstructured word later.
+                || (i == start + 1 && chars[start] == '-');
             if c == '"' {
                 // Quoted segment.
                 word.push('"');
@@ -72,8 +76,16 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, ParseError> {
                 let mut closed = false;
                 while i < chars.len() {
                     if chars[i] == '\\' && i + 1 < chars.len() {
-                        word.push(chars[i + 1]);
-                        i += 2;
+                        if matches!(chars[i + 1], '\\' | '"') {
+                            word.push(chars[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        // Backslashes in quoted Windows/UNC paths are
+                        // ordinary characters unless they escape a quote or
+                        // another backslash.
+                        word.push('\\');
+                        i += 1;
                         continue;
                     }
                     if chars[i] == '"' {
@@ -129,6 +141,12 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, ParseError> {
                     word.push(chars[i]);
                     i += 1;
                 }
+                if i < chars.len() && !chars[i].is_whitespace() && !matches!(chars[i], '(' | ')') {
+                    return Err(ParseError {
+                        message: "unexpected characters after regex flags".into(),
+                        position: i,
+                    });
+                }
                 continue;
             }
             word.push(c);
@@ -144,6 +162,7 @@ struct Parser {
     pos: usize,
     notes: Vec<String>,
     now: UnixNanos,
+    max_depth: usize,
 }
 
 /// Parse query text into the typed AST.
@@ -153,12 +172,26 @@ pub fn parse(input: &str) -> Result<ParsedQuery, ParseError> {
 
 /// Parse with an explicit "now" (for relative dates; used by tests).
 pub fn parse_at(input: &str, now: UnixNanos) -> Result<ParsedQuery, ParseError> {
+    let limits = QueryLimits::default();
+    // A valid textual query can carry `max_clauses` values of up to
+    // `max_text_len` bytes plus modest syntax overhead. Bound the tokenizer
+    // before it duplicates the input into `Vec<char>` and token strings.
+    let max_input_len = limits
+        .max_clauses
+        .saturating_mul(limits.max_text_len.saturating_add(32));
+    if input.len() > max_input_len {
+        return Err(ParseError {
+            message: format!("query text is too long ({} > {max_input_len})", input.len()),
+            position: 0,
+        });
+    }
     let toks = tokenize(input)?;
     let mut p = Parser {
         toks,
         pos: 0,
         notes: Vec::new(),
         now,
+        max_depth: limits.max_depth,
     };
     if p.toks.is_empty() {
         return Ok(ParsedQuery {
@@ -166,7 +199,7 @@ pub fn parse_at(input: &str, now: UnixNanos) -> Result<ParsedQuery, ParseError> 
             notes: vec!["empty query matches everything".into()],
         });
     }
-    let q = p.expr()?;
+    let q = p.expr(1)?;
     if p.pos < p.toks.len() {
         let position = match &p.toks[p.pos] {
             Tok::LParen(i) | Tok::RParen(i) | Tok::Word(i, _) => *i,
@@ -176,6 +209,10 @@ pub fn parse_at(input: &str, now: UnixNanos) -> Result<ParsedQuery, ParseError> 
             position,
         });
     }
+    q.validate(&limits).map_err(|e| ParseError {
+        message: e.to_string(),
+        position: 0,
+    })?;
     Ok(ParsedQuery {
         query: q,
         notes: p.notes,
@@ -191,15 +228,15 @@ impl Parser {
         matches!(self.peek(), Some(Tok::Word(_, s)) if s == w)
     }
 
-    fn expr(&mut self) -> Result<Query, ParseError> {
-        self.or()
+    fn expr(&mut self, depth: usize) -> Result<Query, ParseError> {
+        self.or(depth)
     }
 
-    fn or(&mut self) -> Result<Query, ParseError> {
-        let mut parts = vec![self.and()?];
+    fn or(&mut self, depth: usize) -> Result<Query, ParseError> {
+        let mut parts = vec![self.and(depth)?];
         while self.is_word("OR") || self.is_word("|") {
             self.pos += 1;
-            parts.push(self.and()?);
+            parts.push(self.and(depth)?);
         }
         Ok(if parts.len() == 1 {
             parts.pop().expect("one")
@@ -208,7 +245,7 @@ impl Parser {
         })
     }
 
-    fn and(&mut self) -> Result<Query, ParseError> {
+    fn and(&mut self, depth: usize) -> Result<Query, ParseError> {
         let mut parts = Vec::new();
         loop {
             match self.peek() {
@@ -218,7 +255,7 @@ impl Parser {
                     self.pos += 1;
                     continue;
                 }
-                _ => parts.push(self.unary()?),
+                _ => parts.push(self.unary(depth)?),
             }
         }
         if parts.is_empty() {
@@ -238,11 +275,25 @@ impl Parser {
         })
     }
 
-    fn unary(&mut self) -> Result<Query, ParseError> {
+    fn unary(&mut self, depth: usize) -> Result<Query, ParseError> {
+        if depth > self.max_depth {
+            return Err(ParseError {
+                message: format!(
+                    "query syntax nesting depth {depth} exceeds limit {}",
+                    self.max_depth
+                ),
+                position: self
+                    .peek()
+                    .map(|t| match t {
+                        Tok::LParen(i) | Tok::RParen(i) | Tok::Word(i, _) => *i,
+                    })
+                    .unwrap_or(0),
+            });
+        }
         match self.peek().cloned() {
             Some(Tok::LParen(pos)) => {
                 self.pos += 1;
-                let inner = self.expr()?;
+                let inner = self.expr(depth + 1)?;
                 match self.peek() {
                     Some(Tok::RParen(_)) => {
                         self.pos += 1;
@@ -263,7 +314,7 @@ impl Parser {
             // conjunction.
             Some(Tok::Word(_, w)) if w == "NOT" || w == "!" || w == "-" => {
                 self.pos += 1;
-                Ok(Query::not(self.unary()?))
+                Ok(Query::not(self.unary(depth + 1)?))
             }
             Some(Tok::Word(pos, w)) => {
                 self.pos += 1;
@@ -283,6 +334,9 @@ impl Parser {
     }
 
     fn term(&mut self, pos: usize, raw: &str) -> Result<Query, ParseError> {
+        if raw == "*" {
+            return Ok(Query::All);
+        }
         if raw.starts_with('"') || raw.starts_with('/') {
             return self.text_clause(TextField::Name, raw, true, pos);
         }
@@ -293,10 +347,21 @@ impl Parser {
                 || raw[2..].starts_with('/')
                 || raw.starts_with("\\\\"))
         {
-            self.notes
-                .push(format!("\"{raw}\" interpreted as a path prefix"));
+            let mode = if raw.contains('*') || raw.contains('?') {
+                PathMode::Glob
+            } else {
+                PathMode::Prefix
+            };
+            self.notes.push(format!(
+                "\"{raw}\" interpreted as a path {}",
+                if mode == PathMode::Glob {
+                    "glob"
+                } else {
+                    "prefix"
+                }
+            ));
             return Ok(Query::Path {
-                mode: PathMode::Prefix,
+                mode,
                 value: raw.replace('/', "\\"),
                 case_sensitive: false,
             });
@@ -331,6 +396,21 @@ impl Parser {
                 let pattern = &rest[..end];
                 let flags = &rest[end + 1..];
                 let cs = flags.contains('c');
+                let max_regex_len = QueryLimits::default().max_regex_len;
+                if pattern.len() > max_regex_len {
+                    return Err(ParseError {
+                        message: format!("regex is too long ({} > {max_regex_len})", pattern.len()),
+                        position: pos,
+                    });
+                }
+                regex::RegexBuilder::new(pattern)
+                    .case_insensitive(!cs)
+                    .size_limit(1 << 20)
+                    .build()
+                    .map_err(|error| ParseError {
+                        message: format!("invalid regex: {error}"),
+                        position: pos,
+                    })?;
                 return Ok(Query::Text {
                     field,
                     mode: TextMode::Regex,
@@ -405,6 +485,8 @@ impl Parser {
             if field == TextField::Name {
                 if let Some(ext) = value.strip_prefix("*.") {
                     if !ext.is_empty()
+                        && ext != "-"
+                        && !ext.eq_ignore_ascii_case("none")
                         && ext
                             .chars()
                             .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
@@ -412,7 +494,7 @@ impl Parser {
                         self.notes
                             .push(format!("\"{value}\" interpreted as extension {ext}"));
                         return Ok(Query::Extension {
-                            values: vec![ext.to_string()],
+                            values: vec![ext.to_ascii_lowercase()],
                         });
                     }
                 }
@@ -452,6 +534,27 @@ impl Parser {
             position: pos,
         };
         Ok(Some(match field {
+            "ranked" | "name_ranked" => Query::Text {
+                field: TextField::Name,
+                mode: TextMode::Ranked,
+                value: unquote(value),
+                case_sensitive: false,
+                slop: 0,
+            },
+            "path_ranked" => Query::Text {
+                field: TextField::Path,
+                mode: TextMode::Ranked,
+                value: unquote(value),
+                case_sensitive: false,
+                slop: 0,
+            },
+            "content_ranked" => Query::Text {
+                field: TextField::Content,
+                mode: TextMode::Ranked,
+                value: unquote(value),
+                case_sensitive: false,
+                slop: 0,
+            },
             "name" | "n" | "file" => self.text_clause(TextField::Name, value, false, pos)?,
             "content" | "text" | "body" => {
                 self.text_clause(TextField::Content, value, false, pos)?
@@ -861,6 +964,13 @@ fn parse_duration_ns(s: &str) -> Option<i64> {
 /// `>D`, `>=D`, `<D`, `<=D`, `D..E`, `D`, `7d`, `today`
 pub fn parse_time_range(s: &str, now: UnixNanos) -> Option<(Option<UnixNanos>, Option<UnixNanos>)> {
     let s = s.trim();
+    // Exact half-open range emitted by the renderer. Unlike `A..B`, the
+    // upper timestamp is already exclusive and must not expand to the end of
+    // its displayed date/time granularity.
+    if let Some((a, b)) = s.split_once(",<") {
+        let a = a.strip_prefix(">=")?;
+        return Some((Some(date_span(a, now)?.0), Some(date_span(b, now)?.0)));
+    }
     if let Some(v) = s.strip_prefix(">=") {
         return Some((Some(date_span(v, now)?.0), None));
     }
@@ -968,6 +1078,21 @@ mod tests {
     }
 
     #[test]
+    fn invalid_regex_is_rejected_during_parse() {
+        let error = parse("name:/(unclosed/").unwrap_err();
+        assert!(error.message.contains("invalid regex"), "{error}");
+
+        // Minimized hosted-fuzz inputs that previously let bytes after one
+        // closed regex make `text_clause` reinterpret a later slash as the
+        // delimiter. Regex flags are now the only bytes allowed before the
+        // token boundary.
+        assert!(parse("//\0\0\0.C:ҍ\\/.fi").is_err());
+        assert!(parse(r#"/na//\/\\/.fi"#).is_err());
+        assert!(parse("-/fm.txt").is_err());
+        assert!(parse("-/ft,\0\\/-//\0\0f\0\0\u{1}").is_err());
+    }
+
+    #[test]
     fn sizes_and_times() {
         assert_eq!(parse_size("1.5M"), Some(1_572_864));
         assert_eq!(parse_size("4k"), Some(4096));
@@ -1029,6 +1154,18 @@ mod tests {
                 values: vec!["cs".into()]
             }
         );
+        for reserved in ["*.-", "*.none", "*.NoNe"] {
+            assert!(
+                matches!(
+                    q(reserved),
+                    Query::Text {
+                        mode: TextMode::Regex,
+                        ..
+                    }
+                ),
+                "{reserved} must remain a glob rather than changing meaning through ext:"
+            );
+        }
         assert_eq!(
             q("setup?.cs"),
             Query::Text {

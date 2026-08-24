@@ -850,7 +850,7 @@ fn compile_text(
                     .push(Box::new(move |s, _| re.is_match(&stored_of(s))));
             }
             let is_name = field == TextField::Name;
-            let plan = TrigramPlan::for_regex(value);
+            let plan = TrigramPlan::for_regex_with_case(value, case_sensitive);
             let positive = ctx.neg_depth == 0;
             let candidates = if positive {
                 plan.query(&|t| term_text(tri_field, t))
@@ -1700,6 +1700,8 @@ struct Cursor {
     total: Option<(u64, bool)>,
 }
 
+const MAX_CURSOR_BYTES: usize = 256;
+
 fn decode_cursor(
     c: &Option<String>,
     signing_key: &[u8; 32],
@@ -1715,6 +1717,9 @@ fn decode_cursor(
         }
         Some(s) => s,
     };
+    if s.len() > MAX_CURSOR_BYTES {
+        return Err(QueryError::InvalidCursor);
+    }
     let (unsigned, signature) = match s.rsplit_once(";s:") {
         Some((unsigned, signature)) if !signature.is_empty() => (unsigned, Some(signature)),
         _ => (s.as_str(), None),
@@ -1726,26 +1731,53 @@ fn decode_cursor(
         total: None,
     };
     let mut seen_offset = false;
+    let mut seen_generation = false;
+    let mut seen_fingerprint = false;
+    let mut seen_total = false;
+    let mut seen_exact = false;
     let (mut total, mut exact): (Option<u64>, Option<bool>) = (None, None);
     for part in unsigned.split(';') {
         let (key, value) = part.split_once(':').ok_or(QueryError::InvalidCursor)?;
         match key {
             "o" => {
+                if seen_offset {
+                    return Err(QueryError::InvalidCursor);
+                }
                 cursor.offset = value.parse().map_err(|_| QueryError::InvalidCursor)?;
                 seen_offset = true;
             }
-            "g" => cursor.generation = Some(value.parse().map_err(|_| QueryError::InvalidCursor)?),
-            "q" => {
-                cursor.fingerprint =
-                    Some(u64::from_str_radix(value, 16).map_err(|_| QueryError::InvalidCursor)?)
+            "g" => {
+                if seen_generation {
+                    return Err(QueryError::InvalidCursor);
+                }
+                cursor.generation = Some(value.parse().map_err(|_| QueryError::InvalidCursor)?);
+                seen_generation = true;
             }
-            "t" => total = Some(value.parse().map_err(|_| QueryError::InvalidCursor)?),
+            "q" => {
+                if seen_fingerprint {
+                    return Err(QueryError::InvalidCursor);
+                }
+                cursor.fingerprint =
+                    Some(u64::from_str_radix(value, 16).map_err(|_| QueryError::InvalidCursor)?);
+                seen_fingerprint = true;
+            }
+            "t" => {
+                if seen_total {
+                    return Err(QueryError::InvalidCursor);
+                }
+                total = Some(value.parse().map_err(|_| QueryError::InvalidCursor)?);
+                seen_total = true;
+            }
             "x" => {
+                if seen_exact {
+                    return Err(QueryError::InvalidCursor);
+                }
                 exact = Some(match value {
                     "1" => true,
                     "0" => false,
                     _ => return Err(QueryError::InvalidCursor),
-                })
+                });
+                seen_exact = true;
             }
             _ => return Err(QueryError::InvalidCursor),
         }
@@ -3008,4 +3040,91 @@ fn completeness_for(
 /// Attribute names accepted by the query syntax.
 pub fn attribute_bit(name: &str) -> Option<u32> {
     attr_bit(name)
+}
+
+#[cfg(test)]
+mod cursor_property_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, RngSeed};
+
+    const KEY: [u8; 32] = [0x27; 32];
+
+    fn signed(unsigned: &str) -> String {
+        let signature = blake3::keyed_hash(&KEY, unsigned.as_bytes());
+        format!("{unsigned};s:{signature}")
+    }
+
+    #[test]
+    fn duplicate_fields_and_oversized_cursors_are_rejected() {
+        for cursor in [
+            "o:1;o:2".to_string(),
+            signed("o:1;g:2;g:3;q:0000000000000004"),
+            signed("o:1;g:2;q:0000000000000004;q:5"),
+            signed("o:1;g:2;q:0000000000000004;t:6;t:7;x:1"),
+            signed("o:1;g:2;q:0000000000000004;t:6;x:1;x:0"),
+            format!("o:1{}", ";padding".repeat(MAX_CURSOR_BYTES)),
+        ] {
+            assert_eq!(
+                decode_cursor(&Some(cursor), &KEY),
+                Err(QueryError::InvalidCursor)
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            rng_seed: RngSeed::Fixed(0xe1d0_c027),
+            max_shrink_iters: 20_000,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn structured_cursor_round_trips_numeric_extremes(
+            offset in any::<usize>(),
+            generation in any::<u64>(),
+            fingerprint in any::<u64>(),
+            total in prop::option::of((any::<u64>(), any::<bool>())),
+        ) {
+            let encoded = encode_cursor(offset, generation, fingerprint, total, &KEY);
+            let decoded = decode_cursor(&Some(encoded), &KEY).expect("encoded cursor is valid");
+            prop_assert_eq!(
+                decoded,
+                Cursor {
+                    offset,
+                    generation: Some(generation),
+                    fingerprint: Some(fingerprint),
+                    total,
+                }
+            );
+        }
+
+        #[test]
+        fn changing_any_signed_payload_byte_is_rejected(
+            offset in any::<usize>(),
+            generation in any::<u64>(),
+            fingerprint in any::<u64>(),
+            index in any::<usize>(),
+        ) {
+            let encoded = encode_cursor(offset, generation, fingerprint, None, &KEY);
+            let unsigned_len = encoded.find(";s:").expect("signature separator");
+            let mut bytes = encoded.into_bytes();
+            let at = index % unsigned_len;
+            bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+            let changed = String::from_utf8(bytes).expect("cursor is ASCII");
+            prop_assert_eq!(
+                decode_cursor(&Some(changed), &KEY),
+                Err(QueryError::InvalidCursor)
+            );
+        }
+
+        #[test]
+        fn arbitrary_bounded_cursor_text_never_panics(
+            cursor in prop::collection::vec(any::<char>(), 0..=MAX_CURSOR_BYTES),
+        ) {
+            let cursor: String = cursor.into_iter().collect();
+            let _ = decode_cursor(&Some(cursor), &KEY);
+        }
+    }
 }

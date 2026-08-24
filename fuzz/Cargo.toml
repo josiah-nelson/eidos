@@ -1,0 +1,33 @@
+[package]
+name = "eidos-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+eidos-domain = { path = "../crates/eidos-domain" }
+eidos-query = { path = "../crates/eidos-query" }
+eidos-search = { path = "../crates/eidos-search" }
+libfuzzer-sys = "0.4.13"
+regex = "1.13.1"
+
+[workspace]
+resolver = "2"
+members = ["."]
+
+[[bin]]
+name = "query_parser"
+path = "fuzz_targets/query_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "regex_plan"
+path = "fuzz_targets/regex_plan.rs"
+test = false
+doc = false
+bench = false
