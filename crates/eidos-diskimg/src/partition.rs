@@ -400,13 +400,15 @@ fn read_mbr<R: Read + Seek>(
             protective = true;
             continue;
         }
-        if retained >= limits.max_partitions {
-            truncated = true;
-            continue;
-        }
         let first = u32_at(&boot, at + 8) as u64;
         let sectors = u32_at(&boot, at + 12) as u64;
         if sectors == 0 {
+            continue;
+        }
+        let extended = matches!(kind, 0x05 | 0x0F | 0x85);
+        has_extended |= extended;
+        if retained >= limits.max_partitions {
+            truncated = true;
             continue;
         }
         if first == 0 {
@@ -428,8 +430,6 @@ fn read_mbr<R: Read + Seek>(
                 )))
             }
         };
-        let extended = matches!(kind, 0x05 | 0x0F | 0x85);
-        has_extended |= extended;
         let end = start + length;
         if partitions
             .iter()
@@ -756,7 +756,10 @@ mod tests {
             SECTOR,
             &[
                 PartSpec::basic(128, 128, "", true),
-                PartSpec::basic(256, 128, "", true),
+                PartSpec {
+                    mbr_type: 0x0F,
+                    ..PartSpec::basic(256, 128, "", false)
+                },
             ],
         );
         let limits = DiskImageLimits {
@@ -766,7 +769,9 @@ mod tests {
         let table = table(disk, &limits).unwrap();
         assert!(table.truncated);
         assert_eq!(table.partitions.len(), 1);
-        assert!(table.incomplete_reason.unwrap().contains("entry budget"));
+        let reason = table.incomplete_reason.unwrap();
+        assert!(reason.contains("entry budget"), "{reason}");
+        assert!(reason.contains("logical partitions"), "{reason}");
     }
 
     #[test]
