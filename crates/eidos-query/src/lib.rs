@@ -240,6 +240,11 @@ pub fn render(q: &Query) -> String {
                     .iter()
                     .map(|v| if v.is_empty() {
                         "none".to_string()
+                    } else if v
+                        .chars()
+                        .any(|c| c.is_whitespace() || matches!(c, '\\' | '"' | '(' | ')'))
+                    {
+                        quoted(v)
                     } else {
                         v.clone()
                     })
@@ -474,6 +479,7 @@ mod tests {
             "in:fixture",
             "attr:hidden,system",
             "mtime:2026-01-01..2026-01-03",
+            "fixtuxtr e:r\"kure_fieldC:Lctu\\\\\\f2ile?.txt\nd:\"alph\u{17}\u{5}ſſUa",
         ] {
             let parsed = parse(input).unwrap();
             let rendered = render(&parsed.query);

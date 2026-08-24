@@ -610,7 +610,11 @@ impl Parser {
             "ext" | "e" | "extension" => {
                 let values: Vec<String> = value
                     .split(',')
-                    .map(|v| v.trim().trim_start_matches('.').to_ascii_lowercase())
+                    .map(|v| {
+                        unquote(v.trim())
+                            .trim_start_matches('.')
+                            .to_ascii_lowercase()
+                    })
                     .map(|v| {
                         if v == "none" || v == "-" {
                             String::new()
