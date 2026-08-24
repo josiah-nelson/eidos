@@ -36,7 +36,6 @@ const DESCRIPTION: &str =
 const ERROR_ACCESS_DENIED: i32 = 5;
 const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
-const ERROR_SERVICE_EXISTS: i32 = 1073;
 const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: i32 = 1063;
 const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
 const ERROR_SERVICE_NEVER_STARTED: u32 = 1077;
@@ -233,15 +232,21 @@ fn cmd_install(name: &str, args: InstallArgs) -> anyhow::Result<()> {
         | ServiceAccess::QUERY_CONFIG
         | ServiceAccess::START
         | ServiceAccess::DELETE;
-    let (service, replaced) = match manager.create_service(&info, access) {
-        Ok(s) => (s, false),
-        Err(e) if os_error(&e) == Some(ERROR_SERVICE_EXISTS) => {
+    // Order of mutations, so that any failure leaves the machine as it was:
+    //   1. account grants (undone on any later failure);
+    //   2. registration: create, or for --replace update after a snapshot of
+    //      the previous configuration (restored on failure);
+    //   3. per-service settings (description, delayed start, failure
+    //      actions, pre-shutdown).
+    // A created registration is deleted and grants are revoked on failure;
+    // a replaced registration is restored and grants are revoked.
+    let (service, replaced, previous) = match manager.open_service(name, access) {
+        Ok(s) => {
             if !args.replace {
                 bail!(
                     "service '{name}' is already installed; pass --replace to update it or `eidos service uninstall` first"
                 );
             }
-            let s = manager.open_service(name, access).map_err(describe)?;
             let st = s.query_status().map_err(describe)?;
             if st.current_state != ServiceState::Stopped {
                 bail!(
@@ -249,14 +254,94 @@ fn cmd_install(name: &str, args: InstallArgs) -> anyhow::Result<()> {
                     state_name(st.current_state)
                 );
             }
-            s.change_config(&info).map_err(describe)?;
-            (s, true)
+            let previous = s.query_config().map_err(describe)?;
+            (Some(s), true, Some(previous))
         }
+        Err(e) if os_error(&e) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => (None, false, None),
         Err(e) => return Err(describe(e)),
     };
+
+    let mut grants = match &account_name {
+        Some(account) => Some(Grants::apply(
+            account,
+            args.account == Account::User,
+            !args.no_acl,
+            &[&serve.data_dir, &log_dir],
+        )?),
+        None => None,
+    };
+
+    let registered = (|| -> anyhow::Result<windows_service::service::Service> {
+        let service = match service {
+            Some(s) => {
+                s.change_config(&info).map_err(describe)?;
+                s
+            }
+            None => manager.create_service(&info, access).map_err(describe)?,
+        };
+        configure(&service, args.start)?;
+        Ok(service)
+    })();
+    let service = match registered {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(g) = grants.as_mut() {
+                g.undo();
+            }
+            return Err(match (replaced, previous) {
+                (true, Some(prev)) => {
+                    let restore = restore_config(&manager, name, access, &prev);
+                    e.context(match restore {
+                        Ok(()) => format!(
+                            "service '{name}' was not updated (previous registration restored; grants revoked)"
+                        ),
+                        Err(r) => format!(
+                            "service '{name}' update failed and the previous registration could not be restored ({r:#}); check `eidos service status`"
+                        ),
+                    })
+                }
+                _ => {
+                    // create_service may have succeeded before a later
+                    // setting failed: remove whatever exists now.
+                    if let Ok(s) = manager.open_service(name, ServiceAccess::DELETE) {
+                        let _ = s.delete();
+                    }
+                    e.context(format!(
+                        "service '{name}' was not installed (registration rolled back; grants revoked)"
+                    ))
+                }
+            });
+        }
+    };
+
+    println!(
+        "{} service '{name}' ({})",
+        if replaced { "updated" } else { "installed" },
+        args.display_name
+    );
+    println!("  executable: {}", exe.display());
+    println!("  data dir:   {}", serve.data_dir.display());
+    println!("  log dir:    {}", log_dir.display());
+    println!("  bind:       http://{}", serve.bind);
+    println!(
+        "  account:    {}",
+        account_name.as_deref().unwrap_or("LocalSystem")
+    );
+    println!("  start:      {}", start_mode_name(args.start));
+    if args.start_now {
+        drop(service);
+        cmd_start(name, WaitArgs { timeout: 120 })?;
+    } else {
+        println!("start it with: eidos service start");
+    }
+    Ok(())
+}
+
+/// Per-service settings applied after the registration exists.
+fn configure(service: &windows_service::service::Service, start: StartMode) -> anyhow::Result<()> {
     service.set_description(DESCRIPTION).map_err(describe)?;
     service
-        .set_delayed_auto_start(args.start == StartMode::Delayed)
+        .set_delayed_auto_start(start == StartMode::Delayed)
         .map_err(describe)?;
     service
         .update_failure_actions(ServiceFailureActions {
@@ -288,74 +373,116 @@ fn cmd_install(name: &str, args: InstallArgs) -> anyhow::Result<()> {
     service
         .set_preshutdown_timeout(Duration::from_secs(180))
         .map_err(describe)?;
-
-    // Rights and ACLs are granted only once the registration exists, so a
-    // refused or half-configured registration never leaves widened
-    // privileges behind; if a grant fails, a registration this command
-    // created is removed again.
-    if let Some(account) = &account_name {
-        let granted = grant_account_access(
-            account,
-            args.account == Account::User,
-            !args.no_acl,
-            &[&serve.data_dir, &log_dir],
-        );
-        if let Err(e) = granted {
-            if !replaced {
-                let _ = service.delete();
-                return Err(e.context(format!(
-                    "service '{name}' was not installed (registration rolled back)"
-                )));
-            }
-            return Err(e.context(format!(
-                "service '{name}' registration was updated but the account grants failed"
-            )));
-        }
-    }
-
-    println!(
-        "{} service '{name}' ({})",
-        if replaced { "updated" } else { "installed" },
-        args.display_name
-    );
-    println!("  executable: {}", exe.display());
-    println!("  data dir:   {}", serve.data_dir.display());
-    println!("  log dir:    {}", log_dir.display());
-    println!("  bind:       http://{}", serve.bind);
-    println!(
-        "  account:    {}",
-        account_name.as_deref().unwrap_or("LocalSystem")
-    );
-    println!("  start:      {}", start_mode_name(args.start));
-    if args.start_now {
-        drop(service);
-        cmd_start(name, WaitArgs { timeout: 120 })?;
-    } else {
-        println!("start it with: eidos service start");
-    }
     Ok(())
 }
 
-/// Grant what a non-LocalSystem service account needs: the logon right (for a
-/// named account) and Modify on the directories it writes.
-fn grant_account_access(
-    account: &str,
-    named_user: bool,
-    acl: bool,
-    dirs: &[&Path],
+/// Put a `--replace` registration back the way `query_config` saw it. The
+/// SCM never returns a stored password, so a previous named account keeps
+/// working only if its secret was not overwritten (it is overwritten once
+/// `change_config` succeeded with a new password); the caller reports that.
+fn restore_config(
+    manager: &ServiceManager,
+    name: &str,
+    access: ServiceAccess,
+    prev: &windows_service::service::ServiceConfig,
 ) -> anyhow::Result<()> {
-    if named_user {
-        grant_logon_as_service(account)
-            .with_context(|| format!("granting 'Log on as a service' to {account}"))?;
-        println!("granted 'Log on as a service' to {account}");
-    }
-    if acl {
-        for dir in dirs {
-            grant_modify(dir, account)?;
-            println!("granted Modify on {} to {account}", dir.display());
+    let service = manager.open_service(name, access).map_err(describe)?;
+    // `executable_path` from query_config is the full command line; split
+    // the program from its arguments so ServiceInfo re-quotes it correctly.
+    let line = prev.executable_path.to_string_lossy().into_owned();
+    let tokens = split_command_line(&line);
+    let (exe, arguments) = match tokens.split_first() {
+        Some((exe, rest)) => (
+            PathBuf::from(exe),
+            rest.iter().map(OsString::from).collect(),
+        ),
+        None => (prev.executable_path.clone(), Vec::new()),
+    };
+    let info = ServiceInfo {
+        name: OsString::from(name),
+        display_name: prev.display_name.clone(),
+        service_type: prev.service_type,
+        start_type: prev.start_type,
+        error_control: prev.error_control,
+        executable_path: exe,
+        launch_arguments: arguments,
+        dependencies: prev.dependencies.clone(),
+        account_name: prev.account_name.clone(),
+        account_password: None,
+    };
+    service.change_config(&info).map_err(describe)
+}
+
+/// What `install` granted to the service account, so that every completed
+/// grant can be undone if a later step fails.
+struct Grants {
+    account: String,
+    /// The logon right was added by us (it was absent before).
+    logon_right_added: bool,
+    /// Directories that received an explicit Modify ACE from us.
+    acl_dirs: Vec<PathBuf>,
+}
+
+impl Grants {
+    /// Grant what a non-LocalSystem service account needs: the logon right
+    /// (for a named account, only if it does not already hold it) and Modify
+    /// on the directories it writes. On error the grants made so far are
+    /// already undone.
+    fn apply(account: &str, named_user: bool, acl: bool, dirs: &[&Path]) -> anyhow::Result<Grants> {
+        let mut grants = Grants {
+            account: account.to_string(),
+            logon_right_added: false,
+            acl_dirs: Vec::new(),
+        };
+        let result = (|| -> anyhow::Result<()> {
+            if named_user {
+                let already = logon_right(account, RightOp::Has)
+                    .with_context(|| format!("checking the logon right of {account}"))?;
+                if !already {
+                    logon_right(account, RightOp::Add)
+                        .with_context(|| format!("granting 'Log on as a service' to {account}"))?;
+                    grants.logon_right_added = true;
+                    println!("granted 'Log on as a service' to {account}");
+                }
+            }
+            if acl {
+                for dir in dirs {
+                    grant_modify(dir, account)?;
+                    grants.acl_dirs.push(dir.to_path_buf());
+                    println!("granted Modify on {} to {account}", dir.display());
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(grants),
+            Err(e) => {
+                grants.undo();
+                Err(e)
+            }
         }
     }
-    Ok(())
+
+    /// Revoke everything `apply` granted. Best effort: each failure is
+    /// reported and the rest is still attempted.
+    fn undo(&mut self) {
+        for dir in self.acl_dirs.drain(..) {
+            match revoke_modify(&dir, &self.account) {
+                Ok(()) => println!("revoked Modify on {} from {}", dir.display(), self.account),
+                Err(e) => eprintln!(
+                    "warning: could not revoke Modify on {}: {e:#}",
+                    dir.display()
+                ),
+            }
+        }
+        if self.logon_right_added {
+            match logon_right(&self.account, RightOp::Remove) {
+                Ok(_) => println!("revoked 'Log on as a service' from {}", self.account),
+                Err(e) => eprintln!("warning: could not revoke 'Log on as a service': {e:#}"),
+            }
+            self.logon_right_added = false;
+        }
+    }
 }
 
 /// Account name for the SCM (`None` = LocalSystem) and the password, if any.
@@ -945,15 +1072,25 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
 /// Give `account` Modify (read/write/delete, inherited by children) on
 /// `dir` so a non-LocalSystem service can write its catalog and logs.
 fn grant_modify(dir: &Path, account: &str) -> anyhow::Result<()> {
+    icacls(dir, "/grant", &format!("{account}:(OI)(CI)M"))
+}
+
+/// Remove every explicit ACE for `account` on `dir` (the inverse of
+/// [`grant_modify`]; inherited entries are untouched).
+fn revoke_modify(dir: &Path, account: &str) -> anyhow::Result<()> {
+    icacls(dir, "/remove:g", account)
+}
+
+fn icacls(dir: &Path, verb: &str, subject: &str) -> anyhow::Result<()> {
     let out = std::process::Command::new("icacls")
         .arg(dir)
-        .arg("/grant")
-        .arg(format!("{account}:(OI)(CI)M"))
+        .arg(verb)
+        .arg(subject)
         .output()
         .context("running icacls")?;
     if !out.status.success() {
         bail!(
-            "icacls failed on {}: {}",
+            "icacls {verb} failed on {}: {}",
             dir.display(),
             String::from_utf8_lossy(&out.stdout).trim()
         );
@@ -999,14 +1136,25 @@ fn validate_credentials(domain: &str, user: &str, password: &str) -> anyhow::Res
     Ok(())
 }
 
-/// Add `SeServiceLogonRight` for `account` through the Local Security
-/// Authority. Idempotent.
-fn grant_logon_as_service(account: &str) -> anyhow::Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightOp {
+    Has,
+    Add,
+    Remove,
+}
+
+/// Query, grant, or revoke `SeServiceLogonRight` for `account` through the
+/// Local Security Authority. Returns whether the account holds the right
+/// (for `Has`) or `true` after a successful change.
+fn logon_right(account: &str, op: RightOp) -> anyhow::Result<bool> {
     use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
     use windows_sys::Win32::Security::Authentication::Identity::{
-        LsaAddAccountRights, LsaClose, LsaNtStatusToWinError, LsaOpenPolicy, LSA_HANDLE,
+        LsaAddAccountRights, LsaClose, LsaEnumerateAccountRights, LsaFreeMemory,
+        LsaNtStatusToWinError, LsaOpenPolicy, LsaRemoveAccountRights, LSA_HANDLE,
         LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, POLICY_CREATE_ACCOUNT, POLICY_LOOKUP_NAMES,
     };
+    // STATUS_OBJECT_NAME_NOT_FOUND: the account has no rights at all.
+    const NO_RIGHTS: i32 = 0xC000_0034_u32 as i32;
     use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
 
     let name = wide(account);
@@ -1078,19 +1226,58 @@ fn grant_logon_as_service(account: &str) -> anyhow::Result<()> {
         MaximumLength: ((chars + 1) * 2) as u16,
         Buffer: right.as_mut_ptr(),
     };
-    // SAFETY: policy is open; sid and lsa_right outlive the call.
-    let st = unsafe { LsaAddAccountRights(policy, sid.as_mut_ptr().cast(), &lsa_right, 1) };
+    let (what, st, result) = match op {
+        RightOp::Has => {
+            let mut rights: *mut LSA_UNICODE_STRING = std::ptr::null_mut();
+            let mut count = 0u32;
+            // SAFETY: policy is open; out-params are valid; the buffer is
+            // freed with LsaFreeMemory below.
+            let st = unsafe {
+                LsaEnumerateAccountRights(policy, sid.as_mut_ptr().cast(), &mut rights, &mut count)
+            };
+            let mut found = false;
+            if st == 0 {
+                let wanted: Vec<u16> = right[..chars].to_vec();
+                for i in 0..count as usize {
+                    // SAFETY: `rights` holds `count` entries returned by LSA.
+                    let entry = unsafe { &*rights.add(i) };
+                    let len = entry.Length as usize / 2;
+                    // SAFETY: Buffer is a valid wide string of `len` chars.
+                    let text = unsafe { std::slice::from_raw_parts(entry.Buffer, len) };
+                    if text == wanted.as_slice() {
+                        found = true;
+                    }
+                }
+                // SAFETY: buffer came from LsaEnumerateAccountRights.
+                unsafe { LsaFreeMemory(rights.cast()) };
+                ("LsaEnumerateAccountRights", 0, found)
+            } else if st == NO_RIGHTS {
+                ("LsaEnumerateAccountRights", 0, false)
+            } else {
+                ("LsaEnumerateAccountRights", st, false)
+            }
+        }
+        RightOp::Add => {
+            // SAFETY: policy is open; sid and lsa_right outlive the call.
+            let st = unsafe { LsaAddAccountRights(policy, sid.as_mut_ptr().cast(), &lsa_right, 1) };
+            ("LsaAddAccountRights", st, true)
+        }
+        RightOp::Remove => {
+            // SAFETY: as above; `false` removes only the listed right.
+            let st = unsafe {
+                LsaRemoveAccountRights(policy, sid.as_mut_ptr().cast(), false, &lsa_right, 1)
+            };
+            ("LsaRemoveAccountRights", st, true)
+        }
+    };
     // SAFETY: closing the handle we opened.
     unsafe { LsaClose(policy) };
     if st != 0 {
         // SAFETY: pure conversion.
         let code = unsafe { LsaNtStatusToWinError(st) };
-        bail!(
-            "LsaAddAccountRights: {}",
-            std::io::Error::from_raw_os_error(code as i32)
-        );
+        bail!("{what}: {}", std::io::Error::from_raw_os_error(code as i32));
     }
-    Ok(())
+    Ok(result)
 }
 
 fn os_error(e: &windows_service::Error) -> Option<i32> {
