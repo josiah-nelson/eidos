@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 use ts_rs::TS;
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How long a drained journal read blocks in the kernel waiting for new
+/// records before returning empty so the loop can check for cancellation.
+pub const JOURNAL_WAIT: Duration = Duration::from_secs(1);
 pub const DEFAULT_RECONCILE_INTERVAL_S: i64 = 6 * 3600;
 /// Minimum pause before a watcher retries a reconciliation that failed.
 pub const RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -173,7 +176,7 @@ impl UsnCheckpoint {
 
 #[cfg(windows)]
 fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStatus>) {
-    use eidos_scanner::usn::{read_journal, ReadOutcome, UsnError, VolumeHandle};
+    use eidos_scanner::usn::{read_journal_wait, ReadOutcome, UsnError, VolumeHandle};
 
     let mut buf = vec![0u8; 1024 * 1024];
     let mut vol: Option<VolumeHandle> = None;
@@ -287,7 +290,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             }
         }
         let v = vol.as_ref().expect("opened");
-        match read_journal(v, cp.journal_id, cp.next_usn, &mut buf) {
+        // Block in the kernel until records arrive (or one second passes so
+        // cancellation/shutdown stay responsive). Change latency is the
+        // journal wake-up, not a poll interval.
+        match read_journal_wait(v, cp.journal_id, cp.next_usn, &mut buf, JOURNAL_WAIT) {
             Ok(ReadOutcome::Records { records, next_usn }) => {
                 io_failures = 0;
                 if records.is_empty() {
@@ -320,7 +326,8 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         }
                     }
                     status.set(WatcherState::Live, None);
-                    std::thread::sleep(POLL_INTERVAL);
+                    // No sleep: the next read blocks in the kernel until
+                    // records arrive or JOURNAL_WAIT elapses.
                     continue;
                 }
                 let started = Instant::now();

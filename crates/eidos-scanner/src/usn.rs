@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
     ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_JOURNAL_DELETE_IN_PROGRESS,
     ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE, ERROR_NOT_FOUND, ERROR_NO_MORE_FILES,
-    GENERIC_READ, INVALID_HANDLE_VALUE,
+    GENERIC_READ, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ExtendedFileIdType, FileAttributeTagInfo, FileBasicInfo, FileIdInfo,
@@ -230,12 +230,40 @@ pub fn read_journal(
     start_usn: i64,
     buf: &mut [u8],
 ) -> Result<ReadOutcome, UsnError> {
+    read_journal_opts(vol, journal_id, start_usn, buf, None)
+}
+
+/// Like [`read_journal`], but when the journal is drained the call blocks in
+/// the kernel until at least one new record arrives or `wait` elapses
+/// (`BytesToWaitFor`/`Timeout` on `FSCTL_READ_USN_JOURNAL`), returning empty
+/// records on timeout. This is the push-style feed: change latency becomes
+/// the ioctl wake-up rather than a poll interval.
+pub fn read_journal_wait(
+    vol: &VolumeHandle,
+    journal_id: u64,
+    start_usn: i64,
+    buf: &mut [u8],
+    wait: std::time::Duration,
+) -> Result<ReadOutcome, UsnError> {
+    read_journal_opts(vol, journal_id, start_usn, buf, Some(wait))
+}
+
+fn read_journal_opts(
+    vol: &VolumeHandle,
+    journal_id: u64,
+    start_usn: i64,
+    buf: &mut [u8],
+    wait: Option<std::time::Duration>,
+) -> Result<ReadOutcome, UsnError> {
     let req = READ_USN_JOURNAL_DATA_V1 {
         StartUsn: start_usn,
         ReasonMask: 0xFFFF_FFFF,
         ReturnOnlyOnClose: 0,
-        Timeout: 0,
-        BytesToWaitFor: 0,
+        // Timeout is in seconds; 0 with nonzero BytesToWaitFor would wait
+        // indefinitely, so waiting reads always pass at least one second and
+        // rely on the caller's loop for cancellation checks.
+        Timeout: wait.map(|w| w.as_secs().max(1)).unwrap_or(0),
+        BytesToWaitFor: u64::from(wait.is_some()),
         UsnJournalID: journal_id,
         MinMajorVersion: 2,
         MaxMajorVersion: 3,
@@ -261,7 +289,9 @@ pub fn read_journal(
         return match code {
             ERROR_JOURNAL_ENTRY_DELETED => Ok(ReadOutcome::EntryDeleted),
             ERROR_INVALID_PARAMETER => Ok(ReadOutcome::JournalChanged),
-            ERROR_HANDLE_EOF => Ok(ReadOutcome::Records {
+            // EOF: drained (non-waiting read). WAIT_TIMEOUT: a waiting read's
+            // window elapsed with no new records; both mean "nothing yet".
+            ERROR_HANDLE_EOF | WAIT_TIMEOUT => Ok(ReadOutcome::Records {
                 records: Vec::new(),
                 next_usn: start_usn,
             }),
@@ -707,6 +737,67 @@ mod tests {
         match read_journal(&vol, info.journal_id ^ 0x5555, info.next_usn, &mut buf).unwrap() {
             ReadOutcome::JournalChanged => {}
             other => panic!("expected JournalChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn waiting_read_returns_promptly_when_records_arrive_or_skip() {
+        let root = match temp_volume_root() {
+            Some(r) => r,
+            None => return,
+        };
+        let vol = match VolumeHandle::open(&root) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skipping USN test: {e}");
+                return;
+            }
+        };
+        let info = match query_journal(&vol) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("skipping USN test: {e}");
+                return;
+            }
+        };
+        // A writer that fires while the waiting read is blocked in the
+        // kernel. The volume is shared, so any process's records also wake
+        // the read — the assertion is only that it returns promptly with
+        // records rather than sleeping out the full window.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir
+            .path()
+            .join(format!("eidos-wait-{}.txt", std::process::id()));
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::fs::write(&marker, b"wake").unwrap();
+        });
+        let mut buf = vec![0u8; 256 * 1024];
+        let started = std::time::Instant::now();
+        let outcome = read_journal_wait(
+            &vol,
+            info.journal_id,
+            info.next_usn,
+            &mut buf,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        writer.join().unwrap();
+        match outcome {
+            ReadOutcome::Records { records, next_usn } => {
+                // Either woken by records (ours or a bystander's) well before
+                // the 10 s window, or — only if the volume was totally idle —
+                // an empty timeout return, which the 10 s bound rules out.
+                assert!(
+                    !records.is_empty() || next_usn != info.next_usn,
+                    "waiting read returned empty without advancing"
+                );
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(9),
+                    "waiting read slept out its window despite volume activity"
+                );
+            }
+            other => panic!("unexpected outcome {other:?}"),
         }
     }
 }
