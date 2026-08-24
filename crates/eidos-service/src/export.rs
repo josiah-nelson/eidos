@@ -208,6 +208,7 @@ pub(crate) struct ExportHeader {
     exported_at: String,
     total: eidos_domain::TotalCount,
     max_rows: u64,
+    coverage: eidos_domain::CoverageEnvelope,
     completeness: Vec<eidos_domain::SourceCompleteness>,
     warnings: Vec<String>,
 }
@@ -382,6 +383,7 @@ async fn start(st: Arc<AppState>, p: Plan) -> Result<Response, ApiError> {
     let first = fetch_page(&st, &p.req).await?;
 
     let total = first.total;
+    let coverage_full = first.coverage.full;
     let format = p.format;
     let max_rows = p.max_rows;
     // Capacity 1: the producer may prepare at most one page beyond the one the
@@ -417,6 +419,12 @@ async fn start(st: Arc<AppState>, p: Plan) -> Result<Response, ApiError> {
     h.insert(
         "x-eidos-export-total-exact",
         HeaderValue::from_static(if total.exact { "true" } else { "false" }),
+    );
+    // CSV has no metadata envelope, and the CLI must be able to decide its
+    // completeness exit status without buffering JSON/NDJSON bodies.
+    h.insert(
+        "x-eidos-export-coverage-full",
+        HeaderValue::from_static(if coverage_full { "true" } else { "false" }),
     );
     Ok(resp)
 }
@@ -668,6 +676,7 @@ fn write_header(out: &mut Vec<u8>, p: &Plan, first: &SearchResponse) {
         exported_at: UnixNanos::now().to_rfc3339_nanos(),
         total: first.total,
         max_rows: p.max_rows,
+        coverage: first.coverage.clone(),
         completeness: first.completeness.clone(),
         warnings: first.warnings.clone(),
     };

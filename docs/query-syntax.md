@@ -262,6 +262,7 @@ Both carry `"schema": "eidos-export/2"`. `format=json` is one document. All
   "exported_at": "2026-08-23T01:02:03.123456789Z",
   "total": { "value": "1200", "exact": true },
   "max_rows": "100000",
+  "coverage": { "full": true, "degraded": [ ], "sources": [ ] },
   "completeness": [ ],
   "warnings": [ ],
   "rows": [ ],
@@ -279,6 +280,10 @@ the first is the header object (`"type": "header"`, everything above except
 `"type": "summary"` line with `rows_exported`, `truncated`, and `error`. Row
 lines never carry a `schema` key, so the three line kinds are easy to tell
 apart.
+
+All export formats also return `X-Eidos-Export-Coverage-Full`; CSV clients use
+that header because CSV has no metadata envelope. The CLI exits with status 2
+when coverage is degraded or the export row cap truncates the result set.
 
 `completeness` is the same per-source block `/api/search` returns, captured
 from the first page: a stale, degraded, or still-indexing source is visible in

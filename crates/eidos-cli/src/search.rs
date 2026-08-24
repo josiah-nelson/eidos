@@ -377,6 +377,7 @@ fn export(args: &SearchArgs, q: &str) -> anyhow::Result<i32> {
     let total = header("x-eidos-export-total");
     let exact = header("x-eidos-export-total-exact");
     let cap = header("x-eidos-export-max-rows");
+    let coverage_full = header("x-eidos-export-coverage-full");
     if status >= 400 {
         let text = resp.body_mut().read_to_string()?;
         let err: ApiErr = serde_json::from_str(&text).unwrap_or(ApiErr {
@@ -416,21 +417,57 @@ fn export(args: &SearchArgs, q: &str) -> anyhow::Result<i32> {
             return Ok(1);
         }
     }
-    if let (Some(total), Some(cap)) = (total.as_deref(), cap.as_deref()) {
-        let truncated = total
-            .parse::<u64>()
-            .ok()
-            .zip(cap.parse::<u64>().ok())
-            .is_some_and(|(t, c)| t > c);
+    let truncated = match (total.as_deref(), cap.as_deref()) {
+        (Some(total), Some(cap)) => {
+            let truncated = total
+                .parse::<u64>()
+                .ok()
+                .zip(cap.parse::<u64>().ok())
+                .is_some_and(|(t, c)| t > c);
+            eprintln!(
+                "matched {total}{} result(s); export cap {cap}{}",
+                if exact.as_deref() == Some("false") {
+                    "+"
+                } else {
+                    ""
+                },
+                if truncated { " (TRUNCATED)" } else { "" }
+            );
+            truncated
+        }
+        _ => false,
+    };
+    let full = coverage_full.as_deref() == Some("true");
+    if !full {
         eprintln!(
-            "matched {total}{} result(s); export cap {cap}{}",
-            if exact.as_deref() == Some("false") {
-                "+"
+            "coverage: degraded{}",
+            if coverage_full.is_none() {
+                " (server did not provide the coverage contract)"
             } else {
                 ""
-            },
-            if truncated { " (TRUNCATED)" } else { "" }
+            }
         );
     }
-    Ok(0)
+    Ok(export_exit_code(full, truncated))
+}
+
+fn export_exit_code(coverage_full: bool, truncated: bool) -> i32 {
+    if coverage_full && !truncated {
+        0
+    } else {
+        2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_exit_code;
+
+    #[test]
+    fn export_requires_full_coverage_and_the_complete_row_set() {
+        assert_eq!(export_exit_code(true, false), 0);
+        assert_eq!(export_exit_code(false, false), 2);
+        assert_eq!(export_exit_code(true, true), 2);
+        assert_eq!(export_exit_code(false, true), 2);
+    }
 }

@@ -174,6 +174,10 @@ async fn csv_quotes_commas_quotes_newlines_and_unicode() {
     );
     assert_eq!(header(&headers, "x-eidos-export-total"), Some("3"));
     assert_eq!(header(&headers, "x-eidos-export-max-rows"), Some("100000"));
+    assert_eq!(
+        header(&headers, "x-eidos-export-coverage-full"),
+        Some("true")
+    );
     assert!(!body.starts_with('\u{feff}'), "no BOM unless asked for");
 
     let records = parse_csv(&body);
@@ -282,10 +286,19 @@ async fn envelope_carries_completeness_of_stale_and_partial_sources() {
         .unwrap();
     let app = eidos_service::api::router(state.clone(), None);
 
-    let (status, _, body) = get(&app, "/api/search/export?format=json&q=ext:txt").await;
+    let (status, headers, body) = get(&app, "/api/search/export?format=json&q=ext:txt").await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-eidos-export-coverage-full"),
+        Some("false")
+    );
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["schema"], "eidos-export/2");
+    assert_eq!(doc["coverage"]["full"], false);
+    assert_eq!(
+        doc["coverage"]["sources"][0]["degraded"][0]["kind"],
+        "stale"
+    );
     let c = &doc["completeness"][0];
     assert_eq!(c["state"], "stale");
     assert_eq!(c["metadata_complete"], false);
@@ -322,6 +335,7 @@ async fn json_and_ndjson_share_one_versioned_row_schema() {
     assert!(doc["exported_at"].as_str().unwrap().ends_with('Z'));
     assert!(doc["total"]["value"].is_string());
     assert!(doc["max_rows"].is_string());
+    assert_eq!(doc["coverage"]["full"], true);
     assert!(doc["warnings"].is_array());
     let rows = doc["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
@@ -350,6 +364,7 @@ async fn json_and_ndjson_share_one_versioned_row_schema() {
     let head: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(head["schema"], "eidos-export/2");
     assert_eq!(head["type"], "header");
+    assert_eq!(head["coverage"]["full"], true);
     assert!(head["completeness"].is_array());
     let row: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(row, rows[0], "NDJSON rows equal the JSON document's rows");
