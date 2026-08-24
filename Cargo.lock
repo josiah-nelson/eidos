@@ -759,6 +759,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidos-sync"
+version = "0.5.0-dev"
+dependencies = [
+ "blake3",
+ "eidos-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
