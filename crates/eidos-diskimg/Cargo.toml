@@ -1,0 +1,11 @@
+[package]
+name = "eidos-diskimg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Read-only inventory of NTFS filesystems inside VHDX disk images, without booting them"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

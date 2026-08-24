@@ -605,6 +605,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidos-diskimg"
+version = "0.5.0-dev"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eidos-domain"
 version = "0.5.0-dev"
 dependencies = [
