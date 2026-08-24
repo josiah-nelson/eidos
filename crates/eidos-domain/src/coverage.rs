@@ -331,13 +331,13 @@ fn source_coverage(
             });
         }
     }
+    // Reconciling is deliberately excluded: a rescan is running because the
+    // guarantee lapsed, so results are only authoritative as of the last
+    // completed scan even while the change feed is live.
     let healthy_live = c.freshness == Freshness::Live
         && matches!(
             c.state,
-            SourceState::MetadataComplete
-                | SourceState::ContentPending
-                | SourceState::Complete
-                | SourceState::Reconciling
+            SourceState::MetadataComplete | SourceState::ContentPending | SourceState::Complete
         );
     SourceCoverage {
         source_id: c.source_id,
@@ -451,5 +451,21 @@ mod tests {
         assert_eq!(r.severity, CoverageSeverity::Error);
         assert_eq!(env.sources[0].degraded.len(), 1, "no duplicate NotIndexed");
         assert_eq!(env.sources[0].watermark, None);
+    }
+
+    #[test]
+    fn reconciling_keeps_the_last_scan_watermark() {
+        let mut c = complete("g");
+        c.state = SourceState::Reconciling;
+        let env =
+            CoverageEnvelope::derive(&[c], &ResponseSignals::default(), UnixNanos::new(5_000));
+        let r = &env.sources[0].degraded[0];
+        assert_eq!(r.kind, CoverageKind::Reconciling);
+        assert_eq!(r.severity, CoverageSeverity::Info);
+        assert_eq!(
+            env.sources[0].watermark,
+            Some(UnixNanos::new(1_000)),
+            "a live feed does not make mid-reconciliation results authoritative now"
+        );
     }
 }

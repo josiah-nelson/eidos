@@ -6,6 +6,8 @@ import {
   api,
   exportUrl,
   type ApiInt,
+  type CoverageEnvelope,
+  type CoverageReason,
   type ExportFormat,
   type FacetField,
   type FacetValue,
@@ -90,6 +92,38 @@ export default function SearchPage() {
     () => Array.from(new Set(results.data?.pages.flatMap((p) => p.warnings ?? []) ?? [])),
     [results.data],
   )
+  // Coverage can also degrade on a later page (a source dropping offline
+  // mid-walk, lag appearing). The rendered rows span every loaded page, so
+  // the banner merges every page's envelope: full only if every page was
+  // full, with distinct reasons unioned (per source from that source's
+  // entries) and watermarks from the newest page.
+  const coverage = useMemo<CoverageEnvelope | undefined>(() => {
+    const pages = results.data?.pages
+    if (!pages || pages.length === 0) return undefined
+    const key = (r: CoverageReason) => `${r.kind}|${r.severity}|${r.detail}`
+    const distinct = (reasons: CoverageReason[]): CoverageReason[] => {
+      const seen = new Set<string>()
+      return reasons.filter((r) => {
+        const k = key(r)
+        if (seen.has(k)) return false
+        seen.add(k)
+        return true
+      })
+    }
+    const latest = pages[pages.length - 1]
+    return {
+      full: pages.every((p) => p.coverage.full),
+      degraded: distinct(pages.flatMap((p) => p.coverage.degraded ?? [])),
+      sources: latest.coverage.sources.map((s) => ({
+        ...s,
+        degraded: distinct(
+          pages.flatMap(
+            (p) => p.coverage.sources.find((x) => x.source_id === s.source_id)?.degraded ?? [],
+          ),
+        ),
+      })),
+    }
+  }, [results.data])
 
   const submit = () => set({ q: draft })
   /** Refine the query with a facet value, including or excluding it. */
@@ -211,7 +245,7 @@ export default function SearchPage() {
       {first && (
         <div className="results">
           <div className="results-main">
-            <CoverageBanners coverage={first.coverage} />
+            {coverage && <CoverageBanners coverage={coverage} />}
             {warnings.map((w, i) => (
               <div key={i} className="banner warn">
                 <span className="badge warn">warning</span>

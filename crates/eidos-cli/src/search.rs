@@ -1,8 +1,9 @@
 //! `eidos search` — runs a query against the running service over HTTP so the
 //! CLI and the web UI share one query contract and result schema.
 //!
-//! Exit status: 0 = complete results; 2 = results returned but at least one
-//! in-scope source is incomplete/stale/offline; 1 = error.
+//! Exit status: 0 = full coverage (nothing degraded the answer); 2 = results
+//! returned but coverage is degraded (offline/stale/unscanned source, index
+//! lag, truncated totals, content backlog for a content query); 1 = error.
 
 use anyhow::Context;
 use clap::Args;
@@ -119,12 +120,11 @@ pub fn run(args: SearchArgs) -> anyhow::Result<i32> {
     } else {
         print_table(&view, &q);
     }
-    let needs_content = view.response.hits.iter().any(|h| !h.snippets.is_empty());
-    Ok(if view.response.all_sources_complete(needs_content) {
-        0
-    } else {
-        2
-    })
+    // The typed envelope is the completeness contract: anything that degraded
+    // this answer — including index lag or a truncated total that the legacy
+    // per-source flags never reflected — must fail scripts that ask for
+    // complete results.
+    Ok(if view.response.coverage.full { 0 } else { 2 })
 }
 
 fn print_table(v: &SearchView, q: &str) {
