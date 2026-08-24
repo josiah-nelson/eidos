@@ -22,6 +22,17 @@ fn unicode_value() -> impl Strategy<Value = String> {
     prop::collection::vec(any::<char>(), 1..32).prop_map(|chars| chars.into_iter().collect())
 }
 
+fn syntax_weighted_char() -> impl Strategy<Value = char> {
+    prop_oneof![
+        8 => prop::sample::select(vec![
+            '/', '\\', '"', '-', '!', '=', '~', ':', '*', '?', '(', ')', ',', '|', '&', ' ',
+            '\t', '\n', '\r', '\0',
+        ]),
+        4 => prop::char::range(' ', '~'),
+        1 => any::<char>(),
+    ]
+}
+
 fn leaf() -> impl Strategy<Value = String> {
     prop_oneof![
         1 => Just("*".to_string()),
@@ -164,6 +175,35 @@ proptest! {
         };
         let result = query.validate(&limits);
         prop_assert_eq!(result.is_ok(), len <= max_text_len);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 8_192,
+        rng_seed: RngSeed::Fixed(0xe1d0_b027),
+        max_shrink_iters: 60_000,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn syntax_weighted_accepted_inputs_round_trip(
+        chars in prop::collection::vec(syntax_weighted_char(), 0..128),
+    ) {
+        let input: String = chars.into_iter().collect();
+        if let Ok(parsed) = parse_at(&input, NOW) {
+            let rendered = render(&parsed.query);
+            let reparsed = parse_at(&rendered, NOW).unwrap_or_else(|error| {
+                panic!("rendered query did not parse: {input:?} -> {rendered:?}: {error}")
+            });
+            prop_assert_eq!(
+                reparsed.query,
+                parsed.query,
+                "{:?} -> {:?}",
+                input,
+                rendered
+            );
+        }
     }
 }
 
