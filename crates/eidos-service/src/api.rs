@@ -45,6 +45,7 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
         )
         .route("/sources/{id}/archives", post(requeue_archives))
         .merge(crate::retry_api::routes())
+        .merge(crate::interactions_api::routes())
         .route("/resolve", get(resolve))
         .route("/search", post(search).get(search_get))
         .route(
