@@ -184,6 +184,21 @@ wait with stable maximum hold identifies sustained contention. SQLite's
 five-second busy timeout is only a fallback for an unexpected writer outside
 the coordinating process.
 
+Service open also completes its durable restart repair before background
+threads start. It aborts crash-open scan generations, requeues jobs left
+`running`, and requeues content records left `indexing` before their Tantivy
+commit. `startup_recovery` on `GET /api/activity` records all three counts for
+the lifetime of the process; `eidos activity` and the Activity page render the
+same summary. The recovered source's last published generation stays visible,
+with a degraded reason for the interrupted scan, while queued work remains
+available to the normal bounded workers.
+
+The deterministic `restart_retention` integration test exercises one combined
+fixture with published catalog/index state, committed content search, archive
+virtual paths, queued/running jobs, an unfinished content publication, and an
+open scan. It asserts a healthy catalog projection and content index reopen
+without rebuild, then checks the exact recovery counters and Activity JSON.
+
 Transient failures (share offline, sharing violation) retry on their own with
 exponential backoff. Deterministic, corrupt, unsupported, and resource-limit
 failures are terminal on purpose: they come back only through an explicit

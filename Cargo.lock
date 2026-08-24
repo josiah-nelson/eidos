@@ -654,6 +654,7 @@ version = "0.5.0-dev"
 dependencies = [
  "anyhow",
  "axum",
+ "eidos-archive",
  "eidos-catalog",
  "eidos-content",
  "eidos-domain",

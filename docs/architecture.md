@@ -196,6 +196,31 @@ session abandonment does the same in `Drop`, while startup recovery aborts
 generations left open by process termination. Wait and hold telemetry from the
 gate makes violations observable without weakening that publication boundary.
 
+### Restart boundary
+
+Opening application state performs durable repair before any watcher, follower,
+or content worker can start. It aborts scan generations a terminated process
+left open, moves jobs left `running` back to the due queue, and requeues content
+records left between their catalog write and content-index commit. The counts
+from that synchronous pass remain fixed in the process's startup-recovery
+status, even after workers drain the repaired queue.
+
+Repair never substitutes a rebuild for healthy retained state. A source's last
+published generation, catalog rows, archive virtual topology, catalog-index
+projection record, and committed content-index documents reopen in place. The
+catalog follower compares the retained projection generation and performs only
+normal outbox catch-up; the content index rebuilds from stored chunks only when
+its own durable marker or a genuinely fresh/empty index requires it. An aborted
+open generation leaves the previous generation published and puts the source
+in a degraded, explicitly reasoned state rather than advertising completeness.
+
+The restart integration fixture creates all of these states together: a
+published generation and projection, searchable stored text, ZIP virtual
+members, queued and running jobs, an uncommitted `indexing` content record, and
+a crash-only open scan. Reopening must report each repair, preserve every
+healthy document/topology count, avoid projection/content rebuilds, and expose
+the recovered queue through Activity.
+
 ### Directory aggregate invariants
 
 Whatever a full reconciliation would compute is the definition; the

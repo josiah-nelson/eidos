@@ -27,6 +27,7 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+eidos-archive = { workspace = true }
 # `ServiceExt::oneshot` drives the axum router in API tests.
 tower = { workspace = true }
 tokio = { workspace = true, features = ["net"] }

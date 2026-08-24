@@ -6,7 +6,7 @@ export type ApiInt = string;
 
 export type ActivitySourceView = { source_id: SourceId, name: string, state: SourceState, content_enabled: boolean, content_concurrency: number, content_reserved: number, content_peak_reserved: number, jobs_queued: ApiInt, jobs_running: ApiInt, jobs_failed: ApiInt, jobs_failed_bytes: ApiInt, content_states: { [key in string]: ApiInt }, content_bytes_indexed: ApiInt, reconciliation_deferred?: ReconciliationDeferral, };
 
-export type ActivityView = { content_enabled: boolean, jobs: JobCounts, content: ContentStats, archives: ArchiveStats, workers: ContentWorkersView, follower: FollowerView, content_index_documents: ApiInt, content_rebuild: RebuildStatus, admission: AdmissionView, catalog_writer: CatalogWriterStats, sources: Array<ActivitySourceView>, recent_failures: Array<JobRecord>, };
+export type ActivityView = { content_enabled: boolean, startup_recovery: StartupRecovery, jobs: JobCounts, content: ContentStats, archives: ArchiveStats, workers: ContentWorkersView, follower: FollowerView, content_index_documents: ApiInt, content_rebuild: RebuildStatus, admission: AdmissionView, catalog_writer: CatalogWriterStats, sources: Array<ActivitySourceView>, recent_failures: Array<JobRecord>, };
 
 export type AddSourceBody = { name: string, root_path: string, kind?: SourceKind | null, aliases: Array<string>, scan: boolean, };
 
@@ -223,6 +223,8 @@ export type SourceRecord = { id: SourceId, host_id: HostId, name: string, kind: 
 export type SourceState = "new" | "enumerating" | "metadata_complete" | "content_pending" | "complete" | "degraded" | "offline" | "stale" | "reconciling" | "retired";
 
 export type SourceView = { source: SourceRecord, counts: SourceCounts, completeness: SourceCompleteness, scan?: ScanProgress, watcher?: WatcherView, reconciliation_deferred?: ReconciliationDeferral, };
+
+export type StartupRecovery = { aborted_scan_generations: ApiInt, requeued_running_jobs: ApiInt, requeued_unfinished_content: ApiInt, };
 
 export type TextField = "name" | "path" | "content";
 

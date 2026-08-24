@@ -49,6 +49,7 @@ fn n(v: &serde_json::Value, path: &str) -> u64 {
 
 fn print_activity(v: &serde_json::Value) {
     let w = &v["workers"];
+    let recovery = &v["startup_recovery"];
     println!(
         "content: {}  workers: {}  throughput: {}/s  indexed: {} files / {}  unsupported: {}  failed: {}  retried: {}",
         if v["content_enabled"].as_bool().unwrap_or(false) { "on" } else { "off" },
@@ -83,6 +84,12 @@ fn print_activity(v: &serde_json::Value) {
         "catalog writer hold: {:.1} ms total  {:.1} ms max",
         g(v, "catalog_writer.total_hold_ms").as_f64().unwrap_or(0.0),
         g(v, "catalog_writer.max_hold_ms").as_f64().unwrap_or(0.0),
+    );
+    println!(
+        "startup recovery: {} scans aborted  {} running jobs requeued  {} unfinished content records requeued",
+        n(recovery, "aborted_scan_generations"),
+        n(recovery, "requeued_running_jobs"),
+        n(recovery, "requeued_unfinished_content"),
     );
     if let Some(e) = w["last_error"].as_str() {
         println!("last error: {e}");
