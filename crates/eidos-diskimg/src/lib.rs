@@ -106,9 +106,8 @@ pub mod flag {
     pub const SHORT_NAME: u32 = 1 << 6;
 }
 
-/// One live file or directory found inside an image. NTFS hard links are
-/// represented once per MFT record using a deterministic preferred name;
-/// `hard_links` records how many names the file declares.
+/// One live directory entry found inside an image. Hard-linked files produce
+/// one member per long/POSIX `$FILE_NAME`, sharing the same MFT `record`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     pub volume: u32,
@@ -121,6 +120,9 @@ pub struct Member {
     pub is_dir: bool,
     pub size: u64,
     pub allocated: u64,
+    /// Whether `allocated` was computed from concrete NTFS data runs. When
+    /// false it is a conservative cluster-rounded upper bound.
+    pub allocation_exact: bool,
     pub created: Option<UnixNanos>,
     pub modified: Option<UnixNanos>,
     pub accessed: Option<UnixNanos>,
