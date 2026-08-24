@@ -70,6 +70,8 @@ struct Record {
     name: String,
     flags: u32,
     parent: u64,
+    parent_sequence: u16,
+    sequence: u16,
     is_dir: bool,
     size: u64,
     allocated: u64,
@@ -199,9 +201,26 @@ fn resolve(
     }
     let mut flags = raw.flags;
     let mut current = records[&record].parent;
+    let mut expected_sequence = records[&record].parent_sequence;
     seen.clear();
     seen.insert(record);
-    while current != ROOT_RECORD {
+    loop {
+        if current == ROOT_RECORD {
+            if records
+                .get(&current)
+                .is_some_and(|root| root.sequence == expected_sequence)
+            {
+                break;
+            }
+            flags |= flag::ORPHAN;
+            let segment = format!("(orphan {current})");
+            bytes = bytes.saturating_add(segment.len() + 1);
+            if bytes > limits.max_path_bytes {
+                return Some(Resolved::TooLong);
+            }
+            segments.push(segment);
+            break;
+        }
         if segments.len() >= limits.max_path_depth {
             return Some(Resolved::TooDeep);
         }
@@ -217,11 +236,15 @@ fn resolve(
             segments.push(segment);
             break;
         }
-        match records.get(&current) {
+        match records
+            .get(&current)
+            .filter(|parent| parent.sequence == expected_sequence)
+        {
             Some(parent) => {
                 segments.push(parent.name.clone());
                 flags |= parent.flags;
                 current = parent.parent;
+                expected_sequence = parent.parent_sequence;
             }
             None => {
                 flags |= flag::ORPHAN;
@@ -249,33 +272,52 @@ fn resolve(
 fn is_metafile(
     record: u64,
     records: &HashMap<u64, Record>,
-    memo: &mut HashMap<u64, bool>,
+    memo: &mut HashMap<(u64, u16), bool>,
     depth_limit: usize,
 ) -> bool {
+    if record == ROOT_RECORD {
+        return false;
+    }
+    if record < FIRST_USER_RECORD {
+        return true;
+    }
+    let Some(record_raw) = records.get(&record) else {
+        return false;
+    };
+    if !record_raw.name.starts_with('$') {
+        return false;
+    }
     let mut chain = Vec::new();
-    let mut current = record;
+    let mut current = record_raw.parent;
+    let mut expected_sequence = record_raw.parent_sequence;
     let verdict = loop {
         // The root directory is reserved but holds user files, so reaching
         // it means the chain was ordinary all the way up.
         if current == ROOT_RECORD {
             break false;
         }
+        let identity = (current, expected_sequence);
+        if let Some(&known) = memo.get(&identity) {
+            break known;
+        }
+        let Some(raw) = records
+            .get(&current)
+            .filter(|raw| raw.sequence == expected_sequence)
+        else {
+            break false;
+        };
         if current < FIRST_USER_RECORD {
             break true;
         }
-        if let Some(&known) = memo.get(&current) {
-            break known;
+        if !raw.name.starts_with('$') || chain.len() >= depth_limit {
+            break false;
         }
-        match records.get(&current) {
-            Some(raw) if raw.name.starts_with('$') && chain.len() < depth_limit => {
-                chain.push(current);
-                current = raw.parent;
-            }
-            _ => break false,
-        }
+        chain.push(identity);
+        current = raw.parent;
+        expected_sequence = raw.parent_sequence;
     };
-    for node in chain {
-        memo.insert(node, verdict);
+    for identity in chain {
+        memo.insert(identity, verdict);
     }
     verdict
 }
@@ -403,6 +445,7 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
                 .unwrap_or((file_name.data_size(), file_name.allocated_size()))
         };
         let info = file.info().ok();
+        let parent = file_name.parent_directory_reference();
         records.insert(
             number,
             Record {
@@ -412,7 +455,9 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
                     name
                 },
                 flags,
-                parent: file_name.parent_directory_reference().file_record_number(),
+                parent: parent.file_record_number(),
+                parent_sequence: parent.sequence_number(),
+                sequence: file.sequence_number(),
                 is_dir,
                 size,
                 allocated,
@@ -448,7 +493,7 @@ pub fn inventory_volume<R: Read + Seek, F: FnMut(Member)>(
         });
     }
 
-    let mut memo: HashMap<u64, bool> = HashMap::new();
+    let mut memo: HashMap<(u64, u16), bool> = HashMap::new();
     let mut seen: HashSet<u64> = HashSet::new();
     let mut numbers: Vec<u64> = records.keys().copied().collect();
     numbers.sort_unstable();
@@ -522,6 +567,8 @@ mod tests {
             name: name.to_string(),
             flags: 0,
             parent,
+            parent_sequence: 1,
+            sequence: 1,
             is_dir: true,
             size: 0,
             allocated: 0,
@@ -534,10 +581,14 @@ mod tests {
     }
 
     fn tree(entries: &[(u64, &str, u64)]) -> HashMap<u64, Record> {
-        entries
+        let mut records: HashMap<u64, Record> = entries
             .iter()
             .map(|(n, name, parent)| (*n, record(name, *parent)))
-            .collect()
+            .collect();
+        records
+            .entry(ROOT_RECORD)
+            .or_insert_with(|| record("$Root", ROOT_RECORD));
+        records
     }
 
     fn resolve_one(
@@ -605,6 +656,25 @@ mod tests {
                 assert_eq!(flags, flag::ORPHAN);
             }
             _ => panic!("cycle did not resolve"),
+        }
+
+        let mut stale = tree(&[(43, "child", 44), (44, "reused", ROOT_RECORD)]);
+        stale.get_mut(&43).unwrap().parent_sequence = 2;
+        match resolve_one(43, &stale, &limits) {
+            Some(Resolved::Path(path, flags)) => {
+                assert_eq!(path, "(orphan 44)/child");
+                assert_eq!(flags, flag::ORPHAN);
+            }
+            _ => panic!("stale parent reference did not resolve as an orphan"),
+        }
+        let mut stale_root = tree(&[(44, "child", ROOT_RECORD)]);
+        stale_root.get_mut(&44).unwrap().parent_sequence = 2;
+        match resolve_one(44, &stale_root, &limits) {
+            Some(Resolved::Path(path, flags)) => {
+                assert_eq!(path, "(orphan 5)/child");
+                assert_eq!(flags, flag::ORPHAN);
+            }
+            _ => panic!("stale root reference did not resolve as an orphan"),
         }
     }
 
@@ -683,7 +753,7 @@ mod tests {
 
     #[test]
     fn metafiles_are_recognised_through_the_extend_subtree() {
-        let records = tree(&[
+        let mut records = tree(&[
             // $Extend is record 11; its children inherit metafile status.
             (11, "$Extend", ROOT_RECORD),
             (24, "$Quota", 11),
@@ -702,5 +772,10 @@ mod tests {
         for user in [ROOT_RECORD, 32, 33] {
             assert!(!is_metafile(user, &records, &mut memo, 256), "{user}");
         }
+        // A stale reference to a reused reserved slot must not suppress an
+        // otherwise visible member as NTFS metadata.
+        records.get_mut(&24).unwrap().parent_sequence = 2;
+        memo.clear();
+        assert!(!is_metafile(24, &records, &mut memo, 256));
     }
 }
