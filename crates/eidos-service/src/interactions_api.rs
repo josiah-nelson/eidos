@@ -27,7 +27,7 @@ use axum::{Json, Router};
 use eidos_catalog::interactions::{
     query_hash, InteractionAction, InteractionEvent, QueryShape, MAX_SESSION_ID_LEN,
 };
-use eidos_domain::{ObjectId, SourceId, UnixNanos};
+use eidos_domain::{ObjectId, Query, SourceId, UnixNanos};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -170,10 +170,83 @@ fn resolve_query(text: &str) -> (String, QueryShape) {
     }
     match eidos_query::parse(text) {
         Ok(parsed) => (
-            query_hash(&eidos_query::render(&parsed.query)),
+            query_hash(&eidos_query::render(&canonical(&parsed.query))),
             QueryShape::classify(&parsed.query),
         ),
         Err(_) => (query_hash(text), QueryShape::Name),
+    }
+}
+
+/// The query in a form whose rendering does not depend on the order things
+/// were typed in.
+///
+/// `and` and `or` are commutative and their set-valued clauses are sets, so
+/// `readme ext:md`, `ext:md readme`, and `ext:md,txt` versus `ext:txt,md` are
+/// each one search asked twice. Grouping them apart would split the evidence
+/// for a query across as many groups as there are ways to write it. Siblings
+/// are ordered by their own canonical rendering, so the sort is bottom-up and
+/// stable regardless of nesting.
+///
+/// Time bounds are floored to the day for the same reason: a relative clause
+/// like `mtime:>=30d` parses to the instant it was typed, so without this two
+/// runs of one query minutes apart would never group at all.
+fn canonical(query: &Query) -> Query {
+    /// Whole days since the epoch, in nanoseconds. `div_euclid` floors, so
+    /// timestamps before 1970 round the same direction as those after it.
+    fn floor_to_day(t: UnixNanos) -> UnixNanos {
+        const DAY_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
+        UnixNanos(t.0.div_euclid(DAY_NS) * DAY_NS)
+    }
+    fn ordered(clauses: &[Query]) -> Vec<Query> {
+        let mut out: Vec<Query> = clauses.iter().map(canonical).collect();
+        out.sort_by_cached_key(eidos_query::render);
+        out
+    }
+    fn sorted<T: Ord + Clone>(values: &[T]) -> Vec<T> {
+        let mut out = values.to_vec();
+        out.sort();
+        out
+    }
+    fn by_label<T: Copy>(values: &[T], label: impl Fn(T) -> &'static str) -> Vec<T> {
+        let mut out = values.to_vec();
+        out.sort_by_key(|v| label(*v));
+        out
+    }
+    match query {
+        Query::And { clauses } => Query::And {
+            clauses: ordered(clauses),
+        },
+        Query::Or { clauses } => Query::Or {
+            clauses: ordered(clauses),
+        },
+        Query::Not { clause } => Query::Not {
+            clause: Box::new(canonical(clause)),
+        },
+        Query::Extension { values } => Query::Extension {
+            values: sorted(values),
+        },
+        Query::Kind { values } => Query::Kind {
+            values: by_label(values, |k| k.as_str()),
+        },
+        Query::ContentState { states } => Query::ContentState {
+            states: by_label(states, |s| s.as_str()),
+        },
+        Query::Time {
+            field,
+            after,
+            before,
+        } => Query::Time {
+            field: *field,
+            after: after.map(floor_to_day),
+            before: before.map(floor_to_day),
+        },
+        Query::Host { ids } => Query::Host { ids: sorted(ids) },
+        Query::Object { ids } => Query::Object { ids: sorted(ids) },
+        Query::Source { ids, names } => Query::Source {
+            ids: sorted(ids),
+            names: sorted(names),
+        },
+        leaf => leaf.clone(),
     }
 }
 
@@ -189,6 +262,38 @@ mod tests {
         assert_ne!(resolve_query("ext:txt readme").0, hash);
         assert_eq!(resolve_query("content:zephyr").1, QueryShape::ContentRanked);
         assert_eq!(resolve_query("").1, QueryShape::Metadata);
+    }
+
+    /// One search written several ways is one group, or the evidence for it
+    /// is split across as many groups as there are ways to type it.
+    #[test]
+    fn clause_order_does_not_split_a_query_into_several_groups() {
+        let same = |a: &str, b: &str| {
+            assert_eq!(
+                resolve_query(a).0,
+                resolve_query(b).0,
+                "{a} and {b} are the same search"
+            );
+            assert_eq!(resolve_query(a).1, resolve_query(b).1);
+        };
+        same("readme ext:md", "ext:md readme");
+        same("ext:md,txt", "ext:txt,md");
+        same(
+            "ext:md mtime:>=30d content:zephyr",
+            "content:zephyr ext:md mtime:>=30d",
+        );
+        same("ext:md OR ext:txt", "ext:txt OR ext:md");
+        same("-ext:vhdx size:>1G", "size:>1G -ext:vhdx");
+        same("(readme OR license) ext:md", "ext:md (license OR readme)");
+        // A relative time clause resolves to the instant it was parsed; the
+        // same query run twice must still be one group.
+        same("ext:md mtime:>=30d", "mtime:>=30d ext:md");
+        // Different searches still land apart.
+        assert_ne!(resolve_query("ext:md readme").0, resolve_query("ext:md").0);
+        assert_ne!(
+            resolve_query("ext:md OR ext:txt").0,
+            resolve_query("ext:md ext:txt").0
+        );
     }
 
     #[test]

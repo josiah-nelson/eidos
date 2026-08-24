@@ -3,7 +3,9 @@ import { test } from 'node:test'
 import {
   InteractionQueue,
   MAX_INTERACTION_BATCH,
+  PresentationLog,
   newSessionId,
+  pageFingerprint,
   tabSessionId,
   type Interaction,
 } from './interactions.ts'
@@ -107,6 +109,37 @@ test('a transport that throws loses the batch and nothing else', () => {
   assert.equal(h.queue.size, 0)
   h.queue.push(presented(1))
   assert.doesNotThrow(() => h.queue.flushAll())
+})
+
+test('a page of results is reported once, and again when its hits change', () => {
+  const log = new PresentationLog()
+  const key = 'ext:md|files|relevance|true|50'
+
+  assert.deepEqual(log.unreported(key, [['1', '2', '3']]), [0])
+  // A refetch that returns the same hits is the same presentation.
+  assert.deepEqual(log.unreported(key, [['1', '2', '3']]), [])
+  // Scrolling on adds a page; the first one is not reported again.
+  assert.deepEqual(log.unreported(key, [['1', '2', '3'], ['4', '5']]), [1])
+  assert.deepEqual(log.unreported(key, [['1', '2', '3'], ['4', '5']]), [])
+
+  // A stale refetch returns different hits under the same query: what the
+  // reader is looking at now was never reported.
+  assert.deepEqual(log.unreported(key, [['1', '9', '3'], ['4', '5']]), [0])
+  // Order matters too — a re-sorted page is a different presentation.
+  assert.deepEqual(log.unreported(key, [['3', '9', '1'], ['4', '5']]), [0])
+
+  // A different query starts over, even when it lands on the same hits.
+  assert.deepEqual(log.unreported('ext:txt|files|relevance|true|50', [['3', '9', '1']]), [0])
+  // Going back reports again: the first page is a fresh presentation.
+  assert.deepEqual(log.unreported(key, [['3', '9', '1'], ['4', '5']]), [0, 1])
+
+  // Shrinking the result set must not let a dropped page vouch for a later one.
+  assert.deepEqual(log.unreported(key, [['3', '9', '1']]), [])
+  assert.deepEqual(log.unreported(key, [['3', '9', '1'], ['7']]), [1])
+
+  assert.equal(pageFingerprint(['1', '2']), pageFingerprint(['1', '2']))
+  assert.notEqual(pageFingerprint(['1', '2']), pageFingerprint(['12']))
+  assert.notEqual(pageFingerprint([]), pageFingerprint(['1']))
 })
 
 test('a tab keeps one session id, and separate tabs differ', () => {

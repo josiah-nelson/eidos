@@ -17,7 +17,7 @@ import {
 import { CompletenessBanner, ContentBadge, ErrorBox } from '../components'
 import { ContentPreviewPanel } from '../ContentPreview'
 import { bytes, count, duration, when } from '../format'
-import { track } from '../interactions'
+import { PresentationLog, track } from '../interactions'
 import { applyFacetClick, negate, type FacetForms } from '../query-clause'
 import { SavedSearchControls } from '../SavedSearches'
 import { PAGE_SIZES, canonicalSearchParams, readSearchView } from '../saved-searches'
@@ -92,19 +92,25 @@ export default function SearchPage() {
     [results.data],
   )
 
-  // Record the hits of every page of results this query returned, once each.
-  // A page is the unit the server rendered, so a page that arrives twice (a
-  // refetch of the same cursor) is reported once, and re-running the query
-  // reports it again as the new presentation it is.
-  const reported = useRef({ key: '', pages: 0 })
+  // Record the hits of every page of results this query returned, once per
+  // distinct set of hits. A page is the unit the server rendered; the same
+  // page arriving again unchanged is not a new presentation, but a refetch
+  // that returns different hits under the same cursor is, and so is running
+  // the query again.
+  const presentations = useRef(new PresentationLog())
   useEffect(() => {
     const pages = results.data?.pages
     if (!pages) return
     const key = `${q}|${mode}|${sort}|${desc}|${pageSize}`
-    if (reported.current.key !== key) reported.current = { key, pages: 0 }
+    const fresh = new Set(
+      presentations.current.unreported(
+        key,
+        pages.map((page) => page.hits.map((h) => String(h.object_id))),
+      ),
+    )
     let rank = 0
     for (const [index, page] of pages.entries()) {
-      if (index >= reported.current.pages) {
+      if (fresh.has(index)) {
         track(
           ...page.hits.map((h, i) => ({
             action: 'presented' as const,
@@ -117,7 +123,6 @@ export default function SearchPage() {
       }
       rank += page.hits.length
     }
-    reported.current.pages = pages.length
   }, [results.data, q, mode, sort, desc, pageSize])
 
   const openPreview = (target: PreviewTarget) => {

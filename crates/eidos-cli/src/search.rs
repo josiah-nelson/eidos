@@ -248,6 +248,11 @@ const INTERACTION_TIMEOUT: Duration = Duration::from_millis(750);
 /// Best effort in every direction: no retry, a short deadline, errors dropped,
 /// and nothing about the search changes whether it succeeds. `EIDOS_NO_INTERACTIONS`
 /// turns it off.
+///
+/// Ranks are positions in what this invocation printed. A `--cursor`
+/// continuation starts again at 0, because that is where the page it printed
+/// starts; the session id is what ties one printed page together, and a
+/// scripted walk of the cursors is a new session per call by design.
 fn record_presented(agent: &ureq::Agent, url: &str, q: &str, response: &SearchResponse) {
     if response.hits.is_empty() || std::env::var_os("EIDOS_NO_INTERACTIONS").is_some() {
         return;

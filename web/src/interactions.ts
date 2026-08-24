@@ -126,6 +126,53 @@ export class InteractionQueue {
   }
 }
 
+/**
+ * A short mark for one page of results, used to tell a page that has already
+ * been reported from one whose contents changed under it — a refetch of the
+ * same query can return different hits, and those are a new presentation.
+ *
+ * FNV-1a over the ids, plus the count: cheap, and a collision only costs one
+ * page of impressions in data nobody makes a decision on individually.
+ */
+export function pageFingerprint(ids: readonly string[]): string {
+  let hash = 0x811c9dc5
+  for (const id of ids) {
+    for (let i = 0; i < id.length; i++) {
+      hash = Math.imul(hash ^ id.charCodeAt(i), 0x01000193)
+    }
+    hash = Math.imul(hash ^ 0x2c, 0x01000193)
+  }
+  return `${ids.length}:${(hash >>> 0).toString(36)}`
+}
+
+/**
+ * Which pages of a result set are a presentation that has not been recorded.
+ *
+ * A page is the unit the server rendered. The same page arriving again with
+ * the same hits — a refetch on focus, a re-render — is not a new presentation.
+ * The same page arriving with different hits is: the index changed under the
+ * reader, and what they are looking at now was never reported. Changing the
+ * query starts the log over, because that is a different result set entirely.
+ */
+export class PresentationLog {
+  private key = ''
+  private pages: string[] = []
+
+  /** Indexes of `pages` (each a page's hit ids) that should be reported. */
+  unreported(key: string, pages: readonly (readonly string[])[]): number[] {
+    if (this.key !== key) {
+      this.key = key
+      this.pages = []
+    }
+    const marks = pages.map(pageFingerprint)
+    const fresh = marks.flatMap((mark, index) => (this.pages[index] === mark ? [] : [index]))
+    // Pages this result set no longer has must not vouch for pages fetched
+    // later under the same query.
+    this.pages = marks
+    return fresh
+  }
+}
+
 /** Random opaque id, short enough for the service's session id limit. */
 export function newSessionId(): string {
   const uuid = globalThis.crypto?.randomUUID?.()
