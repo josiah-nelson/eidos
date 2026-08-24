@@ -1,8 +1,6 @@
 [package]
 name = "eidos-sync"
 description = "Sync core for the eidos fleet: state machines developed and verified under deterministic simulation before any transport exists"
-autobins = false
-autotests = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,11 +13,3 @@ eidos-domain = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-
-[[test]]
-name = "sim_semantics"
-path = "tests/sim_semantics.rs"
-
-[[test]]
-name = "sim_smoke"
-path = "tests/sim_smoke.rs"
