@@ -644,6 +644,7 @@ dependencies = [
  "eidos-content",
  "eidos-domain",
  "eidos-scanner",
+ "getrandom 0.4.3",
  "parking_lot",
  "rusqlite",
  "serde",

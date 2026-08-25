@@ -395,6 +395,47 @@ CREATE TABLE interaction_events (
 CREATE INDEX interaction_events_ts ON interaction_events (ts);
 "#,
     ),
+    (
+        "source sync ledger: touches, consumers, epochs (ADR-0015)",
+        r#"
+-- One row per sync-enabled source. `epoch` is the 16-byte fencing token a
+-- consumer keys its cursor to; enabling, re-enabling, or a native journal
+-- identity change mints a new one. `head_seq` is the per-source sequence,
+-- advanced once per ledger touch inside the catalog writer transaction.
+CREATE TABLE sync_sources (
+    source_id         INTEGER PRIMARY KEY,
+    epoch             BLOB NOT NULL,
+    head_seq          INTEGER NOT NULL DEFAULT 0,
+    compacted_through INTEGER NOT NULL DEFAULT 0,
+    journal_id        INTEGER,
+    backfill_after    INTEGER NOT NULL DEFAULT 0,
+    ready             INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+-- The ledger stores touches, not images: the sequence at which an object
+-- was last changed, its generation, and whether that change was a deletion.
+-- Row images are materialized from the live catalog at ship time.
+CREATE TABLE sync_rows (
+    source_id  INTEGER NOT NULL,
+    object_id  INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    deleted    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (source_id, object_id)
+) WITHOUT ROWID;
+CREATE INDEX sync_rows_seq ON sync_rows (source_id, seq);
+-- Acknowledged watermark per registered consumer; the minimum across
+-- consumers is the floor below which deletion rows may be collected.
+CREATE TABLE sync_consumers (
+    source_id   INTEGER NOT NULL,
+    consumer_id BLOB NOT NULL,
+    watermark   INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (source_id, consumer_id)
+) WITHOUT ROWID;
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.
@@ -428,7 +469,7 @@ mod tests {
     fn migrations_apply_once_and_are_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         let first = migrate(&mut conn).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let second = migrate(&mut conn).unwrap();
         assert!(second.is_empty());
         let v: i64 = conn
