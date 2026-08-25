@@ -72,6 +72,23 @@ fn object_at(f: &Fixture, rel: &str) -> Option<eidos_catalog::ObjectRecord> {
     f.catalog.get_object(id).unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn a_literal_backslash_in_a_posix_name_is_not_a_path_separator() {
+    let f = fixture();
+    let name = r"odd\name.txt";
+    std::fs::write(f.root.join(name), b"odd").unwrap();
+    scan(&f);
+
+    let object = object_at(&f, name).expect("the literal-backslash name should resolve");
+    let expected = f.root.join(name).display().to_string();
+    assert_eq!(
+        f.catalog.render_path(object.id).unwrap().as_deref(),
+        Some(expected.as_str())
+    );
+    assert!(object_at(&f, "odd/name.txt").is_none());
+}
+
 #[test]
 fn full_scan_counts_sizes_and_aggregates() {
     let f = fixture();

@@ -763,6 +763,11 @@ fn compile_text(
             term_text(folded_field, &fold(value))
         }
         TextMode::Substring => {
+            let value = if field == TextField::Path {
+                canonical_path(value)
+            } else {
+                value.to_string()
+            };
             ctx.readable.push(format!(
                 "{label} contains \"{value}\"{}",
                 if case_sensitive {
@@ -773,11 +778,17 @@ fn compile_text(
             ));
             if case_sensitive {
                 needs_positive(ctx, "a case-sensitive clause")?;
-                let v = value.to_string();
-                ctx.verifiers
-                    .push(Box::new(move |s, _| stored_of(s).contains(&v)));
+                let v = value.clone();
+                ctx.verifiers.push(Box::new(move |s, _| {
+                    let stored = stored_of(s);
+                    if field == TextField::Path {
+                        canonical_path(&stored).contains(&v)
+                    } else {
+                        stored.contains(&v)
+                    }
+                }));
             }
-            let needle = fold(value);
+            let needle = fold(&value);
             let candidates = if ctx.neg_depth == 0 {
                 trigram_query(tri_field, std::slice::from_ref(&needle))
             } else {
