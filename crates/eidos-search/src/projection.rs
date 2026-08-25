@@ -223,6 +223,10 @@ impl CatalogIndex {
         let position = catalog.projection_position(PROJECTION_NAME)?;
         let rows = catalog.outbox_poll(position, batch)?;
         if rows.is_empty() {
+            // Idle iterations still release a bounded slice of consumed rows
+            // so a backlog left by an upgrade, or one larger than the
+            // per-iteration allowance, drains without waiting for writes.
+            catalog.outbox_prune(batch.max(1).saturating_mul(4))?;
             return Ok((rebuilt, None));
         }
         let stats = self.apply_outbox(catalog, &rows)?;
