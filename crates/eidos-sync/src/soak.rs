@@ -1,134 +1,214 @@
-//! Fast protocol scenario used by the million-seed nightly gate.
+//! Generated protocol universes for the million-seed nightly gate.
+//!
+//! A universe is a seed, a [`FaultPlan`], and a [`WorkloadPlan`]: several
+//! sources running generated histories (skewed upserts, deletes, recreates,
+//! epoch changes, checkpoint/rewind forks) against one central while the
+//! network drops, duplicates, delays, and partitions and processes crash.
+//! Every event is followed by the protocol invariants and the ghost oracle;
+//! the end state must converge for every source the central did not have to
+//! fence. A failure is minimized (faults first, then workload steps) and
+//! recorded as a pasteable replay.
 
 use crate::env::Node;
-use crate::identity::SourceEpoch;
 use crate::protocol::{
-    self, Applier, CursorState, LocalMutation, MaterializedRow, ReplicaState, Shipper, SyncMsg,
-    CURSOR_STATE_KEY, REPLICA_STATE_KEY,
+    self, AdmissionAlarm, Applier, CursorState, ReplicaState, Shipper, SyncMsg, CURSOR_STATE_KEY,
+    REPLICA_STATE_KEY,
 };
 use crate::rng::DeterministicRng;
-use crate::shrink::reproducer;
+use crate::shrink::{reproducer_universe, shrink_universe, Replay};
 use crate::sim::{FaultPlan, Invariant, NodeFactory, Simulation};
-use eidos_domain::{ObjectId, SourceId};
+use crate::workload::{GhostHistory, SourceOp, WorkloadParams, WorkloadPlan};
+use eidos_domain::SourceId;
 use serde::Serialize;
-use std::collections::BTreeMap;
 
-const SOURCE_NODE: usize = 0;
-const CENTRAL_NODE: usize = 1;
-const SOURCE: SourceId = SourceId::new(1);
 const HORIZON_NS: u64 = 200_000_000;
-const UNTIL_NS: u64 = 600_000_000;
-const MAX_STEPS: u64 = 5_000;
+const UNTIL_NS: u64 = 900_000_000;
+const MAX_STEPS: u64 = 12_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SoakFailure {
     pub seed: u64,
     pub message: String,
+    /// Minimized universe as a pasteable Rust expression.
     pub reproducer: String,
 }
 
-fn epoch() -> SourceEpoch {
-    SourceEpoch::random_v4(0x534f_414b, 1)
+/// Generate the universe for `seed`.
+pub fn universe(seed: u64) -> (FaultPlan, WorkloadPlan) {
+    let mut rng = DeterministicRng::new(seed);
+    let workload = WorkloadPlan::random(&mut rng, &WorkloadParams::soak());
+    let nodes = workload.sources.len() + 1;
+    let fault = FaultPlan::random(&mut rng, nodes, HORIZON_NS);
+    (fault, workload)
 }
 
-fn workload() -> Vec<LocalMutation> {
-    let mut script = Vec::new();
-    for generation in 1..=3u64 {
-        for object in 1..=4i64 {
-            script.push(LocalMutation {
-                object: ObjectId::new(object),
-                generation,
-                value: Some(format!("{object}:{generation}").into_bytes()),
-            });
+/// One shipper per source plus the central applier, central last.
+pub fn factories(workload: &WorkloadPlan) -> Vec<NodeFactory<SyncMsg>> {
+    let central = workload.sources.len();
+    let mut factories: Vec<NodeFactory<SyncMsg>> = workload
+        .sources
+        .iter()
+        .cloned()
+        .map(|source| {
+            Box::new(move || {
+                Box::new(Shipper::new(source.clone(), central).with_repair_leaf_bits(8))
+                    as Box<dyn Node<Msg = SyncMsg>>
+            }) as NodeFactory<SyncMsg>
+        })
+        .collect();
+    factories.push(Box::new(|| Box::new(Applier::new(true)) as _));
+    factories
+}
+
+fn fenced(cursors: &CursorState, source: SourceId) -> bool {
+    cursors.alarms.iter().any(|alarm| match alarm {
+        AdmissionAlarm::SequenceRewind { source: s, .. }
+        | AdmissionAlarm::HistoryFork { source: s, .. }
+        | AdmissionAlarm::RetiredEpoch { source: s, .. } => *s == source,
+    })
+}
+
+/// Every invariant a generated universe is checked against after each event.
+pub fn invariants(workload: &WorkloadPlan) -> Vec<Invariant<'static, SyncMsg>> {
+    let central = workload.sources.len();
+    let mut invariants: Vec<Invariant<'static, SyncMsg>> = Vec::new();
+    invariants.push(Box::new(protocol::effects_do_not_lead_watermarks(central)));
+    for (node, source) in workload.sources.iter().enumerate() {
+        invariants.push(Box::new(protocol::compaction_respects_oldest_watermark(
+            node,
+        )));
+        invariants.push(Box::new(protocol::watermark_monotonic(
+            central,
+            source.source,
+        )));
+        invariants.push(Box::new(protocol::replica_matches_ghost(
+            central,
+            source.clone(),
+        )));
+        let linear = !source
+            .ops
+            .iter()
+            .any(|op| matches!(op, SourceOp::EpochChange | SourceOp::Rewind));
+        if linear {
+            invariants.push(Box::new(protocol::no_lost_tombstones(
+                node,
+                central,
+                source.source,
+                workload.terminal_tombstones(source.source),
+            )));
         }
     }
-    script.push(LocalMutation {
-        object: ObjectId::new(4),
-        generation: 4,
-        value: None,
-    });
-    script
+    invariants
 }
 
-fn expected(script: &[LocalMutation]) -> BTreeMap<ObjectId, MaterializedRow> {
-    script
-        .iter()
-        .enumerate()
-        .map(|(index, mutation)| {
-            (
-                mutation.object,
-                MaterializedRow {
-                    seq: index as u64 + 1,
-                    generation: mutation.generation,
-                    value: mutation.value.clone(),
-                },
-            )
-        })
-        .collect()
+/// Run one universe to completion and check its end state. The error is a
+/// human-readable reason.
+pub fn run_universe(seed: u64, fault: &FaultPlan, workload: &WorkloadPlan) -> Result<(), String> {
+    let mut sim = Simulation::new(seed, fault.clone(), factories(workload))
+        .map_err(|error| format!("invalid fault plan: {error}"))?;
+    run_universe_in(&mut sim, workload, UNTIL_NS, MAX_STEPS)
 }
 
-pub fn run_seed(seed: u64) -> Result<(), SoakFailure> {
-    let script = workload();
-    let source_script = script.clone();
-    let factories: Vec<NodeFactory<SyncMsg>> = vec![
-        Box::new(move || {
-            Box::new(
-                Shipper::new(SOURCE, epoch(), CENTRAL_NODE, source_script.clone())
-                    .with_repair_leaf_bits(8),
-            ) as Box<dyn Node<Msg = SyncMsg>>
-        }),
-        Box::new(|| Box::new(Applier::new(true)) as _),
-    ];
-    let plan = FaultPlan::random(&mut DeterministicRng::new(seed), 2, HORIZON_NS);
-    let replay = reproducer(seed, &plan);
-    let fail = |message| SoakFailure {
-        seed,
-        message,
-        reproducer: replay.clone(),
-    };
-    let mut sim = Simulation::new(seed, plan, factories)
-        .map_err(|error| fail(format!("invalid generated plan: {error}")))?;
-    let mut invariants: Vec<Invariant<'_, SyncMsg>> = vec![
-        Box::new(protocol::compaction_respects_oldest_watermark(SOURCE_NODE)),
-        Box::new(protocol::watermark_monotonic(CENTRAL_NODE, SOURCE)),
-        Box::new(protocol::effects_do_not_lead_watermarks(CENTRAL_NODE)),
-        Box::new(protocol::no_lost_tombstones(
-            SOURCE_NODE,
-            CENTRAL_NODE,
-            SOURCE,
-            vec![(script.len() as u64, ObjectId::new(4))],
-        )),
-    ];
-    sim.run_until(UNTIL_NS, MAX_STEPS, &mut invariants)
-        .map_err(|violation| fail(violation.to_string()))?;
+/// [`run_universe`] over a caller-built simulation (custom node knobs) and
+/// time/step budget. The simulation must have `workload.sources.len() + 1`
+/// nodes with the central last.
+pub fn run_universe_in(
+    sim: &mut Simulation<SyncMsg>,
+    workload: &WorkloadPlan,
+    until_ns: u64,
+    max_steps: u64,
+) -> Result<(), String> {
+    workload
+        .validate()
+        .map_err(|error| format!("invalid workload: {error}"))?;
+    let central = workload.sources.len();
+    let mut invariants = invariants(workload);
+    sim.run_until(until_ns, max_steps, &mut invariants)
+        .map_err(|violation| violation.to_string())?;
+
     let replicas: ReplicaState = sim
-        .durable(CENTRAL_NODE, REPLICA_STATE_KEY)
+        .durable(central, REPLICA_STATE_KEY)
         .map(serde_json::from_slice)
         .transpose()
-        .map_err(|error| fail(format!("invalid durable replica state: {error}")))?
+        .map_err(|error| format!("invalid durable replica state: {error}"))?
         .unwrap_or_default();
     let cursors: CursorState = sim
-        .durable(CENTRAL_NODE, CURSOR_STATE_KEY)
+        .durable(central, CURSOR_STATE_KEY)
         .map(serde_json::from_slice)
         .transpose()
-        .map_err(|error| fail(format!("invalid durable cursor state: {error}")))?
+        .map_err(|error| format!("invalid durable cursor state: {error}"))?
         .unwrap_or_default();
-    if replicas.sources.get(&SOURCE) != Some(&expected(&script)) {
-        return Err(fail(
-            "replica did not converge to the materialized source image".into(),
-        ));
-    }
-    if cursors
-        .sources
-        .get(&SOURCE)
-        .map(|cursor| cursor.applied_seq)
-        != Some(script.len() as u64)
-    {
-        return Err(fail(
-            "replica watermark did not converge to the source head".into(),
-        ));
+    for source in &workload.sources {
+        let id = source.source;
+        let ghost = GhostHistory::replay(source);
+        let Some(history) = ghost.current_history() else {
+            continue;
+        };
+        if fenced(&cursors, id) {
+            // A fenced source may not converge; the ghost invariant already
+            // proved the central kept one consistent history.
+            continue;
+        }
+        let cursor = cursors
+            .sources
+            .get(&id)
+            .ok_or_else(|| format!("source {id}: central never admitted it"))?;
+        let final_epoch = source.epoch(history.incarnation);
+        if cursor.epoch != final_epoch {
+            return Err(format!(
+                "source {id}: central epoch {} is not the final incarnation {final_epoch}",
+                cursor.epoch
+            ));
+        }
+        if cursor.applied_seq != history.head() {
+            return Err(format!(
+                "source {id}: watermark {} did not converge to head {}",
+                cursor.applied_seq,
+                history.head()
+            ));
+        }
+        let rows = replicas.sources.get(&id).cloned().unwrap_or_default();
+        ghost
+            .check_replica(|n| source.epoch(n), cursor.epoch, cursor.applied_seq, &rows)
+            .map_err(|reason| format!("source {id}: {reason}"))?;
+        let expected_live = history
+            .images
+            .last()
+            .map(|image| image.values().filter(|row| row.value.is_some()).count())
+            .unwrap_or(0);
+        let live = rows.values().filter(|row| row.value.is_some()).count();
+        if live != expected_live {
+            return Err(format!(
+                "source {id}: replica has {live} live rows, history has {expected_live}"
+            ));
+        }
     }
     Ok(())
+}
+
+/// Run the generated universe for `seed`; on failure, minimize it.
+pub fn run_seed(seed: u64) -> Result<(), SoakFailure> {
+    let (fault, workload) = universe(seed);
+    let Err(message) = run_universe(seed, &fault, &workload) else {
+        return Ok(());
+    };
+    // Shrink toward the protocol failure, not toward a universe the
+    // simulation cannot even construct.
+    let (fault, workload) = shrink_universe(fault, workload, |fault, workload| {
+        run_universe(seed, fault, workload).is_err_and(|error| !error.starts_with("invalid "))
+    });
+    let message = run_universe(seed, &fault, &workload)
+        .err()
+        .unwrap_or(message);
+    Err(SoakFailure {
+        seed,
+        message,
+        reproducer: reproducer_universe(&Replay {
+            seed,
+            plan: fault,
+            workload: Some(workload),
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -140,5 +220,26 @@ mod tests {
         for seed in 0..100 {
             run_seed(seed).unwrap_or_else(|failure| panic!("{failure:?}"));
         }
+    }
+
+    #[test]
+    fn generated_universes_exercise_every_transition() {
+        // Coverage, not luck: across the first seeds the generator must
+        // reach multiple sources, epoch changes, and forks.
+        let mut multi = false;
+        let mut epochs = false;
+        let mut forks = false;
+        for seed in 0..300 {
+            let (_, workload) = universe(seed);
+            multi |= workload.sources.len() > 1;
+            for op in workload.sources.iter().flat_map(|s| s.ops.iter()) {
+                epochs |= matches!(op, SourceOp::EpochChange);
+                forks |= matches!(op, SourceOp::Rewind);
+            }
+        }
+        assert!(
+            multi && epochs && forks,
+            "multi={multi} epochs={epochs} forks={forks}"
+        );
     }
 }

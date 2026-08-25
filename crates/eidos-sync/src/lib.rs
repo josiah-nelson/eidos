@@ -23,6 +23,9 @@
 //!   versioned, pasteable reproducer.
 //! - [`merkle`]: row-level 2^17–2^20-leaf anti-entropy trees; only divergent
 //!   leaves transfer when a compacted log no longer covers a cursor.
+//! - [`workload`]: generated, replayable source histories (mutations,
+//!   epoch changes, checkpoint/rewind forks) and the ghost oracle that says
+//!   what the central must hold at every durable cursor.
 //! - [`soak`]: the fast protocol universe used by the million-seed CI gate.
 //! - [`toy`]: a miniature shipper/applier pair (append → ship → ack →
 //!   compact) that proves the harness catches the bug classes the real
@@ -43,3 +46,4 @@ pub mod shrink;
 pub mod sim;
 pub mod soak;
 pub mod toy;
+pub mod workload;

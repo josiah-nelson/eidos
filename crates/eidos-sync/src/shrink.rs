@@ -7,16 +7,21 @@
 //! minimal for both probability knobs under the supplied failure predicate.
 
 use crate::sim::{FaultPlan, NodeFactory, PlanError, Simulation};
+use crate::workload::{SourceOp, WorkloadPlan};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const REPLAY_SCHEMA: &str = "eidos-sync-replay/1";
+pub const REPLAY_SCHEMA: &str = "eidos-sync-replay/2";
+/// Still accepted: fault-only replays recorded before workloads existed.
+pub const REPLAY_SCHEMA_V1: &str = "eidos-sync-replay/1";
 
 /// A complete deterministic universe independent of protocol factories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Replay {
     pub seed: u64,
     pub plan: FaultPlan,
+    /// `None` for a fixed-script scenario; `Some` for generated universes.
+    pub workload: Option<WorkloadPlan>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -24,6 +29,8 @@ struct ReplayWire {
     schema: String,
     seed: u64,
     plan: FaultPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workload: Option<WorkloadPlan>,
 }
 
 #[derive(Debug, Error)]
@@ -37,12 +44,13 @@ pub enum ReplayError {
 impl Replay {
     pub fn from_json(json: &str) -> Result<Self, ReplayError> {
         let wire: ReplayWire = serde_json::from_str(json)?;
-        if wire.schema != REPLAY_SCHEMA {
+        if wire.schema != REPLAY_SCHEMA && wire.schema != REPLAY_SCHEMA_V1 {
             return Err(ReplayError::Schema(wire.schema));
         }
         Ok(Self {
             seed: wire.seed,
             plan: wire.plan,
+            workload: wire.workload,
         })
     }
 
@@ -51,6 +59,7 @@ impl Replay {
             schema: REPLAY_SCHEMA.to_string(),
             seed: self.seed,
             plan: self.plan.clone(),
+            workload: self.workload.clone(),
         })
         .expect("replay consists only of infallibly serializable values")
     }
@@ -138,13 +147,111 @@ fn minimize_probabilities(plan: &mut FaultPlan, still_fails: &impl Fn(&FaultPlan
     }
 }
 
+/// Minimize a whole universe: faults first (they are the usual cause), then
+/// workload steps per source with `ddmin`, then faults again, to a fixpoint.
+/// Workload candidates that no longer validate (a rewind without its
+/// checkpoint, a generation regression) are skipped rather than tried.
+pub fn shrink_universe(
+    mut fault: FaultPlan,
+    mut workload: WorkloadPlan,
+    still_fails: impl Fn(&FaultPlan, &WorkloadPlan) -> bool,
+) -> (FaultPlan, WorkloadPlan) {
+    assert!(
+        still_fails(&fault, &workload),
+        "shrink requires a failing universe"
+    );
+    loop {
+        let before = (fault.clone(), workload.clone());
+        fault = shrink(fault, |candidate| still_fails(candidate, &workload));
+        workload = shrink_workload(workload, |candidate| still_fails(&fault, candidate));
+        if (fault.clone(), workload.clone()) == before {
+            return (fault, workload);
+        }
+    }
+}
+
+/// `ddmin` over each source's steps, then one-minimal removal, then drop
+/// sources whose steps are all gone. Only validating candidates are tried.
+pub fn shrink_workload(
+    mut plan: WorkloadPlan,
+    still_fails: impl Fn(&WorkloadPlan) -> bool,
+) -> WorkloadPlan {
+    let fails = |candidate: &WorkloadPlan| candidate.validate().is_ok() && still_fails(candidate);
+    for index in 0..plan.sources.len() {
+        let mut granularity = 2usize;
+        while plan.sources[index].ops.len() >= 2 {
+            let len = plan.sources[index].ops.len();
+            granularity = granularity.min(len);
+            let chunk = len.div_ceil(granularity);
+            let mut reduced = false;
+            let mut start = 0usize;
+            while start < len {
+                let end = (start + chunk).min(len);
+                let mut candidate = plan.clone();
+                candidate.sources[index].ops.drain(start..end);
+                if fails(&candidate) {
+                    plan = candidate;
+                    granularity = granularity.saturating_sub(1).max(2);
+                    reduced = true;
+                    break;
+                }
+                start = end;
+            }
+            if !reduced {
+                if granularity == len {
+                    break;
+                }
+                granularity = (granularity * 2).min(len);
+            }
+        }
+        let mut op = 0;
+        while op < plan.sources[index].ops.len() {
+            let mut candidate = plan.clone();
+            candidate.sources[index].ops.remove(op);
+            if fails(&candidate) {
+                plan = candidate;
+            } else {
+                op += 1;
+            }
+        }
+        // A rewind's checkpoint is only load-bearing through the rewind;
+        // once the rewind is gone the checkpoint is noise.
+        let ops = &plan.sources[index].ops;
+        if !ops.iter().any(|op| matches!(op, SourceOp::Rewind)) {
+            let mut candidate = plan.clone();
+            candidate.sources[index]
+                .ops
+                .retain(|op| !matches!(op, SourceOp::Checkpoint));
+            if fails(&candidate) {
+                plan = candidate;
+            }
+        }
+    }
+    let mut index = 0;
+    while index < plan.sources.len() && plan.sources.len() > 1 {
+        let mut candidate = plan.clone();
+        candidate.sources.remove(index);
+        if fails(&candidate) {
+            plan = candidate;
+        } else {
+            index += 1;
+        }
+    }
+    plan
+}
+
 /// A one-line, valid Rust expression for logs and CI. Paste the returned
 /// expression into a test and call `.simulation(factories)` on it.
 pub fn reproducer(seed: u64, plan: &FaultPlan) -> String {
-    let replay = Replay {
+    reproducer_universe(&Replay {
         seed,
         plan: plan.clone(),
-    };
+        workload: None,
+    })
+}
+
+/// [`reproducer`] for a universe that also carries a generated workload.
+pub fn reproducer_universe(replay: &Replay) -> String {
     format!(
         "eidos_sync::shrink::Replay::from_json(r###\"{}\"###).expect(\"valid replay\")",
         replay.to_json()
@@ -190,6 +297,7 @@ mod tests {
         let replay = Replay {
             seed: 42,
             plan: plan(),
+            workload: None,
         };
         assert_eq!(Replay::from_json(&replay.to_json()).unwrap(), replay);
         let expression = reproducer(replay.seed, &replay.plan);
