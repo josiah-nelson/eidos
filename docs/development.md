@@ -1,8 +1,11 @@
 # Development
 
 Reproducible build, test, lint, and benchmark commands. Windows is the
-primary development platform; the workspace also builds on other platforms
-with a reduced (std-only) lister and no change feeds.
+primary development platform. macOS builds and tests the whole workspace and
+has a native enumeration adapter (`getattrlistbulk`, APFS volume
+capabilities); it has no change feed yet, so macOS sources are kept fresh by
+reconciliation scans. Other platforms fall back to the portable `readdir`
+lister with no change feed.
 
 ## Toolchain
 
@@ -31,6 +34,20 @@ cd web; npm ci; npm run lint; npm test; npm run build
 Tests never touch user data: every integration test builds its own fixture
 under a `tempfile::tempdir()`. USN-journal tests need an elevated session
 and skip themselves otherwise.
+
+The scanner's filesystem contract suite runs over every enumeration adapter
+the current platform can use, so a native fast path cannot diverge from the
+portable reference. Point it at another volume to cover behaviour the boot
+volume does not have — a case-sensitive filesystem, exFAT, or a mounted
+share:
+
+```bash
+# macOS: a scratch case-sensitive APFS volume
+hdiutil create -size 64m -fs "Case-sensitive APFS" -volname Scratch -type SPARSE scratch
+hdiutil attach scratch.sparseimage
+EIDOS_TEST_VOLUME=/Volumes/Scratch cargo test -p eidos-scanner --test filesystem_contract
+hdiutil detach /Volumes/Scratch
+```
 
 ### Property and fuzz tests
 

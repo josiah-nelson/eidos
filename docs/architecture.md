@@ -81,7 +81,7 @@ crates/
   catalog/            SQLite schema, transactions, migrations
   scanner-core/       platform-neutral scan/change contracts
   scanner-windows/    NTFS/USN and Windows directory/SMB adapters
-  scanner-macos/      macOS directory, APFS capability, and FSEvents adapters
+  scanner-macos/      getattrlistbulk, APFS capabilities, FSEvents adapters
   scheduler/          durable jobs, priorities, backpressure
   content/            sniffing, decoding, chunking, hashing
   archive/            virtual entries and archive budgets
@@ -130,7 +130,11 @@ stores the exact name, so a case-sensitive volume resolves `Report.txt` and
 resolves either spelling to the one object. Feeds share that enum, not their semantics: a USN cursor is a durable
 journal position and an FSEvents cursor is a coalescing event id, so each
 adapter keeps its own opaque, versioned cursor rather than pretending to a
-common one.
+common one. Enumeration adapters are chosen per platform —
+`FileIdExtdDirectoryInfo` batches on Windows, `getattrlistbulk` on macOS,
+`readdir` elsewhere and on remote volumes — and every adapter a platform can
+use runs the same filesystem contract suite
+([ADR-0017](adr/0017-macos-enumeration-and-volume-facts.md)).
 
 Hard links produce multiple entries referencing one object. Content is indexed
 once per object generation. Symlinks/reparse points are entries with explicit
