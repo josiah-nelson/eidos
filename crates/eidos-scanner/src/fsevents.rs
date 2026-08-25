@@ -412,6 +412,22 @@ impl FsEventsFeed {
         // SAFETY: the label is NUL-terminated and outlives the call, which
         // copies it; a NULL attribute makes a serial queue.
         let queue = unsafe { dispatch_queue_create(label.as_ptr(), std::ptr::null()) };
+        if queue.is_null() {
+            // The stream owns `delivery`, so releasing it also runs the
+            // context release callback and frees the channel state.
+            // SAFETY: `stream` was created successfully but has not been
+            // scheduled or started yet.
+            unsafe {
+                FSEventStreamInvalidate(stream);
+                FSEventStreamRelease(stream);
+            }
+            return Err(ScanError::new(
+                ScanErrorKind::Transient,
+                0,
+                "could not allocate the FSEvents dispatch queue",
+                root,
+            ));
+        }
         // SAFETY: both the stream and the queue are live.
         unsafe { FSEventStreamSetDispatchQueue(stream, queue) };
         // SAFETY: the stream is scheduled on a queue, which start requires.

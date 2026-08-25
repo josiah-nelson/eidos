@@ -247,6 +247,27 @@ impl FsEventsCheckpoint {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn fsevents_batch_checkpoint(
+    checkpoint: &FsEventsCheckpoint,
+    event_id: u64,
+    retryable_errors: u64,
+) -> (FsEventsCheckpoint, bool) {
+    if retryable_errors > 0 {
+        return (checkpoint.clone(), true);
+    }
+    (
+        FsEventsCheckpoint {
+            cursor: eidos_scanner::fsevents::FsEventsCursor {
+                store_uuid: checkpoint.cursor.store_uuid.clone(),
+                event_id,
+            },
+            root: checkpoint.root.clone(),
+        },
+        false,
+    )
+}
+
 /// Canonical form of a source root as FSEvents reports paths: symlinks
 /// resolved, `/var` spelled `/private/var`. Comparing a notification against
 /// an unresolved root would classify every path as out of scope.
@@ -430,27 +451,18 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                     continue;
                 }
                 // A batch that hit a retryable read failure describes less
-                // than it was asked to. Applying what was read is right - the
-                // filesystem said so - but acknowledging the position is not:
-                // the cursor stays put so a restart replays these paths, and
-                // re-reading a path that has not changed since is idempotent.
-                let complete = tstats.retryable_errors == 0;
-                let next = if complete {
-                    FsEventsCheckpoint {
-                        cursor: eidos_scanner::fsevents::FsEventsCursor {
-                            store_uuid: cp.cursor.store_uuid.clone(),
-                            event_id,
-                        },
-                        root: cp.root.clone(),
-                    }
-                } else {
+                // than it was asked to. Apply what was read, retain the old
+                // checkpoint, then reopen the stream from that checkpoint so
+                // a later clean batch cannot acknowledge past the missed path.
+                let (next, replay_batch) =
+                    fsevents_batch_checkpoint(&cp, event_id, tstats.retryable_errors);
+                if replay_batch {
                     tracing::warn!(
                         source = source_id.0,
                         retryable_errors = tstats.retryable_errors,
-                        "holding the change-feed cursor: part of this batch could not be read"
+                        "holding the change-feed cursor and reopening the stream: part of this batch could not be read"
                     );
-                    cp.clone()
-                };
+                }
                 let apply = {
                     let Some(_mutation) = status.mutation_guard(&state) else {
                         stop(&status, "cancelled".into());
@@ -468,7 +480,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         status.batches.fetch_add(1, Ordering::Relaxed);
                         status.events.fetch_add(astats.events, Ordering::Relaxed);
                         status.records.fetch_add(tstats.paths, Ordering::Relaxed);
-                        if complete {
+                        if !replay_batch {
                             status
                                 .last_position
                                 .store(event_id as i64, Ordering::Relaxed);
@@ -477,7 +489,15 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         status
                             .last_apply_ms
                             .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        status.set(WatcherState::Live, None);
+                        if replay_batch {
+                            feed = None;
+                            status.set(
+                                WatcherState::Starting,
+                                Some("retrying an incomplete change-feed batch".into()),
+                            );
+                        } else {
+                            status.set(WatcherState::Live, None);
+                        }
                         tracing::debug!(
                             source = source_id.0,
                             paths = tstats.paths,
@@ -505,7 +525,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         feed = None;
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "watcher: apply failed; will retry batch");
+                        // The stream already consumed this batch. Reopen it at
+                        // the unchanged durable checkpoint to actually retry.
+                        feed = None;
+                        tracing::error!(error = %e, "watcher: apply failed; reopening the feed to retry the batch");
                         std::thread::sleep(Duration::from_secs(2));
                     }
                 }
@@ -1144,6 +1167,10 @@ pub fn native_scan_sequence(
                     Some("this volume keeps no event history; periodic reconciliation only"),
                 );
             }
+            // A recovery scan may have been launched by an existing watcher.
+            // With no resumable cursor that watcher must retire; the periodic
+            // reconciler owns this source from here.
+            stop_watcher(state, source_id);
             return Ok(summary);
         };
         progress.set_phase("enumerating");
@@ -1285,6 +1312,43 @@ mod cancellation_tests {
         drop(mutation);
         thread.join().unwrap();
         assert!(status.cancel.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod fsevents_checkpoint_tests {
+    use super::{fsevents_batch_checkpoint, FsEventsCheckpoint};
+    use eidos_scanner::fsevents::FsEventsCursor;
+
+    fn checkpoint(event_id: u64) -> FsEventsCheckpoint {
+        FsEventsCheckpoint {
+            cursor: FsEventsCursor {
+                store_uuid: "store".into(),
+                event_id,
+            },
+            root: "/source".into(),
+        }
+    }
+
+    #[test]
+    fn an_incomplete_batch_retains_its_cursor_and_reopens_the_feed() {
+        let current = checkpoint(10);
+        let (next, reopen) = fsevents_batch_checkpoint(&current, 20, 1);
+
+        assert!(reopen);
+        assert_eq!(next.cursor.event_id, current.cursor.event_id);
+        assert_eq!(next.cursor.store_uuid, current.cursor.store_uuid);
+        assert_eq!(next.root, current.root);
+    }
+
+    #[test]
+    fn a_complete_batch_advances_without_reopening_the_feed() {
+        let current = checkpoint(10);
+        let (next, reopen) = fsevents_batch_checkpoint(&current, 20, 0);
+
+        assert!(!reopen);
+        assert_eq!(next.cursor.event_id, 20);
+        assert_eq!(next.cursor.store_uuid, current.cursor.store_uuid);
     }
 }
 

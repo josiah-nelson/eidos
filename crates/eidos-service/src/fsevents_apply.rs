@@ -22,7 +22,7 @@ use eidos_catalog::changes::{ChangeEvent, NativeKey, ObjectSnapshot};
 use eidos_catalog::Catalog;
 use eidos_domain::{ObjectKind, SourceId};
 use eidos_scanner::fsevents::PathChange;
-use eidos_scanner::{walk, DirectoryLister, RawEntry, WalkOptions};
+use eidos_scanner::{walk, DirectoryLister, RawEntry, ScanError, ScanErrorKind, WalkOptions};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -59,13 +59,25 @@ pub struct PathTranslator<'a> {
 }
 
 impl PathTranslator<'_> {
+    fn record_read_error(&self, stats: &mut TranslateStats, error: &ScanError, operation: &str) {
+        if error.is_retryable() {
+            stats.retryable_errors += 1;
+        } else {
+            stats.io_errors += 1;
+        }
+        tracing::debug!(
+            path = %error.path.display(),
+            error = %error,
+            operation,
+            "could not translate a changed path"
+        );
+    }
+
     /// Native key of the object at `path` as the filesystem reports it now.
-    fn key_of(&self, path: &Path) -> Option<NativeKey> {
+    fn key_of(&self, path: &Path) -> Result<Option<NativeKey>, ScanError> {
         self.lister
             .stat(path)
-            .ok()
-            .and_then(|entry| entry.native_id)
-            .map(NativeKey::from)
+            .map(|entry| entry.native_id.map(NativeKey::from))
     }
 
     /// Whether the catalog can attach children to this parent: it either knows
@@ -114,6 +126,7 @@ impl PathTranslator<'_> {
         current_parent: NativeKey,
         current_name: &str,
         events: &mut Vec<ChangeEvent>,
+        stats: &mut TranslateStats,
     ) -> bool {
         let Ok(Some(id)) = self.catalog.object_by_native(self.source_id, object) else {
             return false;
@@ -141,8 +154,16 @@ impl PathTranslator<'_> {
             }
             // The entry names this object elsewhere. If that path still
             // exists it is a genuine hard link and must stay.
-            if self.entry_names_object(parent_id, &entry.name, object) {
-                continue;
+            match self.entry_names_object(parent_id, &entry.name, object) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    // An unreadable alias is not evidence that the alias is
+                    // gone. Keep it for now and hold the batch cursor when the
+                    // failure may clear on retry.
+                    self.record_read_error(stats, &error, "checking a catalogued alias");
+                    continue;
+                }
             }
             events.push(ChangeEvent::Unlink {
                 parent: parent_key,
@@ -168,30 +189,35 @@ impl PathTranslator<'_> {
         parent_id: eidos_domain::ObjectId,
         name: &str,
         object: NativeKey,
-    ) -> bool {
+    ) -> Result<bool, ScanError> {
         let Ok(Some(parent_path)) = self.catalog.render_path(parent_id) else {
             // Without a path the safest answer is "still there": a spurious
             // unlink loses data, while a missed one is repaired by the next
             // reconciliation.
-            return true;
+            return Ok(true);
         };
         let parent_path = PathBuf::from(parent_path);
-        let Ok(entry) = self.lister.stat(&parent_path.join(name)) else {
-            return false;
+        let entry = match self.lister.stat(&parent_path.join(name)) {
+            Ok(entry) => entry,
+            Err(error) if error.kind == ScanErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
         };
         match entry.native_id.map(NativeKey::from) {
             // Some other object answers to that name now, so this object's
             // entry under it is stale whatever the spelling.
-            Some(found) if found != object => false,
-            None => true,
-            Some(_) => match std::fs::read_dir(&parent_path) {
-                Ok(children) => children
-                    .filter_map(Result::ok)
-                    .any(|child| child.file_name().to_string_lossy() == name),
-                // The directory became unreadable between the two calls;
-                // keeping the entry is the conservative answer.
-                Err(_) => true,
-            },
+            Some(found) if found != object => Ok(false),
+            None => Ok(true),
+            Some(_) => {
+                let children = std::fs::read_dir(&parent_path)
+                    .map_err(|error| ScanError::from_io(&parent_path, &error))?;
+                for child in children {
+                    let child = child.map_err(|error| ScanError::from_io(&parent_path, &error))?;
+                    if child.file_name().to_string_lossy() == name {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
         }
     }
 
@@ -229,9 +255,20 @@ impl PathTranslator<'_> {
                         return;
                     }
                 };
-                let Some(parent) = self.key_of(&event.path) else {
-                    stats.io_errors += 1;
-                    return;
+                let parent = match self.key_of(&event.path) {
+                    Ok(Some(parent)) => parent,
+                    Ok(None) => {
+                        stats.io_errors += 1;
+                        return;
+                    }
+                    Err(error) => {
+                        self.record_read_error(
+                            stats,
+                            &error,
+                            "reading an expanded directory identity",
+                        );
+                        return;
+                    }
                 };
                 stats.expanded_directories += 1;
                 for child in children {
@@ -271,9 +308,16 @@ impl PathTranslator<'_> {
         let Some(parent_path) = path.parent() else {
             return;
         };
-        let Some(parent) = self.key_of(parent_path) else {
-            stats.out_of_scope += 1;
-            return;
+        let parent = match self.key_of(parent_path) {
+            Ok(Some(parent)) => parent,
+            Ok(None) => {
+                stats.out_of_scope += 1;
+                return;
+            }
+            Err(error) => {
+                self.record_read_error(stats, &error, "reading the changed path's parent");
+                return;
+            }
         };
         if !self.in_scope(parent, batch_dirs) {
             stats.out_of_scope += 1;
@@ -290,7 +334,7 @@ impl PathTranslator<'_> {
             .ok()
             .flatten()
             .is_some();
-        if self.unlink_stale_entries(object, parent, &entry.name, events) {
+        if self.unlink_stale_entries(object, parent, &entry.name, events, stats) {
             stats.relinked += 1;
         }
         let is_directory = entry.kind == ObjectKind::Directory;
@@ -360,10 +404,15 @@ impl PathTranslator<'_> {
             return;
         };
         let parent = match self.key_of(parent_path) {
-            Some(key) => key,
-            None => {
+            Ok(Some(key)) => key,
+            Ok(None) => return,
+            Err(error) if error.kind == ScanErrorKind::NotFound => {
                 // The parent is gone too; its own notification (or the
                 // subtree delete above) covers this entry.
+                return;
+            }
+            Err(error) => {
+                self.record_read_error(stats, &error, "reading a removed path's parent");
                 return;
             }
         };
@@ -423,5 +472,153 @@ impl PathTranslator<'_> {
             self.absent(&path, &relinked, &mut events, &mut stats);
         }
         (events, stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eidos_catalog::scan::{run_scan, RunScanOptions};
+    use eidos_catalog::NewSource;
+    use eidos_domain::SourceKind;
+    use eidos_scanner::VolumeInfo;
+    use std::sync::Arc;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        catalog: Arc<Catalog>,
+        source: SourceId,
+    }
+
+    impl Fixture {
+        fn new(with_hard_link: bool) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("file.txt"), b"one").unwrap();
+            if with_hard_link {
+                std::fs::hard_link(root.join("file.txt"), root.join("alias.txt")).unwrap();
+            }
+            let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+            let host = catalog.ensure_host("fsevents-test", "macos").unwrap();
+            let source = catalog
+                .add_source(&NewSource {
+                    host_id: host,
+                    name: "fsevents-test".into(),
+                    kind: SourceKind::MacosLocal,
+                    root_path: root.display().to_string(),
+                    aliases: vec![],
+                })
+                .unwrap();
+            let lister = eidos_scanner::default_lister();
+            run_scan(
+                &catalog,
+                source,
+                lister.as_ref(),
+                &RunScanOptions::default(),
+            )
+            .unwrap();
+            Self {
+                _dir: dir,
+                root,
+                catalog,
+                source,
+            }
+        }
+
+        fn translate_with_fault(
+            &self,
+            changed: &Path,
+            fault: &Path,
+        ) -> (Vec<ChangeEvent>, TranslateStats) {
+            let lister = FaultingLister {
+                inner: eidos_scanner::default_lister(),
+                fault: fault.to_path_buf(),
+            };
+            PathTranslator {
+                lister: &lister,
+                catalog: &self.catalog,
+                source_id: self.source,
+                root: &self.root,
+            }
+            .translate(&[PathChange {
+                path: changed.to_path_buf(),
+                event_id: 10,
+                removed_or_renamed: false,
+                is_directory: false,
+            }])
+        }
+    }
+
+    struct FaultingLister {
+        inner: Box<dyn DirectoryLister>,
+        fault: PathBuf,
+    }
+
+    impl DirectoryLister for FaultingLister {
+        fn list(&self, dir: &Path) -> Result<Vec<RawEntry>, ScanError> {
+            self.inner.list(dir)
+        }
+
+        fn volume_info(&self, root: &Path) -> Result<VolumeInfo, ScanError> {
+            self.inner.volume_info(root)
+        }
+
+        fn stat(&self, path: &Path) -> Result<RawEntry, ScanError> {
+            if path == self.fault {
+                return Err(ScanError::new(
+                    ScanErrorKind::Transient,
+                    0,
+                    "injected transient read failure",
+                    path,
+                ));
+            }
+            self.inner.stat(path)
+        }
+
+        fn name(&self) -> &'static str {
+            "faulting-fsevents-test-lister"
+        }
+    }
+
+    #[test]
+    fn a_transient_present_parent_read_holds_the_cursor() {
+        let fixture = Fixture::new(false);
+        let changed = fixture.root.join("file.txt");
+        let (events, stats) = fixture.translate_with_fault(&changed, &fixture.root);
+
+        assert!(events.is_empty());
+        assert_eq!(stats.retryable_errors, 1);
+        assert_eq!(stats.io_errors, 0);
+    }
+
+    #[test]
+    fn a_transient_absent_parent_read_holds_the_cursor() {
+        let fixture = Fixture::new(false);
+        let changed = fixture.root.join("file.txt");
+        std::fs::remove_file(&changed).unwrap();
+        let (events, stats) = fixture.translate_with_fault(&changed, &fixture.root);
+
+        assert!(events.is_empty());
+        assert_eq!(stats.retryable_errors, 1);
+        assert_eq!(stats.io_errors, 0);
+    }
+
+    #[test]
+    fn a_transient_alias_read_never_unlinks_a_live_hard_link() {
+        let fixture = Fixture::new(true);
+        let changed = fixture.root.join("file.txt");
+        let alias = fixture.root.join("alias.txt");
+        let (events, stats) = fixture.translate_with_fault(&changed, &alias);
+
+        assert_eq!(stats.retryable_errors, 1);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                ChangeEvent::Unlink { name, .. } if name == "alias.txt"
+            )),
+            "an uncertain alias must be retained: {events:?}"
+        );
     }
 }
