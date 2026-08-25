@@ -14,6 +14,8 @@ pub mod content_preview;
 pub mod content_workers;
 pub mod export;
 pub mod follower;
+#[cfg(target_os = "macos")]
+mod fsevents_apply;
 pub mod interactions_api;
 pub mod retry_api;
 pub mod scanner;

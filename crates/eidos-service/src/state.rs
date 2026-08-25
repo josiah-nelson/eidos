@@ -248,8 +248,8 @@ impl AppState {
         self.watchers.lock().get(&id).cloned()
     }
 
-    /// Start change-feed watchers for every published native source and the
-    /// periodic reconciler.
+    /// Resume change-feed watchers for published sources with a durable native
+    /// cursor, then start the periodic reconciler for feed-less sources.
     pub fn start_background(self: &Arc<Self>) -> anyhow::Result<()> {
         if self.content_rebuild {
             // Runs under the index writer gate: content workers and the
@@ -266,7 +266,11 @@ impl AppState {
         }
         for s in self.catalog.list_sources()? {
             if s.published_generation.is_some()
-                && s.kind == eidos_domain::SourceKind::WindowsLocal
+                && matches!(
+                    s.kind,
+                    eidos_domain::SourceKind::WindowsLocal | eidos_domain::SourceKind::MacosLocal
+                )
+                && eidos_catalog::changes::is_native_feed_checkpoint(s.checkpoint_kind.as_deref())
                 && s.state != eidos_domain::SourceState::Retired
             {
                 crate::watcher::ensure_watcher(self, s.id);

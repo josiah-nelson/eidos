@@ -90,6 +90,17 @@ pub struct Checkpoint {
     pub value: serde_json::Value,
 }
 
+/// Checkpoint kinds that are native change-feed cursors. A source holding one
+/// is fed incrementally and is as fresh as its feed; anything else is only as
+/// fresh as its last reconciliation. Naming one platform's feed here - as the
+/// freshness and reconciliation rules once did - silently demotes every other
+/// platform's live sources to periodic.
+pub const NATIVE_FEED_CHECKPOINTS: [&str; 2] = ["usn", "fsevents"];
+
+pub fn is_native_feed_checkpoint(kind: Option<&str>) -> bool {
+    kind.is_some_and(|kind| NATIVE_FEED_CHECKPOINTS.contains(&kind))
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyStats {
     pub events: u64,
@@ -973,5 +984,21 @@ impl<'a> Applier<'a> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn every_native_feed_cursor_counts_as_one() {
+        // Adding a feed without adding it here silently demotes that
+        // platform's live sources to periodic reconciliation.
+        assert!(is_native_feed_checkpoint(Some("usn")));
+        assert!(is_native_feed_checkpoint(Some("fsevents")));
+        assert!(!is_native_feed_checkpoint(None));
+        assert!(!is_native_feed_checkpoint(Some("")));
+        assert!(!is_native_feed_checkpoint(Some("something-else")));
     }
 }

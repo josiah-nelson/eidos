@@ -668,7 +668,7 @@ pub fn completeness_from(
         (SourceState::Degraded, _) | (SourceState::Offline, _) | (SourceState::Stale, _) => {
             Freshness::Unknown
         }
-        (_, Some("usn")) => Freshness::Live,
+        (_, kind) if crate::changes::is_native_feed_checkpoint(kind) => Freshness::Live,
         _ => Freshness::Periodic,
     };
     let checkpoint_age_ms = src

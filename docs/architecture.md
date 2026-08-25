@@ -134,7 +134,11 @@ common one. Enumeration adapters are chosen per platform —
 `FileIdExtdDirectoryInfo` batches on Windows, `getattrlistbulk` on macOS,
 `readdir` elsewhere and on remote volumes — and every adapter a platform can
 use runs the same filesystem contract suite
-([ADR-0017](adr/0017-macos-enumeration-and-volume-facts.md)).
+([ADR-0017](adr/0017-macos-enumeration-and-volume-facts.md)). Change-feed
+adapters are chosen the same way: the USN journal on Windows and FSEvents on
+macOS, each with its own cursor and its own loss semantics, both normalised
+into the one identity-keyed change contract the catalog applies
+([ADR-0018](adr/0018-macos-change-feed.md)).
 
 Hard links produce multiple entries referencing one object. Content is indexed
 once per object generation. Symlinks/reparse points are entries with explicit

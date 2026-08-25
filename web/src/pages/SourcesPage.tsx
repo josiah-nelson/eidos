@@ -170,14 +170,14 @@ function SourceCard({
                 {s.watcher.state}
               </span>{' '}
               {s.watcher.live
-                ? `USN · ${count(s.watcher.events)} events in ${count(s.watcher.batches)} batches` +
+                ? `${s.watcher.feed === 'macos_fsevents' ? 'FSEvents' : 'USN'} · ${count(s.watcher.events)} events in ${count(s.watcher.batches)} batches` +
                   (s.watcher.last_batch_ms_ago != null ? ` · last ${Math.round(integerNumber(s.watcher.last_batch_ms_ago) / 1000)}s ago` : '')
                 : (s.watcher.detail ?? '')}
             </>
-          ) : source.kind !== 'windows_local' ? (
-            'periodic reconciliation'
-          ) : (
+          ) : source.checkpoint_kind === 'usn' || source.checkpoint_kind === 'fsevents' ? (
             <span className="muted">not watching</span>
+          ) : (
+            'periodic reconciliation'
           )}
         </dd>
         {source.state_reason && (
