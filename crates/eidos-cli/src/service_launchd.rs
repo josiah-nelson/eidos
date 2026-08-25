@@ -96,8 +96,11 @@ pub fn run(args: ServiceArgs, log_filter: String, log_json: bool) -> anyhow::Res
         ServiceCommand::Start(wait) => cmd_start(&label, wait),
         ServiceCommand::Stop(wait) => cmd_stop(&label, wait),
         ServiceCommand::Restart(wait) => {
-            cmd_stop(&label, wait.clone())?;
-            cmd_start(&label, wait)
+            // One deadline for the whole restart: `--timeout` is what the
+            // command may take, not what each half may take.
+            let deadline = deadline(wait.timeout);
+            stop_by(&label, deadline)?;
+            start_by(&label, deadline)
         }
         ServiceCommand::Status(status) => cmd_status(&label, status),
     }
@@ -123,8 +126,28 @@ fn agents_dir() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join("Library/LaunchAgents"))
 }
 
+/// launchd labels are reverse-DNS names, and this one also becomes a file name
+/// under `~/Library/LaunchAgents`. Anything that could climb out of that
+/// directory would let `--replace` overwrite, or `uninstall` delete, a
+/// registration belonging to something else.
+fn validated_label(label: &str) -> anyhow::Result<&str> {
+    let acceptable = !label.is_empty()
+        && label.len() <= 255
+        && label != "."
+        && label != ".."
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !acceptable {
+        bail!(
+            "invalid label {label:?}: use a reverse-DNS name of letters, digits, dots, dashes, and underscores"
+        );
+    }
+    Ok(label)
+}
+
 fn plist_path(label: &str) -> anyhow::Result<PathBuf> {
-    Ok(agents_dir()?.join(format!("{label}.plist")))
+    Ok(agents_dir()?.join(format!("{}.plist", validated_label(label)?)))
 }
 
 struct LaunchctlOutput {
@@ -194,11 +217,13 @@ fn job_state(label: &str) -> anyhow::Result<JobState> {
     Ok(state)
 }
 
-fn wait_for(
-    timeout_s: u64,
+/// Poll until `ready`, or until `deadline`. One deadline covers a whole
+/// operation, so `--timeout` bounds the time a command can take rather than
+/// the time each of its phases can take.
+fn wait_until(
+    deadline: std::time::Instant,
     mut ready: impl FnMut() -> anyhow::Result<bool>,
 ) -> anyhow::Result<bool> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_s);
     loop {
         if ready()? {
             return Ok(true);
@@ -208,6 +233,10 @@ fn wait_for(
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+fn deadline(timeout_s: u64) -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(timeout_s)
 }
 
 // ----- install / uninstall -------------------------------------------------
@@ -319,17 +348,29 @@ fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
     }
     let document = plist_document(label, &program, &arguments, &log_dir);
 
-    if path.exists() {
-        // Replacing a loaded job must unload the old definition first, or
-        // launchd keeps running the one it already read.
-        let _ = launchctl(&["bootout", &service_target(label)])?;
-    }
     std::fs::create_dir_all(agents_dir()?)?;
-    // Write then rename so a partially written plist is never loadable.
+    // Write then rename so a partially written plist is never loadable, and
+    // do the write *before* unloading anything: a failure here then leaves the
+    // running agent exactly as it was.
     let temporary = path.with_extension("plist.new");
     std::fs::write(&temporary, document)
         .with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path).with_context(|| format!("installing {}", path.display()))?;
+    let was_loaded = job_state(label)?.loaded;
+    if was_loaded {
+        // launchd keeps running the definition it already read, so the old job
+        // has to be gone - not merely asked to go - before the new file lands.
+        unload(label, deadline(30))?;
+    }
+    if let Err(e) = std::fs::rename(&temporary, &path) {
+        // The replacement never landed. Put the agent back rather than
+        // leaving the machine with no indexer.
+        if was_loaded {
+            let _ = launchctl(&["bootstrap", &domain(), &path.display().to_string()]);
+        }
+        let _ = std::fs::remove_file(&temporary);
+        return Err(anyhow::Error::new(e))
+            .with_context(|| format!("installing {}", path.display()));
+    }
 
     println!("installed {} -> {}", label, path.display());
     if !is_bundled(&program) {
@@ -340,8 +381,10 @@ fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
             program.display()
         );
     }
-    if args.start_now {
-        cmd_start(label, WaitArgs { timeout: 120 })?;
+    if args.start_now || was_loaded {
+        // A replacement that was running before must be running after: an
+        // install is a configuration change, not an outage.
+        start_by(label, deadline(120))?;
     } else {
         println!("run `eidos service start` to load it");
     }
@@ -367,6 +410,10 @@ fn cmd_uninstall(label: &str) -> anyhow::Result<()> {
 // ----- start / stop --------------------------------------------------------
 
 fn cmd_start(label: &str, wait: WaitArgs) -> anyhow::Result<()> {
+    start_by(label, deadline(wait.timeout))
+}
+
+fn start_by(label: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
     let path = plist_path(label)?;
     if !path.exists() {
         bail!(
@@ -374,37 +421,57 @@ fn cmd_start(label: &str, wait: WaitArgs) -> anyhow::Result<()> {
             path.display()
         );
     }
-    let state = job_state(label)?;
-    if state.loaded {
-        // Already bootstrapped: (re)start the job itself.
-        launchctl_ok(&["kickstart", &service_target(label)])?;
-    } else {
-        launchctl_ok(&["bootstrap", &domain(), &path.display().to_string()])?;
-    }
-    let started = wait_for(wait.timeout, || Ok(job_state(label)?.running))?;
+    load(label, &path)?;
+    let started = wait_until(deadline, || Ok(job_state(label)?.running))?;
     if !started {
-        bail!(
-            "the agent did not start within {}s; see `eidos service status`",
-            wait.timeout
-        );
+        bail!("the agent did not start in time; see `eidos service status`");
     }
     // launchd reports "running" as soon as it spawns the process, which is
     // before the API is listening. Callers mean "ready to answer", so wait
     // for that too when the installed plist says where to ask.
     if bind_address(&path).is_some() {
-        let answering = wait_for(wait.timeout, || Ok(probe_health(&path).is_some()))?;
+        let answering = wait_until(deadline, || Ok(probe_health(&path).is_some()))?;
         if !answering {
-            bail!(
-                "the agent started but did not answer within {}s; see the log directory",
-                wait.timeout
-            );
+            bail!("the agent started but did not answer in time; see the log directory");
         }
     }
     println!("started {label}");
     Ok(())
 }
 
+/// Get the job running, whichever state launchd is in.
+///
+/// `bootout` is asynchronous, so a job can still look loaded a moment after it
+/// was removed and look absent a moment after it was added. Each command is
+/// therefore tried and, if launchd disagrees about which state it is in, the
+/// other one is used rather than failing the operation.
+fn load(label: &str, path: &Path) -> anyhow::Result<()> {
+    let target = service_target(label);
+    let plist = path.display().to_string();
+    if job_state(label)?.loaded {
+        if launchctl_ok(&["kickstart", &target]).is_ok() {
+            return Ok(());
+        }
+        let _ = launchctl(&["bootout", &target])?;
+        return launchctl_ok(&["bootstrap", &domain(), &plist]);
+    }
+    if launchctl_ok(&["bootstrap", &domain(), &plist]).is_ok() {
+        return Ok(());
+    }
+    launchctl_ok(&["kickstart", &target])
+}
+
+/// Unload the job and wait for launchd to finish doing it.
+fn unload(label: &str, deadline: std::time::Instant) -> anyhow::Result<bool> {
+    let _ = launchctl(&["bootout", &service_target(label)])?;
+    wait_until(deadline, || Ok(!job_state(label)?.loaded))
+}
+
 fn cmd_stop(label: &str, wait: WaitArgs) -> anyhow::Result<()> {
+    stop_by(label, deadline(wait.timeout))
+}
+
+fn stop_by(label: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
     let state = job_state(label)?;
     if !state.loaded {
         println!("{label} is not loaded");
@@ -412,10 +479,8 @@ fn cmd_stop(label: &str, wait: WaitArgs) -> anyhow::Result<()> {
     }
     // `bootout` unloads the job. `KeepAlive` would restart a merely killed
     // process, so this is what "stopped but still installed" means here.
-    launchctl_ok(&["bootout", &service_target(label)])?;
-    let stopped = wait_for(wait.timeout, || Ok(!job_state(label)?.loaded))?;
-    if !stopped {
-        bail!("the agent did not unload within {}s", wait.timeout);
+    if !unload(label, deadline)? {
+        bail!("the agent did not unload in time");
     }
     println!("stopped {label}");
     Ok(())
@@ -484,13 +549,34 @@ fn bind_address(plist: &Path) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// A listen address turned into one a client can connect to. `0.0.0.0` and
+/// `[::]` mean "every interface" to a listener and nothing at all to a
+/// connector, so they become loopback.
+fn routable(bind: &str) -> Option<String> {
+    let address: std::net::SocketAddr = bind.parse().ok()?;
+    if !address.ip().is_unspecified() {
+        return Some(bind.to_string());
+    }
+    Some(match address.ip() {
+        std::net::IpAddr::V4(_) => format!("127.0.0.1:{}", address.port()),
+        std::net::IpAddr::V6(_) => format!("[::1]:{}", address.port()),
+    })
+}
+
 /// Ask the running agent for `/api/health` on the address recorded in the
 /// installed plist, so status reflects the service that was actually
 /// installed rather than a default.
 fn probe_health(plist: &Path) -> Option<serde_json::Value> {
-    let bind = bind_address(plist)?;
+    let bind = routable(&bind_address(plist)?)?;
     let url = format!("http://{bind}/api/health");
-    ureq::get(&url)
+    // The probe runs inside a deadline-bounded poll, so it must not be able
+    // to block on the operating system's own connect timeout.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(2)))
+        .build()
+        .into();
+    agent
+        .get(&url)
         .call()
         .ok()?
         .body_mut()
@@ -616,6 +702,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bind_address(&plist), None);
+    }
+
+    #[test]
+    fn a_label_cannot_escape_the_registration_directory() {
+        assert!(validated_label("com.jnel.eidos.agent").is_ok());
+        assert!(validated_label("com.jnel.eidos.agent-test_2").is_ok());
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../../../etc/passwd",
+            "com.jnel/../other",
+            "com.jnel.eidos agent",
+            "com.jnel\0agent",
+        ] {
+            assert!(
+                validated_label(bad).is_err(),
+                "{bad:?} must not be accepted as a label"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wildcard_listener_is_probed_on_loopback() {
+        // "every interface" is not an address a client can dial.
+        assert_eq!(routable("0.0.0.0:7700").as_deref(), Some("127.0.0.1:7700"));
+        assert_eq!(routable("[::]:7700").as_deref(), Some("[::1]:7700"));
+        assert_eq!(
+            routable("127.0.0.1:7700").as_deref(),
+            Some("127.0.0.1:7700")
+        );
+        assert_eq!(
+            routable("192.0.2.10:7700").as_deref(),
+            Some("192.0.2.10:7700")
+        );
+        assert_eq!(routable("not-an-address").as_deref(), None);
     }
 
     #[test]

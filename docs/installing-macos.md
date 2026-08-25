@@ -52,7 +52,10 @@ eidos service uninstall      # unload and remove the registration; data is kept
 ```
 
 `stop` unloads the job rather than killing the process, because launchd would
-restart anything that merely died. Indexed data lives in the data directory
+restart anything that merely died. Re-running `install --replace` on a running
+agent replaces its configuration and leaves it running: an install is a
+configuration change, not an outage. `--timeout` bounds the whole command,
+including a restart's stop and start together. Indexed data lives in the data directory
 you chose and is never touched by `uninstall`.
 
 Logs are in `<data-dir>/logs`: `eidos.log.<date>` is the rolling agent log,
