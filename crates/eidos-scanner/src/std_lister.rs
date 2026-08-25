@@ -115,10 +115,14 @@ impl DirectoryLister for StdLister {
             };
             let md = match std::fs::symlink_metadata(item.path()) {
                 Ok(m) => m,
-                Err(e) => {
-                    tracing::debug!(path = %item.path().display(), error = %e, "metadata failed");
-                    continue;
-                }
+                // A child that vanished between reading the directory and
+                // reading the child is genuinely gone, and omitting it is the
+                // truth. Any other failure is not: a listing that silently
+                // drops a child claims it no longer exists, and publication
+                // would tombstone a file that is still there. Fail the whole
+                // directory so the scan records an error instead.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(ScanError::from_io(&item.path(), &e)),
             };
             let (kind, attributes) = classify(&md, &name);
             let size = if kind == ObjectKind::File {

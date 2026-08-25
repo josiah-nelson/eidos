@@ -246,6 +246,46 @@ fn case_behavior_and_unicode_nfd_names_are_observed() {
     }
 }
 
+/// A listing that quietly omits a child claims the child no longer exists,
+/// and publication tombstones what is not re-observed. An unreadable child
+/// must therefore fail its directory, while one that genuinely vanished
+/// between opening the directory and reading the child is simply absent.
+#[test]
+#[cfg(unix)]
+fn an_unreadable_child_fails_its_directory_instead_of_vanishing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping permission fixture: root bypasses mode checks");
+        return;
+    }
+    for (adapter, lister) in listers() {
+        let temporary = fixture_root();
+        let root = temporary.path();
+        let closed = root.join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        std::fs::write(closed.join("hidden.txt"), b"unreadable").unwrap();
+        std::fs::write(root.join("visible.txt"), b"readable").unwrap();
+        // Nothing inside `closed` can be read, including its child's metadata.
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = lister.list(&closed);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match result {
+            Err(error) => assert_eq!(
+                error.kind,
+                eidos_scanner::ScanErrorKind::AccessDenied,
+                "{adapter}: {error}"
+            ),
+            Ok(entries) => assert_eq!(
+                entries.len(),
+                1,
+                "{adapter}: a listing must not omit a child it could not read"
+            ),
+        }
+    }
+}
+
 #[test]
 #[cfg(unix)]
 fn permission_failure_is_an_error_not_a_traversal() {

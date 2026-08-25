@@ -80,6 +80,12 @@ cursor is a coalescing event id, and each adapter keeps its own.
   content policy judges by reparse tag. The portable lister now applies each
   platform's own rule, and the shared contract asserts what holds everywhere:
   a symlink carries the reparse attribute and is never walked into.
+- A child that cannot be read fails its whole directory rather than being
+  omitted from the listing. Omission is not a neutral act here: publication
+  tombstones what a listed directory did not re-observe, so a dropped child
+  reads as a deletion of a file that still exists. A child that genuinely
+  vanished between opening the directory and reading it is still simply
+  absent, which is the truth.
 - Case sensitivity is a recorded per-volume fact rather than an assumption.
   Path equality still must not be assumed either way: the same host can mount
   case-sensitive and case-insensitive APFS volumes at once.

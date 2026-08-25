@@ -533,21 +533,25 @@ impl MacLister {
                 let group = &remaining[..length];
                 let entry = parse_group(group).ok_or_else(|| unsupported(dir))?;
                 offset += length;
-                if entry.error != 0 {
-                    // A per-entry error is the kernel telling us this child
-                    // could not be read; the rest of the batch is still valid.
-                    tracing::debug!(
-                        dir = %dir.display(),
-                        error = entry.error,
-                        "getattrlistbulk reported a per-entry error"
-                    );
-                    continue;
-                }
                 if entry.returned.commonattr & libc::ATTR_CMN_NAME == 0 {
                     return Err(unsupported(dir));
                 }
                 let (name, _) = decode_name(entry.name);
                 if name.is_empty() || name == "." || name == ".." {
+                    continue;
+                }
+                if entry.error != 0 {
+                    // A child the kernel could not describe must not be
+                    // dropped: a listing that omits it claims the child no
+                    // longer exists, and publication would tombstone it. Read
+                    // it on its own, and if that fails too, fail the whole
+                    // directory so the scan records an error instead of a
+                    // deletion.
+                    match self.fallback.stat(&dir.join(&name)) {
+                        Ok(repaired) => out.push(repaired),
+                        Err(e) if e.kind == ScanErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
                     continue;
                 }
                 out.push(to_raw_entry(&entry, IDENTITY_CONFIDENCE));
