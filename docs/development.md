@@ -2,10 +2,11 @@
 
 Reproducible build, test, lint, and benchmark commands. Windows is the
 primary development platform. macOS builds and tests the whole workspace and
-has a native enumeration adapter (`getattrlistbulk`, APFS volume
-capabilities); it has no change feed yet, so macOS sources are kept fresh by
-reconciliation scans. Other platforms fall back to the portable `readdir`
-lister with no change feed.
+has native enumeration (`getattrlistbulk`, APFS volume capabilities) and a
+native change feed (FSEvents, with a cursor validated against the volume's
+event store). A volume that keeps no event history stays on periodic
+reconciliation. Other platforms fall back to the portable `readdir` lister
+with no change feed.
 
 ## Toolchain
 

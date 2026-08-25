@@ -258,8 +258,10 @@ export type UnixNanos = ApiInt;
 
 export type VolumeId = ApiInt;
 
+export type WatcherFeed = "windows_usn" | "macos_fsevents";
+
 export type WatcherState = "starting" | "live" | "reconciling" | "stopped";
 
-export type WatcherView = { state: WatcherState, live: boolean, detail: string | null, batches: ApiInt, events: ApiInt, records: ApiInt, reconciles: ApiInt, last_usn: ApiInt, last_batch_ms_ago: ApiInt | null, last_apply_ms: ApiInt, uptime_s: ApiInt, };
+export type WatcherView = { state: WatcherState, live: boolean, detail: string | null, feed: WatcherFeed, batches: ApiInt, events: ApiInt, records: ApiInt, reconciles: ApiInt, last_position: ApiInt, last_batch_ms_ago: ApiInt | null, last_apply_ms: ApiInt, uptime_s: ApiInt, };
 
 export type WorkerCurrent = { worker: string, source_id: SourceId, object_id: ObjectId, path: string, size: ApiInt, started_ms_ago: ApiInt, };

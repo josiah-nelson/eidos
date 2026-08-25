@@ -266,7 +266,10 @@ impl AppState {
         }
         for s in self.catalog.list_sources()? {
             if s.published_generation.is_some()
-                && s.kind == eidos_domain::SourceKind::WindowsLocal
+                && matches!(
+                    s.kind,
+                    eidos_domain::SourceKind::WindowsLocal | eidos_domain::SourceKind::MacosLocal
+                )
                 && s.state != eidos_domain::SourceState::Retired
             {
                 crate::watcher::ensure_watcher(self, s.id);

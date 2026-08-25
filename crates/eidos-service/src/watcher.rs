@@ -30,6 +30,26 @@ pub const DEFAULT_RECONCILE_INTERVAL_S: i64 = 6 * 3600;
 /// Minimum pause before a watcher retries a reconciliation that failed.
 pub const RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(30);
 
+/// The feed this build watches with. A host has exactly one.
+#[cfg(target_os = "macos")]
+const FEED: WatcherFeed = WatcherFeed::MacosFsEvents;
+#[cfg(not(target_os = "macos"))]
+const FEED: WatcherFeed = WatcherFeed::WindowsUsn;
+
+/// Which native feed a watcher is driven by. The position below is a
+/// position *in that feed*: a USN is a byte offset in a journal and an
+/// FSEvents id is a per-volume event counter, and neither is comparable to
+/// the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherFeed {
+    WindowsUsn,
+    /// Spelled the way the volume record spells it, not the way Rust
+    /// capitalises it, so one name means one thing across the wire.
+    #[serde(rename = "macos_fsevents")]
+    MacosFsEvents,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum WatcherState {
@@ -51,7 +71,8 @@ pub struct WatcherStatus {
     pub events: AtomicU64,
     pub records: AtomicU64,
     pub reconciles: AtomicU64,
-    pub last_usn: AtomicI64,
+    /// Latest position applied from the native feed.
+    pub last_position: AtomicI64,
     last_batch: Mutex<Option<Instant>>,
     last_apply_ms: AtomicU64,
     #[cfg(windows)]
@@ -63,11 +84,12 @@ pub struct WatcherView {
     pub state: WatcherState,
     pub live: bool,
     pub detail: Option<String>,
+    pub feed: WatcherFeed,
     pub batches: u64,
     pub events: u64,
     pub records: u64,
     pub reconciles: u64,
-    pub last_usn: i64,
+    pub last_position: i64,
     pub last_batch_ms_ago: Option<u64>,
     pub last_apply_ms: u64,
     pub uptime_s: u64,
@@ -85,7 +107,7 @@ impl WatcherStatus {
             events: AtomicU64::new(0),
             records: AtomicU64::new(0),
             reconciles: AtomicU64::new(0),
-            last_usn: AtomicI64::new(0),
+            last_position: AtomicI64::new(0),
             last_batch: Mutex::new(None),
             last_apply_ms: AtomicU64::new(0),
             #[cfg(windows)]
@@ -101,7 +123,7 @@ impl WatcherStatus {
         self.journal_cancel.cancel();
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn mutation_guard<'a>(&'a self, state: &AppState) -> Option<parking_lot::MutexGuard<'a, ()>> {
         let guard = self.mutation_gate.lock();
         if self.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
@@ -129,7 +151,8 @@ impl WatcherStatus {
             events: self.events.load(Ordering::Relaxed),
             records: self.records.load(Ordering::Relaxed),
             reconciles: self.reconciles.load(Ordering::Relaxed),
-            last_usn: self.last_usn.load(Ordering::Relaxed),
+            feed: FEED,
+            last_position: self.last_position.load(Ordering::Relaxed),
             last_batch_ms_ago: self
                 .last_batch
                 .lock()
@@ -151,18 +174,18 @@ pub fn ensure_watcher(state: &Arc<AppState>, source_id: SourceId) -> Arc<Watcher
     }
     let status = Arc::new(WatcherStatus::new(source_id));
     watchers.insert(source_id, status.clone());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let st = state.clone();
     let s2 = status.clone();
     std::thread::Builder::new()
-        .name(format!("usn-watch-{}", source_id.0))
+        .name(format!("feed-watch-{}", source_id.0))
         .spawn(move || {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             watch_loop(st, source_id, s2);
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "macos")))]
             s2.set(
                 WatcherState::Stopped,
-                Some("change feeds are Windows-only in v0.5".into()),
+                Some("this platform has no native change feed".into()),
             );
         })
         .expect("spawn watcher");
@@ -195,6 +218,282 @@ impl UsnCheckpoint {
             return None;
         }
         serde_json::from_value(cp.value.clone()).ok()
+    }
+}
+
+/// Durable FSEvents position for one source. The event-store UUID travels
+/// with the id because an id from a replaced store is not stale but
+/// meaningless (ADR-0018).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FsEventsCheckpoint {
+    pub cursor: eidos_scanner::fsevents::FsEventsCursor,
+    pub root: String,
+}
+
+#[cfg(target_os = "macos")]
+impl FsEventsCheckpoint {
+    pub fn to_checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            kind: "fsevents".into(),
+            value: serde_json::to_value(self).expect("serialisable"),
+        }
+    }
+    pub fn from_checkpoint(cp: &Checkpoint) -> Option<Self> {
+        if cp.kind != "fsevents" {
+            return None;
+        }
+        serde_json::from_value(cp.value.clone()).ok()
+    }
+}
+
+/// Canonical form of a source root as FSEvents reports paths: symlinks
+/// resolved, `/var` spelled `/private/var`. Comparing a notification against
+/// an unresolved root would classify every path as out of scope.
+#[cfg(target_os = "macos")]
+fn canonical_root(root: &str) -> std::path::PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| std::path::PathBuf::from(root))
+}
+
+#[cfg(target_os = "macos")]
+fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStatus>) {
+    use eidos_scanner::fsevents::{FeedMessage, FsEventsFeed};
+
+    let mut feed: Option<FsEventsFeed> = None;
+    let stop = |status: &WatcherStatus, reason: String| {
+        tracing::info!(source = source_id.0, reason, "watcher stopped");
+        status.set(WatcherState::Stopped, Some(reason));
+    };
+    // Reconcile by enumeration and forget the cursor. Every path that loses
+    // event continuity funnels through here so a partial feed can never be
+    // mistaken for a complete one.
+    let reconcile = |status: &Arc<WatcherStatus>, reason: String| -> bool {
+        tracing::warn!(source = source_id.0, reason, "change feed cannot continue");
+        let Some(_mutation) = status.mutation_guard(&state) else {
+            return false;
+        };
+        let _ = state
+            .catalog
+            .set_source_state(source_id, SourceState::Degraded, Some(&reason));
+        let _ = state.catalog.clear_checkpoint(source_id);
+        match scanner::start_feed_recovery_scan(&state, source_id, UnixNanos::now()) {
+            Ok(scanner::AutomaticScanOutcome::Started(_)) => {
+                status.reconciles.fetch_add(1, Ordering::Relaxed);
+                status.set(WatcherState::Reconciling, Some(reason));
+            }
+            Ok(scanner::AutomaticScanOutcome::Deferred(d)) => {
+                status.set(WatcherState::Reconciling, Some(d.reason));
+            }
+            Err(e) => tracing::error!(error = %e, "reconcile start failed"),
+        }
+        true
+    };
+    loop {
+        if status.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
+            stop(&status, "cancelled".into());
+            return;
+        }
+        let source = match state.catalog.get_source(source_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                stop(&status, "source removed".into());
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "watcher: catalog read failed");
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        if source.state == SourceState::Retired {
+            stop(&status, "source retired".into());
+            return;
+        }
+        if state
+            .scan_progress(source_id)
+            .is_some_and(|p| !p.is_finished())
+        {
+            // An in-flight scan owns the source; the stream is closed so the
+            // watcher cannot apply events against a generation being built.
+            feed = None;
+            status.set(WatcherState::Reconciling, Some("scan in progress".into()));
+            std::thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+        let cp = match state.catalog.checkpoint(source_id) {
+            Ok(Some((cp, _))) => FsEventsCheckpoint::from_checkpoint(&cp),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(error = %e, "watcher: checkpoint read failed");
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        let Some(cp) = cp else {
+            if source.published_generation.is_none() {
+                stop(
+                    &status,
+                    "source has no published generation; scan it first".into(),
+                );
+                return;
+            }
+            let failed_recently = state.scan_progress(source_id).is_some_and(|p| {
+                p.result.lock().as_ref().is_some_and(|r| r.is_err())
+                    && p.finished_for().is_some_and(|d| d < RECONCILE_RETRY_DELAY)
+            });
+            if failed_recently {
+                status.set(
+                    WatcherState::Reconciling,
+                    Some("waiting to retry after a failed reconciliation".into()),
+                );
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+            if !reconcile(&status, "establishing a change-feed cursor".into()) {
+                stop(&status, "cancelled".into());
+                return;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+            continue;
+        };
+        let root = canonical_root(&cp.root);
+        if feed.is_none() {
+            match FsEventsFeed::open(&root, Some(&cp.cursor)) {
+                Ok(f) => {
+                    status.set(
+                        WatcherState::Starting,
+                        Some(if f.replaying() {
+                            "replaying stored events".into()
+                        } else {
+                            "watching".to_string()
+                        }),
+                    );
+                    feed = Some(f);
+                }
+                Err(e) if e.kind == eidos_scanner::ScanErrorKind::Unsupported => {
+                    if !reconcile(&status, format!("{}; reconciling", e.message)) {
+                        stop(&status, "cancelled".into());
+                        return;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                    continue;
+                }
+                Err(e) => {
+                    status.set(
+                        WatcherState::Starting,
+                        Some(format!("opening the change feed failed: {e}")),
+                    );
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+            }
+        }
+        let message = feed.as_mut().expect("opened").recv_timeout(POLL_INTERVAL);
+        let Some(message) = message else {
+            status.set(WatcherState::Live, None);
+            continue;
+        };
+        match message {
+            FeedMessage::HistoryDone => {
+                status.set(WatcherState::Live, None);
+            }
+            FeedMessage::Rescan(reason) => {
+                feed = None;
+                if !reconcile(&status, format!("{}; reconciling", reason.as_str())) {
+                    stop(&status, "cancelled".into());
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            FeedMessage::Batch { changes, event_id } => {
+                if status.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
+                    stop(&status, "cancelled".into());
+                    return;
+                }
+                let started = Instant::now();
+                let translator = crate::fsevents_apply::PathTranslator {
+                    lister: state.lister.as_ref(),
+                    catalog: &state.catalog,
+                    source_id,
+                    root: &root,
+                };
+                let (events, tstats) = translator.translate(&changes);
+                if tstats.needs_rescan {
+                    feed = None;
+                    if !reconcile(
+                        &status,
+                        "a moved subtree is larger than one batch can describe; reconciling".into(),
+                    ) {
+                        stop(&status, "cancelled".into());
+                        return;
+                    }
+                    continue;
+                }
+                let next = FsEventsCheckpoint {
+                    cursor: eidos_scanner::fsevents::FsEventsCursor {
+                        store_uuid: cp.cursor.store_uuid.clone(),
+                        event_id,
+                    },
+                    root: cp.root.clone(),
+                };
+                let apply = {
+                    let Some(_mutation) = status.mutation_guard(&state) else {
+                        stop(&status, "cancelled".into());
+                        return;
+                    };
+                    state.catalog.apply_feed_changes(
+                        source_id,
+                        &events,
+                        &cp.to_checkpoint(),
+                        &next.to_checkpoint(),
+                    )
+                };
+                match apply {
+                    Ok(Some(astats)) => {
+                        status.batches.fetch_add(1, Ordering::Relaxed);
+                        status.events.fetch_add(astats.events, Ordering::Relaxed);
+                        status.records.fetch_add(tstats.paths, Ordering::Relaxed);
+                        status
+                            .last_position
+                            .store(event_id as i64, Ordering::Relaxed);
+                        *status.last_batch.lock() = Some(Instant::now());
+                        status
+                            .last_apply_ms
+                            .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        status.set(WatcherState::Live, None);
+                        tracing::debug!(
+                            source = source_id.0,
+                            paths = tstats.paths,
+                            events = astats.events,
+                            created = astats.objects_created,
+                            tombstoned = astats.objects_tombstoned,
+                            expanded = tstats.expanded_directories,
+                            out_of_scope = tstats.out_of_scope,
+                            ms = started.elapsed().as_millis() as u64,
+                            "applied change batch"
+                        );
+                        if source.state == SourceState::Offline {
+                            let Some(_mutation) = status.mutation_guard(&state) else {
+                                stop(&status, "cancelled".into());
+                                return;
+                            };
+                            let _ = restore_state(&state, source_id);
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            source = source_id.0,
+                            "checkpoint changed while a feed batch was in flight; discarding the stale batch"
+                        );
+                        feed = None;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "watcher: apply failed; will retry batch");
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -362,7 +661,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         };
                         match advance {
                             Ok(true) => {
-                                status.last_usn.store(next_usn, Ordering::Relaxed);
+                                status.last_position.store(next_usn, Ordering::Relaxed);
                             }
                             Ok(false) => {
                                 tracing::debug!(
@@ -437,7 +736,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         status.batches.fetch_add(1, Ordering::Relaxed);
                         status.events.fetch_add(astats.events, Ordering::Relaxed);
                         status.records.fetch_add(tstats.records, Ordering::Relaxed);
-                        status.last_usn.store(next_usn, Ordering::Relaxed);
+                        status.last_position.store(next_usn, Ordering::Relaxed);
                         *status.last_batch.lock() = Some(Instant::now());
                         status
                             .last_apply_ms
@@ -794,7 +1093,64 @@ pub fn native_scan_sequence(
         ensure_watcher(state, source_id);
         Ok(summary)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let source = state
+            .catalog
+            .get_source(source_id)?
+            .ok_or_else(|| anyhow::anyhow!("source {source_id} not found"))?;
+        let volume = state
+            .lister
+            .volume_info(std::path::Path::new(&source.root_path))
+            .ok();
+        let native = volume
+            .as_ref()
+            .is_some_and(|v| v.native_feed == eidos_scanner::NativeFeed::MacosFsEvents);
+        let root = canonical_root(&source.root_path);
+        // The cursor is taken *before* enumeration, so it is always behind
+        // what the published generation contains. Replaying a change the walk
+        // already saw is idempotent; skipping one is data loss. Unlike the USN
+        // journal, FSEvents replays from a stored id on demand, so there is no
+        // overlap window to drain before publishing.
+        let cursor = if native {
+            eidos_scanner::fsevents::current_cursor(&root)
+        } else {
+            None
+        };
+        let Some(cursor) = cursor else {
+            let summary = scanner::run_full_scan(state, source_id, progress)?;
+            let _ = state.catalog.clear_checkpoint(source_id);
+            if native {
+                let _ = state.catalog.set_source_state(
+                    source_id,
+                    summary.final_state,
+                    Some("this volume keeps no event history; periodic reconciliation only"),
+                );
+            }
+            return Ok(summary);
+        };
+        progress.set_phase("enumerating");
+        let session = scanner::enumerate(state, source_id, progress)?;
+        let checkpoint = FsEventsCheckpoint {
+            cursor,
+            root: root.display().to_string(),
+        };
+        progress.set_phase("publishing");
+        let summary = session.finish_with(&PublishOptions {
+            checkpoint: Some(&checkpoint.to_checkpoint()),
+            ..Default::default()
+        })?;
+        tracing::info!(
+            source = source_id.0,
+            generation = summary.generation,
+            event_id = checkpoint.cursor.event_id,
+            "generation published with a change-feed cursor"
+        );
+        progress.set_phase("done");
+        ensure_watcher(state, source_id);
+        Ok(summary)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let summary = scanner::run_full_scan(state, source_id, progress)?;
         Ok(summary)
