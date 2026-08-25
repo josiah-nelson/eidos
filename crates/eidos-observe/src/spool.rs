@@ -1,7 +1,7 @@
 use crate::schema::ObservationRecord;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DAY_NS: i64 = 86_400_000_000_000;
 
@@ -34,6 +34,8 @@ pub struct SpoolStats {
 pub struct Spool {
     connection: Connection,
     limits: SpoolLimits,
+    retention_epoch_utc_ns: i64,
+    retention_started: Instant,
 }
 
 impl Spool {
@@ -52,11 +54,31 @@ impl Spool {
              CREATE INDEX IF NOT EXISTS observations_age
                ON observations(detailed, utc_ns, sequence);",
         )?;
-        Ok(Self { connection, limits })
+        let persisted_retention_utc_ns =
+            connection.query_row("SELECT MAX(utc_ns) FROM observations", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })?;
+        Ok(Self {
+            connection,
+            limits,
+            // Once the spool has history, continue its persisted logical
+            // clock. Adjustable wall time is sampled only for an empty spool;
+            // subsequent age advancement uses monotonic process time.
+            retention_epoch_utc_ns: persisted_retention_utc_ns.unwrap_or_else(utc_now_ns),
+            retention_started: Instant::now(),
+        })
     }
 
     pub fn append(&mut self, record: &ObservationRecord) -> Result<(), SpoolError> {
-        self.append_at(record, utc_now_ns())
+        let elapsed_ns = self
+            .retention_started
+            .elapsed()
+            .as_nanos()
+            .min(i64::MAX as u128) as i64;
+        self.append_at(
+            record,
+            self.retention_epoch_utc_ns.saturating_add(elapsed_ns),
+        )
     }
 
     fn append_at(
@@ -279,5 +301,25 @@ mod tests {
         .unwrap();
         spool.append(&change(utc_now_ns(), "retained")).unwrap();
         assert_eq!(spool.stats().unwrap().detailed_records, 1);
+    }
+
+    #[test]
+    fn reopen_continues_the_persisted_retention_clock() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("spool.db");
+        let limits = SpoolLimits {
+            detailed_max_bytes: u64::MAX,
+            detailed_max_age_ns: 1_000_000_000,
+            summary_max_age_ns: 1_000_000_000,
+        };
+        let mut spool = Spool::open(&file, limits).unwrap();
+        spool
+            .append_at(&change(i64::MAX, "before-reopen"), 1_000)
+            .unwrap();
+        drop(spool);
+
+        let mut reopened = Spool::open(&file, limits).unwrap();
+        reopened.append(&change(i64::MIN, "after-reopen")).unwrap();
+        assert_eq!(reopened.stats().unwrap().detailed_records, 2);
     }
 }
