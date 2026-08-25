@@ -429,3 +429,31 @@ fn limited_batches_cut_through_seq_and_chain() {
     seen.dedup();
     assert_eq!(seen.len() as u64, fx.live_object_count());
 }
+
+// The readonly flag is cleared again so the temporary directory can be removed.
+#[test]
+#[allow(clippy::permissions_set_readonly_false)]
+fn attribute_only_change_is_stamped_on_rescan() {
+    let fx = Fx::new();
+    fx.enable_and_backfill(100);
+    let before = fx.seqs();
+    let three = fx.id("c/three.txt");
+    let path = fx.root.join("c/three.txt");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&path, perms).unwrap();
+    fx.scan();
+    let after = fx.seqs();
+    assert!(
+        after[&three].0 > before[&three].0,
+        "readonly flip re-stamped the row"
+    );
+    let image = row_for(&fx.all_rows(), three).image.clone().unwrap();
+    assert!(
+        image.object.attributes.0 & 0x1 != 0,
+        "image carries the readonly attribute"
+    );
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+}

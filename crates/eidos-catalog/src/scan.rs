@@ -220,6 +220,10 @@ struct ExistingObject {
     changed: Option<i64>,
     generation: i64,
     content_state: String,
+    allocated: i64,
+    attributes: i64,
+    created: Option<i64>,
+    reparse_tag: i64,
 }
 
 impl ScanSession {
@@ -385,7 +389,7 @@ impl ScanSession {
             Some(n) => self
                 .conn
                 .prepare_cached(
-                    "SELECT object_id, kind, size, modified, changed, generation, content_state FROM objects
+                    "SELECT object_id, kind, size, modified, changed, generation, content_state, allocated, attributes, created, reparse_tag FROM objects
                      WHERE source_id = ?1 AND native_volume_serial = ?2 AND native_id_high = ?3 AND native_id_low = ?4 AND deleted_at IS NULL",
                 )?
                 .query_row(
@@ -401,7 +405,7 @@ impl ScanSession {
             None => self
                 .conn
                 .prepare_cached(
-                    "SELECT o.object_id, o.kind, o.size, o.modified, o.changed, o.generation, o.content_state
+                    "SELECT o.object_id, o.kind, o.size, o.modified, o.changed, o.generation, o.content_state, o.allocated, o.attributes, o.created, o.reparse_tag
                      FROM entries en JOIN objects o ON o.object_id = en.object_id
                      WHERE en.source_id = ?1 AND en.parent_id = ?2 AND en.name = ?3 AND en.deleted_at IS NULL AND o.deleted_at IS NULL",
                 )?
@@ -440,13 +444,18 @@ impl ScanSession {
                 // this in Milestone 2; BLAKE3 verifies it in Milestone 4).
                 let content_changed = e.kind == ObjectKind::File
                     && (ex.size != size || ex.modified != e.modified.map(|t| t.0));
-                // Any of the shipped columns moving marks the row for sync.
-                // ChangeTime covers attribute/rename edits on feeds that
-                // report it; feeds without it ship on size/modified only.
+                // Any shipped column moving marks the row for sync. Access
+                // time is deliberately excluded: where last-access updates
+                // are enabled every read moves it, and re-stamping the whole
+                // source on each scan would make the ledger useless.
                 let row_changed = content_changed
                     || ex.size != size
+                    || ex.allocated != alloc
+                    || ex.attributes != e.attributes.0 as i64
+                    || ex.created != e.created.map(|t| t.0)
                     || ex.modified != e.modified.map(|t| t.0)
-                    || ex.changed != e.changed.map(|t| t.0);
+                    || ex.changed != e.changed.map(|t| t.0)
+                    || ex.reparse_tag != e.reparse_tag as i64;
                 let (generation, content_state) = if content_changed {
                     self.stats.content_changed += 1;
                     (
@@ -980,6 +989,10 @@ fn map_existing(r: &rusqlite::Row<'_>) -> rusqlite::Result<ExistingObject> {
         changed: r.get(4)?,
         generation: r.get(5)?,
         content_state: r.get(6)?,
+        allocated: r.get(7)?,
+        attributes: r.get(8)?,
+        created: r.get(9)?,
+        reparse_tag: r.get(10)?,
     })
 }
 
