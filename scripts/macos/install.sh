@@ -4,6 +4,19 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 OUTPUT_DIR="$REPO_DIR/dist/macos"
+
+bootstrap_launchd() {
+    local domain=$1
+    local plist=$2
+    for _ in 1 2; do
+        if /bin/launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
+            return 0
+        fi
+        /bin/sleep 1
+    done
+    /bin/launchctl bootstrap "$domain" "$plist"
+}
+
 enable_endpoint_security=0
 if [[ "${1:-}" == "--endpoint-security" ]]; then
     enable_endpoint_security=1
@@ -46,13 +59,13 @@ if [[ -f "$OUTPUT_DIR/entitlement-mode" && "$(<"$OUTPUT_DIR/entitlement-mode")" 
     /usr/libexec/PlistBuddy -c "Delete :ProgramArguments:$entitlement_index" "$plist" 2>/dev/null || true
     /usr/libexec/PlistBuddy -c "Add :ProgramArguments:$entitlement_index string --entitlement-claimed" "$plist"
 fi
-/bin/launchctl bootstrap system "$plist"
+bootstrap_launchd system "$plist"
 /bin/launchctl enable system/com.jnel.eidos.collector
 /bin/launchctl kickstart -k system/com.jnel.eidos.collector
 
 console_uid=$(/usr/bin/stat -f '%u' /dev/console)
 if [[ "$console_uid" -gt 0 ]]; then
     /bin/launchctl bootout "gui/$console_uid/com.jnel.eidos.collector.session" >/dev/null 2>&1 || true
-    /bin/launchctl bootstrap "gui/$console_uid" /Library/LaunchAgents/com.jnel.eidos.collector.session.plist || true
+    bootstrap_launchd "gui/$console_uid" /Library/LaunchAgents/com.jnel.eidos.collector.session.plist || true
 fi
 printf '%s\n' 'Eidos Collector installed and started'

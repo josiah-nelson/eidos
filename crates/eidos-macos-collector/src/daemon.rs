@@ -325,6 +325,7 @@ async fn run_fsevents(
     let mut deleted = HashMap::new();
     let mut fan_out = HashMap::new();
     let mut pending_rename = None;
+    let mut highest_id = (since != kFSEventStreamEventIdSinceNow).then_some(since);
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -332,9 +333,9 @@ async fn run_fsevents(
             }
             batch = stream.next() => {
                 let Some(batch) = batch else { break };
-                let mut last_id = None;
+                let mut batch_highest = None;
                 for event in batch {
-                    last_id = Some(event.id);
+                    batch_highest = max_cursor(batch_highest, Some(event.id));
                     process_event(
                         &shared,
                         event,
@@ -344,7 +345,9 @@ async fn run_fsevents(
                         &mut pending_rename,
                     )?;
                 }
-                if let Some(id) = last_id {
+                let next_id = max_cursor(highest_id, batch_highest);
+                if next_id != highest_id {
+                    let id = next_id.expect("a changed cursor has an event id");
                     let cursor = FeedCursor {
                         feed: FeedKind::Fsevents,
                         version: 1,
@@ -352,6 +355,7 @@ async fn run_fsevents(
                     };
                     save_cursor(&cursor_file, id)?;
                     *shared.cursor.lock().expect("cursor lock") = Some(cursor);
+                    highest_id = Some(id);
                 }
             }
         }
@@ -665,9 +669,30 @@ fn load_cursor(file: &Path) -> Option<FeedCursor> {
     })
 }
 
+fn max_cursor(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+        (current, candidate) => current.or(candidate),
+    }
+}
+
 fn save_cursor(file: &Path, value: u64) -> anyhow::Result<()> {
     let temporary = file.with_extension("cursor.tmp");
     fs::write(&temporary, format!("{value}\n"))?;
     fs::rename(temporary, file)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::max_cursor;
+
+    #[test]
+    fn fsevents_cursor_never_regresses() {
+        assert_eq!(max_cursor(None, None), None);
+        assert_eq!(max_cursor(None, Some(12)), Some(12));
+        assert_eq!(max_cursor(Some(12), None), Some(12));
+        assert_eq!(max_cursor(Some(12), Some(18)), Some(18));
+        assert_eq!(max_cursor(Some(18), Some(12)), Some(18));
+    }
 }
