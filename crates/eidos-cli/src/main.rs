@@ -20,6 +20,7 @@ mod bench;
 mod content;
 mod detach;
 mod logging;
+mod observe;
 mod profile;
 mod search;
 #[cfg(windows)]
@@ -63,6 +64,8 @@ enum Command {
     Archive(archive::ArchiveArgs),
     /// Content job controls in the running service (retry failures).
     Content(content::ContentArgs),
+    /// Manage a bounded, privacy-preserving workload observation study.
+    Observe(observe::ObserveArgs),
 }
 
 /// Everything that configures a running service. Shared by `serve`
@@ -263,6 +266,7 @@ fn main() -> anyhow::Result<()> {
         Command::Activity(args) => activity::run(args),
         Command::Archive(args) => archive::run(args),
         Command::Content(args) => content::run(args),
+        Command::Observe(args) => observe::run(args),
         #[cfg(windows)]
         Command::Service(args) => service::run(args, cli.log, cli.log_json),
         Command::Search(args) => {

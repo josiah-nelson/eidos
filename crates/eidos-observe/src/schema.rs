@@ -69,6 +69,7 @@ pub enum GapCause {
     ClockJump,
     UncleanShutdown,
     CollectorStopped,
+    KeyUnavailable,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
