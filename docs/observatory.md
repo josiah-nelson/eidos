@@ -104,10 +104,11 @@ notarized component package whose postinstall bootstraps the system
 LaunchDaemon. If it is absent, the script reports that fact and retains the
 notarized app archive, CLI, and `install.sh` fallback.
 
-The system LaunchDaemon runs as root with `KeepAlive`, a 30-second throttle,
-and a 10 MiB log file resource limit. The user LaunchAgent maintains the
-keychain session handoff. All control uses the Unix socket; neither component
-opens a TCP port.
+The system LaunchDaemon runs as root with `KeepAlive` and a 30-second throttle.
+The daemon writes through an in-process 10 MiB capped log writer; launchd's
+standard streams go to `/dev/null`, so the log bound cannot constrain the much
+larger spool. The user LaunchAgent maintains the keychain session handoff. All
+control uses the Unix socket; neither component opens a TCP port.
 
 To enable the runtime Endpoint Security lane for a pending-entitlement test:
 

@@ -14,30 +14,43 @@ const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 #[cfg(target_os = "macos")]
 #[derive(Clone)]
-struct BoundedLog(Arc<Mutex<std::fs::File>>);
+struct BoundedLog {
+    file: Arc<Mutex<std::fs::File>>,
+    max_bytes: u64,
+}
 
 #[cfg(target_os = "macos")]
 impl BoundedLog {
     fn open() -> std::io::Result<Self> {
+        Self::open_at("/var/log/eidos-collector.log", MAX_LOG_BYTES)
+    }
+
+    fn open_at(path: impl AsRef<std::path::Path>, max_bytes: u64) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/var/log/eidos-collector.log")?;
-        Ok(Self(Arc::new(Mutex::new(file))))
+            .open(path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+            max_bytes,
+        })
     }
 }
 
 #[cfg(target_os = "macos")]
-struct LogWriter(Arc<Mutex<std::fs::File>>);
+struct LogWriter {
+    file: Arc<Mutex<std::fs::File>>,
+    max_bytes: u64,
+}
 
 #[cfg(target_os = "macos")]
 impl Write for LogWriter {
     fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
         let mut file = self
-            .0
+            .file
             .lock()
             .map_err(|_| std::io::Error::other("log lock poisoned"))?;
-        if file.metadata()?.len().saturating_add(input.len() as u64) > MAX_LOG_BYTES {
+        if file.metadata()?.len().saturating_add(input.len() as u64) > self.max_bytes {
             file.set_len(0)?;
             file.rewind()?;
         }
@@ -45,7 +58,7 @@ impl Write for LogWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0
+        self.file
             .lock()
             .map_err(|_| std::io::Error::other("log lock poisoned"))?
             .flush()
@@ -57,7 +70,10 @@ impl<'a> MakeWriter<'a> for BoundedLog {
     type Writer = LogWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        LogWriter(self.0.clone())
+        LogWriter {
+            file: self.file.clone(),
+            max_bytes: self.max_bytes,
+        }
     }
 }
 
@@ -126,4 +142,20 @@ async fn main() -> anyhow::Result<()> {
 fn main() {
     eprintln!("eidos-collector is available only on macOS");
     std::process::exit(2);
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{BoundedLog, MakeWriter, Write};
+
+    #[test]
+    fn log_is_truncated_before_crossing_its_bound() {
+        let path = std::env::temp_dir().join(format!("eidos-bounded-log-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let log = BoundedLog::open_at(&path, 16).unwrap();
+        log.make_writer().write_all(b"123456789012").unwrap();
+        log.make_writer().write_all(b"abcdefgh").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcdefgh");
+        std::fs::remove_file(path).unwrap();
+    }
 }
