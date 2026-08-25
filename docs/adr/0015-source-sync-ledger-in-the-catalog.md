@@ -64,11 +64,15 @@ offline for three weeks grows without bound (hardening gate H2).
      `updated_at`. `consumer_id` is a stable typed device identity, not the
      simulator's node id (hardening H3.4).
 
-3. **Sequence numbers are per source and minted in the writer transaction.**
-   `head_seq` in `sync_sources` is incremented once per transaction that
-   touches a source's rows; every row stamped in that transaction receives
-   the new value. The same transaction may not stamp two different sequence
-   values for one source.
+3. **Sequence numbers are per source and minted per touch, inside the writer
+   transaction.** `head_seq` in `sync_sources` advances by one for each
+   object stamped (or by the set size for set-shaped stamps such as
+   publish-time tombstones and backfill, which assign consecutive values in
+   object-id order). Sequences are therefore strictly monotonic per source,
+   and a transaction may mint many; a batch certifies the interval up to the
+   head read in the same snapshot as its images, so no per-transaction
+   grouping is needed. (Amended 2026-08-24 from "one value per transaction",
+   which added bookkeeping without adding a guarantee.)
 
 4. **Retention follows ADR-0013 exactly, over rows instead of a log.** Live
    rows are the source image and are never compacted. A `deleted` row is

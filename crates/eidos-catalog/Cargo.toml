@@ -23,6 +23,7 @@ ts-rs = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam-channel = { workspace = true }
 blake3 = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

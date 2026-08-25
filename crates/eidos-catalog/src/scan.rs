@@ -433,13 +433,20 @@ impl ScanSession {
                     "UPDATE objects SET deleted_at = ?2 WHERE object_id = ?1",
                     params![ex.id.0, UnixNanos::now().0],
                 )?;
+                crate::sync::touch_conn(&self.conn, self.source.id, ex.id)?;
             } else {
                 // ChangeTime moves on renames and attribute edits, so only size
                 // and LastWriteTime indicate new content (USN reasons refine
                 // this in Milestone 2; BLAKE3 verifies it in Milestone 4).
                 let content_changed = e.kind == ObjectKind::File
                     && (ex.size != size || ex.modified != e.modified.map(|t| t.0));
-                let _ = ex.changed;
+                // Any of the shipped columns moving marks the row for sync.
+                // ChangeTime covers attribute/rename edits on feeds that
+                // report it; feeds without it ship on size/modified only.
+                let row_changed = content_changed
+                    || ex.size != size
+                    || ex.modified != e.modified.map(|t| t.0)
+                    || ex.changed != e.changed.map(|t| t.0);
                 let (generation, content_state) = if content_changed {
                     self.stats.content_changed += 1;
                     (
@@ -476,6 +483,9 @@ impl ScanSession {
                 if content_changed {
                     self.record_policy(ex.id, decision)?;
                 }
+                if row_changed {
+                    crate::sync::touch_conn(&self.conn, self.source.id, ex.id)?;
+                }
                 self.stats.objects_updated += 1;
                 return Ok(ex.id);
             }
@@ -509,6 +519,7 @@ impl ScanSession {
             ])?;
         let id = ObjectId(self.conn.last_insert_rowid());
         self.record_policy(id, decision)?;
+        crate::sync::touch_conn(&self.conn, self.source.id, id)?;
         self.stats.objects_created += 1;
         Ok(id)
     }
@@ -566,10 +577,11 @@ impl ScanSession {
                     .execute(params![entry_id, gen, ext])?;
                 return Ok(());
             }
-            Some((entry_id, _)) => {
+            Some((entry_id, old_obj)) => {
                 self.conn
                     .prepare_cached("UPDATE entries SET deleted_at = ?2 WHERE entry_id = ?1")?
                     .execute(params![entry_id, UnixNanos::now().0])?;
+                crate::sync::touch_conn(&self.conn, self.source.id, ObjectId(old_obj))?;
                 self.stats.entries_replaced += 1;
             }
             None => {}
@@ -581,6 +593,7 @@ impl ScanSession {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
             )?
             .execute(params![source_id, parent.0, obj.0, e.name, folded, ext, gen])?;
+        crate::sync::touch_conn(&self.conn, self.source.id, obj)?;
         self.stats.entries_created += 1;
         Ok(())
     }
@@ -677,6 +690,8 @@ impl ScanSession {
                 break;
             }
         }
+        // 2b. Sync ledger: every object this publish tombstoned (ADR-0015).
+        crate::sync::stamp_publish_tombstones_conn(&self.conn, self.source.id, now)?;
         // 3. Hard-link counts.
         self.conn.execute(
             "UPDATE objects SET link_count = (SELECT COUNT(*) FROM entries e WHERE e.object_id = objects.object_id AND e.deleted_at IS NULL)

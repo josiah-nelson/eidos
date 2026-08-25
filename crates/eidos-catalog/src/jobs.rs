@@ -535,6 +535,14 @@ pub fn outbox_append_conn(
         "INSERT INTO outbox (source_id, object_id, op, generation, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
     )?
     .execute(params![source.0, object.0, op, generation, UnixNanos::now().0])?;
+    // Every outbox row is a change to a shippable row, so the sync ledger
+    // (ADR-0015) is stamped here rather than at each call site. A source
+    // that is not sync-enabled costs one no-op primary-key update.
+    if op == "subtree" {
+        crate::sync::touch_subtree_conn(conn, source, object)?;
+    } else {
+        crate::sync::touch_conn(conn, source, object)?;
+    }
     Ok(())
 }
 

@@ -25,6 +25,7 @@ pub mod read;
 pub mod retry;
 pub mod scan;
 pub mod schema;
+pub mod sync;
 
 pub use model::*;
 
