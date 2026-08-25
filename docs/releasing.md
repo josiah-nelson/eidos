@@ -40,6 +40,21 @@ gh workflow run installer.yml --ref <branch>
 Run it before tagging whenever a change touches `installer/`, `build.ps1`, or
 the way the web UI is embedded — ordinary CI does not cover any of that.
 
+## macOS
+
+There is no macOS release job yet. `scripts/macos/build-agent.sh` produces
+`dist/macos/Eidos.app` — the bundle the agent is installed from, because Full
+Disk Access is only properly supported for bundled executables — signing with
+a *Developer ID Application* identity when the keychain has one and ad-hoc
+otherwise. `scripts/macos/sign-notarize.sh` already carries the notarisation
+path used for the observatory collector (temporary keychain from
+`APPLE_CERTIFICATE_P12`, `notarytool submit --wait`, `stapler staple`); a
+macOS release job reuses it for the agent bundle and publishes the notarised
+`Eidos.app`.
+
+Until then, macOS is installed from source: see
+[installing-macos.md](installing-macos.md).
+
 ## Azure and GitHub configuration
 
 The signing principal needs the **Artifact Signing Certificate Profile

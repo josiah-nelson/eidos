@@ -259,6 +259,10 @@ live and which port to use, and opens the web interface when it finishes.
 [docs/installing.md](docs/installing.md) covers every option, unattended
 installs, upgrades and removal.
 
+macOS has no installer package yet: build `Eidos.app` from a clone and
+install the agent from it, which is what makes Full Disk Access grantable.
+See [docs/installing-macos.md](docs/installing-macos.md).
+
 Building from source requires Rust stable with the MSVC target, Visual
 Studio Build Tools with the Windows SDK, and Node.js 24 or newer; see
 [docs/development.md](docs/development.md).

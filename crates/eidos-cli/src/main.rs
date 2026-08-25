@@ -24,6 +24,10 @@ mod observe;
 mod profile;
 mod search;
 #[cfg(windows)]
+#[path = "service.rs"]
+mod service;
+#[cfg(target_os = "macos")]
+#[path = "service_launchd.rs"]
 mod service;
 
 use clap::{Args, Parser, Subcommand};
@@ -51,8 +55,8 @@ enum Command {
     Source(admin::SourceArgs),
     /// Run the service in the foreground (HTTP API and web UI).
     Serve(ServeArgs),
-    /// Install, control, or run eidos as a Windows service.
-    #[cfg(windows)]
+    /// Install, control, or run eidos as a background service.
+    #[cfg(any(windows, target_os = "macos"))]
     Service(service::ServiceArgs),
     /// Search through the running service (same API and schema as the web UI).
     Search(search::SearchArgs),
@@ -245,9 +249,9 @@ impl ServeArgs {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // The service host initialises logging itself (file only; there is no
-    // console) once the SCM has handed it the start request.
-    #[cfg(windows)]
+    // The service host initialises its own logging once its supervisor has
+    // handed it the start request.
+    #[cfg(any(windows, target_os = "macos"))]
     if let Command::Service(args) = &cli.command {
         if args.is_run() {
             return service::run(args.clone(), cli.log.clone(), cli.log_json);
@@ -267,7 +271,7 @@ fn main() -> anyhow::Result<()> {
         Command::Archive(args) => archive::run(args),
         Command::Content(args) => content::run(args),
         Command::Observe(args) => observe::run(args),
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         Command::Service(args) => service::run(args, cli.log, cli.log_json),
         Command::Search(args) => {
             let code = search::run(args)?;

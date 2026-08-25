@@ -38,6 +38,9 @@ cd web; npm ci; npm run lint; npm test; npm run build
 scripts/check.sh               # --skip-web / --skip-release to shorten
 ```
 
+`scripts/macos/build-agent.sh` builds the `Eidos.app` bundle the macOS agent
+is installed from; see [installing-macos.md](installing-macos.md).
+
 CI runs the Rust gate on both Windows and macOS, because the enumeration and
 change-feed adapters differ per platform and the contracts they share are only
 proven when both run them. The Windows lane also checks formatting and that

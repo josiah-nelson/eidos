@@ -703,6 +703,7 @@ dependencies = [
  "eidos-scanner",
  "eidos-search",
  "eidos-service",
+ "libc",
  "mimalloc",
  "regex",
  "rpassword",
