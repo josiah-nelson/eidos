@@ -95,6 +95,10 @@ str_enum! {
         WindowsLocal => "windows_local",
         /// Windows path crawled generically (non-NTFS or subdirectory root).
         WindowsGeneric => "windows_generic",
+        /// Local macOS volume with an FSEvents change feed.
+        MacosLocal => "macos_local",
+        /// macOS path crawled generically (no usable feed or subdirectory root).
+        MacosGeneric => "macos_generic",
         /// Remote SMB share crawled generically with weak freshness semantics.
         Smb => "smb",
     }

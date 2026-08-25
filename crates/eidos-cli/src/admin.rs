@@ -79,9 +79,8 @@ pub fn run(args: SourceArgs) -> anyhow::Result<()> {
             let kind = match kind {
                 Some(k) => k.parse::<SourceKind>().context("invalid kind")?,
                 None => match lister.volume_info(&root) {
-                    Ok(v) if v.is_remote() => SourceKind::Smb,
-                    Ok(v) if v.is_native_local() => SourceKind::WindowsLocal,
-                    _ => SourceKind::WindowsGeneric,
+                    Ok(v) => v.source_kind(),
+                    Err(_) => eidos_scanner::GENERIC_SOURCE_KIND,
                 },
             };
             let id = catalog.add_source(&NewSource {

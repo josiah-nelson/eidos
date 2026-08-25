@@ -246,8 +246,10 @@ impl Aggregator {
                             if self.largest.len() < self.top
                                 || self.largest.last().is_some_and(|(_, s)| e.size > *s)
                             {
-                                self.largest
-                                    .push((format!("{path_str}\\{}", e.name), e.size));
+                                self.largest.push((
+                                    format!("{path_str}{}{}", std::path::MAIN_SEPARATOR, e.name),
+                                    e.size,
+                                ));
                                 self.largest.sort_by_key(|x| std::cmp::Reverse(x.1));
                                 self.largest.truncate(self.top);
                             }
@@ -427,12 +429,17 @@ fn print_summary(r: &Report, rec: &BenchRecord) {
     println!("Profile of {}  (lister: {})", r.root, r.lister);
     if let Some(v) = &r.volume {
         println!(
-            "  volume: {} [{}] serial={:x} type={:?} usn={} file_ids={} cluster={}",
+            "  volume: {} [{}] serial={:x} type={:?} feed={} case={} file_ids={} cluster={}",
             v.volume_root,
             v.filesystem,
             v.volume_serial,
             v.drive_type,
-            v.supports_usn,
+            v.native_feed.as_str(),
+            match v.case_sensitive {
+                Some(true) => "sensitive",
+                Some(false) => "insensitive",
+                None => "unknown",
+            },
             v.supports_file_ids,
             v.bytes_per_cluster
         );

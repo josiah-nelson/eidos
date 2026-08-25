@@ -61,6 +61,7 @@ encoding_rs = "0.8"
 zstd = "0.13"
 mimalloc = "0.1"
 crossbeam-channel = "0.5"
+libc = "0.2"
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 memchr = "2.8"
 lru = "0.16"

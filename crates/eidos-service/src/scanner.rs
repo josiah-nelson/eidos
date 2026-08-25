@@ -5,7 +5,7 @@ use crate::state::{
 };
 use crate::watcher;
 use eidos_catalog::scan::{ScanKind, ScanSession, ScanSummary};
-use eidos_domain::{JobStage, SourceId, SourceKind, UnixNanos};
+use eidos_domain::{JobStage, SourceId, UnixNanos};
 use eidos_scanner::WalkOptions;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -297,13 +297,7 @@ pub fn enumerate(
     {
         Ok(v) => {
             state.catalog.upsert_volume(state.host_id, source_id, &v)?;
-            let kind = if v.is_remote() {
-                SourceKind::Smb
-            } else if v.is_native_local() {
-                SourceKind::WindowsLocal
-            } else {
-                SourceKind::WindowsGeneric
-            };
+            let kind = v.source_kind();
             if kind != source.kind {
                 state.catalog.set_source_kind(source_id, kind)?;
             }

@@ -436,6 +436,17 @@ CREATE TABLE sync_consumers (
 ) WITHOUT ROWID;
 "#,
     ),
+    (
+        "portable volume capabilities: case sensitivity and native feed",
+        r#"
+-- Case sensitivity is a per-volume fact that path equality depends on, and
+-- `supports_usn` alone can no longer say which native feed a volume drives
+-- now that FSEvents exists alongside the USN journal. `unknown` keeps rows
+-- written before the probe existed distinguishable from a measured `none`.
+ALTER TABLE volumes ADD COLUMN case_sensitive TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE volumes ADD COLUMN native_feed TEXT NOT NULL DEFAULT 'none';
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.
@@ -469,7 +480,7 @@ mod tests {
     fn migrations_apply_once_and_are_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         let first = migrate(&mut conn).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(first, (1..=CURRENT_VERSION).collect::<Vec<_>>());
         let second = migrate(&mut conn).unwrap();
         assert!(second.is_empty());
         let v: i64 = conn

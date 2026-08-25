@@ -164,10 +164,42 @@ impl LatencySamples {
     }
 }
 
+/// Name of the machine this agent runs on. It identifies the host row every
+/// source hangs off, so an empty or shared value would merge two machines'
+/// catalogs; Windows publishes it in the environment, and Unix has to ask the
+/// kernel because `HOSTNAME` is a shell variable that is usually not exported.
 pub fn hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    if let Ok(name) = std::env::var("COMPUTERNAME") {
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    if let Some(name) = system_hostname() {
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(unix)]
+fn system_hostname() -> Option<String> {
+    // `HOST_NAME_MAX` is 255 on Linux and 255 on Darwin; the extra byte holds
+    // the terminator the call may or may not write when the name is truncated.
+    let mut buf = vec![0u8; 256];
+    // SAFETY: `buf` is a live allocation of the length passed to the call.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    buf.truncate(end);
+    String::from_utf8(buf).ok()
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> Option<String> {
+    None
 }
 
 #[cfg(test)]
