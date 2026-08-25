@@ -23,18 +23,8 @@
     <key>Umask</key>
     <string>027</string>
     <key>StandardOutPath</key>
-    <string>/var/log/eidos-collector.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/eidos-collector.log</string>
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>FileSize</key>
-        <integer>10485760</integer>
-    </dict>
-    <key>HardResourceLimits</key>
-    <dict>
-        <key>FileSize</key>
-        <integer>10485760</integer>
-    </dict>
+    <string>/dev/null</string>
 </dict>
 </plist>

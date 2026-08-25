@@ -1,7 +1,65 @@
 #[cfg(target_os = "macos")]
 use clap::Parser;
 #[cfg(target_os = "macos")]
-use tracing_subscriber::{filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use std::io::{Seek, Write};
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+use tracing_subscriber::{
+    filter::filter_fn, fmt::MakeWriter, layer::SubscriberExt, util::SubscriberInitExt, Layer,
+};
+
+#[cfg(target_os = "macos")]
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct BoundedLog(Arc<Mutex<std::fs::File>>);
+
+#[cfg(target_os = "macos")]
+impl BoundedLog {
+    fn open() -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/var/log/eidos-collector.log")?;
+        Ok(Self(Arc::new(Mutex::new(file))))
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct LogWriter(Arc<Mutex<std::fs::File>>);
+
+#[cfg(target_os = "macos")]
+impl Write for LogWriter {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        let mut file = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("log lock poisoned"))?;
+        if file.metadata()?.len().saturating_add(input.len() as u64) > MAX_LOG_BYTES {
+            file.set_len(0)?;
+            file.rewind()?;
+        }
+        file.write(input)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("log lock poisoned"))?
+            .flush()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> MakeWriter<'a> for BoundedLog {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
+}
 
 #[cfg(target_os = "macos")]
 struct FseventDropLayer;
@@ -40,12 +98,14 @@ struct Args {
 #[cfg(target_os = "macos")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let log = BoundedLog::open()?;
     tracing_subscriber::registry()
         .with(FseventDropLayer)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
                 .without_time()
+                .with_writer(log)
                 .with_filter(filter_fn(|metadata| {
                     !metadata.target().starts_with("fsevent_stream")
                 })),
