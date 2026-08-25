@@ -261,6 +261,14 @@ fn live_changes_reach_the_catalog() {
         Some(id_of(&state, sid, "a.txt"))
     );
 
+    // A backslash is an ordinary macOS file-name character. The catalog must
+    // not split it into two components when applying or resolving an event.
+    let odd = r"odd\name.txt";
+    std::fs::write(e.root.join(odd), b"odd").unwrap();
+    wait_until(VISIBLE, || exists(&state, sid, odd)).expect("backslash-name create visible");
+    std::fs::remove_file(e.root.join(odd)).unwrap();
+    wait_until(VISIBLE, || !exists(&state, sid, odd)).expect("backslash-name delete visible");
+
     // Deleting a directory takes its subtree with it.
     std::fs::create_dir_all(e.root.join("pkg/inner")).unwrap();
     std::fs::write(e.root.join("pkg/inner/x.rs"), b"fn x() {}").unwrap();

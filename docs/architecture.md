@@ -122,6 +122,12 @@ is recorded at lower confidence rather than claimed to be stable across runs.
 Fallback sources use a confidence-bearing composite identity and must tolerate
 path-based replacement.
 
+A stored path is rendered with the separator its *source* uses, not the one
+the rendering host prefers: the rendered path is what the content pipeline
+opens and what the UI shows, and a central catalog holds paths from every host
+in a fleet. Matching is done in one canonical spelling so a path query finds a
+hit whichever host it came from.
+
 Volume capabilities are recorded per volume, including case sensitivity and
 which native change feed the volume can drive (`windows_usn`, `macos_fsevents`,
 or none). Path resolution follows the volume's case semantics: ingestion always

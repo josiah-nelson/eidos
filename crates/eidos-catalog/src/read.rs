@@ -216,8 +216,9 @@ impl Catalog {
             .is_some_and(|value| value == "sensitive"))
     }
 
-    /// Resolve a path relative to the source root (components separated by
-    /// `\` or `/`) to an object.
+    /// Resolve a path relative to the source root. POSIX sources split only
+    /// on `/`, because `\` is legal inside one of their file names; Windows
+    /// sources accept either separator.
     ///
     /// A case-sensitive volume can hold `Report.txt` and `report.txt` side by
     /// side, so the folded name is only a candidate filter there and the exact
@@ -231,13 +232,17 @@ impl Catalog {
                 None => return Ok(None),
             };
             let case_sensitive = Self::source_is_case_sensitive(conn, source)?;
+            let separator = crate::paths::separator(&src.root_path);
             let mut folded_stmt = conn.prepare_cached(
                 "SELECT object_id FROM entries WHERE source_id = ?1 AND parent_id = ?2 AND name_folded = ?3 AND deleted_at IS NULL LIMIT 1",
             )?;
             let mut exact_stmt = conn.prepare_cached(
                 "SELECT object_id FROM entries WHERE source_id = ?1 AND parent_id = ?2 AND name_folded = ?3 AND name = ?4 AND deleted_at IS NULL LIMIT 1",
             )?;
-            for comp in relative.split(['\\', '/']).filter(|c| !c.is_empty()) {
+            for comp in relative
+                .split(|c| c == '/' || (separator == '\\' && c == '\\'))
+                .filter(|c| !c.is_empty())
+            {
                 let folded = crate::policy::fold(comp);
                 let found = if case_sensitive {
                     exact_stmt
@@ -526,17 +531,12 @@ pub(crate) fn render_path_conn(conn: &Connection, id: ObjectId) -> Result<Option
         params![sid],
         |r| r.get(0),
     )?;
-    let mut out = root.trim_end_matches(['\\', '/']).to_string();
     if parts.is_empty() {
-        // Root itself: keep a trailing separator for drive roots like `G:\`.
-        if out.len() == 2 && out.ends_with(':') {
-            out.push('\\');
-        }
-        return Ok(Some(out));
+        return Ok(Some(crate::paths::root_display(&root)));
     }
+    let mut out = crate::paths::root_display(&root);
     for p in parts.iter().rev() {
-        out.push('\\');
-        out.push_str(p);
+        out = crate::paths::join(&root, &out, p);
     }
     Ok(Some(out))
 }

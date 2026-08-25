@@ -72,6 +72,23 @@ fn object_at(f: &Fixture, rel: &str) -> Option<eidos_catalog::ObjectRecord> {
     f.catalog.get_object(id).unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn a_literal_backslash_in_a_posix_name_is_not_a_path_separator() {
+    let f = fixture();
+    let name = r"odd\name.txt";
+    std::fs::write(f.root.join(name), b"odd").unwrap();
+    scan(&f);
+
+    let object = object_at(&f, name).expect("the literal-backslash name should resolve");
+    let expected = f.root.join(name).display().to_string();
+    assert_eq!(
+        f.catalog.render_path(object.id).unwrap().as_deref(),
+        Some(expected.as_str())
+    );
+    assert!(object_at(&f, "odd/name.txt").is_none());
+}
+
 #[test]
 fn full_scan_counts_sizes_and_aggregates() {
     let f = fixture();
@@ -133,10 +150,25 @@ fn full_scan_counts_sizes_and_aggregates() {
     assert!(!c.content_complete);
     assert_eq!(c.content_pending, 5);
 
-    // Path rendering.
+    // Path rendering. A rendered path is what the content pipeline opens, so
+    // the contract is that it names the file on this filesystem - not that it
+    // is spelled with any particular separator.
     let three = object_at(&f, "a/b/c/three.cs").unwrap();
     let path = f.catalog.render_path(three.id).unwrap().unwrap();
-    assert!(path.ends_with("root\\a\\b\\c\\three.cs"), "{path}");
+    assert_eq!(
+        path,
+        f.root
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("three.cs")
+            .display()
+            .to_string()
+    );
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "a rendered path must be openable: {path}"
+    );
     assert_eq!(three.kind, ObjectKind::File);
     assert_eq!(three.size, 300);
     assert_eq!(three.content_state, ContentState::Pending);
@@ -251,7 +283,20 @@ fn subtree_move_preserves_objects() {
     assert_eq!(s.tombstoned_objects, 0);
     assert_eq!(s.tombstoned_entries, 1, "only the old a/b entry");
     let path = f.catalog.render_path(three_after.id).unwrap().unwrap();
-    assert!(path.ends_with("root\\e\\b\\c\\three.cs"), "{path}");
+    assert_eq!(
+        path,
+        f.root
+            .join("e")
+            .join("b")
+            .join("c")
+            .join("three.cs")
+            .display()
+            .to_string()
+    );
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "a rendered path must be openable after a move: {path}"
+    );
     let a = object_at(&f, "a").unwrap();
     let e = object_at(&f, "e").unwrap();
     let agg_a = f.catalog.directory_aggregate(a.id).unwrap().unwrap();

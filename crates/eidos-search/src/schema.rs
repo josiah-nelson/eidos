@@ -12,7 +12,10 @@ use tantivy::schema::{
 };
 use tantivy::TantivyDocument;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 2;
+/// 3: `path_folded` holds a canonical spelling of the path, so an index built
+/// before that (whose terms still hold backslash separators) has to be rebuilt
+/// or every path filter would silently miss what it already indexed.
+pub const CATALOG_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Fields {
@@ -113,6 +116,33 @@ pub fn fold(s: &str) -> String {
     s.to_lowercase()
 }
 
+/// One spelling of a path for matching. Paths are *stored and displayed* the
+/// way their source spells them - a Windows source keeps its backslashes and a
+/// macOS source its slashes - but a query should not have to know which host a
+/// hit came from, so both sides of a path comparison are canonicalised here.
+///
+/// Only a separator is rewritten. A backslash is a legal character in a Unix
+/// file name, so rewriting it everywhere would index `/data/odd\name` as if it
+/// were `/data/odd/name` and make two different files indistinguishable; a
+/// path is therefore canonicalised against the separator its own source uses,
+/// and only a source that spells paths with backslashes has them rewritten.
+pub fn canonical_path_for(separator: char, path: &str) -> String {
+    if separator == '\\' {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    }
+}
+
+/// Canonicalise a path *query*. A backslash typed in a query means a
+/// separator - that is how a Windows path is written - so both spellings find
+/// the same hit. The cost is that a Unix file whose name contains a literal
+/// backslash cannot be addressed with one, which is recorded in
+/// docs/query-syntax.md.
+pub fn canonical_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 /// Attribute terms stored in the `attrs` field.
 pub fn attr_terms(a: FileAttributes) -> Vec<&'static str> {
     let mut out = Vec::new();
@@ -172,7 +202,10 @@ pub fn document(f: &Fields, row: &ProjectionRow) -> TantivyDocument {
     d.add_text(f.name, &row.name);
     d.add_text(f.name_folded, fold(&row.name));
     d.add_text(f.path, &row.path);
-    d.add_text(f.path_folded, fold(&row.path));
+    d.add_text(
+        f.path_folded,
+        fold(&canonical_path_for(row.separator, &row.path)),
+    );
     d.add_text(f.path_tokens, &row.path);
     d.add_text(f.extension, &row.extension);
     d.add_text(f.kind, row.kind.as_str());
@@ -218,6 +251,94 @@ pub fn document(f: &Fields, row: &ProjectionRow) -> TantivyDocument {
     d.add_u64(f.generation, row.generation as u64);
     d.add_u64(f.link_count, row.link_count as u64);
     d.add_text(f.name_tri, &row.name);
-    d.add_text(f.path_tri, &row.path);
+    // The trigram field selects candidates for the folded path field, so it
+    // has to hold the same spelling: trigrams of `\src\` would never be asked
+    // for by a glob compiled against `/src/`.
+    d.add_text(f.path_tri, canonical_path_for(row.separator, &row.path));
     d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backslash is a legal character in a Unix file name. Rewriting it
+    /// everywhere would index `/data/odd\name` as `/data/odd/name`, making two
+    /// different files indistinguishable to a path filter.
+    #[test]
+    fn only_a_separator_is_canonicalised() {
+        assert_eq!(
+            canonical_path_for('\\', "G:\\Corpus\\notes.txt"),
+            "G:/Corpus/notes.txt"
+        );
+        assert_eq!(
+            canonical_path_for('/', "/data/odd\\name.txt"),
+            "/data/odd\\name.txt"
+        );
+        assert_eq!(canonical_path_for('/', "/data/a/b.txt"), "/data/a/b.txt");
+    }
+
+    /// A backslash typed into a query means a separator: that is how a Windows
+    /// path is written, and both spellings must find the same hit.
+    #[test]
+    fn a_query_reads_a_backslash_as_a_separator() {
+        assert_eq!(canonical_path("G:\\Corpus\\*"), "G:/Corpus/*");
+        assert_eq!(canonical_path("/Volumes/C/*"), "/Volumes/C/*");
+    }
+
+    fn windows_row(path: &str) -> ProjectionRow {
+        ProjectionRow {
+            entry_id: 1,
+            separator: '\\',
+            object_id: eidos_domain::ObjectId(1),
+            source_id: eidos_domain::SourceId(1),
+            parent_id: None,
+            ancestors: Vec::new(),
+            name: "a.cs".into(),
+            path: path.into(),
+            extension: "cs".into(),
+            kind: eidos_domain::ObjectKind::File,
+            size: 1,
+            allocated: 4096,
+            modified: None,
+            created: None,
+            attributes: FileAttributes(0x20),
+            content_state: eidos_domain::ContentState::Pending,
+            generation: 1,
+            link_count: 1,
+            file_count: 0,
+            dir_count: 0,
+            subtree_logical: 0,
+            subtree_allocated: 0,
+            newest_modified: None,
+            agg_complete: true,
+            desc_extensions: Vec::new(),
+        }
+    }
+
+    /// The trigram field picks the candidates that the folded path field then
+    /// verifies, so the two must hold one spelling. When only the folded field
+    /// was canonicalised, a glob compiled to `/src/` asked for trigrams that a
+    /// Windows path indexed as `\src\` had never produced, and every such
+    /// query came back empty.
+    #[test]
+    fn the_trigram_and_folded_path_fields_hold_one_spelling() {
+        use tantivy::schema::Value;
+        let (_schema, fields) = build_schema();
+        let document = document(&fields, &windows_row("G:\\Corpus\\src\\a.cs"));
+        let text = |field| {
+            document
+                .get_first(field)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            text(fields.path),
+            "G:\\Corpus\\src\\a.cs",
+            "display path is untouched"
+        );
+        assert_eq!(text(fields.path_folded), "g:/corpus/src/a.cs");
+        assert_eq!(text(fields.path_tri), "G:/Corpus/src/a.cs");
+    }
 }
