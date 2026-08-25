@@ -65,7 +65,7 @@ fi
 if [ "$skip_web" -eq 0 ]; then
     command -v npm >/dev/null 2>&1 || { echo "npm not found on PATH" >&2; exit 1; }
     cd web
-    [ -d node_modules ] || step "npm ci" npm ci
+    step "npm ci" npm ci
     step "npm run lint" npm run lint
     step "npm test" npm test
     step "npm run build" npm run build
