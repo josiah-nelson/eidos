@@ -772,6 +772,7 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

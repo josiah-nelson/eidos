@@ -25,9 +25,10 @@ backlog age. FSEvents paths exist only transiently while these values are
 formed.
 
 The APFS lane uses FSEvents flags and read-only Foundation resource metadata to
-classify clones, hard-link identity observations, sparse allocation, packages,
-extended attributes, and iCloud placeholders. It requests metadata keys only;
-it never opens file data or calls a download/materialization API. Unsupported
+classify volume identity, clones, hard-link identity observations, sparse
+allocation, packages, extended attributes/resource forks, snapshot mounts,
+external volumes, and iCloud placeholders. It requests metadata keys only; it
+never opens file data or calls a download/materialization API. Unsupported
 providers remain unclassified rather than being probed in a way that could
 hydrate an object.
 

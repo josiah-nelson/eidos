@@ -52,6 +52,7 @@ struct Shared {
     gaps: Mutex<Vec<CaptureGap>>,
     cursor: Mutex<Option<FeedCursor>>,
     endpoint_counts: Arc<Counters>,
+    logical_changes: AtomicU64,
     started: Instant,
     export_dir: PathBuf,
     build_hash: String,
@@ -63,8 +64,13 @@ struct Shared {
 struct NativeFileMetadata {
     logical_size: u64,
     allocated_size: u64,
+    volume_id_high: u64,
+    volume_id_low: u64,
     ubiquitous: libc::c_int,
     placeholder: libc::c_int,
+    resource_fork: libc::c_int,
+    snapshot: libc::c_int,
+    external_volume: libc::c_int,
 }
 
 extern "C" {
@@ -125,6 +131,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         gaps: Mutex::new(Vec::new()),
         cursor: Mutex::new(load_cursor(&config.data_dir.join("fsevents.cursor"))),
         endpoint_counts: endpoint_lane.counters.clone(),
+        logical_changes: AtomicU64::new(0),
         started: Instant::now(),
         export_dir: config.export_dir.clone(),
         build_hash,
@@ -443,13 +450,17 @@ fn process_event(
         None
     };
     let extension = event.path.extension().and_then(|value| value.to_str());
+    let metadata = native_metadata(&event.path);
     let record = ObservationRecord::LogicalChange(LogicalChange {
         at: time_anchor(),
         object: object.clone(),
         subtree: subtree.clone(),
         operation,
         rename_pair,
-        size: SizeBucket::Unknown,
+        size: metadata
+            .as_ref()
+            .map(|value| bucket_size(value.logical_size))
+            .unwrap_or(SizeBucket::Unknown),
         extension: bucket_extension(extension),
         depth: bucket_depth(event.path.components().count().saturating_sub(1)),
         edit_count: CountBucket::from(edit_count),
@@ -458,7 +469,17 @@ fn process_event(
         backlog_age: AgeBucket::Immediate,
     });
     shared.spool.lock().expect("spool lock").append(&record)?;
-    observe_apfs(shared, &event, object, subtree)?;
+    shared.logical_changes.fetch_add(1, Ordering::Relaxed);
+    let volume = metadata
+        .as_ref()
+        .map(|value| {
+            let mut identity = [0; 16];
+            identity[..8].copy_from_slice(&value.volume_id_high.to_le_bytes());
+            identity[8..].copy_from_slice(&value.volume_id_low.to_le_bytes());
+            key.token("volume", &identity)
+        })
+        .unwrap_or_else(|| subtree.clone());
+    observe_apfs(shared, &event, object, volume, metadata.as_ref())?;
     Ok(())
 }
 
@@ -573,6 +594,7 @@ fn observe_apfs(
     event: &fsevent_stream::stream::Event,
     object: eidos_observe::ObjectToken,
     volume: eidos_observe::ObjectToken,
+    metadata: Option<&NativeFileMetadata>,
 ) -> anyhow::Result<()> {
     let mut kinds = Vec::new();
     if event.flags.contains(StreamFlags::ITEM_CLONED) {
@@ -587,8 +609,7 @@ fn observe_apfs(
     if event.path.extension().is_some_and(|value| value == "app") {
         kinds.push(ApfsKind::Package);
     }
-    let metadata = native_metadata(&event.path);
-    if let Some(metadata) = &metadata {
+    if let Some(metadata) = metadata {
         if metadata.logical_size > metadata.allocated_size.saturating_mul(2)
             && metadata.logical_size > 0
         {
@@ -596,6 +617,15 @@ fn observe_apfs(
         }
         if metadata.placeholder != 0 {
             kinds.push(ApfsKind::CloudPlaceholder);
+        }
+        if metadata.resource_fork != 0 {
+            kinds.push(ApfsKind::ResourceFork);
+        }
+        if metadata.snapshot != 0 {
+            kinds.push(ApfsKind::Snapshot);
+        }
+        if metadata.external_volume != 0 {
+            kinds.push(ApfsKind::ExternalVolume);
         }
     }
     for kind in kinds {
@@ -606,7 +636,6 @@ fn observe_apfs(
             kind,
             prevalence: CountBucket::One,
             size: metadata
-                .as_ref()
                 .map(|value| bucket_size(value.logical_size))
                 .unwrap_or(SizeBucket::Unknown),
         });
@@ -648,10 +677,12 @@ async fn run_health(
                 }
                 append_health(&shared, LifecycleEvent::Heartbeat, None)?;
                 let endpoint = shared.endpoint_counts.snapshot();
+                let changed_objects = shared.logical_changes.swap(0, Ordering::Relaxed);
                 if endpoint.opens > prior_endpoint.opens
                     || endpoint.closes > prior_endpoint.closes
                     || endpoint.mappings > prior_endpoint.mappings
                     || endpoint.executions > prior_endpoint.executions
+                    || changed_objects > 0
                 {
                     let record = ObservationRecord::Workload(WorkloadSummary {
                         at: time_anchor(),
@@ -660,7 +691,7 @@ async fn run_health(
                         closes: CountBucket::from(endpoint.closes - prior_endpoint.closes),
                         mappings: CountBucket::from(endpoint.mappings - prior_endpoint.mappings),
                         executions: CountBucket::from(endpoint.executions - prior_endpoint.executions),
-                        changed_objects: CountBucket::Zero,
+                        changed_objects: CountBucket::from(changed_objects),
                     });
                     shared.spool.lock().expect("spool lock").append(&record)?;
                 }
@@ -779,7 +810,7 @@ fn save_cursor(file: &Path, value: u64) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{increment, max_cursor, LogicalState};
+    use super::{increment, max_cursor, native_metadata, LogicalState};
     use eidos_observe::StudyKey;
 
     fn token(value: u64) -> eidos_observe::ObjectToken {
@@ -805,5 +836,21 @@ mod tests {
         assert_eq!(max_cursor(Some(12), None), Some(12));
         assert_eq!(max_cursor(Some(12), Some(18)), Some(18));
         assert_eq!(max_cursor(Some(18), Some(12)), Some(18));
+    }
+
+    #[test]
+    fn metadata_reports_keyable_volume_and_resource_fork_facts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("juniper.dat");
+        std::fs::write(&file, b"fixture").unwrap();
+        let status = std::process::Command::new("/usr/bin/xattr")
+            .args(["-w", "com.apple.ResourceFork", "fixture"])
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let metadata = native_metadata(&file).unwrap();
+        assert_ne!((metadata.volume_id_high, metadata.volume_id_low), (0, 0));
+        assert_ne!(metadata.resource_fork, 0);
     }
 }
