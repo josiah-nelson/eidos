@@ -17,7 +17,7 @@ use fsevent_stream::stream::create_event_stream;
 use futures_util::StreamExt;
 use std::ffi::{c_char, CString};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -216,13 +216,8 @@ fn set_admin_group(path: &Path) {
 
 fn handle_connection(mut stream: UnixStream, shared: &Shared) {
     let response = (|| -> anyhow::Result<Response> {
-        stream.set_read_timeout(Some(IPC_TIMEOUT))?;
         stream.set_write_timeout(Some(IPC_TIMEOUT))?;
-        let mut line = String::new();
-        BufReader::new(&stream).take(65_537).read_line(&mut line)?;
-        if line.len() > 65_536 {
-            anyhow::bail!("request exceeds 64 KiB");
-        }
+        let line = read_request(&mut stream)?;
         match serde_json::from_str::<Request>(&line)? {
             Request::Status => Ok(Response::Status {
                 status: status(shared)?,
@@ -262,6 +257,31 @@ fn handle_connection(mut stream: UnixStream, shared: &Shared) {
     });
     let _ = serde_json::to_writer(&mut stream, &response);
     let _ = stream.write_all(b"\n");
+}
+
+fn read_request(stream: &mut UnixStream) -> std::io::Result<String> {
+    let deadline = Instant::now() + IPC_TIMEOUT;
+    let mut request = Vec::with_capacity(1024);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(std::io::ErrorKind::TimedOut)?;
+        stream.set_read_timeout(Some(remaining))?;
+        let mut buffer = [0u8; 4096];
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let newline = buffer[..count].iter().position(|byte| *byte == b'\n');
+        request.extend_from_slice(&buffer[..newline.map_or(count, |index| index + 1)]);
+        if request.len() > 65_536 {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        if newline.is_some() {
+            return String::from_utf8(request)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+    }
 }
 
 fn status(shared: &Shared) -> anyhow::Result<CollectorStatus> {
