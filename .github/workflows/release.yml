@@ -73,6 +73,15 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # The per-commit gate lints Windows but does not test it, so this is the
+      # last chance to catch Windows runtime behaviour before a signed build
+      # goes out. It runs before anything is built or signed so a failure
+      # costs nothing but the test time.
+      - name: Run the Windows test suite
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+        run: cargo test --locked
+
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
