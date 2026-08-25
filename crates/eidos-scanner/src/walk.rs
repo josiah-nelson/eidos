@@ -283,6 +283,40 @@ mod tests {
         assert_eq!(stats.errors, 1);
     }
 
+    /// Cancels itself once it has listed `after` directories, and counts how
+    /// many listings happened in total.
+    struct CancelAfter {
+        inner: StdLister,
+        listed: AtomicU64,
+        after: u64,
+        cancel: Arc<AtomicBool>,
+    }
+
+    impl crate::DirectoryLister for CancelAfter {
+        fn list(&self, dir: &std::path::Path) -> Result<Vec<RawEntry>, ScanError> {
+            let result = self.inner.list(dir);
+            if self.listed.fetch_add(1, Ordering::SeqCst) + 1 >= self.after {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+            result
+        }
+        fn volume_info(&self, root: &std::path::Path) -> Result<crate::VolumeInfo, ScanError> {
+            self.inner.volume_info(root)
+        }
+        fn stat(&self, path: &std::path::Path) -> Result<RawEntry, ScanError> {
+            self.inner.stat(path)
+        }
+        fn name(&self) -> &'static str {
+            "cancel-after"
+        }
+    }
+
+    /// Cancellation is observed between work items, so the bound is the
+    /// listing that asked to stop plus at most one already in flight per
+    /// worker. Counting *events consumed* instead would race: with tiny
+    /// directories the workers can finish the whole tree before the consumer
+    /// sees its fifth event, which is not a bug and used to fail this test on
+    /// a fast machine.
     #[test]
     fn cancellation_stops_early() {
         let tmp = tempfile::tempdir().unwrap();
@@ -290,24 +324,29 @@ mod tests {
             std::fs::create_dir_all(tmp.path().join(format!("d{i}"))).unwrap();
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        let c2 = cancel.clone();
-        let mut n = 0;
+        let threads = 2;
+        let after = 5;
+        let lister = CancelAfter {
+            inner: StdLister,
+            listed: AtomicU64::new(0),
+            after,
+            cancel: cancel.clone(),
+        };
         let stats = walk(
             tmp.path(),
-            &StdLister,
+            &lister,
             &WalkOptions {
-                threads: 2,
+                threads,
                 cancel: Some(cancel),
                 ..Default::default()
             },
-            |_| {
-                n += 1;
-                if n == 5 {
-                    c2.store(true, Ordering::Relaxed);
-                }
-            },
+            |_| {},
         );
         assert!(stats.cancelled);
-        assert!(stats.directories_listed < 201);
+        assert!(
+            stats.directories_listed <= after + threads as u64,
+            "listed {} directories after cancelling on the {after}th",
+            stats.directories_listed
+        );
     }
 }
