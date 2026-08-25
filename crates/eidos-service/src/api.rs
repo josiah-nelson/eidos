@@ -8,6 +8,7 @@ use crate::api_json::ApiJson;
 use crate::export;
 use crate::scanner::{start_scan, ScanProgressView, StartScanError};
 use crate::state::AppState;
+use crate::web::WebAssets;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -23,7 +24,18 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ts_rs::TS;
 
+/// API router plus, optionally, the web UI served from a directory on disk.
+/// `None` is API only; see [`router_with_web`] for the embedded UI.
 pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router {
+    let web = match web_dir {
+        Some(dir) => WebAssets::Directory(dir.to_path_buf()),
+        None => WebAssets::Disabled,
+    };
+    router_with_web(state, &web)
+}
+
+/// API router with the web UI taken from `web`.
+pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/sources", get(list_sources).post(add_source))
@@ -61,20 +73,8 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
             state.admission.config().max_body_bytes,
         ))
         .with_state(state);
-    let mut app = Router::new().nest("/api", api);
-    if let Some(dir) = web_dir {
-        if dir.join("index.html").exists() {
-            let index = dir.join("index.html");
-            // `fallback` (not `not_found_service`) keeps the 200 status so
-            // deep links into the SPA are real pages, not 404s with a body.
-            let serve = tower_http::services::ServeDir::new(dir)
-                .fallback(tower_http::services::ServeFile::new(index));
-            app = app.fallback_service(serve);
-            tracing::info!(dir = %dir.display(), "serving web UI");
-        } else {
-            tracing::warn!(dir = %dir.display(), "web UI directory has no index.html; API only");
-        }
-    }
+    let app = Router::new().nest("/api", api);
+    let app = crate::web::mount(app, web);
     app.layer(tower_http::trace::TraceLayer::new_for_http())
 }
 

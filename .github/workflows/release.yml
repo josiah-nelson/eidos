@@ -15,10 +15,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Everything that carries a signature: the product, the setup UI, the
+  # package, the Burn engine, and the finished bundle.
+  SIGN_DESCRIPTION: eidos
+  SIGN_TIMESTAMP: http://timestamp.acs.microsoft.com
 
 jobs:
   windows:
-    name: signed Windows x86-64 release
+    name: signed Windows x86-64 installer
     runs-on: windows-2025
     environment: release
 
@@ -77,6 +81,18 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install the WiX command line (burn detach/reattach)
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 7.0.0
+          wix eula accept wix7
+          wix --version
+
       - name: Build web UI
         working-directory: web
         run: |
@@ -84,9 +100,16 @@ jobs:
           npm run build
 
       - name: Build Windows executable
+        # The web UI is embedded in the executable; refuse to build without it.
+        env:
+          EIDOS_REQUIRE_WEB: "1"
         run: cargo build --locked --release --bin eidos
 
-      - name: Sign Windows executable with Azure Artifact Signing
+      - name: Build setup UI
+        shell: pwsh
+        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipBundle
+
+      - name: Sign eidos.exe and the setup UI
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -95,11 +118,13 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          files: ${{ github.workspace }}\target\release\eidos.exe
+          files: |
+            ${{ github.workspace }}\target\release\eidos.exe
+            ${{ github.workspace }}\installer\Eidos.Setup.Ui\bin\Release\net472\eidos-setup-ui.exe
           file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
           timestamp-digest: SHA256
-          description: eidos
+          description: ${{ env.SIGN_DESCRIPTION }}
           description-url: https://github.com/${{ github.repository }}
           exclude-environment-credential: false
           exclude-workload-identity-credential: true
@@ -112,24 +137,74 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
-      - name: Verify Authenticode signature and timestamp
+      - name: Build MSI (binds the signed executable)
+        shell: pwsh
+        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipUi -SkipBundle
+
+      - name: Sign eidos.msi
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          files: ${{ github.workspace }}\installer\out\eidos.msi
+          file-digest: SHA256
+          timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
+          timestamp-digest: SHA256
+          description: ${{ env.SIGN_DESCRIPTION }}
+          description-url: https://github.com/${{ github.repository }}
+          exclude-environment-credential: false
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Build bundle (from the signed MSI and UI)
+        shell: pwsh
+        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipUi
+
+      - name: Detach the Burn engine
         shell: pwsh
         run: |
-          $binary = Join-Path $env:GITHUB_WORKSPACE 'target\release\eidos.exe'
-          $signature = Get-AuthenticodeSignature -LiteralPath $binary
+          New-Item -ItemType Directory -Force installer\out\engine | Out-Null
+          wix burn detach installer\out\eidos-setup.exe -engine installer\out\engine\burn-engine.exe
 
-          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-            throw "Authenticode verification failed: $($signature.StatusMessage)"
-          }
-          if ($null -eq $signature.TimeStamperCertificate) {
-            throw 'The executable has no trusted timestamp.'
-          }
+      - name: Sign the Burn engine
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          files: ${{ github.workspace }}\installer\out\engine\burn-engine.exe
+          file-digest: SHA256
+          timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
+          timestamp-digest: SHA256
+          description: ${{ env.SIGN_DESCRIPTION }}
+          description-url: https://github.com/${{ github.repository }}
+          exclude-environment-credential: false
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
 
-          Write-Host "Verified signer: $($signature.SignerCertificate.Subject)"
-          Write-Host "Certificate thumbprint: $($signature.SignerCertificate.Thumbprint)"
-
-      - name: Package signed release
-        id: package
+      - name: Reattach the signed engine
+        id: names
         shell: pwsh
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -141,27 +216,66 @@ jobs:
             $version = "manual-$($env:GITHUB_SHA.Substring(0, 7))"
           }
           $version = $version -replace '[^0-9A-Za-z._-]', '-'
+          $setup = "installer\out\eidos-$version-setup.exe"
+          $msi = "installer\out\eidos-$version.msi"
+          wix burn reattach installer\out\eidos-setup.exe -engine installer\out\engine\burn-engine.exe -o $setup
+          Copy-Item installer\out\eidos.msi $msi
+          "setup=$setup" >> $env:GITHUB_OUTPUT
+          "msi=$msi" >> $env:GITHUB_OUTPUT
 
-          $packageName = "eidos-$version-windows-x86_64"
-          $stagingRoot = Join-Path $env:RUNNER_TEMP 'eidos-release'
-          $packageRoot = Join-Path $stagingRoot $packageName
-          $webRoot = Join-Path $packageRoot 'web\dist'
+      - name: Sign the setup bundle
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          files: ${{ github.workspace }}\${{ steps.names.outputs.setup }}
+          file-digest: SHA256
+          timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
+          timestamp-digest: SHA256
+          description: ${{ env.SIGN_DESCRIPTION }}
+          description-url: https://github.com/${{ github.repository }}
+          exclude-environment-credential: false
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
 
-          New-Item -ItemType Directory -Force -Path $webRoot | Out-Null
-          Copy-Item -LiteralPath 'target\release\eidos.exe' -Destination $packageRoot
-          Copy-Item -Path 'web\dist\*' -Destination $webRoot -Recurse
-          Copy-Item -LiteralPath 'README.md', 'LICENSE' -Destination $packageRoot
+      - name: Verify every signature and timestamp
+        id: verify
+        shell: pwsh
+        env:
+          SETUP: ${{ steps.names.outputs.setup }}
+          MSI: ${{ steps.names.outputs.msi }}
+        run: |
+          function Assert-Signed([string]$path) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $path
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+              throw "Authenticode verification failed for ${path}: $($signature.StatusMessage)"
+            }
+            if ($null -eq $signature.TimeStamperCertificate) {
+              throw "$path has no trusted timestamp."
+            }
+            Write-Host "$path signed by $($signature.SignerCertificate.Subject) ($($signature.SignerCertificate.Thumbprint))"
+          }
+          Assert-Signed 'target\release\eidos.exe'
+          Assert-Signed 'installer\Eidos.Setup.Ui\bin\Release\net472\eidos-setup-ui.exe'
+          Assert-Signed $env:MSI
+          Assert-Signed 'installer\out\engine\burn-engine.exe'
+          Assert-Signed $env:SETUP
 
-          $archive = Join-Path $env:RUNNER_TEMP "$packageName.zip"
-          Compress-Archive -LiteralPath $packageRoot -DestinationPath $archive -CompressionLevel Optimal
-
-          $checksumPath = "$archive.sha256"
-          $checksum = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$checksum  $([IO.Path]::GetFileName($archive))" |
-            Set-Content -LiteralPath $checksumPath -NoNewline
-
-          "archive=$archive" >> $env:GITHUB_OUTPUT
-          "checksum=$checksumPath" >> $env:GITHUB_OUTPUT
+          foreach ($file in @($env:SETUP, $env:MSI)) {
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $([IO.Path]::GetFileName($file))" | Set-Content -LiteralPath "$file.sha256" -NoNewline
+          }
 
       - name: Upload assets to published release
         if: github.event_name == 'release'
@@ -169,10 +283,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          ARCHIVE_PATH: ${{ steps.package.outputs.archive }}
-          CHECKSUM_PATH: ${{ steps.package.outputs.checksum }}
+          SETUP: ${{ steps.names.outputs.setup }}
+          MSI: ${{ steps.names.outputs.msi }}
         run: |
-          gh release upload $env:RELEASE_TAG $env:ARCHIVE_PATH $env:CHECKSUM_PATH --clobber
+          gh release upload $env:RELEASE_TAG $env:SETUP "$env:SETUP.sha256" $env:MSI "$env:MSI.sha256" --clobber
 
       - name: Upload manual test artifact
         if: github.event_name == 'workflow_dispatch'
@@ -180,7 +294,7 @@ jobs:
         with:
           name: eidos-signed-windows-x86_64
           path: |
-            ${{ steps.package.outputs.archive }}
-            ${{ steps.package.outputs.checksum }}
-          if-no-files-found: error
-          retention-days: 7
+            ${{ steps.names.outputs.setup }}
+            ${{ steps.names.outputs.setup }}.sha256
+            ${{ steps.names.outputs.msi }}
+            ${{ steps.names.outputs.msi }}.sha256

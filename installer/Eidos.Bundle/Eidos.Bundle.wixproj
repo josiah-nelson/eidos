@@ -1,0 +1,22 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <!--
+    eidos-setup.exe: Burn bundle that carries eidos.msi and the setup UI.
+    Built by installer\build.ps1 after the MSI and the UI.
+  -->
+  <PropertyGroup>
+    <AcceptEula>wix7</AcceptEula>
+    <OutputType>Bundle</OutputType>
+    <OutputName>eidos-setup</OutputName>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <Version Condition="'$(Version)' == ''">0.5.0</Version>
+    <MsiPath Condition="'$(MsiPath)' == ''">$(MSBuildThisFileDirectory)..\out\eidos.msi</MsiPath>
+    <BaDir Condition="'$(BaDir)' == ''">$(MSBuildThisFileDirectory)..\Eidos.Setup.Ui\bin\Release\net472</BaDir>
+    <DefineConstants>$(DefineConstants);Version=$(Version);MsiPath=$(MsiPath);BaDir=$(BaDir)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.BootstrapperApplications.wixext" Version="7.0.0" />
+    <PackageReference Include="WixToolset.Netfx.wixext" Version="7.0.0" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="7.0.0" />
+  </ItemGroup>
+</Project>

@@ -123,8 +123,48 @@ them but must not parse or synthesize them.
 ```powershell
 .\target\release\eidos.exe source add projects D:\Projects        # register a source
 .\target\release\eidos.exe source add share \\fileserver\share     # SMB roots work too (no live feed)
-.\target\release\eidos.exe serve --data-dir data --web-dir web\dist   # http://127.0.0.1:7700
+.\target\release\eidos.exe serve --data-dir data                     # http://127.0.0.1:7700
 ```
+
+The built web UI (`web/dist`) is embedded in `eidos.exe` at compile time, so
+one file serves both the API and the UI; `build.rs` re-embeds it whenever
+`web/dist` changes. A checkout without a web build still compiles (API only,
+with a build warning); `EIDOS_REQUIRE_WEB=1` turns that into a build error
+and is set by the release workflow. `--web-dir web\dist` serves the UI from
+disk instead (edit-refresh during UI work) and `--no-web` serves the API
+only.
+
+`serve --detach` starts the same service as a background process of the
+current user (no console window, logs under `--log-dir`, defaulting to
+`<data-dir>\logs`), waits until `/api/health` answers, prints the URL, and
+returns; it does nothing when something already answers there. This is the
+per-user counterpart of the Windows service below.
+
+### Windows service
+
+```powershell
+# Register (elevated). Every serve flag is stored on the service command line.
+.\eidos.exe service install --data-dir C:\ProgramData\eidos --bind 127.0.0.1:7700
+.\eidos.exe service install --data-dir D:\eidos --account user            # prompts for the password
+.\eidos.exe service start | stop | restart | status [--json] | uninstall
+```
+
+`install` registers `eidos.exe service run …` with the service control
+manager: delayed automatic start (`--start auto|manual|disabled`), restart
+on failure (5 s, 30 s, 2 min; reset daily), a 3-minute pre-shutdown window,
+and logs in `<data-dir>\logs\eidos.log.<date>` (`--log-dir` to move them).
+`--account local-system` (default) sees local disks only; `local-service` /
+`network-service` are least-privilege; `user` runs as a named account
+(default: the current user; `--user DOMAIN\name`, `--password-stdin` for
+scripts), validates the credentials, grants *Log on as a service*, and gives
+the account Modify on the data and log directories. `--replace` updates an
+existing registration in place. `status` shows the registration, state, and
+whether `GET /api/health` answers. `uninstall` removes the registration and
+never deletes indexed data.
+
+The `service_scm` integration test drives the whole cycle through the real
+SCM under a throwaway name; it needs an elevated session and
+`EIDOS_SCM_TESTS=1`, and skips itself otherwise.
 
 The service scans new sources, keeps local NTFS sources live through the USN
 journal, rescans feed-less sources on their reconcile interval, rebuilds the
@@ -136,8 +176,9 @@ as soon as the iteration returns.
 
 `serve` flags / environment: `--data-dir` (`EIDOS_DATA_DIR`), `--bind`
 (`EIDOS_BIND`, default loopback — the API has no authentication yet and warns
-when bound elsewhere), `--web-dir` (`EIDOS_WEB_DIR`, empty for API only),
-`--scan-threads`, `--no-auto-reconcile`, `--no-content` (metadata only),
+when bound elsewhere), `--web-dir` (`EIDOS_WEB_DIR`, overrides the embedded
+UI), `--no-web`, `--log-dir` (`EIDOS_LOG_DIR`, daily files in addition to
+stderr), `--scan-threads`, `--no-auto-reconcile`, `--no-content` (metadata only),
 `--content-workers N` (`EIDOS_CONTENT_WORKERS`, default 4),
 `--export-page-size N` (`EIDOS_EXPORT_PAGE_SIZE`, default 500) and
 `--export-max-rows N` (`EIDOS_EXPORT_MAX_ROWS`, default 100000) and

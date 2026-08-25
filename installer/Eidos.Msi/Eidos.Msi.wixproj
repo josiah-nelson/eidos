@@ -1,0 +1,43 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <!--
+    eidos Windows Installer package (dual-scope: per-user or per-machine).
+
+    Build through installer\build.ps1, which supplies Version and BinDir, or
+    directly:  dotnet build -c Release -p:Version=0.5.0 -p:BinDir=..\..\target\release
+  -->
+  <PropertyGroup>
+    <!-- WiX v7 requires an explicit Open Source Maintenance Fee EULA gesture. -->
+    <AcceptEula>wix7</AcceptEula>
+    <OutputName>eidos</OutputName>
+    <OutputType>Package</OutputType>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <Version Condition="'$(Version)' == ''">0.5.0</Version>
+    <BinDir Condition="'$(BinDir)' == ''">$(MSBuildThisFileDirectory)..\..\target\release</BinDir>
+    <RepoRoot>$(MSBuildThisFileDirectory)..\..</RepoRoot>
+    <DefineConstants>$(DefineConstants);Version=$(Version);BinDir=$(BinDir);RepoRoot=$(RepoRoot)</DefineConstants>
+    <!--
+      ICE30: eidos.exe is authored twice under INSTALLFOLDER, in two components
+      whose conditions are mutually exclusive (per-machine with the service,
+      per-user without). Windows Installer only ever installs one of them.
+    -->
+    <SuppressIces>ICE30;ICE105</SuppressIces>
+    <!--
+      ICE105 flags service, CommonAppData and no-impersonate rows as invalid
+      "for a per-user application". This package is dual-scope: those rows
+      belong to components conditioned on ALLUSERS=1 and never install
+      per-user.
+    -->
+    <!--
+      WIX1149: the MSI-native ServiceConfig (MsiServiceConfig table) carries
+      an old SDK caveat, but it is the only way to set delayed auto-start and
+      the pre-shutdown delay without a custom action; util:ServiceConfig
+      covers failure actions only. Both are verified after install.
+    -->
+    <SuppressSpecificWarnings>1149</SuppressSpecificWarnings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="7.0.0" />
+    <PackageReference Include="WixToolset.Firewall.wixext" Version="7.0.0" />
+  </ItemGroup>
+</Project>

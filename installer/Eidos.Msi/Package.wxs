@@ -1,0 +1,277 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  eidos Windows Installer package.
+
+  Dual-scope: the same MSI installs per-user (no service, no elevation) or
+  per-machine (Windows service). The bootstrapper decides the scope and passes
+  the choices below as properties; running the MSI directly takes the
+  defaults (per-user).
+
+  Public properties (all remembered in HKMU\Software\eidos so upgrades,
+  repair and uninstall find the same paths):
+
+    EIDOS_INSTALLDIR            install folder (default: Program Files\eidos
+                                or %LocalAppData%\Programs\eidos)
+    EIDOS_DATADIR               catalog, indexes and logs (default:
+                                %ProgramData%\eidos or %LocalAppData%\eidos)
+    EIDOS_BIND                  listen address (default 127.0.0.1)
+    EIDOS_PORT                  listen port (default 7700)
+    EIDOS_SERVICE_ACCOUNT_KIND  local-system | local-service | network-service | user
+    EIDOS_SERVICE_DOMAIN / EIDOS_SERVICE_USER / EIDOS_SERVICE_PASSWORD (hidden)
+    EIDOS_START_SERVICE         1 = start the service at the end of install
+    EIDOS_START_MENU            1 = Start-menu shortcuts
+    EIDOS_REMOVE_DATA           1 = delete the data directory on uninstall
+
+  Nothing here reads or writes indexed sources; the only directories touched
+  are the install folder and the data directory.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+
+  <Package Id="Eidos.Indexer"
+           Name="eidos"
+           Manufacturer="eidos"
+           Version="$(var.Version)"
+           Scope="perUserOrMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+
+    <SummaryInformation Description="eidos filesystem indexer" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of eidos is already installed. Uninstall it first to install this version." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Launch Condition="VersionNT64" Message="eidos requires 64-bit Windows 10 or later." />
+
+    <Icon Id="eidos.ico" SourceFile="eidos.ico" />
+    <Property Id="ARPPRODUCTICON" Value="eidos.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/josiah-nelson/eidos" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/josiah-nelson/eidos/blob/main/docs/overview.md" />
+
+    <!-- ===== choices ===================================================== -->
+
+    <Property Id="EIDOS_INSTALLDIR" Secure="yes">
+      <RegistrySearch Id="InstallDirUser" Root="HKCU" Key="Software\eidos" Name="InstallDir" Type="raw" Bitness="always64" />
+      <RegistrySearch Id="InstallDirMachine" Root="HKLM" Key="Software\eidos" Name="InstallDir" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="EIDOS_DATADIR" Secure="yes">
+      <RegistrySearch Id="DataDirUser" Root="HKCU" Key="Software\eidos" Name="DataDir" Type="raw" Bitness="always64" />
+      <RegistrySearch Id="DataDirMachine" Root="HKLM" Key="Software\eidos" Name="DataDir" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="EIDOS_BIND" Value="127.0.0.1" Secure="yes">
+      <RegistrySearch Id="BindUser" Root="HKCU" Key="Software\eidos" Name="Bind" Type="raw" Bitness="always64" />
+      <RegistrySearch Id="BindMachine" Root="HKLM" Key="Software\eidos" Name="Bind" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="EIDOS_PORT" Value="7700" Secure="yes">
+      <RegistrySearch Id="PortUser" Root="HKCU" Key="Software\eidos" Name="Port" Type="raw" Bitness="always64" />
+      <RegistrySearch Id="PortMachine" Root="HKLM" Key="Software\eidos" Name="Port" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="EIDOS_SERVICE_ACCOUNT_KIND" Value="local-system" Secure="yes">
+      <RegistrySearch Id="AccountKindMachine" Root="HKLM" Key="Software\eidos" Name="ServiceAccountKind" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="EIDOS_SERVICE_DOMAIN" Secure="yes">
+      <RegistrySearch Id="ServiceDomainMachine" Root="HKLM" Key="Software\eidos" Name="ServiceDomain" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="EIDOS_SERVICE_USER" Secure="yes">
+      <RegistrySearch Id="ServiceUserMachine" Root="HKLM" Key="Software\eidos" Name="ServiceUser" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="EIDOS_SERVICE_PASSWORD" Secure="yes" Hidden="yes" />
+    <Property Id="EIDOS_START_SERVICE" Value="1" Secure="yes" />
+    <Property Id="EIDOS_START_MENU" Value="1" Secure="yes" />
+    <Property Id="EIDOS_REMOVE_DATA" Secure="yes" />
+
+    <!-- A property passed empty on the command line (PROP="") clears the
+         default above; restore the defaults so an empty value never leaks
+         into the service registration or the shortcuts. -->
+    <SetProperty Id="EIDOS_BIND" Action="DefaultBind" Value="127.0.0.1" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_BIND" />
+    <SetProperty Id="EIDOS_PORT" Action="DefaultPort" Value="7700" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_PORT" />
+    <SetProperty Id="EIDOS_SERVICE_ACCOUNT_KIND" Action="DefaultAccountKind" Value="local-system" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_SERVICE_ACCOUNT_KIND" />
+    <SetProperty Id="EIDOS_START_SERVICE" Action="DefaultStartService" Value="1" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_START_SERVICE" />
+    <SetProperty Id="EIDOS_START_MENU" Action="DefaultStartMenu" Value="1" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_START_MENU" />
+
+    <!-- Account name for the SCM; empty means LocalSystem. -->
+    <SetProperty Id="EIDOS_SERVICE_ACCOUNT" Value="NT AUTHORITY\LocalService" Before="CostInitialize" Sequence="both"
+                 Condition="EIDOS_SERVICE_ACCOUNT_KIND=&quot;local-service&quot;" />
+    <SetProperty Id="EIDOS_SERVICE_ACCOUNT" Action="SetServiceAccountNetwork" Value="NT AUTHORITY\NetworkService" Before="CostInitialize" Sequence="both"
+                 Condition="EIDOS_SERVICE_ACCOUNT_KIND=&quot;network-service&quot;" />
+    <SetProperty Id="EIDOS_SERVICE_ACCOUNT" Action="SetServiceAccountUser" Value="[EIDOS_SERVICE_DOMAIN]\[EIDOS_SERVICE_USER]" Before="CostInitialize" Sequence="both"
+                 Condition="EIDOS_SERVICE_ACCOUNT_KIND=&quot;user&quot;" />
+
+    <!-- Browser URL for shortcuts: a wildcard bind is reachable on loopback. -->
+    <SetProperty Id="EIDOS_URL" Value="http://127.0.0.1:[EIDOS_PORT]/" Before="CostInitialize" Sequence="both"
+                 Condition="EIDOS_BIND=&quot;0.0.0.0&quot; OR EIDOS_BIND=&quot;::&quot; OR EIDOS_BIND=&quot;[::]&quot;" />
+    <SetProperty Id="EIDOS_URL" Action="SetUrlFromBind" Value="http://[EIDOS_BIND]:[EIDOS_PORT]/" Before="CostInitialize" Sequence="both"
+                 Condition="NOT (EIDOS_BIND=&quot;0.0.0.0&quot; OR EIDOS_BIND=&quot;::&quot; OR EIDOS_BIND=&quot;[::]&quot;)" />
+
+    <!-- ===== directories ================================================= -->
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="eidos" />
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="eidos">
+        <Directory Id="LOGFOLDER" Name="logs" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="MenuFolder" Name="eidos" />
+    </StandardDirectory>
+
+    <!-- Per-scope defaults; an explicit property wins. ALLUSERS is 1 for a
+         per-machine install of a dual-scope package and empty per-user. -->
+    <SetDirectory Id="INSTALLFOLDER" Value="[EIDOS_INSTALLDIR]" Condition="EIDOS_INSTALLDIR" />
+    <SetDirectory Id="INSTALLFOLDER" Action="SetInstallFolderMachine" Value="[ProgramFiles64Folder]eidos" Condition="NOT EIDOS_INSTALLDIR AND ALLUSERS=1" />
+    <SetDirectory Id="INSTALLFOLDER" Action="SetInstallFolderUser" Value="[LocalAppDataFolder]Programs\eidos" Condition="NOT EIDOS_INSTALLDIR AND NOT ALLUSERS=1" />
+    <SetDirectory Id="DATAFOLDER" Value="[EIDOS_DATADIR]" Condition="EIDOS_DATADIR" />
+    <SetDirectory Id="DATAFOLDER" Action="SetDataFolderMachine" Value="[CommonAppDataFolder]eidos" Condition="NOT EIDOS_DATADIR AND ALLUSERS=1" />
+    <SetDirectory Id="DATAFOLDER" Action="SetDataFolderUser" Value="[LocalAppDataFolder]eidos" Condition="NOT EIDOS_DATADIR AND NOT ALLUSERS=1" />
+
+    <!-- ===== program files =============================================== -->
+
+    <!-- Per-machine: the executable registers the Windows service. -->
+    <Component Id="EidosExeMachine" Directory="INSTALLFOLDER" Guid="B6955070-DB0F-4438-B169-6A8BE6518063" Condition="ALLUSERS=1">
+      <File Id="EidosExeMachine" Name="eidos.exe" Source="$(var.BinDir)\eidos.exe" KeyPath="yes" />
+      <ServiceInstall Id="EidosService"
+                      Name="eidos"
+                      DisplayName="eidos"
+                      Description="eidos filesystem indexer: catalog, change feeds, content index, and local web UI."
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="normal"
+                      Account="[EIDOS_SERVICE_ACCOUNT]"
+                      Password="[EIDOS_SERVICE_PASSWORD]"
+                      Arguments="service --name eidos run --data-dir &quot;[DATAFOLDER].&quot; --log-dir &quot;[LOGFOLDER].&quot; --bind [EIDOS_BIND]:[EIDOS_PORT]"
+                      Vital="yes">
+        <ServiceConfig DelayedAutoStart="yes" PreShutdownDelay="180000" OnInstall="yes" OnReinstall="yes" />
+        <util:ServiceConfig FirstFailureActionType="restart"
+                            SecondFailureActionType="restart"
+                            ThirdFailureActionType="restart"
+                            RestartServiceDelayInSeconds="30"
+                            ResetPeriodInDays="1" />
+      </ServiceInstall>
+      <!-- Stop on install (upgrade) and uninstall; remove the registration
+           on uninstall. Starting is a separate, conditioned component. -->
+      <ServiceControl Id="EidosServiceStop" Name="eidos" Stop="both" Remove="uninstall" Wait="yes" />
+    </Component>
+
+    <!-- Start the service at the end of the install when asked. A failed
+         start fails (and rolls back) the install rather than leaving a
+         registered-but-broken service behind. -->
+    <Component Id="ServiceStart" Directory="INSTALLFOLDER" Condition="ALLUSERS=1 AND EIDOS_START_SERVICE=1">
+      <RegistryValue Root="HKMU" Key="Software\eidos" Name="StartService" Type="integer" Value="1" KeyPath="yes" />
+      <ServiceControl Id="EidosServiceStart" Name="eidos" Start="install" Wait="yes" />
+    </Component>
+
+    <!-- Per-user: the same executable, no service. -->
+    <Component Id="EidosExeUser" Directory="INSTALLFOLDER" Guid="D0F44032-5E16-44C4-A726-321D2155E825" Condition="NOT ALLUSERS=1">
+      <File Id="EidosExeUser" Name="eidos.exe" Source="$(var.BinDir)\eidos.exe" KeyPath="yes" />
+    </Component>
+
+    <Component Id="Readme" Directory="INSTALLFOLDER">
+      <File Name="README.md" Source="$(var.RepoRoot)\README.md" />
+    </Component>
+    <Component Id="License" Directory="INSTALLFOLDER">
+      <File Name="LICENSE" Source="$(var.RepoRoot)\LICENSE" />
+    </Component>
+
+    <!-- "Log on as a service" for a named account (never creates users). -->
+    <Component Id="ServiceLogonRight" Directory="INSTALLFOLDER" Guid="6D0203CF-AFD0-461E-AE95-71017B9359B0"
+               Condition="ALLUSERS=1 AND EIDOS_SERVICE_ACCOUNT_KIND=&quot;user&quot;">
+      <RegistryValue Root="HKMU" Key="Software\eidos" Name="ServiceLogonRight" Type="integer" Value="1" KeyPath="yes" />
+      <util:User Id="ServiceUser" Name="[EIDOS_SERVICE_USER]" Domain="[EIDOS_SERVICE_DOMAIN]"
+                 CreateUser="no" LogonAsService="yes" UpdateIfExists="yes" RemoveOnUninstall="no" />
+    </Component>
+
+    <!-- ===== data directory ============================================== -->
+
+    <Component Id="DataFolder" Directory="DATAFOLDER" Guid="68C17CF0-A483-4AAA-98F5-11DC44A597FF">
+      <CreateFolder />
+      <RegistryValue Root="HKMU" Key="Software\eidos" Name="DataDir" Type="string" Value="[DATAFOLDER]" KeyPath="yes" />
+      <!-- Only when asked (EIDOS_REMOVE_DATA=1) and never during an upgrade. -->
+      <util:RemoveFolderEx On="uninstall" Property="EIDOS_DATADIR" Condition="EIDOS_REMOVE_DATA=1 AND NOT UPGRADINGPRODUCTCODE" />
+    </Component>
+    <Component Id="LogFolder" Directory="LOGFOLDER">
+      <CreateFolder />
+      <RegistryValue Root="HKMU" Key="Software\eidos" Name="LogDir" Type="string" Value="[LOGFOLDER]" KeyPath="yes" />
+    </Component>
+
+    <!-- A non-LocalSystem service account needs to write its own catalog. -->
+    <Component Id="DataFolderAclBuiltin" Directory="DATAFOLDER"
+               Condition="ALLUSERS=1 AND (EIDOS_SERVICE_ACCOUNT_KIND=&quot;local-service&quot; OR EIDOS_SERVICE_ACCOUNT_KIND=&quot;network-service&quot;)">
+      <RegistryValue Root="HKMU" Key="Software\eidos" Name="DataAclBuiltin" Type="string" Value="[EIDOS_SERVICE_ACCOUNT]" KeyPath="yes" />
+      <CreateFolder>
+        <util:PermissionEx User="[EIDOS_SERVICE_ACCOUNT]" GenericAll="yes" />
+      </CreateFolder>
+    </Component>
+    <Component Id="DataFolderAclUser" Directory="DATAFOLDER"
+               Condition="ALLUSERS=1 AND EIDOS_SERVICE_ACCOUNT_KIND=&quot;user&quot;">
+      <RegistryValue Root="HKMU" Key="Software\eidos" Name="DataAclUser" Type="string" Value="[EIDOS_SERVICE_ACCOUNT]" KeyPath="yes" />
+      <CreateFolder>
+        <util:PermissionEx User="[EIDOS_SERVICE_USER]" Domain="[EIDOS_SERVICE_DOMAIN]" GenericAll="yes" />
+      </CreateFolder>
+    </Component>
+
+    <!-- ===== remembered settings ========================================= -->
+
+    <Component Id="Settings" Directory="INSTALLFOLDER">
+      <RegistryKey Root="HKMU" Key="Software\eidos">
+        <RegistryValue Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RegistryValue Name="Bind" Type="string" Value="[EIDOS_BIND]" />
+        <RegistryValue Name="Port" Type="string" Value="[EIDOS_PORT]" />
+        <RegistryValue Name="Url" Type="string" Value="[EIDOS_URL]" />
+        <RegistryValue Name="Version" Type="string" Value="$(var.Version)" />
+      </RegistryKey>
+    </Component>
+    <Component Id="ServiceSettings" Directory="INSTALLFOLDER" Condition="ALLUSERS=1">
+      <RegistryKey Root="HKMU" Key="Software\eidos">
+        <RegistryValue Name="ServiceAccountKind" Type="string" Value="[EIDOS_SERVICE_ACCOUNT_KIND]" KeyPath="yes" />
+        <RegistryValue Name="ServiceDomain" Type="string" Value="[EIDOS_SERVICE_DOMAIN]" />
+        <RegistryValue Name="ServiceUser" Type="string" Value="[EIDOS_SERVICE_USER]" />
+      </RegistryKey>
+    </Component>
+
+    <!-- ===== Start menu ================================================== -->
+
+    <Component Id="StartMenu" Directory="MenuFolder" Condition="EIDOS_START_MENU=1">
+      <RegistryValue Root="HKMU" Key="Software\eidos" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
+      <util:InternetShortcut Id="OpenEidos" Name="eidos" Target="[EIDOS_URL]" Type="link" IconFile="[INSTALLFOLDER]eidos.exe" IconIndex="0" />
+      <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
+    </Component>
+    <!-- Per-user installs have no service: a shortcut runs it in a console. -->
+    <Component Id="StartMenuServe" Directory="MenuFolder" Condition="EIDOS_START_MENU=1 AND NOT ALLUSERS=1">
+      <RegistryValue Root="HKCU" Key="Software\eidos" Name="StartMenuServe" Type="integer" Value="1" KeyPath="yes" />
+      <Shortcut Id="StartEidos" Name="Start eidos" Description="Run the eidos indexer for this user"
+                Target="[INSTALLFOLDER]eidos.exe" WorkingDirectory="INSTALLFOLDER"
+                Arguments="serve --detach --data-dir &quot;[DATAFOLDER].&quot; --log-dir &quot;[LOGFOLDER].&quot; --bind [EIDOS_BIND]:[EIDOS_PORT]"
+                Icon="eidos.ico" />
+    </Component>
+
+    <!-- Per-user "start automatically": run in the background at sign-in. -->
+    <Component Id="UserAutostart" Directory="INSTALLFOLDER" Condition="NOT ALLUSERS=1 AND EIDOS_START_SERVICE=1">
+      <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="eidos" Type="string" KeyPath="yes"
+                     Value="&quot;[INSTALLFOLDER]eidos.exe&quot; serve --detach --data-dir &quot;[DATAFOLDER].&quot; --log-dir &quot;[LOGFOLDER].&quot; --bind [EIDOS_BIND]:[EIDOS_PORT]" />
+    </Component>
+
+    <!-- Per-user has no service to stop: end a running eidos.exe before
+         files (and, on request, the data) are removed or replaced. The
+         catalog is crash-safe, so termination loses nothing durable. -->
+    <util:CloseApplication Id="CloseEidos" Target="eidos.exe" CloseMessage="yes" TerminateProcess="0" Timeout="10" RebootPrompt="no" Condition="NOT ALLUSERS=1" />
+    <!-- The extension schedules the close right before InstallFiles, which on
+         uninstall is after RemoveFiles; the process must be gone before the
+         executable, the catalog and the registry values are removed. -->
+    <InstallExecuteSequence>
+      <Custom Action="override Wix4CloseApplications_X64" After="InstallInitialize" />
+    </InstallExecuteSequence>
+
+    <!-- ===== firewall (only when reachable beyond loopback) ============== -->
+
+    <Component Id="Firewall" Directory="INSTALLFOLDER" Condition="ALLUSERS=1 AND NOT EIDOS_BIND=&quot;127.0.0.1&quot; AND NOT EIDOS_BIND=&quot;::1&quot;">
+      <RegistryValue Root="HKMU" Key="Software\eidos" Name="Firewall" Type="integer" Value="1" KeyPath="yes" />
+      <fw:FirewallException Id="EidosApi" Name="eidos API" Description="eidos search API and web UI"
+                            Program="[INSTALLFOLDER]eidos.exe" Port="[EIDOS_PORT]" Protocol="tcp" Profile="private" Scope="localSubnet" />
+    </Component>
+
+  </Package>
+</Wix>
