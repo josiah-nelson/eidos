@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+
+plist=/Library/LaunchDaemons/com.jnel.eidos.collector.plist
+/bin/launchctl bootout system/com.jnel.eidos.collector >/dev/null 2>&1 || true
+/bin/launchctl bootstrap system "$plist"
+/bin/launchctl enable system/com.jnel.eidos.collector
+/bin/launchctl kickstart -k system/com.jnel.eidos.collector
+exit 0
