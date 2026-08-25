@@ -1,7 +1,8 @@
 # Releasing
 
-Published GitHub releases receive a signed Windows x86-64 installer built by
-`.github/workflows/release.yml`:
+Pushing a tag that starts with `v` builds and signs the Windows x86-64
+installer in `.github/workflows/release.yml` and publishes it on the GitHub
+release for that tag:
 
 - `eidos-<tag>-setup.exe` — the guided installer (Burn bundle with the setup
   UI and the MSI); this is what people download.
@@ -26,10 +27,18 @@ before any asset is uploaded; a failure anywhere uploads nothing. See
 `installer/README.md` for the authoring and `installer/build.ps1` for the
 stages the workflow calls (`-SkipMsi`, `-SkipUi`, `-SkipBundle`).
 
-CI (`ci.yml`, job `installer`) builds the same MSI/UI/bundle from a debug
-executable on every pull request, installs it silently per-user on the
-runner, checks `/api/health`, uninstalls with data removal, and keeps the
-unsigned `eidos-setup.exe` as a workflow artifact for manual testing.
+Nothing is built or signed on a pull request. The same MSI/UI/bundle can be
+exercised unsigned on demand with `installer.yml`, which builds from a debug
+executable, installs silently per-user on the runner, checks `/api/health`,
+uninstalls with data removal, and keeps `eidos-setup.exe` as a workflow
+artifact:
+
+```powershell
+gh workflow run installer.yml --ref <branch>
+```
+
+Run it before tagging whenever a change touches `installer/`, `build.ps1`, or
+the way the web UI is embedded — ordinary CI does not cover any of that.
 
 ## Azure and GitHub configuration
 
@@ -68,26 +77,40 @@ certificate profile were created.
 
 ## Test and publish
 
-Run the workflow manually before publishing the first release:
+Run the workflow manually against a branch to rehearse signing without
+touching a release:
 
 ```powershell
 gh workflow run release.yml --ref main
 gh run watch
 ```
 
-A manual run uploads the signed installer and MSI as a seven-day workflow
-artifact and does not alter a GitHub release. Inspect the downloaded files
-with:
+A manual run names the assets `eidos-manual-<sha>-*`, uploads them as a
+seven-day workflow artifact, and publishes nothing. Inspect the downloaded
+files with:
 
 ```powershell
 Get-AuthenticodeSignature .\eidos-manual-abc1234-setup.exe | Format-List Status,StatusMessage,SignerCertificate
 ```
 
-To publish, create a release for the desired tag. The `release: published`
-event builds that tagged revision and uploads the assets. The version inside
-the installer comes from the workspace `version` in `Cargo.toml` with any
-pre-release suffix removed (Windows Installer versions are numeric), so bump
-it before tagging; a same-version rebuild is not a major upgrade.
+To publish, bump the workspace `version` in `Cargo.toml`, then tag and push:
+
+```powershell
+git tag v0.4.0
+git push origin v0.4.0
+```
+
+The tag push builds that revision, signs it, and publishes the release: it
+creates the release with generated notes when the tag has none yet, and
+uploads to an existing release (replacing same-named assets) when one is
+already there — so drafting release notes first and then pushing the tag
+works equally well. A tag with a pre-release suffix (`v0.4.0-rc.1`) is
+published as a pre-release.
+
+The version inside the installer comes from the workspace `version` in
+`Cargo.toml` with any pre-release suffix removed (Windows Installer versions
+are numeric), so bump it before tagging; a same-version rebuild is not a
+major upgrade.
 
 Client-secret authentication is supported by the Artifact Signing action and
 matches the currently provisioned repository secrets. OpenID Connect is the
