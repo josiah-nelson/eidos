@@ -34,6 +34,7 @@ pub struct SpoolStats {
 pub struct Spool {
     connection: Connection,
     limits: SpoolLimits,
+    detailed_bytes: i64,
     retention_epoch_utc_ns: i64,
     retention_started: Instant,
 }
@@ -58,9 +59,15 @@ impl Spool {
             connection.query_row("SELECT MAX(utc_ns) FROM observations", [], |row| {
                 row.get::<_, Option<i64>>(0)
             })?;
+        let detailed_bytes = connection.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM observations WHERE detailed = 1",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(Self {
             connection,
             limits,
+            detailed_bytes,
             // Once the spool has history, continue its persisted logical
             // clock. Adjustable wall time is sampled only for an empty spool;
             // subsequent age advancement uses monotonic process time.
@@ -87,26 +94,41 @@ impl Spool {
         retention_utc_ns: i64,
     ) -> Result<(), SpoolError> {
         let body = serde_json::to_vec(record)?;
+        let body_bytes = i64::try_from(body.len()).unwrap_or(i64::MAX);
         let detailed = record.is_detailed();
         // Retention follows ingestion time, not an event-controlled clock. A
         // replayed, future-dated, or out-of-order anchor cannot move the ring's
         // cutoff and delete otherwise valid history.
         let transaction = self.connection.transaction()?;
+        let mut detailed_bytes = self.detailed_bytes;
         transaction.execute(
             "INSERT INTO observations(utc_ns, detailed, bytes, body) VALUES (?1, ?2, ?3, ?4)",
-            params![retention_utc_ns, detailed, body.len() as i64, body],
+            params![retention_utc_ns, detailed, body_bytes, body],
+        )?;
+        if detailed {
+            detailed_bytes = detailed_bytes.saturating_add(body_bytes);
+        }
+        let detailed_cutoff = retention_utc_ns.saturating_sub(self.limits.detailed_max_age_ns);
+        let expired_detailed_bytes: i64 = transaction.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM observations
+             WHERE detailed = 1 AND utc_ns < ?1",
+            [detailed_cutoff],
+            |row| row.get(0),
         )?;
         transaction.execute(
             "DELETE FROM observations WHERE detailed = 1 AND utc_ns < ?1",
-            [retention_utc_ns.saturating_sub(self.limits.detailed_max_age_ns)],
+            [detailed_cutoff],
         )?;
+        detailed_bytes = detailed_bytes.saturating_sub(expired_detailed_bytes);
         transaction.execute(
             "DELETE FROM observations WHERE detailed = 0 AND utc_ns < ?1",
             [retention_utc_ns.saturating_sub(self.limits.summary_max_age_ns)],
         )?;
         let byte_limit = i64::try_from(self.limits.detailed_max_bytes).unwrap_or(i64::MAX);
-        prune_detailed_bytes(&transaction, byte_limit)?;
+        let removed_bytes = prune_detailed_bytes(&transaction, detailed_bytes, byte_limit)?;
+        detailed_bytes = detailed_bytes.saturating_sub(removed_bytes);
         transaction.commit()?;
+        self.detailed_bytes = detailed_bytes;
         Ok(())
     }
 
@@ -161,19 +183,15 @@ fn utc_now_ns() -> i64 {
 
 fn prune_detailed_bytes(
     transaction: &rusqlite::Transaction<'_>,
+    total: i64,
     byte_limit: i64,
-) -> rusqlite::Result<()> {
-    let total: i64 = transaction.query_row(
-        "SELECT COALESCE(SUM(bytes), 0) FROM observations WHERE detailed = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    let excess = total.saturating_sub(byte_limit);
-    if excess == 0 {
-        return Ok(());
+) -> rusqlite::Result<i64> {
+    if total <= byte_limit {
+        return Ok(0);
     }
+    let excess = total.saturating_sub(byte_limit);
 
-    let cutoff = {
+    let (cutoff, removed_bytes) = {
         let mut statement = transaction.prepare(
             "SELECT sequence, bytes FROM observations
              WHERE detailed = 1 ORDER BY sequence",
@@ -186,7 +204,7 @@ fn prune_detailed_bytes(
             cutoff = Some(row.get::<_, i64>(0)?);
             removed_bytes = removed_bytes.saturating_add(row.get::<_, i64>(1)?);
         }
-        cutoff
+        (cutoff, removed_bytes)
     };
     if let Some(sequence) = cutoff {
         transaction.execute(
@@ -194,7 +212,7 @@ fn prune_detailed_bytes(
             [sequence],
         )?;
     }
-    Ok(())
+    Ok(removed_bytes)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -321,5 +339,31 @@ mod tests {
         let mut reopened = Spool::open(&file, limits).unwrap();
         reopened.append(&change(i64::MIN, "after-reopen")).unwrap();
         assert_eq!(reopened.stats().unwrap().detailed_records, 2);
+    }
+
+    #[test]
+    fn reopen_restores_the_cached_detailed_byte_total() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("spool.db");
+        let limits = SpoolLimits {
+            detailed_max_bytes: 1_000,
+            detailed_max_age_ns: i64::MAX,
+            summary_max_age_ns: i64::MAX,
+        };
+        let mut spool = Spool::open(&file, limits).unwrap();
+        spool.append(&change(1, "before-reopen-a")).unwrap();
+        spool.append(&change(2, "before-reopen-b")).unwrap();
+        drop(spool);
+
+        let mut reopened = Spool::open(&file, limits).unwrap();
+        assert_eq!(
+            reopened.detailed_bytes as u64,
+            reopened.stats().unwrap().detailed_bytes
+        );
+        reopened.append(&change(3, "after-reopen-a")).unwrap();
+        reopened.append(&change(4, "after-reopen-b")).unwrap();
+        let stats = reopened.stats().unwrap();
+        assert!(stats.detailed_bytes <= limits.detailed_max_bytes);
+        assert_eq!(reopened.detailed_bytes as u64, stats.detailed_bytes);
     }
 }
