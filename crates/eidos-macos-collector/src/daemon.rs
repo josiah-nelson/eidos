@@ -369,12 +369,15 @@ async fn run_fsevents(
             }
             batch = stream.next() => {
                 let Some(batch) = batch else { break };
+                let batch_received = Instant::now();
                 for event in batch {
+                    let backlog_age = bucket_age(batch_received.elapsed().as_secs());
                     process_event(
                         &shared,
                         event,
                         &mut state,
                         &mut pending_rename,
+                        backlog_age,
                     )?;
                 }
                 let id = unsafe { FSEventsGetCurrentEventId() };
@@ -400,6 +403,7 @@ fn process_event(
     event: fsevent_stream::stream::Event,
     state: &mut LogicalState,
     pending_rename: &mut Option<(Instant, eidos_observe::ObjectToken)>,
+    backlog_age: AgeBucket,
 ) -> anyhow::Result<()> {
     update_health_flags(shared, event.flags)?;
     let key = shared.key.lock().expect("study key lock");
@@ -461,7 +465,7 @@ fn process_event(
         edit_count: CountBucket::from(edit_count),
         delete_recreate_age,
         fan_out: CountBucket::from(children),
-        backlog_age: AgeBucket::Immediate,
+        backlog_age,
     });
     shared.spool.lock().expect("spool lock").append(&record)?;
     shared.logical_changes.fetch_add(1, Ordering::Relaxed);
