@@ -197,8 +197,9 @@ pub struct AdmissionState {
     /// History chain hash at `applied_seq`: every batch must resume from
     /// exactly this point with exactly this hash, so a source restored to an
     /// older state that then outruns the cursor is fenced rather than
-    /// silently merged.
-    #[serde(default)]
+    /// silently merged. Required on load: durable state recorded before
+    /// chains existed cannot be trusted to resume and must not be
+    /// reinterpreted as genesis.
     pub applied_chain: ChainHash,
     pending_epoch: Option<SourceEpoch>,
     #[serde(default)]

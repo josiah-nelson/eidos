@@ -89,6 +89,9 @@ pub struct RepairRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepairRows {
     pub request: RepairRequest,
+    /// The answering source's head chain; must equal the request's, or the
+    /// rows belong to a history other than the one the offer described.
+    pub through_chain: ChainHash,
     pub rows: Vec<MaterializedChange>,
 }
 
@@ -145,8 +148,9 @@ pub struct Outbox {
     changes: Vec<MaterializedChange>,
     rows: BTreeMap<ObjectId, MaterializedRow>,
     /// Chain hash after each retained sequence, from `compacted_through`
-    /// (inclusive) to the head. Entry 0 is the genesis hash.
-    #[serde(default)]
+    /// (inclusive) to the head. Entry 0 is the genesis hash. Required on
+    /// load: an outbox recorded before chains existed has no verifiable
+    /// history and is rejected rather than resumed from genesis.
     chain: BTreeMap<u64, ChainHash>,
 }
 
@@ -653,6 +657,14 @@ impl Node for Shipper {
             SyncMsg::RepairRequest(request)
                 if request.source == self.state.source && request.epoch == self.state.epoch =>
             {
+                // A request for a head we no longer have (a rewind since
+                // the offer) describes another history; do not answer it
+                // with rows from this one.
+                if request.through_seq != self.state.outbox.next_seq
+                    || request.through_chain != self.state.outbox.head_chain()
+                {
+                    return;
+                }
                 let tree = self.merkle_tree();
                 if request.leaf_bits > MAX_FLEET_LEAF_BITS
                     || tree.leaf_bits() != request.leaf_bits
@@ -680,7 +692,11 @@ impl Node for Shipper {
                     .collect();
                 env.send(
                     self.central,
-                    SyncMsg::RepairRows(RepairRows { request, rows }),
+                    SyncMsg::RepairRows(RepairRows {
+                        through_chain: self.state.outbox.head_chain(),
+                        request,
+                        rows,
+                    }),
                 );
             }
             _ => {}
@@ -1107,7 +1123,7 @@ impl Applier {
         )
     }
 
-    fn on_repair_offer(&self, env: &mut dyn Env<SyncMsg>, from: NodeId, offer: RepairOffer) {
+    fn on_repair_offer(&mut self, env: &mut dyn Env<SyncMsg>, from: NodeId, offer: RepairOffer) {
         let Some(admission) = self.cursors.sources.get(&offer.source) else {
             self.reject(
                 env,
@@ -1119,6 +1135,29 @@ impl Applier {
         };
         if admission.epoch != offer.epoch || offer.through_seq < admission.applied_seq {
             self.reject(env, from, offer.source, "stale repair offer".into());
+            return;
+        }
+        if self.verify_history_chain
+            && offer.through_seq == admission.applied_seq
+            && offer.through_chain != admission.applied_chain
+        {
+            let source = offer.source;
+            let applied_seq = admission.applied_seq;
+            self.record_alarm(
+                env,
+                AdmissionAlarm::HistoryFork {
+                    source,
+                    applied_seq,
+                },
+            );
+            self.reject(
+                env,
+                from,
+                source,
+                format!(
+                    "history fork at sequence {applied_seq}: repair offer differs at the cursor"
+                ),
+            );
             return;
         }
         if offer.leaf_bits > MAX_FLEET_LEAF_BITS {
@@ -1184,7 +1223,10 @@ impl Applier {
             );
             return;
         };
-        if admission.epoch != request.epoch || request.through_seq < admission.applied_seq {
+        if admission.epoch != request.epoch
+            || request.through_seq < admission.applied_seq
+            || (self.verify_history_chain && repair.through_chain != request.through_chain)
+        {
             self.reject(env, from, request.source, "stale repair rows".into());
             return;
         }
@@ -1458,6 +1500,47 @@ pub fn no_lost_tombstones(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_state_recorded_before_chains_is_rejected_not_resumed() {
+        // An outbox with a head but no chain map cannot certify any resume
+        // point; loading it must fail loudly instead of restarting the
+        // chain at genesis and fencing (or merging) a valid peer.
+        let mut outbox = Outbox::new([1]);
+        outbox
+            .append(LocalMutation {
+                object: ObjectId::new(1),
+                generation: 1,
+                value: Some(b"x".to_vec()),
+            })
+            .unwrap();
+        let mut legacy_outbox: serde_json::Value = serde_json::to_value(&outbox).unwrap();
+        assert!(legacy_outbox
+            .as_object_mut()
+            .unwrap()
+            .remove("chain")
+            .is_some());
+        assert!(serde_json::from_value::<Outbox>(legacy_outbox).is_err());
+
+        let mut admission = AdmissionState::new(SourceId::new(1), SourceEpoch::random_v4(1, 2));
+        admission.applied(3, [3u8; 32]);
+        let mut legacy_admission: serde_json::Value = serde_json::to_value(&admission).unwrap();
+        assert!(legacy_admission
+            .as_object_mut()
+            .unwrap()
+            .remove("applied_chain")
+            .is_some());
+        assert!(serde_json::from_value::<AdmissionState>(legacy_admission).is_err());
+
+        // The current formats round-trip.
+        let json = serde_json::to_string(&outbox).unwrap();
+        assert_eq!(serde_json::from_str::<Outbox>(&json).unwrap(), outbox);
+        let json = serde_json::to_string(&admission).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AdmissionState>(&json).unwrap(),
+            admission
+        );
+    }
     use crate::env::{Clock, Fs, SimFs, SimTime, Timers, Transport};
 
     #[derive(Default)]
