@@ -229,6 +229,9 @@ impl CatalogIndex {
         // Index committed; now record the position and consume.
         catalog.set_projection_position(PROJECTION_NAME, stats.last_seq)?;
         catalog.outbox_consume(stats.last_seq)?;
+        // Consumed rows below every projection position are dead weight;
+        // release a bounded slice each iteration so the table stays O(pending).
+        catalog.outbox_prune(batch.max(1).saturating_mul(4))?;
         Ok((rebuilt, Some(stats)))
     }
 }

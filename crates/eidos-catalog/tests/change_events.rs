@@ -1359,3 +1359,56 @@ fn crash_during_replay_is_recovered_as_aborted_with_checkpoint_kept() {
     let (cp, _) = reopened.checkpoint(SourceId(1)).unwrap().unwrap();
     assert_eq!(cp.value["next_usn"], 5);
 }
+
+#[test]
+fn consumed_outbox_rows_are_pruned_below_every_projection_position() {
+    let mut fx = Fx::new();
+    let parent = fx.key_of("a/b");
+    for i in 0..5 {
+        let snap = fx.fresh_snapshot(ObjectKind::File, 10);
+        fx.catalog
+            .apply_changes(
+                fx.source,
+                &[ChangeEvent::Link {
+                    parent,
+                    name: format!("p{i}.txt"),
+                    snapshot: snap,
+                }],
+                None,
+            )
+            .unwrap();
+    }
+    let rows = fx.catalog.outbox_poll(0, 10).unwrap();
+    assert_eq!(rows.len(), 5);
+    let retained_before = fx.catalog.outbox_retained().unwrap();
+    assert!(retained_before >= 5);
+
+    // Nothing consumed and no projection position: nothing is pruned.
+    assert_eq!(fx.catalog.outbox_prune(100).unwrap(), 0);
+
+    // Consumed, but the projection has only recorded reaching row 3: rows
+    // after that position survive even though they are marked consumed.
+    let third = rows[2].seq;
+    fx.catalog.outbox_consume(rows[4].seq).unwrap();
+    fx.catalog.set_projection_position("idx", third).unwrap();
+    let pruned = fx.catalog.outbox_prune(100).unwrap();
+    assert!(pruned >= 3, "pruned {pruned}");
+    assert_eq!(
+        fx.catalog.outbox_retained().unwrap(),
+        retained_before - pruned
+    );
+    assert_eq!(fx.catalog.outbox_pending().unwrap(), 0);
+
+    // A second, slower projection holds the floor.
+    fx.catalog.set_projection_position("slow", third).unwrap();
+    fx.catalog
+        .set_projection_position("idx", rows[4].seq)
+        .unwrap();
+    assert_eq!(fx.catalog.outbox_prune(100).unwrap(), 0);
+    fx.catalog
+        .set_projection_position("slow", rows[4].seq)
+        .unwrap();
+    assert_eq!(fx.catalog.outbox_prune(1).unwrap(), 1);
+    assert_eq!(fx.catalog.outbox_prune(100).unwrap(), 1);
+    assert_eq!(fx.catalog.outbox_retained().unwrap(), retained_before - 5);
+}

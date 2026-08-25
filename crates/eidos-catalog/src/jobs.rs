@@ -513,6 +513,31 @@ impl Catalog {
         })
     }
 
+    /// Delete consumed outbox rows that every projection has moved past.
+    /// Bounded by `limit` so a follower iteration never issues one huge
+    /// delete; the caller repeats on later iterations.
+    pub fn outbox_prune(&self, limit: u32) -> Result<u64> {
+        self.with_writer(|conn| {
+            let n = conn.execute(
+                "DELETE FROM outbox WHERE seq IN (
+                    SELECT seq FROM outbox
+                    WHERE consumed_at IS NOT NULL
+                      AND seq <= (SELECT COALESCE(MIN(outbox_seq), 0) FROM projection_state)
+                    ORDER BY seq LIMIT ?1
+                 )",
+                params![limit as i64],
+            )?;
+            Ok(n as u64)
+        })
+    }
+
+    /// Total outbox rows on disk, consumed or not.
+    pub fn outbox_retained(&self) -> Result<u64> {
+        self.with_reader(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get::<_, i64>(0))? as u64)
+        })
+    }
+
     pub fn outbox_pending(&self) -> Result<u64> {
         self.with_reader(|conn| {
             Ok(conn.query_row(
