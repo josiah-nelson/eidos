@@ -88,6 +88,18 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+# Test wall time is dominated by CPU-bound work — the deterministic sync
+# simulation, tantivy indexing, hashing — which an unoptimised build runs
+# several times slower than an optimised one. Optimising dependencies fully
+# and workspace crates lightly keeps compile time close to a plain debug
+# build while cutting test run time by more than half; `debug-assertions`
+# and overflow checks stay on, so the tests keep checking what they did.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 debug = 1
 codegen-units = 4
