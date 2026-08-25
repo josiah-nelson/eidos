@@ -6,6 +6,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 OUTPUT_DIR="$REPO_DIR/dist/macos"
 APP="$OUTPUT_DIR/Eidos Collector.app"
+CLI="$OUTPUT_DIR/eidos"
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/eidos-sign.XXXXXX")
 TEMP_KEYCHAIN=""
 trap '[[ -z "$TEMP_KEYCHAIN" ]] || /usr/bin/security delete-keychain "$TEMP_KEYCHAIN" >/dev/null 2>&1 || true; rm -rf "$SCRATCH"' EXIT
@@ -54,15 +55,25 @@ elif ! /usr/bin/codesign --force --options runtime --timestamp --entitlements "$
     build_for_identity
     /usr/bin/codesign --force --options runtime --timestamp --entitlements "$entitlements" --sign "$identity" --keychain "$keychain_path" "$APP"
 fi
+if [[ -n "$keychain_path" ]]; then
+    /usr/bin/codesign --force --options runtime --timestamp --sign "$identity" --keychain "$keychain_path" "$CLI"
+else
+    /usr/bin/codesign --force --options runtime --timestamp --sign "$identity" "$CLI"
+fi
 /usr/bin/codesign --verify --deep --strict -vv "$APP"
+/usr/bin/codesign --verify --strict -vv "$CLI"
 
 : "${APPLE_API_KEY_P8:?APPLE_API_KEY_P8 is required for notarization}"
 : "${APPLE_API_KEY_ID:?APPLE_API_KEY_ID is required for notarization}"
 : "${APPLE_API_ISSUER_ID:?APPLE_API_ISSUER_ID is required for notarization}"
 api_key="$SCRATCH/notary-key.p8"
 printf '%s' "$APPLE_API_KEY_P8" | /usr/bin/base64 -D >"$api_key"
-archive="$SCRATCH/Eidos Collector.app.zip"
-/usr/bin/ditto -c -k --keepParent "$APP" "$archive"
+archive="$SCRATCH/Eidos Collector.notary.zip"
+notary_payload="$SCRATCH/notary-payload"
+/bin/mkdir "$notary_payload"
+/usr/bin/ditto "$APP" "$notary_payload/Eidos Collector.app"
+/usr/bin/ditto "$CLI" "$notary_payload/eidos"
+/usr/bin/ditto -c -k --keepParent "$notary_payload" "$archive"
 result="$SCRATCH/notary-result.json"
 /usr/bin/xcrun notarytool submit "$archive" --key "$api_key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --output-format json >"$result"
 submission_id=$(/usr/bin/plutil -extract id raw -o - "$result")
@@ -73,6 +84,8 @@ printf 'notarization id=%s status=%s\n' "$submission_id" "$submission_status"
 
 /usr/bin/xcrun stapler staple "$APP"
 /usr/bin/codesign --verify --deep --strict -vv "$APP"
+/usr/bin/codesign --verify --strict -vv "$CLI"
 /usr/sbin/spctl -a -vv -t exec "$APP"
+/usr/sbin/spctl -a -vv -t exec "$CLI"
 rm -f "$OUTPUT_DIR/Eidos Collector.app.zip"
 /usr/bin/ditto -c -k --keepParent "$APP" "$OUTPUT_DIR/Eidos Collector.app.zip"

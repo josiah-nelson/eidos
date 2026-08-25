@@ -99,6 +99,8 @@ keychain. When none exists, the signing script imports the base64 P12 into a
 temporary keychain under `umask 077` and removes it on exit. The App Store
 Connect API key is likewise decoded only into a trapped temporary directory.
 Decoded certificates, keys, profiles, and secret values are never printed.
+The app and session CLI are signed together and included in the same notary
+submission so keychain authorization remains stable across CLI upgrades.
 
 If a Developer ID Installer identity is present, `package.sh` emits a signed,
 notarized component package whose postinstall bootstraps the system

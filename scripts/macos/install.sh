@@ -39,6 +39,7 @@ if [[ -f "$pkg" ]]; then
 else
     app="$OUTPUT_DIR/Eidos Collector.app"
     /usr/bin/codesign --verify --deep --strict -vv "$app"
+    /usr/bin/codesign --verify --strict -vv "$OUTPUT_DIR/eidos"
     install -d -o root -g wheel -m 0755 "/Library/Application Support/Eidos Collector"
     rm -rf "/Library/Application Support/Eidos Collector/Eidos Collector.app"
     /usr/bin/ditto "$app" "/Library/Application Support/Eidos Collector/Eidos Collector.app"

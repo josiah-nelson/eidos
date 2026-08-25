@@ -12,6 +12,7 @@ final_pkg="$OUTPUT_DIR/Eidos Collector.pkg"
 rm -f "$final_pkg"
 
 /usr/bin/codesign --verify --deep --strict -vv "$APP"
+/usr/bin/codesign --verify --strict -vv "$OUTPUT_DIR/eidos"
 installer_identity=$(/usr/bin/security find-identity -p basic -v 2>/dev/null | /usr/bin/sed -n 's/^.*"\(Developer ID Installer[^"].*\)".*$/\1/p' | /usr/bin/head -1)
 if [[ -z "$installer_identity" ]]; then
     printf '%s\n' 'no Developer ID Installer identity found; shipping notarized app archive plus install.sh'
