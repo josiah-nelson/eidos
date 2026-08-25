@@ -66,6 +66,19 @@ into* the tree produces one notification for its new root and none for the
 children that came with it. Reading that subtree is bounded; a move too large
 to describe as one batch becomes a reconciliation scan instead.
 
+**A batch is only acknowledged when it was fully read.** A retryable failure
+while re-reading a notified path means the batch describes less than it was
+asked to. What was read is still applied — the filesystem said so — but the
+cursor stays put, so a restart replays those paths; re-reading a path that has
+not changed since is idempotent. A permanent failure (denied, malformed) does
+not hold the cursor, because it would never clear.
+
+**A native feed cursor is recognised by being one, not by its platform.**
+Freshness and the reconciliation timer both asked whether the checkpoint was a
+USN journal, which reports every macOS source as periodic and rescans it on a
+timer while its feed is applying every change. Both now ask whether the
+checkpoint is any native feed cursor.
+
 **Every loss signal funnels into one path.** `MustScanSubDirs`, `UserDropped`,
 `KernelDropped`, `EventIdsWrapped`, `RootChanged`, mount changes, and this
 process failing to take delivery all degrade the source, clear the cursor, and

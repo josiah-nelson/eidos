@@ -39,7 +39,12 @@ pub struct TranslateStats {
     pub relinked: u64,
     pub expanded_directories: u64,
     pub out_of_scope: u64,
+    /// Failures that will not resolve by trying again (denied, malformed).
     pub io_errors: u64,
+    /// Failures worth retrying. The cursor must not advance past a batch that
+    /// hit one, or a change would be durably acknowledged without ever having
+    /// been applied.
+    pub retryable_errors: u64,
     /// The batch touched more than one translation can safely describe; the
     /// caller must reconcile by enumeration instead of applying it.
     pub needs_rescan: bool,
@@ -186,9 +191,16 @@ impl PathTranslator<'_> {
                 if overflowed {
                     return;
                 }
-                let Ok(children) = &event.result else {
-                    stats.io_errors += 1;
-                    return;
+                let children = match &event.result {
+                    Ok(children) => children,
+                    Err(e) if e.is_retryable() => {
+                        stats.retryable_errors += 1;
+                        return;
+                    }
+                    Err(_) => {
+                        stats.io_errors += 1;
+                        return;
+                    }
                 };
                 let Some(parent) = self.key_of(&event.path) else {
                     stats.io_errors += 1;
@@ -368,7 +380,11 @@ impl PathTranslator<'_> {
                 ),
                 Err(e) if e.kind == eidos_scanner::ScanErrorKind::NotFound => absent.push(path),
                 Err(e) => {
-                    stats.io_errors += 1;
+                    if e.is_retryable() {
+                        stats.retryable_errors += 1;
+                    } else {
+                        stats.io_errors += 1;
+                    }
                     tracing::debug!(path = %path.display(), error = %e, "could not read a changed path");
                 }
             }

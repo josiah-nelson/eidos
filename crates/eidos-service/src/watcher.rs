@@ -429,12 +429,27 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                     }
                     continue;
                 }
-                let next = FsEventsCheckpoint {
-                    cursor: eidos_scanner::fsevents::FsEventsCursor {
-                        store_uuid: cp.cursor.store_uuid.clone(),
-                        event_id,
-                    },
-                    root: cp.root.clone(),
+                // A batch that hit a retryable read failure describes less
+                // than it was asked to. Applying what was read is right - the
+                // filesystem said so - but acknowledging the position is not:
+                // the cursor stays put so a restart replays these paths, and
+                // re-reading a path that has not changed since is idempotent.
+                let complete = tstats.retryable_errors == 0;
+                let next = if complete {
+                    FsEventsCheckpoint {
+                        cursor: eidos_scanner::fsevents::FsEventsCursor {
+                            store_uuid: cp.cursor.store_uuid.clone(),
+                            event_id,
+                        },
+                        root: cp.root.clone(),
+                    }
+                } else {
+                    tracing::warn!(
+                        source = source_id.0,
+                        retryable_errors = tstats.retryable_errors,
+                        "holding the change-feed cursor: part of this batch could not be read"
+                    );
+                    cp.clone()
                 };
                 let apply = {
                     let Some(_mutation) = status.mutation_guard(&state) else {
@@ -453,9 +468,11 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         status.batches.fetch_add(1, Ordering::Relaxed);
                         status.events.fetch_add(astats.events, Ordering::Relaxed);
                         status.records.fetch_add(tstats.paths, Ordering::Relaxed);
-                        status
-                            .last_position
-                            .store(event_id as i64, Ordering::Relaxed);
+                        if complete {
+                            status
+                                .last_position
+                                .store(event_id as i64, Ordering::Relaxed);
+                        }
                         *status.last_batch.lock() = Some(Instant::now());
                         status
                             .last_apply_ms
@@ -1190,12 +1207,13 @@ fn reconcile_tick_at(state: &Arc<AppState>, now: UnixNanos) -> anyhow::Result<()
             state.clear_reconciliation_deferral(s.id);
             continue;
         }
-        let has_feed = s.checkpoint_kind.as_deref() == Some("usn")
-            && state
-                .watchers
-                .lock()
-                .get(&s.id)
-                .is_some_and(|w| !w.is_stopped());
+        let has_feed =
+            eidos_catalog::changes::is_native_feed_checkpoint(s.checkpoint_kind.as_deref())
+                && state
+                    .watchers
+                    .lock()
+                    .get(&s.id)
+                    .is_some_and(|w| !w.is_stopped());
         if has_feed {
             state.clear_reconciliation_deferral(s.id);
             continue;

@@ -188,6 +188,27 @@ fn a_published_scan_carries_a_validated_cursor() {
 }
 
 #[test]
+fn a_source_with_a_cursor_reports_a_live_feed() {
+    // Freshness and the reconciler both used to ask "is the checkpoint a USN
+    // journal?", which reports every macOS source as periodic and rescans it
+    // on a timer even while its feed is applying every change.
+    let e = env();
+    if !has_event_store(&e.root) {
+        return;
+    }
+    let state = open_state(&e.data);
+    let sid = add_source(&state, &e.root);
+    scan_and_watch(&state, sid);
+
+    let completeness = state.catalog.source_completeness(sid).unwrap();
+    assert_eq!(
+        completeness.freshness,
+        eidos_domain::Freshness::Live,
+        "an FSEvents cursor is a live feed: {completeness:?}"
+    );
+}
+
+#[test]
 fn live_changes_reach_the_catalog() {
     let e = env();
     if !has_event_store(&e.root) {
