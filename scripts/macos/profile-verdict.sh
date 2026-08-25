@@ -5,6 +5,7 @@
 # provisioning-profile or certificate contents.
 validate_es_profile() {
     local scratch="$1"
+    local selected_signing_hash="${2:-}"
     PROFILE_VALID=0
     PROFILE_FILE="$scratch/endpoint-security.provisionprofile"
     local decoded="$scratch/profile.plist"
@@ -42,7 +43,10 @@ validate_es_profile() {
     fi
 
     local signing_hash
-    signing_hash=$(/usr/bin/security find-identity -p codesigning -v 2>/dev/null | /usr/bin/awk '/Developer ID Application/ {print $2; exit}')
+    signing_hash=$selected_signing_hash
+    if [[ -z "$signing_hash" ]]; then
+        signing_hash=$(/usr/bin/security find-identity -p codesigning -v 2>/dev/null | /usr/bin/awk '/Developer ID Application/ {print $2; exit}')
+    fi
     if [[ -z "$signing_hash" && -n "${APPLE_CERTIFICATE_P12:-}" ]]; then
         local p12="$scratch/certificate.p12" pem="$scratch/certificate.pem"
         printf '%s' "$APPLE_CERTIFICATE_P12" | /usr/bin/base64 -D >"$p12" || true

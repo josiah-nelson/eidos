@@ -10,9 +10,8 @@ SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/eidos-sign.XXXXXX")
 TEMP_KEYCHAIN=""
 trap '[[ -z "$TEMP_KEYCHAIN" ]] || /usr/bin/security delete-keychain "$TEMP_KEYCHAIN" >/dev/null 2>&1 || true; rm -rf "$SCRATCH"' EXIT
 
-"$SCRIPT_DIR/build-collector.sh"
-
 identity=$(/usr/bin/security find-identity -p codesigning -v 2>/dev/null | /usr/bin/sed -n 's/^.*"\(Developer ID Application[^"].*\)".*$/\1/p' | /usr/bin/head -1)
+identity_hash=$(/usr/bin/security find-identity -p codesigning -v 2>/dev/null | /usr/bin/awk '/Developer ID Application/ {print $2; exit}')
 keychain_path=""
 import_temporary_identity() {
     : "${APPLE_CERTIFICATE_P12:?APPLE_CERTIFICATE_P12 is required when the login keychain has no Developer ID Application identity}"
@@ -25,19 +24,25 @@ import_temporary_identity() {
     /usr/bin/security import "$p12" -k "$TEMP_KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
     /usr/bin/security set-key-partition-list -S apple-tool:,apple: -s -k '' "$TEMP_KEYCHAIN" >/dev/null
     identity=$(/usr/bin/security find-identity -p codesigning -v "$TEMP_KEYCHAIN" | /usr/bin/sed -n 's/^.*"\(Developer ID Application[^"].*\)".*$/\1/p' | /usr/bin/head -1)
+    identity_hash=$(/usr/bin/security find-identity -p codesigning -v "$TEMP_KEYCHAIN" | /usr/bin/awk '/Developer ID Application/ {print $2; exit}')
     keychain_path="$TEMP_KEYCHAIN"
 }
 if [[ -z "$identity" ]]; then
     import_temporary_identity
 fi
-[[ -n "$identity" ]] || { printf '%s\n' 'no Developer ID Application signing identity found' >&2; exit 1; }
+[[ -n "$identity" && -n "$identity_hash" ]] || { printf '%s\n' 'no Developer ID Application signing identity found' >&2; exit 1; }
 
-mode=$(<"$OUTPUT_DIR/entitlement-mode")
-if [[ "$mode" == endpoint-security ]]; then
-    entitlements="$SCRIPT_DIR/collector.entitlements"
-else
-    entitlements="$SCRIPT_DIR/collector-pending.entitlements"
-fi
+build_for_identity() {
+    "$SCRIPT_DIR/build-collector.sh" --signing-cert-sha1 "$identity_hash"
+    mode=$(<"$OUTPUT_DIR/entitlement-mode")
+    if [[ "$mode" == endpoint-security ]]; then
+        entitlements="$SCRIPT_DIR/collector.entitlements"
+    else
+        entitlements="$SCRIPT_DIR/collector-pending.entitlements"
+    fi
+}
+
+build_for_identity
 if [[ -n "$keychain_path" ]]; then
     /usr/bin/codesign --force --options runtime --timestamp --entitlements "$entitlements" --sign "$identity" --keychain "$keychain_path" "$APP"
 elif ! /usr/bin/codesign --force --options runtime --timestamp --entitlements "$entitlements" --sign "$identity" "$APP"; then
@@ -46,6 +51,7 @@ elif ! /usr/bin/codesign --force --options runtime --timestamp --entitlements "$
         exit 1
     fi
     import_temporary_identity
+    build_for_identity
     /usr/bin/codesign --force --options runtime --timestamp --entitlements "$entitlements" --sign "$identity" --keychain "$keychain_path" "$APP"
 fi
 /usr/bin/codesign --verify --deep --strict -vv "$APP"

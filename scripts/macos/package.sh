@@ -6,13 +6,14 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 OUTPUT_DIR="$REPO_DIR/dist/macos"
 APP="$OUTPUT_DIR/Eidos Collector.app"
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/eidos-package.XXXXXX")
+SCRATCH=$(mktemp -d "$OUTPUT_DIR/.eidos-package.XXXXXX")
 trap 'rm -rf "$SCRATCH"' EXIT
+final_pkg="$OUTPUT_DIR/Eidos Collector.pkg"
+rm -f "$final_pkg"
 
 /usr/bin/codesign --verify --deep --strict -vv "$APP"
 installer_identity=$(/usr/bin/security find-identity -p basic -v 2>/dev/null | /usr/bin/sed -n 's/^.*"\(Developer ID Installer[^"].*\)".*$/\1/p' | /usr/bin/head -1)
 if [[ -z "$installer_identity" ]]; then
-    rm -f "$OUTPUT_DIR/Eidos Collector.pkg"
     printf '%s\n' 'no Developer ID Installer identity found; shipping notarized app archive plus install.sh'
     exit 0
 fi
@@ -28,8 +29,7 @@ install -m 0644 "$SCRIPT_DIR/LaunchDaemons/com.jnel.eidos.collector.plist" "$pay
 install -m 0644 "$SCRIPT_DIR/LaunchAgents/com.jnel.eidos.collector.session.plist" "$payload/Library/LaunchAgents/com.jnel.eidos.collector.session.plist"
 
 version=$(/usr/bin/sed -n 's/^version = "\([0-9][0-9.]*\).*"/\1/p' "$REPO_DIR/Cargo.toml" | /usr/bin/head -1)
-pkg="$OUTPUT_DIR/Eidos Collector.pkg"
-rm -f "$pkg"
+pkg="$SCRATCH/Eidos Collector.pkg"
 /usr/bin/pkgbuild --root "$payload" --scripts "$SCRIPT_DIR/pkg-scripts" \
     --identifier com.jnel.eidos.collector --version "$version" \
     --install-location / --sign "$installer_identity" "$pkg"
@@ -48,3 +48,4 @@ printf 'package notarization id=%s status=%s\n' "$submission_id" "$submission_st
 [[ "$submission_status" == Accepted ]] || exit 1
 /usr/bin/xcrun stapler staple "$pkg"
 /usr/sbin/spctl -a -vv -t install "$pkg"
+/bin/mv "$pkg" "$final_pkg"

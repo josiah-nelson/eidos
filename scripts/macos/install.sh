@@ -34,6 +34,7 @@ fi
 
 pkg="$OUTPUT_DIR/Eidos Collector.pkg"
 if [[ -f "$pkg" ]]; then
+    /usr/sbin/spctl -a -vv -t install "$pkg"
     /usr/sbin/installer -pkg "$pkg" -target /
 else
     app="$OUTPUT_DIR/Eidos Collector.app"

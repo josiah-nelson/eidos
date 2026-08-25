@@ -8,11 +8,18 @@ OUTPUT_DIR="$REPO_DIR/dist/macos"
 APP="$OUTPUT_DIR/Eidos Collector.app"
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/eidos-build.XXXXXX")
 trap 'rm -rf "$SCRATCH"' EXIT
+signing_hash=""
+if [[ "${1:-}" == "--signing-cert-sha1" ]]; then
+    [[ "$#" -ge 2 ]] || { printf '%s\n' 'missing signing certificate hash' >&2; exit 2; }
+    signing_hash=$2
+    shift 2
+fi
+[[ "$#" == 0 ]] || { printf 'usage: %s [--signing-cert-sha1 HASH]\n' "$0" >&2; exit 2; }
 
 # shellcheck source=profile-verdict.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/profile-verdict.sh"
-validate_es_profile "$SCRATCH"
+validate_es_profile "$SCRATCH" "$signing_hash"
 
 cd "$REPO_DIR"
 cargo build --locked --release -p eidos-macos-collector --features endpoint-security
