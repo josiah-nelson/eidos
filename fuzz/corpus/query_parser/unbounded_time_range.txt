@@ -1,0 +1,1 @@
+ranked:":n:fi,systeb" mtime:* -(name:/^.*$/) -(name:/^.*m\.40520\-1\-03$/)
