@@ -195,11 +195,29 @@ offline-preserved agent.
 
 ### 3.2 macOS agent
 
-- FSEvents and snapshot/reconciliation adapter
-- stable native identity where available
-- apparent/allocated size semantics documented
+The fleet sync core is built under deterministic simulation first
+([ADR-0013](adr/0013-sync-core-under-deterministic-simulation.md)) and then
+hardened against real workload evidence before any production transport is
+wired. Part of that hardening is a macOS bootstrap, delivered ahead of full
+macOS parity so shared contracts do not become Windows-locked:
+
+- macOS CI: workspace compilation, platform-neutral tests, and a common
+  temporary-filesystem contract suite
+- an FSEvents cursor/coalescing/overflow and snapshot/reconciliation adapter
+  behind an opaque, versioned feed-cursor contract
+- APFS identity, clone/snapshot, and apparent/allocated size semantics
+  recorded as explicit decisions rather than normalized to NTFS behavior
+- a read-only, notify-only `eidos observe` collector that records bounded,
+  pseudonymized workload measurements for manual export; it never uploads,
+  listens, or accepts remote commands, and its privileged file-access lane is
+  separately enabled
+
+Remaining parity work in this section:
+
+- promote the adapter to a full indexing source (scans, live feed, restart
+  reconciliation on APFS)
 - literal text and archive manifest parity
-- macOS file-open integration
+- macOS file-open integration and the [§7](#7-distribution-surfaces) surfaces
 
 Gate: the catalog/completeness/search contract passes the common platform suite.
 
