@@ -2,6 +2,8 @@
 //! counts, stay idempotent, and a retried job is really re-run by the
 //! content workers.
 
+#![cfg(windows)]
+
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::NewSource;
 use eidos_domain::{FailureClass, JobStage, SearchRequest, SourceId, SourceKind};

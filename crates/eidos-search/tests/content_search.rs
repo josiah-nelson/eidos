@@ -6,6 +6,8 @@
 //! reindexing (a text file that turns binary, empty, or unreadable), and the
 //! rejection of candidates from a superseded generation.
 
+#![cfg(windows)]
+
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::{Catalog, NewSource};
 use eidos_content::{Chunk, Limits};

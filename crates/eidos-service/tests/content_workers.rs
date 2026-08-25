@@ -2,6 +2,8 @@
 //! through batched commits, survive a restart without re-extraction, and
 //! respect the per-source content policy.
 
+#![cfg(windows)]
+
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::NewSource;
 use eidos_domain::{ContentState, SearchRequest, SourceId, SourceKind};
