@@ -176,6 +176,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 fn prepare_directory(path: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o750))?;
+    set_admin_group(path)?;
     Ok(())
 }
 
@@ -192,7 +193,7 @@ fn start_ipc(
     }
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
-    set_admin_group(&socket);
+    set_admin_group(&socket)?;
     listener.set_nonblocking(true)?;
     Ok(std::thread::Builder::new()
         .name("collector-ipc".into())
@@ -210,20 +211,17 @@ fn start_ipc(
         })?)
 }
 
-fn set_admin_group(path: &Path) {
-    let Ok(name) = CString::new("admin") else {
-        return;
-    };
+fn set_admin_group(path: &Path) -> anyhow::Result<()> {
+    let name = CString::new("admin")?;
     let group = unsafe { libc::getgrnam(name.as_ptr()) };
     if group.is_null() {
-        return;
+        anyhow::bail!("admin group is unavailable");
     }
-    let Ok(file_name) = CString::new(path.as_os_str().as_bytes()) else {
-        return;
-    };
-    unsafe {
-        libc::chown(file_name.as_ptr(), u32::MAX, (*group).gr_gid);
+    let file_name = CString::new(path.as_os_str().as_bytes())?;
+    if unsafe { libc::chown(file_name.as_ptr(), u32::MAX, (*group).gr_gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
+    Ok(())
 }
 
 fn handle_connection(mut stream: UnixStream, shared: &Shared) {
@@ -339,7 +337,7 @@ fn export(shared: &Shared) -> anyhow::Result<PathBuf> {
         .join(format!("observation-{now}.eidos-observation.zst"));
     eidos_observe::write_bundle(&file, &bundle)?;
     fs::set_permissions(&file, fs::Permissions::from_mode(0o640))?;
-    set_admin_group(&file);
+    set_admin_group(&file)?;
     Ok(file)
 }
 
