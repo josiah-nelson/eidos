@@ -223,12 +223,19 @@ impl CatalogIndex {
         let position = catalog.projection_position(PROJECTION_NAME)?;
         let rows = catalog.outbox_poll(position, batch)?;
         if rows.is_empty() {
+            // Idle iterations still release a bounded slice of consumed rows
+            // so a backlog left by an upgrade, or one larger than the
+            // per-iteration allowance, drains without waiting for writes.
+            catalog.outbox_prune(batch.max(1).saturating_mul(4))?;
             return Ok((rebuilt, None));
         }
         let stats = self.apply_outbox(catalog, &rows)?;
         // Index committed; now record the position and consume.
         catalog.set_projection_position(PROJECTION_NAME, stats.last_seq)?;
         catalog.outbox_consume(stats.last_seq)?;
+        // Consumed rows below every projection position are dead weight;
+        // release a bounded slice each iteration so the table stays O(pending).
+        catalog.outbox_prune(batch.max(1).saturating_mul(4))?;
         Ok((rebuilt, Some(stats)))
     }
 }
