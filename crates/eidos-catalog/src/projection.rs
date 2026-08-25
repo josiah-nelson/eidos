@@ -12,6 +12,7 @@
 //! parent chain of a whole batch of objects through one cache, so a subtree
 //! rebuild walks each ancestor once instead of once per descendant.
 
+use crate::paths::{join, root_display};
 use crate::read::get_source_conn;
 use crate::{Catalog, CatalogError, Result};
 use eidos_domain::{ContentState, FileAttributes, ObjectId, ObjectKind, SourceId, UnixNanos};
@@ -149,19 +150,11 @@ impl DirMap {
             Some((Some(parent), name)) => {
                 let (ppath, mut anc) = self.dir(parent);
                 anc.push(ObjectId(parent));
-                (format!("{}\\{}", ppath.trim_end_matches('\\'), name), anc)
+                (join(&self.root_path, &ppath, &name), anc)
             }
         };
         self.paths.insert(obj, result.clone());
         result
-    }
-}
-
-fn root_display(root: &str) -> String {
-    if root.len() == 2 && root.ends_with(':') {
-        format!("{root}\\")
-    } else {
-        root.to_string()
     }
 }
 
@@ -417,10 +410,9 @@ impl ChainCache {
                 }
             }
         }
+        let root = self.root(conn, source)?;
         for (node, name) in chain.into_iter().rev() {
-            let rendered = base
-                .as_ref()
-                .map(|b| format!("{}\\{}", b.trim_end_matches('\\'), name));
+            let rendered = base.as_ref().map(|b| join(&root, b, &name));
             if is_node || node != object {
                 self.paths.insert(node, rendered.clone());
             }
@@ -495,7 +487,7 @@ impl Catalog {
                         Some(p) => {
                             let (ppath, mut anc) = dirs.dir(p);
                             anc.push(ObjectId(p));
-                            (format!("{}\\{}", ppath.trim_end_matches('\\'), name), anc)
+                            (join(&dirs.root_path, &ppath, &name), anc)
                         }
                         None => (root_display(&dirs.root_path), Vec::new()),
                     }
@@ -742,7 +734,7 @@ pub mod reference {
                 Some((Some(parent), name)) => {
                     let (ppath, mut anc) = self.dir(parent);
                     anc.push(ObjectId(parent));
-                    (format!("{}\\{}", ppath.trim_end_matches('\\'), name), anc)
+                    (join(&self.root_path, &ppath, &name), anc)
                 }
             };
             self.paths.insert(obj, result.clone());
@@ -825,7 +817,7 @@ pub mod reference {
                             Some(p) => {
                                 let (ppath, mut anc) = dirs.dir(p);
                                 anc.push(ObjectId(p));
-                                (format!("{}\\{}", ppath.trim_end_matches('\\'), name), anc)
+                                (join(&dirs.root_path, &ppath, &name), anc)
                             }
                             None => (root_display(&dirs.root_path), Vec::new()),
                         }

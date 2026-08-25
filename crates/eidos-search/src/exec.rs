@@ -10,7 +10,7 @@ use crate::content::{
 };
 use crate::facets::RangeBucket;
 use crate::regex_plan::TrigramPlan;
-use crate::schema::{attr_bit, attr_name, fold, Fields};
+use crate::schema::{attr_bit, attr_name, canonical_path, fold, Fields};
 use crate::{CatalogIndex, Result, SearchError, PROJECTION_NAME};
 use eidos_catalog::content::ChunkRow;
 use eidos_catalog::Catalog;
@@ -1538,26 +1538,30 @@ fn compile_path(
     ctx: &mut Ctx<'_>,
 ) -> std::result::Result<Box<dyn TQuery>, QueryError> {
     let f = ctx.f;
-    let norm = value.replace('/', "\\");
+    // A path is stored the way its source spells it; matching happens in one
+    // canonical spelling so a query written with either separator finds it.
+    let norm = canonical_path(value);
     Ok(match mode {
         PathMode::Exact => {
             ctx.readable.push(format!("path is \"{norm}\""));
             if case_sensitive {
                 needs_positive(ctx, "a case-sensitive clause")?;
                 let v = norm.clone();
-                ctx.verifiers.push(Box::new(move |s, _| s.path == v));
+                ctx.verifiers
+                    .push(Box::new(move |s, _| canonical_path(&s.path) == v));
             }
             term_text(f.path_folded, &fold(&norm))
         }
         PathMode::Prefix => {
-            let trimmed = norm.trim_end_matches('\\').to_string();
+            let trimmed = norm.trim_end_matches('/').to_string();
             ctx.readable.push(format!("path under \"{trimmed}\""));
-            let pat = format!("{}(\\\\.*)?", regex::escape(&fold(&trimmed)));
+            let pat = format!("{}(/.*)?", regex::escape(&fold(&trimmed)));
             if case_sensitive {
                 needs_positive(ctx, "a case-sensitive clause")?;
                 let v = trimmed.clone();
                 ctx.verifiers.push(Box::new(move |s, _| {
-                    s.path == v || s.path.starts_with(&format!("{v}\\"))
+                    let path = canonical_path(&s.path);
+                    path == v || path.starts_with(&format!("{v}/"))
                 }));
             }
             make_regex(f.path_folded, &pat)?
@@ -1566,7 +1570,7 @@ fn compile_path(
             ctx.readable.push(format!("path matches glob \"{norm}\""));
             let folded = fold(&norm);
             let re = glob_to_regex(&folded);
-            let pat = if norm.contains('\\') {
+            let pat = if norm.contains('/') {
                 re
             } else {
                 format!(".*{re}")

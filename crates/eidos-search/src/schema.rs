@@ -113,6 +113,14 @@ pub fn fold(s: &str) -> String {
     s.to_lowercase()
 }
 
+/// One spelling of a path for matching. Paths are *stored and displayed* the
+/// way their source spells them - a Windows source keeps its backslashes and a
+/// macOS source its slashes - but a query should not have to know which host a
+/// hit came from, so both sides of a path comparison are canonicalised here.
+pub fn canonical_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 /// Attribute terms stored in the `attrs` field.
 pub fn attr_terms(a: FileAttributes) -> Vec<&'static str> {
     let mut out = Vec::new();
@@ -172,7 +180,7 @@ pub fn document(f: &Fields, row: &ProjectionRow) -> TantivyDocument {
     d.add_text(f.name, &row.name);
     d.add_text(f.name_folded, fold(&row.name));
     d.add_text(f.path, &row.path);
-    d.add_text(f.path_folded, fold(&row.path));
+    d.add_text(f.path_folded, fold(&canonical_path(&row.path)));
     d.add_text(f.path_tokens, &row.path);
     d.add_text(f.extension, &row.extension);
     d.add_text(f.kind, row.kind.as_str());

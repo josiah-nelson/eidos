@@ -19,6 +19,7 @@ pub mod content;
 pub mod interactions;
 pub mod jobs;
 pub mod model;
+pub mod paths;
 pub mod policy;
 pub mod projection;
 pub mod read;

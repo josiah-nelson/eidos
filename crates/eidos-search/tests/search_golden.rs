@@ -258,13 +258,16 @@ fn ranked_terms_phrase_and_path_scoping() {
         vec!["Zephyr diagnostics.md"]
     );
     assert_eq!(fx.names("helpers ext:cs"), vec!["Helpers.cs"]);
-    let under = format!("path:\"{}\\proj\"", fx.root.display());
+    // Paths are indexed the way their source spells them, so a path query
+    // uses the same separator the source root does.
+    let separator = std::path::MAIN_SEPARATOR;
+    let under = format!("path:\"{}{separator}proj\"", fx.root.display());
     assert_eq!(
         fx.names(&format!("{under} ext:cs")),
         vec!["Helpers.cs", "Program.cs"]
     );
     assert_eq!(
-        fx.names("path:*\\src\\* ext:cs"),
+        fx.names(&format!("path:*{separator}src{separator}* ext:cs")),
         vec!["Helpers.cs", "Program.cs"]
     );
     assert_eq!(fx.names("ext:cs -path:util"), vec!["Main.cs", "Program.cs"]);

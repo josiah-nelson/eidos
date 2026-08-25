@@ -526,17 +526,12 @@ pub(crate) fn render_path_conn(conn: &Connection, id: ObjectId) -> Result<Option
         params![sid],
         |r| r.get(0),
     )?;
-    let mut out = root.trim_end_matches(['\\', '/']).to_string();
     if parts.is_empty() {
-        // Root itself: keep a trailing separator for drive roots like `G:\`.
-        if out.len() == 2 && out.ends_with(':') {
-            out.push('\\');
-        }
-        return Ok(Some(out));
+        return Ok(Some(crate::paths::root_display(&root)));
     }
+    let mut out = crate::paths::root_display(&root);
     for p in parts.iter().rev() {
-        out.push('\\');
-        out.push_str(p);
+        out = crate::paths::join(&root, &out, p);
     }
     Ok(Some(out))
 }
