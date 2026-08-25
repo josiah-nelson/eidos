@@ -5,6 +5,8 @@
 //! restart so startup cannot fix one subsystem by rebuilding or discarding
 //! healthy state owned by another.
 
+#![cfg(windows)]
+
 use eidos_archive::fixture::{build, Entry};
 use eidos_catalog::scan::{run_scan, RunScanOptions, ScanKind};
 use eidos_catalog::NewSource;

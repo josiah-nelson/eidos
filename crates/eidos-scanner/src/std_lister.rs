@@ -7,6 +7,24 @@ use crate::error::ScanError;
 use eidos_domain::{FileAttributes, ObjectKind, UnixNanos};
 use std::path::Path;
 
+#[cfg(unix)]
+fn native_identity(metadata: &std::fs::Metadata) -> Option<eidos_domain::NativeIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(eidos_domain::NativeIdentity {
+        volume_serial: metadata.dev(),
+        file_id_high: 0,
+        file_id_low: metadata.ino(),
+        // Unix inode reuse and volume remounts prevent a cross-run stability
+        // claim, but the identity is useful for one reconciliation.
+        confidence: eidos_domain::IdentityConfidence::Weak,
+    })
+}
+
+#[cfg(not(unix))]
+fn native_identity(_: &std::fs::Metadata) -> Option<eidos_domain::NativeIdentity> {
+    None
+}
+
 pub struct StdLister;
 
 impl DirectoryLister for StdLister {
@@ -20,7 +38,7 @@ impl DirectoryLister for StdLister {
                 Some(s) => (s.to_string(), false),
                 None => (name_os.to_string_lossy().into_owned(), true),
             };
-            let md = match item.metadata() {
+            let md = match std::fs::symlink_metadata(item.path()) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::debug!(path = %item.path().display(), error = %e, "metadata failed");
@@ -60,7 +78,7 @@ impl DirectoryLister for StdLister {
                 modified: md.modified().ok().map(UnixNanos::from_system_time),
                 changed: None,
                 accessed: md.accessed().ok().map(UnixNanos::from_system_time),
-                native_id: None,
+                native_id: native_identity(&md),
                 reparse_tag: 0,
             });
         }
@@ -103,7 +121,7 @@ impl DirectoryLister for StdLister {
             modified: md.modified().ok().map(UnixNanos::from_system_time),
             changed: None,
             accessed: md.accessed().ok().map(UnixNanos::from_system_time),
-            native_id: None,
+            native_id: native_identity(&md),
             reparse_tag: 0,
         })
     }

@@ -807,6 +807,7 @@ version = "0.5.0-dev"
 dependencies = [
  "crossbeam-channel",
  "eidos-domain",
+ "libc",
  "serde",
  "tempfile",
  "thiserror",

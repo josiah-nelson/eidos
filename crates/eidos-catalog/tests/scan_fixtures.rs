@@ -11,6 +11,7 @@ use eidos_scanner::{
     default_lister, DirEvent, DirToken, DirectoryLister, RawEntry, ScanError, ScanErrorKind,
     VolumeInfo,
 };
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -93,11 +94,9 @@ fn full_scan_counts_sizes_and_aggregates() {
     // never below logical size.
     assert!(counts.allocated_bytes >= counts.logical_bytes);
     let vhdx = object_at(&f, "five.vhdx").unwrap();
-    assert!(
-        vhdx.allocated >= 5000 && vhdx.allocated % 512 == 0,
-        "{}",
-        vhdx.allocated
-    );
+    assert!(vhdx.allocated >= 5000, "{}", vhdx.allocated);
+    #[cfg(windows)]
+    assert_eq!(vhdx.allocated % 512, 0, "{}", vhdx.allocated);
     assert_eq!(
         counts.content_excluded, 2,
         "five.vhdx (disk image) and three.idb (database)"
@@ -265,12 +264,12 @@ fn subtree_move_preserves_objects() {
 /// A lister that fails for one directory to simulate access denied.
 struct FailingLister {
     inner: Box<dyn DirectoryLister>,
-    fail_suffix: String,
+    fail_name: String,
 }
 
 impl DirectoryLister for FailingLister {
     fn list(&self, dir: &Path) -> Result<Vec<RawEntry>, ScanError> {
-        if dir.to_string_lossy().ends_with(&self.fail_suffix) {
+        if dir.file_name() == Some(OsStr::new(&self.fail_name)) {
             return Err(ScanError::new(
                 ScanErrorKind::AccessDenied,
                 5,
@@ -297,7 +296,7 @@ fn unlisted_directory_preserves_previous_children() {
     scan(&f);
     let failing = FailingLister {
         inner: default_lister(),
-        fail_suffix: "\\b".into(),
+        fail_name: "b".into(),
     };
     let s = run_scan(&f.catalog, f.source, &failing, &RunScanOptions::default()).unwrap();
     assert_eq!(s.stats.errors, 1);
@@ -346,7 +345,7 @@ fn unlistable_root_aborts_instead_of_publishing_empty() {
     scan(&f);
     let failing = FailingLister {
         inner: default_lister(),
-        fail_suffix: "\\root".into(),
+        fail_name: "root".into(),
     };
     let err = run_scan(&f.catalog, f.source, &failing, &RunScanOptions::default()).unwrap_err();
     assert!(
@@ -372,7 +371,7 @@ fn unlistable_root_aborts_instead_of_publishing_empty() {
     // Listing errors below the root are reported in completeness.
     let partial = FailingLister {
         inner: default_lister(),
-        fail_suffix: "\\b".into(),
+        fail_name: "b".into(),
     };
     run_scan(&f.catalog, f.source, &partial, &RunScanOptions::default()).unwrap();
     let c = f.catalog.source_completeness(f.source).unwrap();

@@ -258,7 +258,7 @@ fn ranked_terms_phrase_and_path_scoping() {
         vec!["Zephyr diagnostics.md"]
     );
     assert_eq!(fx.names("helpers ext:cs"), vec!["Helpers.cs"]);
-    let under = format!("path:{}", fx.root.join("proj").display());
+    let under = format!("path:\"{}\\proj\"", fx.root.display());
     assert_eq!(
         fx.names(&format!("{under} ext:cs")),
         vec!["Helpers.cs", "Program.cs"]
