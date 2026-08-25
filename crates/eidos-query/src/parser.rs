@@ -899,6 +899,10 @@ pub fn parse_size(s: &str) -> Option<u64> {
 /// `>N`, `>=N`, `<N`, `<=N`, `N..M`, `=N`, `N`
 pub fn parse_size_range(s: &str) -> Option<(Option<u64>, Option<u64>)> {
     let s = s.trim();
+    // Symmetrical with the renderer, which writes `*` for an unbounded range.
+    if s == "*" {
+        return Some((None, None));
+    }
     if let Some(v) = s.strip_prefix(">=") {
         return Some((Some(parse_size(v)?), None));
     }
@@ -996,6 +1000,11 @@ fn parse_duration_ns(s: &str) -> Option<i64> {
 /// `>D`, `>=D`, `<D`, `<=D`, `D..E`, `D`, `7d`, `today`
 pub fn parse_time_range(s: &str, now: UnixNanos) -> Option<(Option<UnixNanos>, Option<UnixNanos>)> {
     let s = s.trim();
+    // `*` is what the renderer writes for a range with neither bound, so it
+    // has to parse back to one; it reads as "has a value for this field".
+    if s == "*" {
+        return Some((None, None));
+    }
     // Exact half-open range emitted by the renderer. Unlike `A..B`, the
     // upper timestamp is already exclusive and must not expand to the end of
     // its displayed date/time granularity.
@@ -1040,6 +1049,45 @@ mod tests {
         parse_at(s, UnixNanos(1_787_000_000_000_000_000))
             .unwrap()
             .query
+    }
+
+    /// The renderer writes a range with neither bound as `key:*`. A rendered
+    /// query that the parser rejects is not a round trip, and every clause
+    /// the AST can hold has to survive one.
+    #[test]
+    fn an_unbounded_range_survives_a_round_trip() {
+        for (text, expected) in [
+            (
+                "mtime:*",
+                Query::Time {
+                    field: TimeField::Modified,
+                    after: None,
+                    before: None,
+                },
+            ),
+            (
+                "ctime:*",
+                Query::Time {
+                    field: TimeField::Created,
+                    after: None,
+                    before: None,
+                },
+            ),
+            (
+                "size:*",
+                Query::Size {
+                    field: SizeField::Logical,
+                    min: None,
+                    max: None,
+                },
+            ),
+        ] {
+            let parsed = q(text);
+            assert_eq!(parsed, expected, "{text}");
+            let rendered = crate::render(&parsed);
+            assert_eq!(rendered, text, "{text} must render back to itself");
+            assert_eq!(q(&rendered), expected, "{rendered} must parse again");
+        }
     }
 
     #[test]

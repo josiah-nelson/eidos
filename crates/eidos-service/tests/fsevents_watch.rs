@@ -419,6 +419,31 @@ fn a_restart_resumes_from_the_stored_cursor() {
 }
 
 #[test]
+fn background_start_leaves_a_feedless_source_to_periodic_reconciliation() {
+    let e = env();
+    if !has_event_store(&e.root) {
+        return;
+    }
+    let state = open_state(&e.data);
+    let sid = add_source(&state, &e.root);
+    let watcher = scan_and_watch(&state, sid);
+    stop_agent(state, sid, &watcher);
+
+    // A no-history volume publishes a generation without a checkpoint. Clear
+    // a real one here to reproduce that durable state on a normal APFS test
+    // volume, then exercise the service-restart path.
+    let state = open_state(&e.data);
+    state.catalog.clear_checkpoint(sid).unwrap();
+    state.start_background().unwrap();
+
+    assert!(
+        state.watcher_status(sid).is_none(),
+        "a source without a resumable cursor belongs to the periodic reconciler"
+    );
+    state.request_shutdown();
+}
+
+#[test]
 fn a_cursor_from_a_replaced_event_store_forces_reconciliation() {
     let e = env();
     if !has_event_store(&e.root) {
