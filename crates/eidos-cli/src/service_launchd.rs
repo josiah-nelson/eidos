@@ -22,8 +22,9 @@ use crate::logging;
 use crate::ServeArgs;
 use anyhow::{bail, Context};
 use clap::{Args, Subcommand};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const DEFAULT_LABEL: &str = "com.jnel.eidos.agent";
 
@@ -156,11 +157,78 @@ struct LaunchctlOutput {
     stderr: String,
 }
 
-fn launchctl(args: &[&str]) -> anyhow::Result<LaunchctlOutput> {
-    let output = Command::new("/bin/launchctl")
-        .args(args)
-        .output()
-        .with_context(|| format!("running launchctl {}", args.join(" ")))?;
+fn command_output_by(
+    command: &mut Command,
+    description: &str,
+    deadline: std::time::Instant,
+) -> anyhow::Result<std::process::Output> {
+    if std::time::Instant::now() >= deadline {
+        bail!("{description} timed out before it could start");
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {description}"))?;
+    let mut stdout = child.stdout.take().context("capturing command stdout")?;
+    let mut stderr = child.stderr.take().context("capturing command stderr")?;
+    // Drain both streams while the child runs. Waiting with full pipes can
+    // deadlock before `try_wait` observes an exit, especially for
+    // `launchctl print` on a verbose job.
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(anyhow::Error::new(error))
+                    .with_context(|| format!("waiting for {description}"));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            // The readers reach EOF after the killed child closes its pipes.
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("{description} timed out");
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading {description} stdout panicked"))?
+        .with_context(|| format!("reading {description} stdout"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading {description} stderr panicked"))?
+        .with_context(|| format!("reading {description} stderr"))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn launchctl(args: &[&str], deadline: std::time::Instant) -> anyhow::Result<LaunchctlOutput> {
+    let description = format!("launchctl {}", args.join(" "));
+    let output = command_output_by(
+        Command::new("/bin/launchctl").args(args),
+        &description,
+        deadline,
+    )?;
     Ok(LaunchctlOutput {
         status: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -168,8 +236,8 @@ fn launchctl(args: &[&str]) -> anyhow::Result<LaunchctlOutput> {
     })
 }
 
-fn launchctl_ok(args: &[&str]) -> anyhow::Result<()> {
-    let out = launchctl(args)?;
+fn launchctl_ok(args: &[&str], deadline: std::time::Instant) -> anyhow::Result<()> {
+    let out = launchctl(args, deadline)?;
     if out.status != 0 {
         let detail = if out.stderr.trim().is_empty() {
             out.stdout.trim().to_string()
@@ -194,8 +262,8 @@ struct JobState {
     last_exit_status: Option<i32>,
 }
 
-fn job_state(label: &str) -> anyhow::Result<JobState> {
-    let out = launchctl(&["print", &service_target(label)])?;
+fn job_state(label: &str, deadline: std::time::Instant) -> anyhow::Result<JobState> {
+    let out = launchctl(&["print", &service_target(label)], deadline)?;
     if out.status != 0 {
         return Ok(JobState::default());
     }
@@ -225,13 +293,17 @@ fn wait_until(
     mut ready: impl FnMut() -> anyhow::Result<bool>,
 ) -> anyhow::Result<bool> {
     loop {
-        if ready()? {
-            return Ok(true);
-        }
         if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        if ready()? {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(200)));
     }
 }
 
@@ -319,6 +391,83 @@ fn plist_document(label: &str, program: &Path, arguments: &[String], log_dir: &P
     )
 }
 
+fn replacement_error(primary: anyhow::Error, rollback: anyhow::Result<()>) -> anyhow::Error {
+    match rollback {
+        Ok(()) => anyhow::anyhow!(
+            "{primary:#}; the previous LaunchAgent configuration was restored"
+        ),
+        Err(rollback) => anyhow::anyhow!(
+            "{primary:#}; restoring the previous LaunchAgent configuration also failed: {rollback:#}"
+        ),
+    }
+}
+
+/// Put a previously installed plist back without ever exposing a partial file.
+fn restore_document(path: &Path, document: &[u8]) -> anyhow::Result<()> {
+    let temporary = path.with_extension("plist.rollback");
+    std::fs::write(&temporary, document)
+        .with_context(|| format!("writing rollback file {}", temporary.display()))?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(anyhow::Error::new(error))
+            .with_context(|| format!("restoring {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Recover the old loaded state even when launchd could not confirm that the
+/// failed replacement finished unloading. A successful start is stronger
+/// evidence that service was restored than the intermediate query failure;
+/// if the start also fails, keep both causes for the operator.
+fn restore_loaded_state(
+    unload_failure: Option<anyhow::Error>,
+    was_loaded: bool,
+    restart: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !was_loaded {
+        return unload_failure.map_or(Ok(()), Err);
+    }
+    match restart() {
+        Ok(()) => Ok(()),
+        Err(restart) => match unload_failure {
+            Some(unload) => Err(anyhow::anyhow!(
+                "{unload:#}; restarting the previous LaunchAgent also failed: {restart:#}"
+            )),
+            None => Err(restart),
+        },
+    }
+}
+
+/// Restore both the old file and the old loaded/stopped state after a new
+/// configuration landed but failed to become healthy.
+fn rollback_replacement(
+    label: &str,
+    path: &Path,
+    document: &[u8],
+    was_loaded: bool,
+) -> anyhow::Result<()> {
+    let unload_deadline = deadline(30);
+    let unload_failure = match job_state(label, unload_deadline) {
+        Ok(state) if state.loaded => match unload(label, unload_deadline) {
+            Ok(true) => None,
+            Ok(false) => Some(anyhow::anyhow!(
+                "the replacement agent did not unload during rollback"
+            )),
+            Err(error) => Some(error.context("unloading the replacement agent during rollback")),
+        },
+        Ok(_) => None,
+        Err(error) => Some(error.context("checking the replacement agent during rollback")),
+    };
+    // Restore the durable file even when launchd could not confirm its
+    // in-memory state, then actively recover the old loaded state. Returning
+    // before that restart would turn a transient state-query error into a
+    // persistent indexing outage.
+    restore_document(path, document)?;
+    restore_loaded_state(unload_failure, was_loaded, || {
+        start_by(label, deadline(120)).context("restarting the previous LaunchAgent")
+    })
+}
+
 fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
     let path = plist_path(label)?;
     if path.exists() && !args.replace {
@@ -327,6 +476,14 @@ fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
             path.display()
         );
     }
+    let previous_document = match std::fs::read(&path) {
+        Ok(document) => Some(document),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(anyhow::Error::new(error))
+                .with_context(|| format!("reading existing {}", path.display()))
+        }
+    };
     let mut serve = args.serve.normalized();
     serve.data_dir = absolute(&serve.data_dir)?;
     let log_dir = match &serve.log_dir {
@@ -355,21 +512,45 @@ fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
     let temporary = path.with_extension("plist.new");
     std::fs::write(&temporary, document)
         .with_context(|| format!("writing {}", temporary.display()))?;
-    let was_loaded = job_state(label)?.loaded;
+    let was_loaded = match job_state(label, deadline(30)) {
+        Ok(state) => state.loaded,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.context("checking the existing LaunchAgent before replacement"));
+        }
+    };
     if was_loaded {
         // launchd keeps running the definition it already read, so the old job
         // has to be gone - not merely asked to go - before the new file lands.
-        unload(label, deadline(30))?;
+        let unload_error = match unload(label, deadline(30)) {
+            Ok(true) => None,
+            Ok(false) => Some(anyhow::anyhow!(
+                "the existing agent did not unload in time; its LaunchAgent file was not replaced"
+            )),
+            Err(error) => Some(
+                error
+                    .context("unloading the existing agent; its LaunchAgent file was not replaced"),
+            ),
+        };
+        if let Some(unload_error) = unload_error {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(replacement_error(
+                unload_error,
+                start_by(label, deadline(120)).context("restoring the existing LaunchAgent"),
+            ));
+        }
     }
     if let Err(e) = std::fs::rename(&temporary, &path) {
         // The replacement never landed. Put the agent back rather than
         // leaving the machine with no indexer.
-        if was_loaded {
-            let _ = launchctl(&["bootstrap", &domain(), &path.display().to_string()]);
-        }
         let _ = std::fs::remove_file(&temporary);
-        return Err(anyhow::Error::new(e))
-            .with_context(|| format!("installing {}", path.display()));
+        let install_error = anyhow::Error::new(e).context(format!("installing {}", path.display()));
+        let rollback = if was_loaded {
+            start_by(label, deadline(120)).context("restarting the previous LaunchAgent")
+        } else {
+            Ok(())
+        };
+        return Err(replacement_error(install_error, rollback));
     }
 
     println!("installed {} -> {}", label, path.display());
@@ -384,7 +565,15 @@ fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
     if args.start_now || was_loaded {
         // A replacement that was running before must be running after: an
         // install is a configuration change, not an outage.
-        start_by(label, deadline(120))?;
+        if let Err(start_error) = start_by(label, deadline(120)) {
+            let Some(previous_document) = previous_document.as_deref() else {
+                return Err(start_error);
+            };
+            return Err(replacement_error(
+                start_error,
+                rollback_replacement(label, &path, previous_document, was_loaded),
+            ));
+        }
     } else {
         println!("run `eidos service start` to load it");
     }
@@ -393,9 +582,10 @@ fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
 
 fn cmd_uninstall(label: &str) -> anyhow::Result<()> {
     let path = plist_path(label)?;
-    let state = job_state(label)?;
+    let deadline = deadline(30);
+    let state = job_state(label, deadline)?;
     if state.loaded {
-        launchctl_ok(&["bootout", &service_target(label)])?;
+        launchctl_ok(&["bootout", &service_target(label)], deadline)?;
     }
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
@@ -421,8 +611,8 @@ fn start_by(label: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
             path.display()
         );
     }
-    load(label, &path)?;
-    let started = wait_until(deadline, || Ok(job_state(label)?.running))?;
+    load(label, &path, deadline)?;
+    let started = wait_until(deadline, || Ok(job_state(label, deadline)?.running))?;
     if !started {
         bail!("the agent did not start in time; see `eidos service status`");
     }
@@ -430,7 +620,7 @@ fn start_by(label: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
     // before the API is listening. Callers mean "ready to answer", so wait
     // for that too when the installed plist says where to ask.
     if bind_address(&path).is_some() {
-        let answering = wait_until(deadline, || Ok(probe_health(&path).is_some()))?;
+        let answering = wait_until(deadline, || Ok(probe_health_by(&path, deadline).is_some()))?;
         if !answering {
             bail!("the agent started but did not answer in time; see the log directory");
         }
@@ -445,26 +635,26 @@ fn start_by(label: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
 /// was removed and look absent a moment after it was added. Each command is
 /// therefore tried and, if launchd disagrees about which state it is in, the
 /// other one is used rather than failing the operation.
-fn load(label: &str, path: &Path) -> anyhow::Result<()> {
+fn load(label: &str, path: &Path, deadline: std::time::Instant) -> anyhow::Result<()> {
     let target = service_target(label);
     let plist = path.display().to_string();
-    if job_state(label)?.loaded {
-        if launchctl_ok(&["kickstart", &target]).is_ok() {
+    if job_state(label, deadline)?.loaded {
+        if launchctl_ok(&["kickstart", &target], deadline).is_ok() {
             return Ok(());
         }
-        let _ = launchctl(&["bootout", &target])?;
-        return launchctl_ok(&["bootstrap", &domain(), &plist]);
+        let _ = launchctl(&["bootout", &target], deadline)?;
+        return launchctl_ok(&["bootstrap", &domain(), &plist], deadline);
     }
-    if launchctl_ok(&["bootstrap", &domain(), &plist]).is_ok() {
+    if launchctl_ok(&["bootstrap", &domain(), &plist], deadline).is_ok() {
         return Ok(());
     }
-    launchctl_ok(&["kickstart", &target])
+    launchctl_ok(&["kickstart", &target], deadline)
 }
 
 /// Unload the job and wait for launchd to finish doing it.
 fn unload(label: &str, deadline: std::time::Instant) -> anyhow::Result<bool> {
-    let _ = launchctl(&["bootout", &service_target(label)])?;
-    wait_until(deadline, || Ok(!job_state(label)?.loaded))
+    let _ = launchctl(&["bootout", &service_target(label)], deadline)?;
+    wait_until(deadline, || Ok(!job_state(label, deadline)?.loaded))
 }
 
 fn cmd_stop(label: &str, wait: WaitArgs) -> anyhow::Result<()> {
@@ -472,7 +662,7 @@ fn cmd_stop(label: &str, wait: WaitArgs) -> anyhow::Result<()> {
 }
 
 fn stop_by(label: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
-    let state = job_state(label)?;
+    let state = job_state(label, deadline)?;
     if !state.loaded {
         println!("{label} is not loaded");
         return Ok(());
@@ -500,7 +690,7 @@ struct StatusReport {
 
 fn cmd_status(label: &str, args: StatusArgs) -> anyhow::Result<()> {
     let path = plist_path(label)?;
-    let job = job_state(label)?;
+    let job = job_state(label, deadline(10))?;
     let health = job.running.then(|| probe_health(&path)).flatten();
     let report = StatusReport {
         label: label.to_string(),
@@ -567,12 +757,28 @@ fn routable(bind: &str) -> Option<String> {
 /// installed plist, so status reflects the service that was actually
 /// installed rather than a default.
 fn probe_health(plist: &Path) -> Option<serde_json::Value> {
+    probe_health_with_timeout(plist, std::time::Duration::from_secs(2))
+}
+
+fn probe_health_by(plist: &Path, deadline: std::time::Instant) -> Option<serde_json::Value> {
+    probe_health_with_timeout(plist, probe_timeout(deadline)?)
+}
+
+fn probe_timeout(deadline: std::time::Instant) -> Option<std::time::Duration> {
+    let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+    (!remaining.is_zero()).then(|| remaining.min(std::time::Duration::from_secs(2)))
+}
+
+fn probe_health_with_timeout(
+    plist: &Path,
+    timeout: std::time::Duration,
+) -> Option<serde_json::Value> {
     let bind = routable(&bind_address(plist)?)?;
     let url = format!("http://{bind}/api/health");
     // The probe runs inside a deadline-bounded poll, so it must not be able
     // to block on the operating system's own connect timeout.
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(2)))
+        .timeout_global(Some(timeout))
         .build()
         .into();
     agent
@@ -746,5 +952,119 @@ mod tests {
             "/Applications/Eidos.app/Contents/MacOS/eidos"
         )));
         assert!(!is_bundled(Path::new("/usr/local/bin/eidos")));
+    }
+
+    #[test]
+    fn an_expired_deadline_never_starts_a_readiness_probe() {
+        let mut probes = 0;
+        let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let ready = wait_until(expired, || {
+            probes += 1;
+            Ok(true)
+        })
+        .unwrap();
+
+        assert!(!ready);
+        assert_eq!(probes, 0);
+    }
+
+    #[test]
+    fn a_health_probe_is_capped_by_the_remaining_deadline() {
+        let near = probe_timeout(std::time::Instant::now() + std::time::Duration::from_millis(50))
+            .unwrap();
+        assert!(near <= std::time::Duration::from_millis(50));
+        assert!(near > std::time::Duration::ZERO);
+
+        let far =
+            probe_timeout(std::time::Instant::now() + std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(far, std::time::Duration::from_secs(2));
+        assert!(
+            probe_timeout(std::time::Instant::now() - std::time::Duration::from_millis(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_child_process_cannot_outlive_its_deadline() {
+        let started = std::time::Instant::now();
+        let result = command_output_by(
+            Command::new("/bin/sleep").arg("5"),
+            "test sleeper",
+            started + std::time::Duration::from_millis(30),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the timed-out child was not terminated promptly"
+        );
+    }
+
+    #[test]
+    fn bounded_child_output_is_collected_without_truncation() {
+        let output = command_output_by(
+            Command::new("/bin/sh").args(["-c", "printf stdout; printf stderr >&2"]),
+            "test output",
+            deadline(2),
+        )
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+    }
+
+    #[test]
+    fn rollback_restores_the_previous_plist_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("agent.plist");
+        std::fs::write(&plist, b"new configuration").unwrap();
+
+        restore_document(&plist, b"previous configuration").unwrap();
+
+        assert_eq!(std::fs::read(&plist).unwrap(), b"previous configuration");
+        assert!(!plist.with_extension("plist.rollback").exists());
+    }
+
+    #[test]
+    fn rollback_failures_are_never_hidden_by_the_original_error() {
+        let restored = replacement_error(anyhow::anyhow!("new agent failed"), Ok(())).to_string();
+        assert!(restored.contains("new agent failed"), "{restored}");
+        assert!(restored.contains("was restored"), "{restored}");
+
+        let failed = replacement_error(
+            anyhow::anyhow!("new agent failed"),
+            Err(anyhow::anyhow!("old agent failed")),
+        )
+        .to_string();
+        assert!(failed.contains("new agent failed"), "{failed}");
+        assert!(failed.contains("old agent failed"), "{failed}");
+    }
+
+    #[test]
+    fn rollback_restarts_a_loaded_agent_even_after_unload_confirmation_fails() {
+        let mut restart_attempts = 0;
+        let recovered = restore_loaded_state(
+            Some(anyhow::anyhow!("launchctl print failed")),
+            true,
+            || {
+                restart_attempts += 1;
+                Ok(())
+            },
+        );
+
+        assert!(recovered.is_ok());
+        assert_eq!(restart_attempts, 1);
+
+        let failed = restore_loaded_state(
+            Some(anyhow::anyhow!("launchctl print failed")),
+            true,
+            || Err(anyhow::anyhow!("bootstrap failed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(failed.contains("launchctl print failed"), "{failed}");
+        assert!(failed.contains("bootstrap failed"), "{failed}");
     }
 }
