@@ -144,6 +144,11 @@ o:<consumed>;g:<index generation>;q:<query fingerprint>[;t:<total>;x:<exact>];s:
 
 - Name/path matching is case-insensitive unless a case-sensitive modifier is
   used; case-sensitive modes are verified against the stored original text.
+- A path is stored and displayed the way its own source spells it, and a
+  path query works with either separator: `path:*\src\*` and `path:*/src/*`
+  find the same hit whichever host it came from. The one thing this costs is
+  that a backslash in a path query always reads as a separator, so a Unix file
+  whose *name* contains a literal backslash cannot be addressed with one.
 - Regexes are unanchored unless you write `^`/`$`. Substring, glob, and
   regex clauses on names and paths find candidates through folded trigrams
   and verify them. A regex is planned as a boolean combination of the

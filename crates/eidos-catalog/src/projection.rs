@@ -55,6 +55,8 @@ fn counted() {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionRow {
     pub entry_id: i64,
+    /// Separator this row's source uses, taken from the rendered path itself.
+    pub separator: char,
     pub object_id: ObjectId,
     pub source_id: SourceId,
     pub parent_id: Option<ObjectId>,
@@ -164,9 +166,13 @@ fn row_from(
     ancestors: Vec<ObjectId>,
     desc_extensions: Vec<String>,
 ) -> rusqlite::Result<ProjectionRow> {
+    // How this row's source spells a path, so a consumer can tell a separator
+    // from a backslash that happens to be part of a name.
+    let separator = crate::paths::separator(&path);
     let kind_s: String = r.get(5)?;
     let state_s: String = r.get(11)?;
     Ok(ProjectionRow {
+        separator,
         entry_id: r.get(0)?,
         object_id: ObjectId(r.get(1)?),
         source_id: SourceId(r.get(20)?),
