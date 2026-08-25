@@ -73,6 +73,7 @@ pub fn attr_bit(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eidos_domain::{Query, SizeField};
 
     #[test]
     fn roundtrip_common_queries() {
