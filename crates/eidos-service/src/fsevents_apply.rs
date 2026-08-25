@@ -141,7 +141,7 @@ impl PathTranslator<'_> {
             }
             // The entry names this object elsewhere. If that path still
             // exists it is a genuine hard link and must stay.
-            if self.entry_still_exists(parent_id, &entry.name) {
+            if self.entry_names_object(parent_id, &entry.name, object) {
                 continue;
             }
             events.push(ChangeEvent::Unlink {
@@ -153,19 +153,46 @@ impl PathTranslator<'_> {
         unlinked
     }
 
-    /// Whether the catalog's `(parent, name)` entry still names something on
-    /// disk. Used to tell a stale entry from a live hard link.
-    fn entry_still_exists(&self, parent_id: eidos_domain::ObjectId, name: &str) -> bool {
+    /// Whether the catalog's `(parent, name)` entry still names this object on
+    /// disk. This is what separates a stale entry from a live hard link, so it
+    /// has to be exact about the name rather than about the path.
+    ///
+    /// A path lookup alone is not exact enough on a case-insensitive volume:
+    /// after `mv Report.txt report.txt` the old path still resolves — to the
+    /// very same file — and believing it would leave the catalog holding both
+    /// spellings of one object. When the path resolves to this object, the
+    /// parent directory is read once to see whether the entry is really still
+    /// spelled that way.
+    fn entry_names_object(
+        &self,
+        parent_id: eidos_domain::ObjectId,
+        name: &str,
+        object: NativeKey,
+    ) -> bool {
         let Ok(Some(parent_path)) = self.catalog.render_path(parent_id) else {
             // Without a path the safest answer is "still there": a spurious
             // unlink loses data, while a missed one is repaired by the next
             // reconciliation.
             return true;
         };
-        Path::new(&parent_path)
-            .join(name)
-            .symlink_metadata()
-            .is_ok()
+        let parent_path = PathBuf::from(parent_path);
+        let Ok(entry) = self.lister.stat(&parent_path.join(name)) else {
+            return false;
+        };
+        match entry.native_id.map(NativeKey::from) {
+            // Some other object answers to that name now, so this object's
+            // entry under it is stale whatever the spelling.
+            Some(found) if found != object => false,
+            None => true,
+            Some(_) => match std::fs::read_dir(&parent_path) {
+                Ok(children) => children
+                    .filter_map(Result::ok)
+                    .any(|child| child.file_name().to_string_lossy() == name),
+                // The directory became unreadable between the two calls;
+                // keeping the entry is the conservative answer.
+                Err(_) => true,
+            },
+        }
     }
 
     /// Enumerate a directory that the catalog has never seen, emitting a

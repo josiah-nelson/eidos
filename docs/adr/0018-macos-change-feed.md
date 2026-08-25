@@ -61,6 +61,13 @@ deleting it would take a live subtree with it. What remains genuinely gone
 becomes an `Unlink` (a file may still have other links) or a `Delete` (a
 directory takes its subtree).
 
+**A stale entry is recognised by name, not by path.** After
+`mv Report.txt report.txt` on a case-insensitive volume the old path still
+resolves — to the very same file — so asking "does the old path exist?" leaves
+the catalog holding both spellings of one object. When the old path resolves to
+the object being relinked, the parent directory is read once to see whether the
+entry is really still spelled that way.
+
 **A directory the catalog has never seen is enumerated.** A subtree *moved
 into* the tree produces one notification for its new root and none for the
 children that came with it. Reading that subtree is bounded; a move too large

@@ -271,6 +271,48 @@ fn live_changes_reach_the_catalog() {
 }
 
 #[test]
+fn a_rename_that_only_changes_case_replaces_the_entry() {
+    // On a case-insensitive volume the old path still resolves after
+    // `mv Report.txt report.txt` - to the same file - so "does the old path
+    // exist?" is the wrong question. Asking it leaves the catalog holding
+    // both spellings of one object.
+    let e = env();
+    if !has_event_store(&e.root) {
+        return;
+    }
+    let state = open_state(&e.data);
+    let sid = add_source(&state, &e.root);
+    scan_and_watch(&state, sid);
+
+    std::fs::write(e.root.join("Report.txt"), b"one").unwrap();
+    wait_until(VISIBLE, || exists(&state, sid, "Report.txt")).expect("create visible");
+    let id = id_of(&state, sid, "Report.txt");
+
+    std::fs::rename(e.root.join("Report.txt"), e.root.join("report.txt")).unwrap();
+    wait_until(VISIBLE, || {
+        state
+            .catalog
+            .entries_for_object(id)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == "report.txt")
+    })
+    .expect("the new spelling must be catalogued");
+    let names: Vec<String> = state
+        .catalog
+        .entries_for_object(id)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["report.txt".to_string()],
+        "one file must not be catalogued under two spellings"
+    );
+}
+
+#[test]
 fn a_subtree_moved_in_is_enumerated_not_guessed() {
     // Nothing inside a moved directory generates a notification of its own,
     // so the translator has to read the subtree it just learned about.
