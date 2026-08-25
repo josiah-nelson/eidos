@@ -54,15 +54,25 @@ jobs:
         run: .\installer\build.ps1 -SkipWeb -SkipRust -BinDir target\debug
       - name: Silent per-user install, health check, uninstall
         shell: pwsh
+        timeout-minutes: 10
         run: |
-          $setup = "installer\out\eidos-setup.exe"
+          # Start-Process -Wait would wait for the process tree, and a
+          # per-user install leaves eidos.exe running in the background;
+          # wait for the setup process alone.
+          function Run-Setup([string]$arguments) {
+            $p = [Diagnostics.Process]::Start("installer\out\eidos-setup.exe", $arguments)
+            if (-not $p.WaitForExit(480000)) { $p.Kill(); throw "setup did not finish: $arguments" }
+            return $p.ExitCode
+          }
           $log = "$env:RUNNER_TEMP\eidos-ci-install.log"
-          $p = Start-Process $setup -ArgumentList "/quiet /log `"$log`" EIDOS_PORT=7710" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Get-Content $log | Select-Object -Last 40; throw "install exit $($p.ExitCode)" }
-          $r = Invoke-WebRequest http://127.0.0.1:7710/api/health -UseBasicParsing
+          $code = Run-Setup "/quiet /log `"$log`" EIDOS_PORT=7710"
+          if ($code -ne 0) { Get-Content $log | Select-Object -Last 40; throw "install exit $code" }
+          $r = Invoke-WebRequest http://127.0.0.1:7710/api/health -UseBasicParsing -TimeoutSec 30
           if ($r.StatusCode -ne 200) { throw "health $($r.StatusCode)" }
-          $u = Start-Process $setup -ArgumentList "/quiet /uninstall EIDOS_REMOVE_DATA=1 /log `"$log.uninstall`"" -Wait -PassThru
-          if ($u.ExitCode -ne 0) { Get-Content "$log.uninstall" | Select-Object -Last 40; throw "uninstall exit $($u.ExitCode)" }
+          Get-Process eidos | Format-Table Id,Path -AutoSize
+          $code = Run-Setup "/quiet /uninstall EIDOS_REMOVE_DATA=1 /log `"$log.uninstall`""
+          if ($code -ne 0) { Get-Content "$log.uninstall" | Select-Object -Last 40; throw "uninstall exit $code" }
+          if (Get-Process eidos -ErrorAction SilentlyContinue) { throw "eidos.exe still running after uninstall" }
           if (Test-Path "$env:LOCALAPPDATA\eidos") { throw "data directory left behind" }
           if (Test-Path "$env:LOCALAPPDATA\Programs\eidos") { throw "program directory left behind" }
       - uses: actions/upload-artifact@v4
