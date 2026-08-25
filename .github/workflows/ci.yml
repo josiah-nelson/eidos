@@ -25,6 +25,21 @@ jobs:
       - run: git diff --exit-code -- web/src/generated/api.ts
       - run: cargo test
 
+  rust-macos:
+    name: rust (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      # The macOS adapters (getattrlistbulk enumeration, the FSEvents feed)
+      # only exist on this lane, and the shared filesystem and change
+      # contracts must hold on both platforms rather than on Windows alone.
+      - run: cargo test
+
   web:
     name: web
     runs-on: ubuntu-latest
