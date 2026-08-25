@@ -194,9 +194,47 @@ pub struct AdmissionState {
     pub source_id: SourceId,
     pub epoch: SourceEpoch,
     pub applied_seq: u64,
+    /// History chain hash at `applied_seq`: every batch must resume from
+    /// exactly this point with exactly this hash, so a source restored to an
+    /// older state that then outruns the cursor is fenced rather than
+    /// silently merged. Required on load: durable state recorded before
+    /// chains existed cannot be trusted to resume and must not be
+    /// reinterpreted as genesis.
+    pub applied_chain: ChainHash,
     pending_epoch: Option<SourceEpoch>,
     #[serde(default)]
     retired_epochs: BTreeSet<SourceEpoch>,
+}
+
+/// Hash chain over a source incarnation's sequence: `chain(0)` is all
+/// zeros and `chain(n) = blake3(chain(n-1) || object || generation ||
+/// value-or-tombstone)`. Two histories that share a prefix share its hashes
+/// and differ from the first divergent sequence on.
+pub type ChainHash = [u8; 32];
+
+pub const CHAIN_GENESIS: ChainHash = [0u8; 32];
+
+pub fn chain_next(
+    previous: &ChainHash,
+    object: i64,
+    generation: u64,
+    value: Option<&[u8]>,
+) -> ChainHash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(previous);
+    hasher.update(&object.to_le_bytes());
+    hasher.update(&generation.to_le_bytes());
+    match value {
+        Some(bytes) => {
+            hasher.update(&[1]);
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    *hasher.finalize().as_bytes()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,9 +260,21 @@ pub enum HelloDecision {
 pub enum BatchDecision {
     Apply,
     AlreadyApplied,
+    /// The batch was cut before the cursor; ask for an exact resume rather
+    /// than merging an interval whose start we cannot verify.
+    Stale {
+        applied_seq: u64,
+    },
     Gap {
         expected_at_most: u64,
         received: u64,
+    },
+    /// Same epoch, same cursor, different history: the source was rewound
+    /// and rewritten past our watermark.
+    HistoryFork {
+        applied_seq: u64,
+        expected: ChainHash,
+        offered: ChainHash,
     },
     FullResyncRequired,
 }
@@ -235,6 +285,7 @@ impl AdmissionState {
             source_id,
             epoch,
             applied_seq: 0,
+            applied_chain: CHAIN_GENESIS,
             pending_epoch: None,
             retired_epochs: BTreeSet::new(),
         }
@@ -281,6 +332,7 @@ impl AdmissionState {
         &self,
         epoch: SourceEpoch,
         after_seq: u64,
+        after_chain: &ChainHash,
         through_seq: u64,
     ) -> BatchDecision {
         if epoch != self.epoch || self.pending_epoch.is_some() {
@@ -295,20 +347,42 @@ impl AdmissionState {
                 received: after_seq,
             };
         }
+        if after_seq < self.applied_seq {
+            return BatchDecision::Stale {
+                applied_seq: self.applied_seq,
+            };
+        }
+        if *after_chain != self.applied_chain {
+            return BatchDecision::HistoryFork {
+                applied_seq: self.applied_seq,
+                expected: self.applied_chain,
+                offered: *after_chain,
+            };
+        }
         BatchDecision::Apply
     }
 
-    pub fn applied(&mut self, through_seq: u64) {
-        self.applied_seq = self.applied_seq.max(through_seq);
+    /// Advance to `through_seq` with the chain hash certified for it.
+    pub fn applied(&mut self, through_seq: u64, through_chain: ChainHash) {
+        if through_seq > self.applied_seq {
+            self.applied_seq = through_seq;
+            self.applied_chain = through_chain;
+        }
     }
 
-    pub fn snapshot_applied(&mut self, epoch: SourceEpoch, through_seq: u64) -> bool {
+    pub fn snapshot_applied(
+        &mut self,
+        epoch: SourceEpoch,
+        through_seq: u64,
+        through_chain: ChainHash,
+    ) -> bool {
         if self.pending_epoch != Some(epoch) {
             return false;
         }
         self.retired_epochs.insert(self.epoch);
         self.epoch = epoch;
         self.applied_seq = through_seq;
+        self.applied_chain = through_chain;
         self.pending_epoch = None;
         true
     }
@@ -361,7 +435,8 @@ mod tests {
     #[test]
     fn admission_fences_rewind_gap_duplicate_and_epoch_change() {
         let mut state = AdmissionState::new(SourceId::new(3), epoch(1));
-        state.applied(8);
+        let h8 = [8u8; 32];
+        state.applied(8, h8);
         assert_eq!(
             state.admit_hello(epoch(1), 7),
             HelloDecision::RejectAndAlarm {
@@ -370,25 +445,41 @@ mod tests {
             }
         );
         assert_eq!(
-            state.admit_batch(epoch(1), 0, 8),
+            state.admit_batch(epoch(1), 0, &CHAIN_GENESIS, 8),
             BatchDecision::AlreadyApplied
         );
         assert_eq!(
-            state.admit_batch(epoch(1), 9, 10),
+            state.admit_batch(epoch(1), 9, &h8, 10),
             BatchDecision::Gap {
                 expected_at_most: 8,
                 received: 9
             }
+        );
+        assert_eq!(
+            state.admit_batch(epoch(1), 8, &[9u8; 32], 12),
+            BatchDecision::HistoryFork {
+                applied_seq: 8,
+                expected: h8,
+                offered: [9u8; 32]
+            }
+        );
+        assert_eq!(
+            state.admit_batch(epoch(1), 5, &CHAIN_GENESIS, 12),
+            BatchDecision::Stale { applied_seq: 8 }
+        );
+        assert_eq!(
+            state.admit_batch(epoch(1), 8, &h8, 12),
+            BatchDecision::Apply
         );
         assert!(matches!(
             state.admit_hello(epoch(2), 1),
             HelloDecision::FullResync { .. }
         ));
         assert_eq!(
-            state.admit_batch(epoch(2), 0, 1),
+            state.admit_batch(epoch(2), 0, &CHAIN_GENESIS, 1),
             BatchDecision::FullResyncRequired
         );
-        assert!(state.snapshot_applied(epoch(2), 1));
+        assert!(state.snapshot_applied(epoch(2), 1, [1u8; 32]));
         assert_eq!(state.epoch, epoch(2));
         assert_eq!(state.applied_seq, 1);
         assert_eq!(
@@ -405,7 +496,8 @@ mod tests {
         for applied in 0..32 {
             for offered in 0..48 {
                 let mut state = AdmissionState::new(SourceId::new(9), epoch(1));
-                state.applied(applied);
+                let chain = [applied as u8; 32];
+                state.applied(applied, chain);
                 let hello = state.admit_hello(epoch(1), offered);
                 if offered < applied {
                     assert!(matches!(hello, HelloDecision::RejectAndAlarm { .. }));
@@ -413,15 +505,19 @@ mod tests {
                     assert_eq!(hello, HelloDecision::Incremental { after_seq: applied });
                 }
                 assert_eq!(
-                    state.admit_batch(epoch(1), applied + 1, applied + 2),
+                    state.admit_batch(epoch(1), applied + 1, &chain, applied + 2),
                     BatchDecision::Gap {
                         expected_at_most: applied,
                         received: applied + 1
                     }
                 );
                 assert_eq!(
-                    state.admit_batch(epoch(1), 0, applied),
+                    state.admit_batch(epoch(1), 0, &CHAIN_GENESIS, applied),
                     BatchDecision::AlreadyApplied
+                );
+                assert_eq!(
+                    state.admit_batch(epoch(1), applied, &chain, applied + 1),
+                    BatchDecision::Apply
                 );
             }
         }

@@ -20,8 +20,10 @@ const HORIZON_NS: u64 = 2_000_000_000;
 const QUIET_NS: u64 = 3_000_000_000;
 const MAX_STEPS: u64 = 100_000;
 
+const EPOCH_SEED: u64 = 0x1234;
+
 fn epoch() -> SourceEpoch {
-    SourceEpoch::random_v4(0x1234, 0x5678)
+    SourceEpoch::random_v4(EPOCH_SEED, 0)
 }
 
 fn workload() -> Vec<LocalMutation> {
@@ -68,7 +70,7 @@ fn factories(script: Vec<LocalMutation>, durable_before_ack: bool) -> Vec<NodeFa
     vec![
         Box::new(move || {
             Box::new(
-                Shipper::new(SOURCE_ID, epoch(), CENTRAL_NODE, script.clone())
+                Shipper::from_mutations(SOURCE_ID, EPOCH_SEED, CENTRAL_NODE, script.clone())
                     .with_repair_leaf_bits(8),
             ) as Box<dyn Node<Msg = SyncMsg>>
         }),
@@ -162,7 +164,7 @@ fn simulated_three_week_offline_reconnect_uses_cursor_and_compacted_suffix() {
     let protocol_factories: Vec<NodeFactory<SyncMsg>> = vec![
         Box::new(move || {
             Box::new(
-                Shipper::new(SOURCE_ID, epoch(), CENTRAL_NODE, source_script.clone())
+                Shipper::from_mutations(SOURCE_ID, EPOCH_SEED, CENTRAL_NODE, source_script.clone())
                     .with_tick_ns(SIX_HOURS_NS),
             ) as _
         }),
@@ -239,6 +241,9 @@ fn truncated_log_repairs_divergent_merkle_leaves_without_a_recrawl() {
         source: SOURCE_ID,
         epoch: epoch(),
         outbox,
+        incarnation: 0,
+        script_index: 0,
+        checkpoint: None,
     };
     let factories: Vec<NodeFactory<SyncMsg>> = vec![
         Box::new(move || {
