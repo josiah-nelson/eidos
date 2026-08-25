@@ -26,18 +26,69 @@ fn native_identity(_: &std::fs::Metadata) -> Option<eidos_domain::NativeIdentity
 }
 
 #[cfg(windows)]
-fn metadata_attributes(metadata: &std::fs::Metadata) -> FileAttributes {
+fn metadata_attributes(
+    metadata: &std::fs::Metadata,
+    _name: &str,
+    _kind: ObjectKind,
+) -> FileAttributes {
     use std::os::windows::fs::MetadataExt;
     FileAttributes(metadata.file_attributes())
 }
 
-#[cfg(not(windows))]
-fn metadata_attributes(metadata: &std::fs::Metadata) -> FileAttributes {
+/// macOS keeps hidden, compressed, immutable, and cloud-placeholder state in
+/// BSD flags, so the fallback path decodes them exactly the way the native
+/// lister does. Directory and reparse bits are added by the caller's kind.
+#[cfg(target_os = "macos")]
+fn metadata_attributes(
+    metadata: &std::fs::Metadata,
+    name: &str,
+    kind: ObjectKind,
+) -> FileAttributes {
+    use std::os::unix::fs::MetadataExt;
+    let flags = std::os::macos::fs::MetadataExt::st_flags(metadata);
+    crate::mac::attributes_from(kind, name, Some(metadata.mode()), Some(flags))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn metadata_attributes(
+    metadata: &std::fs::Metadata,
+    name: &str,
+    _kind: ObjectKind,
+) -> FileAttributes {
+    let mut attributes = FileAttributes::default();
+    if metadata.permissions().readonly() {
+        attributes.0 |= FileAttributes::READONLY;
+    }
+    // Leading-dot names are hidden by convention on every Unix desktop.
+    if name.starts_with('.') {
+        attributes.0 |= FileAttributes::HIDDEN;
+    }
+    attributes
+}
+
+#[cfg(not(any(windows, unix)))]
+fn metadata_attributes(
+    metadata: &std::fs::Metadata,
+    _name: &str,
+    _kind: ObjectKind,
+) -> FileAttributes {
     let mut attributes = FileAttributes::default();
     if metadata.permissions().readonly() {
         attributes.0 |= FileAttributes::READONLY;
     }
     attributes
+}
+
+/// Classify one object from its file type, adding the reparse/directory bits
+/// the portable contract expects.
+fn classify(file_type: std::fs::FileType) -> ObjectKind {
+    if file_type.is_symlink() {
+        ObjectKind::Reparse
+    } else if file_type.is_dir() {
+        ObjectKind::Directory
+    } else {
+        ObjectKind::File
+    }
 }
 
 pub struct StdLister;
@@ -60,17 +111,8 @@ impl DirectoryLister for StdLister {
                     continue;
                 }
             };
-            let ft = md.file_type();
-            let mut attributes = metadata_attributes(&md);
-            let kind = if ft.is_symlink() {
-                attributes.0 |= FileAttributes::REPARSE_POINT;
-                ObjectKind::Reparse
-            } else if ft.is_dir() {
-                attributes.0 |= FileAttributes::DIRECTORY;
-                ObjectKind::Directory
-            } else {
-                ObjectKind::File
-            };
+            let kind = classify(md.file_type());
+            let attributes = metadata_attributes(&md, &name, kind);
             let size = if kind == ObjectKind::File {
                 md.len()
             } else {
@@ -104,22 +146,14 @@ impl DirectoryLister for StdLister {
 
     fn stat(&self, path: &Path) -> Result<RawEntry, ScanError> {
         let md = std::fs::symlink_metadata(path).map_err(|e| ScanError::from_io(path, &e))?;
-        let ft = md.file_type();
-        let mut attributes = metadata_attributes(&md);
-        let kind = if ft.is_symlink() {
-            attributes.0 |= FileAttributes::REPARSE_POINT;
-            ObjectKind::Reparse
-        } else if ft.is_dir() {
-            attributes.0 |= FileAttributes::DIRECTORY;
-            ObjectKind::Directory
-        } else {
-            ObjectKind::File
-        };
+        let kind = classify(md.file_type());
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let attributes = metadata_attributes(&md, &name, kind);
         Ok(RawEntry {
-            name: path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            name,
             name_lossy: false,
             kind,
             attributes,
