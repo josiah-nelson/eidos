@@ -5,6 +5,7 @@
 /installer/**/bin/
 /installer/**/obj/
 /installer/out/
+/dist/
 
 # Local runtime state (catalog, indexes) and raw benchmark output
 /data
@@ -24,3 +25,8 @@
 # Secrets and local overrides
 .env
 *.local
+*.p12
+*.p8
+*.provisionprofile
+*.mobileprovision
+*.keychain-db
