@@ -1,6 +1,6 @@
 # ADR-0015: The source sync ledger lives in the catalog, storing touches not images
 
-Status: proposed
+Status: accepted
 Date: 2026-08-24
 Milestone: post-Sprint-1 hardening, track H2
 
