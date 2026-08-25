@@ -815,6 +815,29 @@ impl Parser {
     }
 }
 
+/// Whether `value` survives the lexer and term grammar as one literal word
+/// when written bare, i.e. without quotes. This is the contract the
+/// renderer relies on: anything false here is rendered quoted.
+///
+/// The rules mirror `lex` and `term`: whitespace and parentheses end a
+/// word; `"` opens a quote; `:` separates an attribute from its value; `=`
+/// and `~` are mode prefixes and also make a following `/` open a regex;
+/// a leading `/` opens a regex and a leading `-` is negation; `*` and `?`
+/// turn a value into a glob; `\` is the quote escape; `,` separates list
+/// values; and the Boolean keywords are operators, not terms.
+pub fn bare_value_is_literal(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['-', '/'])
+        && !matches!(value, "NOT" | "!" | "OR" | "|" | "AND" | "&&")
+        && !value.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '(' | ')' | '"' | ':' | '=' | '~' | '*' | '?' | '\\' | ','
+                )
+        })
+}
+
 fn unquote(s: &str) -> String {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
         s[1..s.len() - 1].to_string()

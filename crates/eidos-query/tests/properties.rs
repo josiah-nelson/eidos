@@ -236,6 +236,77 @@ proptest! {
     }
 }
 
+/// The renderer's bare/quoted decision is `parser::bare_value_is_literal`.
+/// Check it against the real lexer: every value it calls literal must lex
+/// back as that exact `ext:` value, and every value it rejects must either
+/// fail to parse bare or parse as something else, so quoting is required.
+#[test]
+fn bare_literal_predicate_matches_the_lexer() {
+    let specials = "()\":=~*?\\,-/ \t";
+    let mut samples: Vec<String> = vec!["abc".into(), "a1_b".into(), "é".into()];
+    for c in specials.chars() {
+        samples.push(format!("a{c}b"));
+        samples.push(format!("{c}ab"));
+        samples.push(format!("ab{c}"));
+    }
+    samples.extend(["NOT", "OR", "AND", "!", "|", "&&"].map(String::from));
+    for v in samples {
+        if v.contains(',') {
+            // A comma is the list separator and is split before quotes are
+            // removed, so no `ext:` value can contain one; the parser never
+            // produces such an AST and the renderer never meets it.
+            continue;
+        }
+        let bare = parse_at(&format!("ext:{v}"), NOW).map(|p| p.query);
+        let expected = Query::Extension {
+            values: vec![v.to_ascii_lowercase()],
+        };
+        if eidos_query::parser::bare_value_is_literal(&v) {
+            assert_eq!(
+                bare.ok(),
+                Some(expected.clone()),
+                "{v:?} is literal but did not lex as one value"
+            );
+        }
+        // Whether bare or quoted, the renderer's choice must round-trip.
+        // (The predicate may be stricter than one context needs: `a:b` is
+        // literal inside an `ext:` value but an attribute as a bare word.)
+        let rendered = render(&expected);
+        assert_eq!(
+            parse_at(&rendered, NOW).map(|p| p.query).ok(),
+            Some(expected),
+            "{v:?} rendered as {rendered:?}"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 512,
+        rng_seed: RngSeed::Fixed(0x05ee_de17),
+        ..ProptestConfig::default()
+    })]
+
+    /// Any extension value the parser can produce renders back to itself,
+    /// whatever characters it contains.
+    #[test]
+    fn extension_values_round_trip_through_render(raw in unicode_value()) {
+        let value: String = raw
+            .to_ascii_lowercase()
+            .trim_start_matches('.')
+            .chars()
+            .filter(|c| *c != ',')
+            .collect();
+        prop_assume!(!value.is_empty() && value != "none" && value != "-");
+        let query = Query::Extension { values: vec![value.clone(), "cs".into()] };
+        let rendered = render(&query);
+        let reparsed = parse_at(&rendered, NOW)
+            .unwrap_or_else(|e| panic!("{value:?} rendered as {rendered:?}: {e}"))
+            .query;
+        prop_assert_eq!(reparsed, query, "{:?}", rendered);
+    }
+}
+
 #[test]
 fn extension_values_with_regex_openers_survive_render() {
     // Hosted fuzz run: an `ext:` value containing `~/` rendered bare, and the
