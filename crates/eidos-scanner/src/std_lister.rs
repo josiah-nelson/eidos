@@ -25,6 +25,21 @@ fn native_identity(_: &std::fs::Metadata) -> Option<eidos_domain::NativeIdentity
     None
 }
 
+#[cfg(windows)]
+fn metadata_attributes(metadata: &std::fs::Metadata) -> FileAttributes {
+    use std::os::windows::fs::MetadataExt;
+    FileAttributes(metadata.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn metadata_attributes(metadata: &std::fs::Metadata) -> FileAttributes {
+    let mut attributes = FileAttributes::default();
+    if metadata.permissions().readonly() {
+        attributes.0 |= FileAttributes::READONLY;
+    }
+    attributes
+}
+
 pub struct StdLister;
 
 impl DirectoryLister for StdLister {
@@ -46,13 +61,7 @@ impl DirectoryLister for StdLister {
                 }
             };
             let ft = md.file_type();
-            #[cfg(windows)]
-            let mut attributes = {
-                use std::os::windows::fs::MetadataExt;
-                FileAttributes(md.file_attributes())
-            };
-            #[cfg(not(windows))]
-            let mut attributes = FileAttributes::default();
+            let mut attributes = metadata_attributes(&md);
             let kind = if ft.is_symlink() {
                 attributes.0 |= FileAttributes::REPARSE_POINT;
                 ObjectKind::Reparse
@@ -96,9 +105,12 @@ impl DirectoryLister for StdLister {
     fn stat(&self, path: &Path) -> Result<RawEntry, ScanError> {
         let md = std::fs::symlink_metadata(path).map_err(|e| ScanError::from_io(path, &e))?;
         let ft = md.file_type();
+        let mut attributes = metadata_attributes(&md);
         let kind = if ft.is_symlink() {
+            attributes.0 |= FileAttributes::REPARSE_POINT;
             ObjectKind::Reparse
         } else if ft.is_dir() {
+            attributes.0 |= FileAttributes::DIRECTORY;
             ObjectKind::Directory
         } else {
             ObjectKind::File
@@ -110,7 +122,7 @@ impl DirectoryLister for StdLister {
                 .unwrap_or_default(),
             name_lossy: false,
             kind,
-            attributes: FileAttributes::default(),
+            attributes,
             size: if kind == ObjectKind::File {
                 md.len()
             } else {
