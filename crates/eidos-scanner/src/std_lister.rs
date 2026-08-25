@@ -25,37 +25,42 @@ fn native_identity(_: &std::fs::Metadata) -> Option<eidos_domain::NativeIdentity
     None
 }
 
+/// Kind and attributes of one object, decided the way this platform's native
+/// adapter decides them. Windows classifies from the attribute bits, because
+/// only a *directory* reparse point is a `Reparse` object there — a file
+/// symlink or a cloud-backed file is a file with real bytes, and content
+/// policy judges it by reparse tag. Unix classifies from the file type,
+/// because a symlink there has no data of its own.
 #[cfg(windows)]
-fn metadata_attributes(
-    metadata: &std::fs::Metadata,
-    _name: &str,
-    _kind: ObjectKind,
-) -> FileAttributes {
+fn classify(metadata: &std::fs::Metadata, _name: &str) -> (ObjectKind, FileAttributes) {
     use std::os::windows::fs::MetadataExt;
-    FileAttributes(metadata.file_attributes())
+    let attributes = FileAttributes(metadata.file_attributes());
+    (crate::win::object_kind(attributes), attributes)
 }
 
 /// macOS keeps hidden, compressed, immutable, and cloud-placeholder state in
 /// BSD flags, so the fallback path decodes them exactly the way the native
-/// lister does. Directory and reparse bits are added by the caller's kind.
+/// lister does.
 #[cfg(target_os = "macos")]
-fn metadata_attributes(
-    metadata: &std::fs::Metadata,
-    name: &str,
-    kind: ObjectKind,
-) -> FileAttributes {
+fn classify(metadata: &std::fs::Metadata, name: &str) -> (ObjectKind, FileAttributes) {
     use std::os::unix::fs::MetadataExt;
+    let kind = unix_kind(metadata.file_type());
     let flags = std::os::macos::fs::MetadataExt::st_flags(metadata);
-    crate::mac::attributes_from(kind, name, Some(metadata.mode()), Some(flags))
+    (
+        kind,
+        crate::mac::attributes_from(kind, name, Some(metadata.mode()), Some(flags)),
+    )
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn metadata_attributes(
-    metadata: &std::fs::Metadata,
-    name: &str,
-    _kind: ObjectKind,
-) -> FileAttributes {
+fn classify(metadata: &std::fs::Metadata, name: &str) -> (ObjectKind, FileAttributes) {
+    let kind = unix_kind(metadata.file_type());
     let mut attributes = FileAttributes::default();
+    match kind {
+        ObjectKind::Directory => attributes.0 |= FileAttributes::DIRECTORY,
+        ObjectKind::Reparse => attributes.0 |= FileAttributes::REPARSE_POINT,
+        _ => {}
+    }
     if metadata.permissions().readonly() {
         attributes.0 |= FileAttributes::READONLY;
     }
@@ -63,25 +68,29 @@ fn metadata_attributes(
     if name.starts_with('.') {
         attributes.0 |= FileAttributes::HIDDEN;
     }
-    attributes
+    (kind, attributes)
 }
 
 #[cfg(not(any(windows, unix)))]
-fn metadata_attributes(
-    metadata: &std::fs::Metadata,
-    _name: &str,
-    _kind: ObjectKind,
-) -> FileAttributes {
+fn classify(metadata: &std::fs::Metadata, _name: &str) -> (ObjectKind, FileAttributes) {
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_dir() {
+        ObjectKind::Directory
+    } else {
+        ObjectKind::File
+    };
     let mut attributes = FileAttributes::default();
+    if kind == ObjectKind::Directory {
+        attributes.0 |= FileAttributes::DIRECTORY;
+    }
     if metadata.permissions().readonly() {
         attributes.0 |= FileAttributes::READONLY;
     }
-    attributes
+    (kind, attributes)
 }
 
-/// Classify one object from its file type, adding the reparse/directory bits
-/// the portable contract expects.
-fn classify(file_type: std::fs::FileType) -> ObjectKind {
+#[cfg(unix)]
+fn unix_kind(file_type: std::fs::FileType) -> ObjectKind {
     if file_type.is_symlink() {
         ObjectKind::Reparse
     } else if file_type.is_dir() {
@@ -111,8 +120,7 @@ impl DirectoryLister for StdLister {
                     continue;
                 }
             };
-            let kind = classify(md.file_type());
-            let attributes = metadata_attributes(&md, &name, kind);
+            let (kind, attributes) = classify(&md, &name);
             let size = if kind == ObjectKind::File {
                 md.len()
             } else {
@@ -146,12 +154,11 @@ impl DirectoryLister for StdLister {
 
     fn stat(&self, path: &Path) -> Result<RawEntry, ScanError> {
         let md = std::fs::symlink_metadata(path).map_err(|e| ScanError::from_io(path, &e))?;
-        let kind = classify(md.file_type());
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let attributes = metadata_attributes(&md, &name, kind);
+        let (kind, attributes) = classify(&md, &name);
         Ok(RawEntry {
             name,
             name_lossy: false,

@@ -68,10 +68,18 @@ cursor is a coalescing event id, and each adapter keeps its own.
   developer tree it walks in 88 ms against 430 ms for `readdir` + `lstat`
   (warm cache, eight threads, identical entry counts and error counts).
 - Every scanner adapter a platform can use now runs the same
-  temporary-filesystem contract suite, so a native fast path cannot silently
-  diverge from the portable reference. Setting `EIDOS_TEST_VOLUME` runs that
-  suite on another volume, which is how case-sensitive APFS behaviour is
-  covered without assuming such a volume exists.
+  temporary-filesystem contract suite, and one test asserts that two adapters
+  on one host describe the same tree identically, so a native fast path cannot
+  silently diverge from the portable reference. Setting `EIDOS_TEST_VOLUME`
+  runs that suite on another volume, which is how case-sensitive APFS
+  behaviour is covered without assuming such a volume exists.
+- The suite immediately found such a divergence on Windows: the portable
+  lister classified a file symlink from its file type (`Reparse`) while the
+  Windows adapter classifies from the attribute bits, where only a *directory*
+  reparse point is a `Reparse` object and a file symlink is a file whose bytes
+  content policy judges by reparse tag. The portable lister now applies each
+  platform's own rule, and the shared contract asserts what holds everywhere:
+  a symlink carries the reparse attribute and is never walked into.
 - Case sensitivity is a recorded per-volume fact rather than an assumption.
   Path equality still must not be assumed either way: the same host can mount
   case-sensitive and case-insensitive APFS volumes at once.

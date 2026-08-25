@@ -47,6 +47,7 @@ fn listers() -> Vec<(&'static str, Box<dyn DirectoryLister>)> {
 struct EntryView {
     kind: ObjectKind,
     size: u64,
+    attributes: eidos_domain::FileAttributes,
     native_id: Option<NativeIdentity>,
 }
 
@@ -70,6 +71,7 @@ fn snapshot(root: &Path, lister: &dyn DirectoryLister) -> (BTreeMap<PathBuf, Ent
                         EntryView {
                             kind: child.kind,
                             size: child.size,
+                            attributes: child.attributes,
                             native_id: child.native_id,
                         },
                     );
@@ -163,10 +165,19 @@ fn rename_directory_move_hard_link_and_symlink() {
             "{adapter}: hard links share one identity"
         );
         if symlink_created {
-            assert_eq!(
-                entries[Path::new("symbolic-link.bin")].kind,
-                ObjectKind::Reparse,
-                "{adapter}"
+            // What a symlink *is* differs by platform: Unix reports an object
+            // with no data of its own, while Windows treats a file symlink as
+            // a file whose bytes are judged by reparse tag. What every
+            // platform must agree on is that it carries the reparse attribute
+            // and is never walked into.
+            let link = &entries[Path::new("symbolic-link.bin")];
+            assert!(
+                link.attributes.is_reparse(),
+                "{adapter}: a symlink is a reparse point"
+            );
+            assert!(
+                !link.attributes.is_directory(),
+                "{adapter}: a link to a file is not a directory"
             );
         }
     }
@@ -253,5 +264,47 @@ fn permission_failure_is_an_error_not_a_traversal() {
         let (_, errors) = snapshot(temporary.path(), lister.as_ref());
         std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(errors, 1, "{adapter}: an unreadable directory is one error");
+    }
+}
+
+/// The reason every adapter runs the same fixtures: two adapters on one host
+/// must describe one tree identically. Timestamps and allocation size are
+/// deliberately excluded — the portable lister cannot report allocation at
+/// all — and identity is compared only where both adapters produce one.
+#[test]
+fn adapters_describe_the_same_tree_identically() {
+    let temporary = fixture_root();
+    let root = temporary.path();
+    std::fs::create_dir_all(root.join("holly/inner")).unwrap();
+    std::fs::write(root.join("holly/inner/leaf.bin"), vec![7u8; 3000]).unwrap();
+    std::fs::write(root.join("holly/.dotted"), b"hidden by convention").unwrap();
+    std::fs::write(root.join("rowan.txt"), b"plain").unwrap();
+    make_symlink(Path::new("rowan.txt"), &root.join("rowan-link.txt"));
+
+    let mut adapters = listers().into_iter();
+    let (reference_name, reference_lister) = adapters.next().expect("at least one adapter");
+    let (reference, errors) = snapshot(root, reference_lister.as_ref());
+    assert_eq!(errors, 0, "{reference_name}");
+
+    for (adapter, lister) in adapters {
+        let (observed, errors) = snapshot(root, lister.as_ref());
+        assert_eq!(errors, 0, "{adapter}");
+        assert_eq!(
+            observed.keys().collect::<Vec<_>>(),
+            reference.keys().collect::<Vec<_>>(),
+            "{adapter} and {reference_name} must see the same tree"
+        );
+        for (path, entry) in &observed {
+            let expected = &reference[path];
+            assert_eq!(entry.kind, expected.kind, "{adapter}: kind of {path:?}");
+            assert_eq!(entry.size, expected.size, "{adapter}: size of {path:?}");
+            assert_eq!(
+                entry.attributes.0, expected.attributes.0,
+                "{adapter}: attributes of {path:?}"
+            );
+            if let (Some(observed_id), Some(expected_id)) = (entry.native_id, expected.native_id) {
+                assert_eq!(observed_id, expected_id, "{adapter}: identity of {path:?}");
+            }
+        }
     }
 }
