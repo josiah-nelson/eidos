@@ -56,17 +56,23 @@ impl Spool {
     }
 
     pub fn append(&mut self, record: &ObservationRecord) -> Result<(), SpoolError> {
+        self.append_at(record, utc_now_ns())
+    }
+
+    fn append_at(
+        &mut self,
+        record: &ObservationRecord,
+        retention_utc_ns: i64,
+    ) -> Result<(), SpoolError> {
         let body = serde_json::to_vec(record)?;
         let detailed = record.is_detailed();
-        let event_utc_ns = record.utc_ns();
         // Retention follows ingestion time, not an event-controlled clock. A
         // replayed, future-dated, or out-of-order anchor cannot move the ring's
         // cutoff and delete otherwise valid history.
-        let retention_utc_ns = utc_now_ns();
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO observations(utc_ns, detailed, bytes, body) VALUES (?1, ?2, ?3, ?4)",
-            params![event_utc_ns, detailed, body.len() as i64, body],
+            params![retention_utc_ns, detailed, body.len() as i64, body],
         )?;
         transaction.execute(
             "DELETE FROM observations WHERE detailed = 1 AND utc_ns < ?1",
@@ -219,10 +225,10 @@ mod tests {
         .unwrap();
         for sequence in 0..20 {
             spool
-                .append(&change(
+                .append_at(
+                    &change(i64::MAX - sequence, &format!("token-{sequence:02}")),
                     now - 1_900_000_000 + sequence * 100_000_000,
-                    &format!("token-{sequence:02}"),
-                ))
+                )
                 .unwrap();
         }
         let stats = spool.stats().unwrap();
@@ -250,6 +256,13 @@ mod tests {
             .append(&change(now - 500_000_000, "out-of-order"))
             .unwrap();
         assert_eq!(spool.stats().unwrap().detailed_records, 3);
+        spool
+            .append_at(
+                &change(i64::MAX, "later-future-anchor"),
+                now + 20_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(spool.stats().unwrap().detailed_records, 1);
     }
 
     #[test]
