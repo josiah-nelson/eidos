@@ -767,6 +767,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "libc",
+ "lru",
  "security-framework",
  "serde",
  "serde_json",
