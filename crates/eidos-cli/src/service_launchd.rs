@@ -415,6 +415,29 @@ fn restore_document(path: &Path, document: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Recover the old loaded state even when launchd could not confirm that the
+/// failed replacement finished unloading. A successful start is stronger
+/// evidence that service was restored than the intermediate query failure;
+/// if the start also fails, keep both causes for the operator.
+fn restore_loaded_state(
+    unload_failure: Option<anyhow::Error>,
+    was_loaded: bool,
+    restart: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !was_loaded {
+        return unload_failure.map_or(Ok(()), Err);
+    }
+    match restart() {
+        Ok(()) => Ok(()),
+        Err(restart) => match unload_failure {
+            Some(unload) => Err(anyhow::anyhow!(
+                "{unload:#}; restarting the previous LaunchAgent also failed: {restart:#}"
+            )),
+            None => Err(restart),
+        },
+    }
+}
+
 /// Restore both the old file and the old loaded/stopped state after a new
 /// configuration landed but failed to become healthy.
 fn rollback_replacement(
@@ -436,16 +459,13 @@ fn rollback_replacement(
         Err(error) => Some(error.context("checking the replacement agent during rollback")),
     };
     // Restore the durable file even when launchd could not confirm its
-    // in-memory state. A later manual start then still uses the known-good
-    // registration rather than the failed replacement.
+    // in-memory state, then actively recover the old loaded state. Returning
+    // before that restart would turn a transient state-query error into a
+    // persistent indexing outage.
     restore_document(path, document)?;
-    if let Some(error) = unload_failure {
-        return Err(error.context("the previous plist was restored on disk"));
-    }
-    if was_loaded {
-        start_by(label, deadline(120)).context("restarting the previous LaunchAgent")?;
-    }
-    Ok(())
+    restore_loaded_state(unload_failure, was_loaded, || {
+        start_by(label, deadline(120)).context("restarting the previous LaunchAgent")
+    })
 }
 
 fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
@@ -1020,5 +1040,31 @@ mod tests {
         .to_string();
         assert!(failed.contains("new agent failed"), "{failed}");
         assert!(failed.contains("old agent failed"), "{failed}");
+    }
+
+    #[test]
+    fn rollback_restarts_a_loaded_agent_even_after_unload_confirmation_fails() {
+        let mut restart_attempts = 0;
+        let recovered = restore_loaded_state(
+            Some(anyhow::anyhow!("launchctl print failed")),
+            true,
+            || {
+                restart_attempts += 1;
+                Ok(())
+            },
+        );
+
+        assert!(recovered.is_ok());
+        assert_eq!(restart_attempts, 1);
+
+        let failed = restore_loaded_state(
+            Some(anyhow::anyhow!("launchctl print failed")),
+            true,
+            || Err(anyhow::anyhow!("bootstrap failed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(failed.contains("launchctl print failed"), "{failed}");
+        assert!(failed.contains("bootstrap failed"), "{failed}");
     }
 }
