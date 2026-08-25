@@ -6,7 +6,7 @@
 //! to `FileIdBothDirectoryInfo` (64-bit IDs) and `FileFullDirectoryInfo` (no
 //! IDs) for filesystems/servers that reject the richer classes.
 
-use crate::entry::{DirectoryLister, DriveType, RawEntry, VolumeInfo};
+use crate::entry::{DirectoryLister, DriveType, NativeFeed, RawEntry, VolumeInfo};
 use crate::error::{classify_os_error, ScanError, ScanErrorKind};
 use eidos_domain::{FileAttributes, IdentityConfidence, NativeIdentity, ObjectKind, UnixNanos};
 use std::ffi::OsStr;
@@ -546,17 +546,33 @@ impl DirectoryLister for WinLister {
             )
         };
         let bytes_per_cluster = if ok != 0 { spc.saturating_mul(bps) } else { 0 };
+        let filesystem = wide_to_string(&fs_name);
+        let supports_usn = flags & FILE_SUPPORTS_USN_JOURNAL != 0;
+        // The USN journal only drives the incremental path on a local NTFS or
+        // ReFS volume; a remote share advertising the flag is still crawled.
+        let native_feed = if supports_usn
+            && matches!(drive_type, DriveType::Fixed | DriveType::Removable)
+            && (filesystem.eq_ignore_ascii_case("NTFS") || filesystem.eq_ignore_ascii_case("ReFS"))
+        {
+            NativeFeed::WindowsUsn
+        } else {
+            NativeFeed::None
+        };
         Ok(VolumeInfo {
             volume_serial: serial64,
-            filesystem: wide_to_string(&fs_name),
+            filesystem,
             volume_name: wide_to_string(&vol_name),
             fs_flags: flags,
             drive_type,
             supports_file_ids: flags & FILE_SUPPORTS_OPEN_BY_FILE_ID != 0,
-            supports_usn: flags & FILE_SUPPORTS_USN_JOURNAL != 0,
+            supports_usn,
             supports_hard_links: flags & FILE_SUPPORTS_HARD_LINKS != 0,
             supports_reparse_points: flags & FILE_SUPPORTS_REPARSE_POINTS != 0,
             supports_sparse: flags & FILE_SUPPORTS_SPARSE_FILES != 0,
+            // NTFS is case-preserving and case-insensitive as Windows opens
+            // it; per-directory case sensitivity is opt-in and not probed.
+            case_sensitive: Some(false),
+            native_feed,
             bytes_per_cluster,
             volume_root,
         })

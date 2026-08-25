@@ -749,6 +749,7 @@ dependencies = [
 name = "eidos-domain"
 version = "0.5.0-dev"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

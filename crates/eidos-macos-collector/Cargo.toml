@@ -21,7 +21,7 @@ clap = { workspace = true }
 eidos-observe = { workspace = true }
 futures-util = { workspace = true }
 getrandom = { workspace = true }
-libc = "0.2"
+libc = { workspace = true }
 lru = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

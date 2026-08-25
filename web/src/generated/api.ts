@@ -232,7 +232,7 @@ export type SourceDetail = { generations: Array<ScanGeneration>, root_aggregate:
 
 export type SourceId = ApiInt;
 
-export type SourceKind = "windows_local" | "windows_generic" | "smb";
+export type SourceKind = "windows_local" | "windows_generic" | "macos_local" | "macos_generic" | "smb";
 
 export type SourceRecord = { id: SourceId, host_id: HostId, name: string, kind: SourceKind, root_path: string, aliases: Array<string>, state: SourceState, state_reason: string | null, policy_version: number, root_object_id: ObjectId | null, published_generation: ApiInt | null, volume_id: VolumeId | null, preserve_offline: boolean, reconcile_interval_s: ApiInt | null, content_enabled: boolean, content_concurrency: number, checkpoint_kind: string | null, checkpoint_at: UnixNanos | null, last_scan_started_at: UnixNanos | null, last_scan_completed_at: UnixNanos | null, created_at: UnixNanos, updated_at: UnixNanos, };
 

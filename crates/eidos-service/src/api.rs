@@ -317,9 +317,8 @@ async fn add_source(
     let kind = match body.kind {
         Some(k) => k,
         None => match st.lister.volume_info(root) {
-            Ok(v) if v.is_remote() => SourceKind::Smb,
-            Ok(v) if v.is_native_local() => SourceKind::WindowsLocal,
-            _ => SourceKind::WindowsGeneric,
+            Ok(v) => v.source_kind(),
+            Err(_) => eidos_scanner::GENERIC_SOURCE_KIND,
         },
     };
     if st.catalog.find_source_by_name(&body.name)?.is_some() {

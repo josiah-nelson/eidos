@@ -119,12 +119,13 @@ impl Catalog {
             let now = UnixNanos::now().0;
             conn.execute(
                 "INSERT INTO volumes (host_id, volume_serial, filesystem, volume_name, drive_type, fs_flags, bytes_per_cluster,
-                    volume_root, supports_usn, supports_file_ids, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    volume_root, supports_usn, supports_file_ids, case_sensitive, native_feed, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(host_id, volume_serial) DO UPDATE SET filesystem = excluded.filesystem, volume_name = excluded.volume_name,
                     drive_type = excluded.drive_type, fs_flags = excluded.fs_flags, bytes_per_cluster = excluded.bytes_per_cluster,
                     volume_root = excluded.volume_root, supports_usn = excluded.supports_usn,
-                    supports_file_ids = excluded.supports_file_ids, updated_at = excluded.updated_at",
+                    supports_file_ids = excluded.supports_file_ids, case_sensitive = excluded.case_sensitive,
+                    native_feed = excluded.native_feed, updated_at = excluded.updated_at",
                 params![
                     host.0,
                     v.volume_serial as i64,
@@ -136,6 +137,12 @@ impl Catalog {
                     v.volume_root,
                     v.supports_usn as i64,
                     v.supports_file_ids as i64,
+                    match v.case_sensitive {
+                        Some(true) => "sensitive",
+                        Some(false) => "insensitive",
+                        None => "unknown",
+                    },
+                    v.native_feed.as_str(),
                     now
                 ],
             )?;

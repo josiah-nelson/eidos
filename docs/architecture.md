@@ -81,6 +81,7 @@ crates/
   catalog/            SQLite schema, transactions, migrations
   scanner-core/       platform-neutral scan/change contracts
   scanner-windows/    NTFS/USN and Windows directory/SMB adapters
+  scanner-macos/      macOS directory, APFS capability, and FSEvents adapters
   scheduler/          durable jobs, priorities, backpressure
   content/            sniffing, decoding, chunking, hashing
   archive/            virtual entries and archive budgets
@@ -114,9 +115,19 @@ ChunkId(object generation + extraction version + ordinal)
 ```
 
 On Windows, native identity is volume serial plus 128-bit file ID when
-available. NTFS IDs are stable across ordinary renames until deletion. Fallback
-sources use a confidence-bearing composite identity and must tolerate path-based
-replacement.
+available. NTFS IDs are stable across ordinary renames until deletion. On macOS
+it is the device number plus the 64-bit file id; those survive renames within a
+volume, but reuse, restore, and clone behaviour is unmeasured, so the identity
+is recorded at lower confidence rather than claimed to be stable across runs.
+Fallback sources use a confidence-bearing composite identity and must tolerate
+path-based replacement.
+
+Volume capabilities are recorded per volume, including case sensitivity and
+which native change feed the volume can drive (`windows_usn`, `macos_fsevents`,
+or none). Feeds share that enum, not their semantics: a USN cursor is a durable
+journal position and an FSEvents cursor is a coalescing event id, so each
+adapter keeps its own opaque, versioned cursor rather than pretending to a
+common one.
 
 Hard links produce multiple entries referencing one object. Content is indexed
 once per object generation. Symlinks/reparse points are entries with explicit

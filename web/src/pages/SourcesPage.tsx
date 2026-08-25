@@ -174,7 +174,7 @@ function SourceCard({
                   (s.watcher.last_batch_ms_ago != null ? ` · last ${Math.round(integerNumber(s.watcher.last_batch_ms_ago) / 1000)}s ago` : '')
                 : (s.watcher.detail ?? '')}
             </>
-          ) : source.kind === 'smb' || source.kind === 'windows_generic' ? (
+          ) : source.kind !== 'windows_local' ? (
             'periodic reconciliation'
           ) : (
             <span className="muted">not watching</span>
