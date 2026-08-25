@@ -124,7 +124,10 @@ path-based replacement.
 
 Volume capabilities are recorded per volume, including case sensitivity and
 which native change feed the volume can drive (`windows_usn`, `macos_fsevents`,
-or none). Feeds share that enum, not their semantics: a USN cursor is a durable
+or none). Path resolution follows the volume's case semantics: ingestion always
+stores the exact name, so a case-sensitive volume resolves `Report.txt` and
+`report.txt` to different objects, while an unknown or case-insensitive volume
+resolves either spelling to the one object. Feeds share that enum, not their semantics: a USN cursor is a durable
 journal position and an FSEvents cursor is a coalescing event id, so each
 adapter keeps its own opaque, versioned cursor rather than pretending to a
 common one.

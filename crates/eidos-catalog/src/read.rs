@@ -202,8 +202,26 @@ impl Catalog {
         self.with_reader(|conn| render_path_conn(conn, id))
     }
 
+    /// Whether names on this source's volume differ by case. Unknown volumes
+    /// and sources without one resolve case-insensitively, which is what
+    /// Windows and the default APFS layout do.
+    pub(crate) fn source_is_case_sensitive(conn: &Connection, source: SourceId) -> Result<bool> {
+        Ok(conn
+            .prepare_cached(
+                "SELECT v.case_sensitive FROM sources s JOIN volumes v ON v.volume_id = s.volume_id
+                 WHERE s.source_id = ?1",
+            )?
+            .query_row(params![source.0], |r| r.get::<_, String>(0))
+            .optional()?
+            .is_some_and(|value| value == "sensitive"))
+    }
+
     /// Resolve a path relative to the source root (components separated by
     /// `\` or `/`) to an object.
+    ///
+    /// A case-sensitive volume can hold `Report.txt` and `report.txt` side by
+    /// side, so the folded name is only a candidate filter there and the exact
+    /// name decides. The folded index still drives the lookup in both cases.
     pub fn resolve_relative(&self, source: SourceId, relative: &str) -> Result<Option<ObjectId>> {
         self.with_reader(|conn| {
             let src = get_source_conn(conn, source)?
@@ -212,15 +230,25 @@ impl Catalog {
                 Some(r) => r,
                 None => return Ok(None),
             };
-            let mut stmt = conn.prepare_cached(
+            let case_sensitive = Self::source_is_case_sensitive(conn, source)?;
+            let mut folded_stmt = conn.prepare_cached(
                 "SELECT object_id FROM entries WHERE source_id = ?1 AND parent_id = ?2 AND name_folded = ?3 AND deleted_at IS NULL LIMIT 1",
+            )?;
+            let mut exact_stmt = conn.prepare_cached(
+                "SELECT object_id FROM entries WHERE source_id = ?1 AND parent_id = ?2 AND name_folded = ?3 AND name = ?4 AND deleted_at IS NULL LIMIT 1",
             )?;
             for comp in relative.split(['\\', '/']).filter(|c| !c.is_empty()) {
                 let folded = crate::policy::fold(comp);
-                match stmt
-                    .query_row(params![source.0, cur.0, folded], |r| r.get::<_, i64>(0))
-                    .optional()?
-                {
+                let found = if case_sensitive {
+                    exact_stmt
+                        .query_row(params![source.0, cur.0, folded, comp], |r| r.get::<_, i64>(0))
+                        .optional()?
+                } else {
+                    folded_stmt
+                        .query_row(params![source.0, cur.0, folded], |r| r.get::<_, i64>(0))
+                        .optional()?
+                };
+                match found {
                     Some(next) => cur = ObjectId(next),
                     None => return Ok(None),
                 }
