@@ -15,10 +15,10 @@ use fsevent_stream::ffi::{
 use fsevent_stream::flags::StreamFlags;
 use fsevent_stream::stream::create_event_stream;
 use futures_util::StreamExt;
-use std::collections::HashMap;
 use std::ffi::{c_char, CString};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -26,6 +26,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const MAX_TRACKED_IDENTITIES: usize = 65_536;
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -213,6 +216,8 @@ fn set_admin_group(path: &Path) {
 
 fn handle_connection(mut stream: UnixStream, shared: &Shared) {
     let response = (|| -> anyhow::Result<Response> {
+        stream.set_read_timeout(Some(IPC_TIMEOUT))?;
+        stream.set_write_timeout(Some(IPC_TIMEOUT))?;
         let mut line = String::new();
         BufReader::new(&stream).take(65_537).read_line(&mut line)?;
         if line.len() > 65_536 {
@@ -321,9 +326,7 @@ async fn run_fsevents(
         | kFSEventStreamCreateFlagWatchRoot;
     let (mut stream, mut handler) =
         create_event_stream([Path::new("/")], since, Duration::from_secs(1), flags)?;
-    let mut edits = HashMap::new();
-    let mut deleted = HashMap::new();
-    let mut fan_out = HashMap::new();
+    let mut state = LogicalState::new(MAX_TRACKED_IDENTITIES);
     let mut pending_rename = None;
     loop {
         tokio::select! {
@@ -338,9 +341,7 @@ async fn run_fsevents(
                     process_event(
                         &shared,
                         event,
-                        &mut edits,
-                        &mut deleted,
-                        &mut fan_out,
+                        &mut state,
                         &mut pending_rename,
                     )?;
                 }
@@ -364,14 +365,13 @@ async fn run_fsevents(
 fn process_event(
     shared: &Shared,
     event: fsevent_stream::stream::Event,
-    edits: &mut HashMap<eidos_observe::ObjectToken, u64>,
-    deleted: &mut HashMap<eidos_observe::ObjectToken, Instant>,
-    fan_out: &mut HashMap<eidos_observe::ObjectToken, u64>,
+    state: &mut LogicalState,
     pending_rename: &mut Option<(Instant, eidos_observe::ObjectToken)>,
 ) -> anyhow::Result<()> {
     update_health_flags(shared, event.flags)?;
     let key = shared.key.lock().expect("study key lock");
     let Some(key) = key.as_ref() else {
+        record_keyless_gap(shared);
         return Ok(());
     };
     let object = key.token("object", event.path.as_os_str().as_bytes());
@@ -386,17 +386,16 @@ fn process_event(
     } else {
         ChangeOperation::Update
     };
-    let edit_count = edits.entry(object.clone()).or_default();
-    *edit_count += 1;
-    let children = fan_out.entry(subtree.clone()).or_default();
-    *children += 1;
+    let edit_count = increment(&mut state.edits, object.clone());
+    let children = increment(&mut state.fan_out, subtree.clone());
     let delete_recreate_age = match operation {
         ChangeOperation::Delete => {
-            deleted.insert(object.clone(), Instant::now());
+            state.deleted.put(object.clone(), Instant::now());
             None
         }
-        ChangeOperation::Create => deleted
-            .remove(&object)
+        ChangeOperation::Create => state
+            .deleted
+            .pop(&object)
             .map(|when| bucket_age(when.elapsed().as_secs())),
         _ => None,
     };
@@ -422,14 +421,63 @@ fn process_event(
         size: SizeBucket::Unknown,
         extension: bucket_extension(extension),
         depth: bucket_depth(event.path.components().count().saturating_sub(1)),
-        edit_count: CountBucket::from(*edit_count),
+        edit_count: CountBucket::from(edit_count),
         delete_recreate_age,
-        fan_out: CountBucket::from(*children),
+        fan_out: CountBucket::from(children),
         backlog_age: AgeBucket::Immediate,
     });
     shared.spool.lock().expect("spool lock").append(&record)?;
     observe_apfs(shared, &event, object, subtree)?;
     Ok(())
+}
+
+fn record_keyless_gap(shared: &Shared) {
+    let now = time_anchor();
+    let mut gaps = shared.gaps.lock().expect("gaps lock");
+    if let Some(gap) = gaps
+        .last_mut()
+        .filter(|gap| gap.cause == GapCause::KeyUnavailable)
+    {
+        gap.ended_monotonic_ns = now.monotonic_ns;
+        gap.estimated_events = Some(gap.estimated_events.unwrap_or_default().saturating_add(1));
+    } else {
+        gaps.push(CaptureGap {
+            started_monotonic_ns: now.monotonic_ns,
+            ended_monotonic_ns: now.monotonic_ns,
+            cause: GapCause::KeyUnavailable,
+            estimated_events: Some(1),
+        });
+    }
+}
+
+struct LogicalState {
+    edits: lru::LruCache<eidos_observe::ObjectToken, u64>,
+    deleted: lru::LruCache<eidos_observe::ObjectToken, Instant>,
+    fan_out: lru::LruCache<eidos_observe::ObjectToken, u64>,
+}
+
+impl LogicalState {
+    fn new(limit: usize) -> Self {
+        let capacity = NonZeroUsize::new(limit).expect("logical state capacity is nonzero");
+        Self {
+            edits: lru::LruCache::new(capacity),
+            deleted: lru::LruCache::new(capacity),
+            fan_out: lru::LruCache::new(capacity),
+        }
+    }
+}
+
+fn increment(
+    values: &mut lru::LruCache<eidos_observe::ObjectToken, u64>,
+    key: eidos_observe::ObjectToken,
+) -> u64 {
+    if let Some(value) = values.get_mut(&key) {
+        *value = value.saturating_add(1);
+        *value
+    } else {
+        values.put(key, 1);
+        1
+    }
 }
 
 fn update_health_flags(shared: &Shared, flags: StreamFlags) -> anyhow::Result<()> {
@@ -670,4 +718,26 @@ fn save_cursor(file: &Path, value: u64) -> anyhow::Result<()> {
     fs::write(&temporary, format!("{value}\n"))?;
     fs::rename(temporary, file)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{increment, LogicalState};
+    use eidos_observe::StudyKey;
+
+    fn token(value: u64) -> eidos_observe::ObjectToken {
+        StudyKey::from_bytes([9; 32]).token("test", &value.to_le_bytes())
+    }
+
+    #[test]
+    fn logical_accounting_maps_remain_bounded() {
+        let mut state = LogicalState::new(4);
+        for value in 0..100 {
+            assert_eq!(increment(&mut state.edits, token(value)), 1);
+            assert!(state.edits.len() <= 4);
+        }
+        assert!(!state.edits.contains(&token(0)));
+        assert!(state.edits.contains(&token(99)));
+        assert_eq!(increment(&mut state.edits, token(99)), 2);
+    }
 }

@@ -63,6 +63,7 @@ mimalloc = "0.1"
 crossbeam-channel = "0.5"
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 memchr = "2.8"
+lru = "0.16"
 bytes = "1.12"
 futures-core = "0.3"
 futures-util = "0.3"
