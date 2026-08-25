@@ -225,13 +225,17 @@ fn wait_until(
     mut ready: impl FnMut() -> anyhow::Result<bool>,
 ) -> anyhow::Result<bool> {
     loop {
-        if ready()? {
-            return Ok(true);
-        }
         if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        if ready()? {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(200)));
     }
 }
 
@@ -319,6 +323,62 @@ fn plist_document(label: &str, program: &Path, arguments: &[String], log_dir: &P
     )
 }
 
+fn replacement_error(primary: anyhow::Error, rollback: anyhow::Result<()>) -> anyhow::Error {
+    match rollback {
+        Ok(()) => anyhow::anyhow!(
+            "{primary:#}; the previous LaunchAgent configuration was restored"
+        ),
+        Err(rollback) => anyhow::anyhow!(
+            "{primary:#}; restoring the previous LaunchAgent configuration also failed: {rollback:#}"
+        ),
+    }
+}
+
+/// Put a previously installed plist back without ever exposing a partial file.
+fn restore_document(path: &Path, document: &[u8]) -> anyhow::Result<()> {
+    let temporary = path.with_extension("plist.rollback");
+    std::fs::write(&temporary, document)
+        .with_context(|| format!("writing rollback file {}", temporary.display()))?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(anyhow::Error::new(error))
+            .with_context(|| format!("restoring {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Restore both the old file and the old loaded/stopped state after a new
+/// configuration landed but failed to become healthy.
+fn rollback_replacement(
+    label: &str,
+    path: &Path,
+    document: &[u8],
+    was_loaded: bool,
+) -> anyhow::Result<()> {
+    let unload_failure = match job_state(label) {
+        Ok(state) if state.loaded => match unload(label, deadline(30)) {
+            Ok(true) => None,
+            Ok(false) => Some(anyhow::anyhow!(
+                "the replacement agent did not unload during rollback"
+            )),
+            Err(error) => Some(error.context("unloading the replacement agent during rollback")),
+        },
+        Ok(_) => None,
+        Err(error) => Some(error.context("checking the replacement agent during rollback")),
+    };
+    // Restore the durable file even when launchd could not confirm its
+    // in-memory state. A later manual start then still uses the known-good
+    // registration rather than the failed replacement.
+    restore_document(path, document)?;
+    if let Some(error) = unload_failure {
+        return Err(error.context("the previous plist was restored on disk"));
+    }
+    if was_loaded {
+        start_by(label, deadline(120)).context("restarting the previous LaunchAgent")?;
+    }
+    Ok(())
+}
+
 fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
     let path = plist_path(label)?;
     if path.exists() && !args.replace {
@@ -327,6 +387,14 @@ fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
             path.display()
         );
     }
+    let previous_document = match std::fs::read(&path) {
+        Ok(document) => Some(document),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(anyhow::Error::new(error))
+                .with_context(|| format!("reading existing {}", path.display()))
+        }
+    };
     let mut serve = args.serve.normalized();
     serve.data_dir = absolute(&serve.data_dir)?;
     let log_dir = match &serve.log_dir {
@@ -355,21 +423,45 @@ fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
     let temporary = path.with_extension("plist.new");
     std::fs::write(&temporary, document)
         .with_context(|| format!("writing {}", temporary.display()))?;
-    let was_loaded = job_state(label)?.loaded;
+    let was_loaded = match job_state(label) {
+        Ok(state) => state.loaded,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.context("checking the existing LaunchAgent before replacement"));
+        }
+    };
     if was_loaded {
         // launchd keeps running the definition it already read, so the old job
         // has to be gone - not merely asked to go - before the new file lands.
-        unload(label, deadline(30))?;
+        let unload_error = match unload(label, deadline(30)) {
+            Ok(true) => None,
+            Ok(false) => Some(anyhow::anyhow!(
+                "the existing agent did not unload in time; its LaunchAgent file was not replaced"
+            )),
+            Err(error) => Some(
+                error
+                    .context("unloading the existing agent; its LaunchAgent file was not replaced"),
+            ),
+        };
+        if let Some(unload_error) = unload_error {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(replacement_error(
+                unload_error,
+                start_by(label, deadline(120)).context("restoring the existing LaunchAgent"),
+            ));
+        }
     }
     if let Err(e) = std::fs::rename(&temporary, &path) {
         // The replacement never landed. Put the agent back rather than
         // leaving the machine with no indexer.
-        if was_loaded {
-            let _ = launchctl(&["bootstrap", &domain(), &path.display().to_string()]);
-        }
         let _ = std::fs::remove_file(&temporary);
-        return Err(anyhow::Error::new(e))
-            .with_context(|| format!("installing {}", path.display()));
+        let install_error = anyhow::Error::new(e).context(format!("installing {}", path.display()));
+        let rollback = if was_loaded {
+            start_by(label, deadline(120)).context("restarting the previous LaunchAgent")
+        } else {
+            Ok(())
+        };
+        return Err(replacement_error(install_error, rollback));
     }
 
     println!("installed {} -> {}", label, path.display());
@@ -384,7 +476,15 @@ fn cmd_install(label: &str, args: InstallArgs) -> anyhow::Result<()> {
     if args.start_now || was_loaded {
         // A replacement that was running before must be running after: an
         // install is a configuration change, not an outage.
-        start_by(label, deadline(120))?;
+        if let Err(start_error) = start_by(label, deadline(120)) {
+            let Some(previous_document) = previous_document.as_deref() else {
+                return Err(start_error);
+            };
+            return Err(replacement_error(
+                start_error,
+                rollback_replacement(label, &path, previous_document, was_loaded),
+            ));
+        }
     } else {
         println!("run `eidos service start` to load it");
     }
@@ -430,7 +530,7 @@ fn start_by(label: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
     // before the API is listening. Callers mean "ready to answer", so wait
     // for that too when the installed plist says where to ask.
     if bind_address(&path).is_some() {
-        let answering = wait_until(deadline, || Ok(probe_health(&path).is_some()))?;
+        let answering = wait_until(deadline, || Ok(probe_health_by(&path, deadline).is_some()))?;
         if !answering {
             bail!("the agent started but did not answer in time; see the log directory");
         }
@@ -567,12 +667,28 @@ fn routable(bind: &str) -> Option<String> {
 /// installed plist, so status reflects the service that was actually
 /// installed rather than a default.
 fn probe_health(plist: &Path) -> Option<serde_json::Value> {
+    probe_health_with_timeout(plist, std::time::Duration::from_secs(2))
+}
+
+fn probe_health_by(plist: &Path, deadline: std::time::Instant) -> Option<serde_json::Value> {
+    probe_health_with_timeout(plist, probe_timeout(deadline)?)
+}
+
+fn probe_timeout(deadline: std::time::Instant) -> Option<std::time::Duration> {
+    let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+    (!remaining.is_zero()).then(|| remaining.min(std::time::Duration::from_secs(2)))
+}
+
+fn probe_health_with_timeout(
+    plist: &Path,
+    timeout: std::time::Duration,
+) -> Option<serde_json::Value> {
     let bind = routable(&bind_address(plist)?)?;
     let url = format!("http://{bind}/api/health");
     // The probe runs inside a deadline-bounded poll, so it must not be able
     // to block on the operating system's own connect timeout.
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(2)))
+        .timeout_global(Some(timeout))
         .build()
         .into();
     agent
@@ -746,5 +862,62 @@ mod tests {
             "/Applications/Eidos.app/Contents/MacOS/eidos"
         )));
         assert!(!is_bundled(Path::new("/usr/local/bin/eidos")));
+    }
+
+    #[test]
+    fn an_expired_deadline_never_starts_a_readiness_probe() {
+        let mut probes = 0;
+        let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let ready = wait_until(expired, || {
+            probes += 1;
+            Ok(true)
+        })
+        .unwrap();
+
+        assert!(!ready);
+        assert_eq!(probes, 0);
+    }
+
+    #[test]
+    fn a_health_probe_is_capped_by_the_remaining_deadline() {
+        let near = probe_timeout(std::time::Instant::now() + std::time::Duration::from_millis(50))
+            .unwrap();
+        assert!(near <= std::time::Duration::from_millis(50));
+        assert!(near > std::time::Duration::ZERO);
+
+        let far =
+            probe_timeout(std::time::Instant::now() + std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(far, std::time::Duration::from_secs(2));
+        assert!(
+            probe_timeout(std::time::Instant::now() - std::time::Duration::from_millis(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rollback_restores_the_previous_plist_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("agent.plist");
+        std::fs::write(&plist, b"new configuration").unwrap();
+
+        restore_document(&plist, b"previous configuration").unwrap();
+
+        assert_eq!(std::fs::read(&plist).unwrap(), b"previous configuration");
+        assert!(!plist.with_extension("plist.rollback").exists());
+    }
+
+    #[test]
+    fn rollback_failures_are_never_hidden_by_the_original_error() {
+        let restored = replacement_error(anyhow::anyhow!("new agent failed"), Ok(())).to_string();
+        assert!(restored.contains("new agent failed"), "{restored}");
+        assert!(restored.contains("was restored"), "{restored}");
+
+        let failed = replacement_error(
+            anyhow::anyhow!("new agent failed"),
+            Err(anyhow::anyhow!("old agent failed")),
+        )
+        .to_string();
+        assert!(failed.contains("new agent failed"), "{failed}");
+        assert!(failed.contains("old agent failed"), "{failed}");
     }
 }
