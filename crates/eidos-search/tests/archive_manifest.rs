@@ -52,7 +52,7 @@ fn fixture() -> Fx {
             Entry::file("readme.txt", b"hello"),
             Entry::dir("src/"),
             Entry::file("src/lib/mod.rs", b"fn x() {}"),
-            Entry::file("10.0.0.7 (01)/asset.bin", &[0u8; 1000]),
+            Entry::file("192.0.2.7 (01)/asset.bin", &[0u8; 1000]),
             Entry::file("../escape.txt", b"x"),
         ],
         b"built for tests",
@@ -191,7 +191,7 @@ fn containers_get_manifests_and_members() {
     assert_eq!(
         names,
         vec![
-            ("10.0.0.7 (01)", true),
+            ("192.0.2.7 (01)", true),
             ("src", true),
             ("escape.txt", false),
             ("readme.txt", false)
