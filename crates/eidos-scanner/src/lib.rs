@@ -15,6 +15,8 @@ pub mod std_lister;
 pub mod walk;
 
 #[cfg(target_os = "macos")]
+pub mod fsevents;
+#[cfg(target_os = "macos")]
 pub mod mac;
 #[cfg(windows)]
 pub mod usn;
