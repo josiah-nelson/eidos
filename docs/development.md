@@ -21,7 +21,8 @@ with no change feed.
 ## Commands
 
 ```powershell
-# One-shot: format check, clippy (deny warnings), all tests, release build, web lint+test+build
+# Windows. One-shot: format check, clippy (deny warnings), all tests,
+# release build, web lint+test+build
 .\scripts\check.ps1            # -SkipWeb / -SkipRelease to shorten
 
 # Individually
@@ -31,6 +32,16 @@ cargo test
 cargo build --release
 cd web; npm ci; npm run lint; npm test; npm run build
 ```
+
+```bash
+# macOS or another Unix host: the same steps in the same order.
+scripts/check.sh               # --skip-web / --skip-release to shorten
+```
+
+CI runs the Rust gate on both Windows and macOS, because the enumeration and
+change-feed adapters differ per platform and the contracts they share are only
+proven when both run them. The Windows lane also checks formatting and that
+the generated API contract in `web/src/generated/api.ts` is not stale.
 
 Tests never touch user data: every integration test builds its own fixture
 under a `tempfile::tempdir()`. USN-journal tests need an elevated session
