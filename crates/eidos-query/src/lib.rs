@@ -134,6 +134,7 @@ mod tests {
             r#"ranked:"a=/b""#,
             r#"ranked:"a~/b""#,
             r#"ranked:"a=i/b""#,
+            r#"e:"a=i/b""#,
             "*.MiXeD",
             "*.-",
             "*.NoNe",

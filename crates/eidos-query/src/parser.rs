@@ -833,7 +833,7 @@ pub fn bare_value_is_literal(value: &str) -> bool {
             c.is_whitespace()
                 || matches!(
                     c,
-                    '(' | ')' | '"' | ':' | '=' | '~' | '*' | '?' | '\\' | ','
+                    '(' | ')' | '"' | ':' | '=' | '~' | '*' | '?' | '/' | '\\' | ','
                 )
         })
 }

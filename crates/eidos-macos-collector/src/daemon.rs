@@ -23,12 +23,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_TRACKED_IDENTITIES: usize = 65_536;
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+static FSEVENT_BINDING_DROPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_fsevent_binding_drop() {
+    FSEVENT_BINDING_DROPS.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -285,6 +290,7 @@ fn read_request(stream: &mut UnixStream) -> std::io::Result<String> {
 }
 
 fn status(shared: &Shared) -> anyhow::Result<CollectorStatus> {
+    drain_fsevent_binding_drops(shared);
     Ok(CollectorStatus {
         schema: SCHEMA_VERSION.into(),
         running: true,
@@ -302,6 +308,7 @@ fn status(shared: &Shared) -> anyhow::Result<CollectorStatus> {
 }
 
 fn export(shared: &Shared) -> anyhow::Result<PathBuf> {
+    drain_fsevent_binding_drops(shared);
     let now = utc_ns();
     let bundle = ObservationBundle {
         manifest: BundleManifest {
@@ -543,6 +550,24 @@ fn update_health_flags(shared: &Shared, flags: StreamFlags) -> anyhow::Result<()
     Ok(())
 }
 
+fn drain_fsevent_binding_drops(shared: &Shared) {
+    let dropped = FSEVENT_BINDING_DROPS.swap(0, Ordering::Relaxed);
+    if dropped == 0 {
+        return;
+    }
+    let now = time_anchor();
+    let mut drops = shared.drops.lock().expect("drops lock");
+    drops.user = drops.user.saturating_add(dropped);
+    drops.overflows = drops.overflows.saturating_add(1);
+    drop(drops);
+    shared.gaps.lock().expect("gaps lock").push(CaptureGap {
+        started_monotonic_ns: now.monotonic_ns,
+        ended_monotonic_ns: now.monotonic_ns,
+        cause: GapCause::UserDrop,
+        estimated_events: None,
+    });
+}
+
 fn observe_apfs(
     shared: &Shared,
     event: &fsevent_stream::stream::Event,
@@ -610,6 +635,7 @@ async fn run_health(
                 if changed.is_err() || *shutdown.borrow() { break; }
             }
             _ = interval.tick() => {
+                drain_fsevent_binding_drops(&shared);
                 let wall = SystemTime::now();
                 let monotonic = Instant::now();
                 let wall_elapsed = wall.duration_since(prior_wall).unwrap_or_default();

@@ -50,6 +50,7 @@ fi
 
 plist=/Library/LaunchDaemons/com.jnel.eidos.collector.plist
 /bin/launchctl bootout system/com.jnel.eidos.collector >/dev/null 2>&1 || true
+install -o root -g wheel -m 0640 /dev/null /var/log/eidos-collector.log
 if [[ "$enable_endpoint_security" == 1 ]]; then
     /usr/libexec/PlistBuddy -c 'Delete :ProgramArguments:1' "$plist" 2>/dev/null || true
     /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:1 string --endpoint-security' "$plist"
