@@ -237,6 +237,28 @@ proptest! {
 }
 
 #[test]
+fn extension_values_with_regex_openers_survive_render() {
+    // Hosted fuzz run: an `ext:` value containing `~/` rendered bare, and the
+    // lexer then read `~/im|t...` as an unterminated regex.
+    let fuzz = "\u{8}rane\n\u{1d}m\u{1d}79\u{1d}PPPPPPPPPPPP#PPPPPranke\"~a:/i/b\"\ne:\"a~/im|t\u{45a}\"\n";
+    for input in [
+        fuzz,
+        "ext:\"a~/b\"",
+        "ext:\"a=/b\"",
+        "ext:\"a=i/b\"",
+        "ext:\"a:/b\"",
+        "ext:\"/b\"",
+        "ext:\"a~b\",cs",
+    ] {
+        let parsed = parse_at(input, NOW).unwrap();
+        let rendered = render(&parsed.query);
+        let reparsed = parse_at(&rendered, NOW)
+            .unwrap_or_else(|e| panic!("{input:?} rendered as {rendered:?}: {e}"));
+        assert_eq!(reparsed.query, parsed.query, "{input:?} -> {rendered:?}");
+    }
+}
+
+#[test]
 fn quoted_backslashes_and_phrases_are_normal_regressions() {
     for input in [
         r#"path:="C:\fixture\folder with spaces\file.txt""#,

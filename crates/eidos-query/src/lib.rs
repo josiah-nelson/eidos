@@ -240,9 +240,15 @@ pub fn render(q: &Query) -> String {
                     .iter()
                     .map(|v| if v.is_empty() {
                         "none".to_string()
-                    } else if v
-                        .chars()
-                        .any(|c| c.is_whitespace() || matches!(c, '\\' | '"' | '(' | ')'))
+                    } else if v.starts_with('/')
+                        || v.chars().any(|c| {
+                            // `:`, `=`, and `~` make the lexer treat a
+                            // following `/` as a regex opener mid-word, and a
+                            // leading `/` is one at the value start; quoting
+                            // keeps such values literal on re-parse.
+                            c.is_whitespace()
+                                || matches!(c, '\\' | '"' | '(' | ')' | ':' | '=' | '~')
+                        })
                     {
                         quoted(v)
                     } else {
