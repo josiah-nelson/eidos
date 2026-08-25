@@ -809,6 +809,7 @@ dependencies = [
 name = "eidos-scanner"
 version = "0.5.0-dev"
 dependencies = [
+ "core-foundation 0.9.4",
  "crossbeam-channel",
  "eidos-domain",
  "libc",
