@@ -116,13 +116,26 @@ mod tests {
                 drops: DropCounters::default(),
                 units: Units::default(),
             },
-            records: vec![ObservationRecord::Mark(MarkRecord {
-                at: TimeAnchor {
-                    monotonic_ns: 10,
-                    utc_ns: 20,
-                },
-                marker: key.token("mark", b"phase-a"),
-            })],
+            records: vec![
+                ObservationRecord::Mark(MarkRecord {
+                    at: TimeAnchor {
+                        monotonic_ns: 10,
+                        utc_ns: 20,
+                    },
+                    marker: key.token("mark", b"phase-a"),
+                }),
+                ObservationRecord::Apfs(ApfsObservation {
+                    at: TimeAnchor {
+                        monotonic_ns: 11,
+                        utc_ns: 21,
+                    },
+                    volume: key.token("volume", b"volume-a"),
+                    object: key.token("object", b"object-a"),
+                    kind: ApfsKind::Sparse,
+                    prevalence: CountBucket::One,
+                    size: SizeBucket::B4K,
+                }),
+            ],
         }
     }
 
