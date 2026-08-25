@@ -14,10 +14,13 @@ env:
   # their file and line.
   CARGO_PROFILE_DEV_DEBUG: 0
 
-# A stacked branch is often pushed several times in a row; only the newest
-# revision of a ref needs to be checked.
+# A stacked branch is often pushed several times in a row, and only its newest
+# revision needs checking. A push to main is not the same: it gets a group of
+# its own so a merge landing while the previous one still builds cannot cancel
+# it. A cancelled job never reaches its cache-save step, and the Windows lane
+# is slow enough that one lost cache makes every later run cold as well.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
