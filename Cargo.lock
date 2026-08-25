@@ -721,6 +721,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidos-observe"
+version = "0.5.0-dev"
+dependencies = [
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zstd",
+]
+
+[[package]]
 name = "eidos-query"
 version = "0.5.0-dev"
 dependencies = [

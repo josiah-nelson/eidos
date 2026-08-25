@@ -188,6 +188,7 @@ pub fn start_automatic_scan(
 /// A missing or invalid native checkpoint must be repaired to restore the
 /// live feed. It bypasses only the content-work delay; scan ownership is the
 /// same as every other automatic start.
+#[cfg(any(windows, test))]
 pub(crate) fn start_feed_recovery_scan(
     state: &Arc<AppState>,
     source_id: SourceId,
