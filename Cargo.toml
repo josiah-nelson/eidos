@@ -12,6 +12,7 @@ members = [
     "crates/eidos-query",
     "crates/eidos-service",
     "crates/eidos-cli",
+    "crates/eidos-observe",
 ]
 
 [workspace.package]
@@ -32,6 +33,7 @@ eidos-content = { path = "crates/eidos-content" }
 eidos-search = { path = "crates/eidos-search" }
 eidos-query = { path = "crates/eidos-query" }
 eidos-service = { path = "crates/eidos-service" }
+eidos-observe = { path = "crates/eidos-observe" }
 
 anyhow = "1.0"
 thiserror = "2.0"

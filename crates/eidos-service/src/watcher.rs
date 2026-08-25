@@ -101,6 +101,7 @@ impl WatcherStatus {
         self.journal_cancel.cancel();
     }
 
+    #[cfg(windows)]
     fn mutation_guard<'a>(&'a self, state: &AppState) -> Option<parking_lot::MutexGuard<'a, ()>> {
         let guard = self.mutation_gate.lock();
         if self.cancel.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
@@ -150,6 +151,7 @@ pub fn ensure_watcher(state: &Arc<AppState>, source_id: SourceId) -> Arc<Watcher
     }
     let status = Arc::new(WatcherStatus::new(source_id));
     watchers.insert(source_id, status.clone());
+    #[cfg(windows)]
     let st = state.clone();
     let s2 = status.clone();
     std::thread::Builder::new()
