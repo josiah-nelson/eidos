@@ -795,6 +795,13 @@ namespace Eidos.Setup
             {
                 e.SetVariableString("EIDOS_REMOVE_DATA", this.removeData ? "1" : "0", false);
             }
+            if (!this.PerMachine && (action == LaunchAction.Uninstall || action == LaunchAction.Repair || this.olderVersion != null))
+            {
+                // The MSI also closes eidos.exe, but stopping it here first
+                // keeps the executable and catalog unlocked for the whole
+                // transaction. The catalog is crash-safe.
+                this.StopPerUserProcess();
+            }
             var scope = this.PerMachine ? BundleScope.PerMachine : BundleScope.PerUser;
             e.Plan(action, scope);
         }
@@ -963,7 +970,7 @@ namespace Eidos.Setup
                 this.Page = Page.Success;
                 if (this.ba.Command.Display != Display.Full)
                 {
-                    this.Dispatcher?.BeginInvoke(new Action(() => EidosBootstrapper.View?.Close()));
+                    this.EndNonInteractive();
                     return;
                 }
                 this.Raise(nameof(this.SuccessText), nameof(this.PrimaryLabel));
@@ -973,11 +980,38 @@ namespace Eidos.Setup
                 this.Fail(e.Status, this.ErrorMessage);
                 if (this.ba.Command.Display != Display.Full)
                 {
-                    this.Dispatcher?.BeginInvoke(new Action(() => EidosBootstrapper.View?.Close()));
+                    this.EndNonInteractive();
                     return;
                 }
             }
             this.Requery();
+        }
+
+        /// <summary>End every eidos.exe running from the install folder.</summary>
+        private void StopPerUserProcess()
+        {
+            var dir = this.installDir.TrimEnd('\\');
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName("eidos"))
+            {
+                try
+                {
+                    var path = p.MainModule?.FileName ?? "";
+                    if (path.StartsWith(dir, StringComparison.OrdinalIgnoreCase))
+                    {
+                        this.Engine.Log(LogLevel.Standard, $"stopping eidos.exe (pid {p.Id}) before {this.plannedAction}");
+                        p.Kill();
+                        p.WaitForExit(15_000);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    this.Engine.Log(LogLevel.Error, $"stopping eidos.exe (pid {p.Id}): {ex.Message}");
+                }
+                finally
+                {
+                    p.Dispose();
+                }
+            }
         }
 
         /// <summary>
@@ -988,31 +1022,61 @@ namespace Eidos.Setup
         {
             try
             {
+                // The MSI wrote what it actually used (quiet installs take
+                // their values from bundle variables, not from this model).
+                this.ReadRememberedSettings();
+                this.Raise(nameof(this.InstallDir), nameof(this.DataDir), nameof(this.Port), nameof(this.Bind), nameof(this.Url));
                 var exe = Path.Combine(this.installDir, "eidos.exe");
                 var data = this.dataDir.TrimEnd('\\');
                 var args = $"serve --detach --data-dir \"{data}\" --log-dir \"{Path.Combine(data, "logs")}\" --bind {this.bind}:{this.port}";
                 this.ProgressMessage = "Starting eidos…";
+                // No output redirection: the background eidos process the
+                // launcher spawns would inherit the pipe and keep it open,
+                // and a read-to-end here would never return.
                 using (var p = new System.Diagnostics.Process())
                 {
                     p.StartInfo.FileName = exe;
                     p.StartInfo.Arguments = args;
                     p.StartInfo.UseShellExecute = false;
                     p.StartInfo.CreateNoWindow = true;
-                    p.StartInfo.RedirectStandardOutput = true;
-                    p.StartInfo.RedirectStandardError = true;
                     p.Start();
-                    var output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
-                    p.WaitForExit(90_000);
-                    this.Engine.Log(LogLevel.Standard, "eidos serve --detach: " + output.Trim());
+                    if (!p.WaitForExit(90_000))
+                    {
+                        p.Kill();
+                        this.Engine.Log(LogLevel.Error, "eidos serve --detach did not return within 90 s");
+                        return;
+                    }
+                    this.Engine.Log(LogLevel.Standard, $"eidos serve --detach exited with {p.ExitCode}");
                     if (p.ExitCode != 0)
                     {
-                        this.ErrorMessage = output.Trim();
+                        this.ErrorMessage = $"eidos could not be started (exit code {p.ExitCode}); see the log in {Path.Combine(data, "logs")}.";
                     }
                 }
             }
             catch (Exception ex)
             {
                 this.Engine.Log(LogLevel.Error, "starting eidos: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Passive mode has a visible window to close; quiet/embedded mode
+        /// never showed one, and closing an unshown window does not end the
+        /// dispatcher loop, so shut it down directly (as WixBA does).
+        /// </summary>
+        private void EndNonInteractive()
+        {
+            if (this.Dispatcher == null)
+            {
+                return;
+            }
+            if (this.ba.Command.Display == Display.Passive)
+            {
+                this.Dispatcher.BeginInvoke(new Action(() => EidosBootstrapper.View?.Close()));
+            }
+            else
+            {
+                this.Dispatcher.BeginInvoke(new Action(() => this.Dispatcher.InvokeShutdown()));
             }
         }
 

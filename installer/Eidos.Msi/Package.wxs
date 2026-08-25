@@ -258,6 +258,12 @@
          files (and, on request, the data) are removed or replaced. The
          catalog is crash-safe, so termination loses nothing durable. -->
     <util:CloseApplication Id="CloseEidos" Target="eidos.exe" CloseMessage="yes" TerminateProcess="0" Timeout="10" RebootPrompt="no" Condition="NOT ALLUSERS=1" />
+    <!-- The extension schedules the close right before InstallFiles, which on
+         uninstall is after RemoveFiles; the process must be gone before the
+         executable, the catalog and the registry values are removed. -->
+    <InstallExecuteSequence>
+      <Custom Action="override Wix4CloseApplications_X64" After="InstallInitialize" />
+    </InstallExecuteSequence>
 
     <!-- ===== firewall (only when reachable beyond loopback) ============== -->
 
