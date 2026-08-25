@@ -2,17 +2,23 @@ use crate::schema::{ObservationBundle, SCHEMA_VERSION};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
 pub fn write_bundle(file: &Path, bundle: &ObservationBundle) -> Result<(), BundleError> {
     if bundle.manifest.schema != SCHEMA_VERSION {
         return Err(BundleError::Schema(bundle.manifest.schema.clone()));
     }
-    let output = BufWriter::new(File::create(file)?);
-    let mut encoder = zstd::stream::write::Encoder::new(output, 9)?;
-    serde_json::to_writer(&mut encoder, bundle)?;
-    encoder.finish()?;
+    let parent = file.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    {
+        let output = BufWriter::new(temporary.as_file_mut());
+        let mut encoder = zstd::stream::write::Encoder::new(output, 9)?;
+        serde_json::to_writer(&mut encoder, bundle)?;
+        encoder.finish()?.flush()?;
+    }
+    temporary.as_file().sync_all()?;
+    temporary.persist(file).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -133,6 +139,17 @@ mod tests {
         let mut exact = BTreeSet::new();
         collect_fields("", &value, &mut exact);
         assert_eq!(inspection.fields, exact.into_iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn complete_bundle_atomically_replaces_an_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("bundle.eidos-observation.zst");
+        std::fs::write(&file, b"old-incomplete-data").unwrap();
+        let expected = bundle();
+        write_bundle(&file, &expected).unwrap();
+        assert_eq!(read_bundle(&file).unwrap(), expected);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]

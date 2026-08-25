@@ -1,6 +1,7 @@
 use crate::schema::ObservationRecord;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DAY_NS: i64 = 86_400_000_000_000;
 
@@ -57,40 +58,26 @@ impl Spool {
     pub fn append(&mut self, record: &ObservationRecord) -> Result<(), SpoolError> {
         let body = serde_json::to_vec(record)?;
         let detailed = record.is_detailed();
-        let now = record.utc_ns();
+        let event_utc_ns = record.utc_ns();
+        // Retention follows ingestion time, not an event-controlled clock. A
+        // replayed, future-dated, or out-of-order anchor cannot move the ring's
+        // cutoff and delete otherwise valid history.
+        let retention_utc_ns = utc_now_ns();
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO observations(utc_ns, detailed, bytes, body) VALUES (?1, ?2, ?3, ?4)",
-            params![now, detailed, body.len() as i64, body],
+            params![event_utc_ns, detailed, body.len() as i64, body],
         )?;
         transaction.execute(
             "DELETE FROM observations WHERE detailed = 1 AND utc_ns < ?1",
-            [now.saturating_sub(self.limits.detailed_max_age_ns)],
+            [retention_utc_ns.saturating_sub(self.limits.detailed_max_age_ns)],
         )?;
         transaction.execute(
             "DELETE FROM observations WHERE detailed = 0 AND utc_ns < ?1",
-            [now.saturating_sub(self.limits.summary_max_age_ns)],
+            [retention_utc_ns.saturating_sub(self.limits.summary_max_age_ns)],
         )?;
-        loop {
-            let bytes: i64 = transaction.query_row(
-                "SELECT COALESCE(SUM(bytes), 0) FROM observations WHERE detailed = 1",
-                [],
-                |row| row.get(0),
-            )?;
-            if bytes <= self.limits.detailed_max_bytes as i64 {
-                break;
-            }
-            let removed = transaction.execute(
-                "DELETE FROM observations WHERE sequence = (
-                   SELECT sequence FROM observations WHERE detailed = 1
-                   ORDER BY sequence LIMIT 1
-                 )",
-                [],
-            )?;
-            if removed == 0 {
-                break;
-            }
-        }
+        let byte_limit = i64::try_from(self.limits.detailed_max_bytes).unwrap_or(i64::MAX);
+        prune_detailed_bytes(&transaction, byte_limit)?;
         transaction.commit()?;
         Ok(())
     }
@@ -137,6 +124,51 @@ impl Spool {
     }
 }
 
+fn utc_now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+fn prune_detailed_bytes(
+    transaction: &rusqlite::Transaction<'_>,
+    byte_limit: i64,
+) -> rusqlite::Result<()> {
+    let total: i64 = transaction.query_row(
+        "SELECT COALESCE(SUM(bytes), 0) FROM observations WHERE detailed = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let excess = total.saturating_sub(byte_limit);
+    if excess == 0 {
+        return Ok(());
+    }
+
+    let cutoff = {
+        let mut statement = transaction.prepare(
+            "SELECT sequence, bytes FROM observations
+             WHERE detailed = 1 ORDER BY sequence",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut removed_bytes = 0i64;
+        let mut cutoff = None;
+        while removed_bytes < excess {
+            let Some(row) = rows.next()? else { break };
+            cutoff = Some(row.get::<_, i64>(0)?);
+            removed_bytes = removed_bytes.saturating_add(row.get::<_, i64>(1)?);
+        }
+        cutoff
+    };
+    if let Some(sequence) = cutoff {
+        transaction.execute(
+            "DELETE FROM observations WHERE detailed = 1 AND sequence <= ?1",
+            [sequence],
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpoolError {
     #[error(transparent)]
@@ -175,23 +207,64 @@ mod tests {
     #[test]
     fn ring_enforces_byte_and_age_bounds() {
         let temp = tempfile::tempdir().unwrap();
+        let now = utc_now_ns();
         let mut spool = Spool::open(
             &temp.path().join("spool.db"),
             SpoolLimits {
                 detailed_max_bytes: 500,
-                detailed_max_age_ns: 100,
-                summary_max_age_ns: 1_000,
+                detailed_max_age_ns: 1_000_000_000,
+                summary_max_age_ns: 10_000_000_000,
             },
         )
         .unwrap();
         for sequence in 0..20 {
             spool
-                .append(&change(sequence * 10, &format!("token-{sequence:02}")))
+                .append(&change(
+                    now - 1_900_000_000 + sequence * 100_000_000,
+                    &format!("token-{sequence:02}"),
+                ))
                 .unwrap();
         }
         let stats = spool.stats().unwrap();
         assert!(stats.detailed_bytes <= 500);
-        assert!(stats.oldest_utc_ns.unwrap() >= 90);
+        assert!(stats.oldest_utc_ns.unwrap() >= now - 1_000_000_000);
         assert!(stats.detailed_records < 20);
+    }
+
+    #[test]
+    fn event_timestamps_cannot_move_the_retention_cutoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = utc_now_ns();
+        let mut spool = Spool::open(
+            &temp.path().join("spool.db"),
+            SpoolLimits {
+                detailed_max_bytes: u64::MAX,
+                detailed_max_age_ns: 10_000_000_000,
+                summary_max_age_ns: 10_000_000_000,
+            },
+        )
+        .unwrap();
+        spool.append(&change(now, "current")).unwrap();
+        spool.append(&change(i64::MAX, "future-anchor")).unwrap();
+        spool
+            .append(&change(now - 500_000_000, "out-of-order"))
+            .unwrap();
+        assert_eq!(spool.stats().unwrap().detailed_records, 3);
+    }
+
+    #[test]
+    fn oversized_byte_limit_does_not_wrap() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(
+            &temp.path().join("spool.db"),
+            SpoolLimits {
+                detailed_max_bytes: u64::MAX,
+                detailed_max_age_ns: i64::MAX,
+                summary_max_age_ns: i64::MAX,
+            },
+        )
+        .unwrap();
+        spool.append(&change(utc_now_ns(), "retained")).unwrap();
+        assert_eq!(spool.stats().unwrap().detailed_records, 1);
     }
 }
