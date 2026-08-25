@@ -772,6 +772,7 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -809,6 +810,7 @@ version = "0.5.0-dev"
 dependencies = [
  "crossbeam-channel",
  "eidos-domain",
+ "libc",
  "serde",
  "tempfile",
  "thiserror",

@@ -8,6 +8,8 @@
 //! behind; the operator-visible reason keeps the underlying error chain;
 //! and the retry produces exactly one generation's chunks.
 
+#![cfg(windows)]
+
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::{Catalog, NewSource};
 use eidos_content::{Chunk, Limits};

@@ -3,6 +3,8 @@
 //! is advertised, owns the index writer while it runs, and leaves a
 //! durable, recoverable state when it fails or is interrupted.
 
+#![cfg(windows)]
+
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::NewSource;
 use eidos_domain::{SearchRequest, SourceId, SourceKind};

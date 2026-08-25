@@ -363,6 +363,7 @@ mod tests {
         assert!(refs.contains(&"--no-web"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalizes_installer_style_directories() {
         let args = parse(&[

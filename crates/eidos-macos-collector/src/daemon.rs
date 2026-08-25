@@ -10,7 +10,7 @@ use eidos_observe::{
 };
 use fsevent_stream::ffi::{
     kFSEventStreamCreateFlagFileEvents, kFSEventStreamCreateFlagNoDefer,
-    kFSEventStreamCreateFlagWatchRoot, kFSEventStreamEventIdSinceNow,
+    kFSEventStreamCreateFlagWatchRoot, kFSEventStreamEventIdSinceNow, FSEventsGetCurrentEventId,
 };
 use fsevent_stream::flags::StreamFlags;
 use fsevent_stream::stream::create_event_stream;
@@ -23,12 +23,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_TRACKED_IDENTITIES: usize = 65_536;
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+static FSEVENT_BINDING_DROPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_fsevent_binding_drop() {
+    FSEVENT_BINDING_DROPS.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -47,6 +52,7 @@ struct Shared {
     gaps: Mutex<Vec<CaptureGap>>,
     cursor: Mutex<Option<FeedCursor>>,
     endpoint_counts: Arc<Counters>,
+    logical_changes: AtomicU64,
     started: Instant,
     export_dir: PathBuf,
     build_hash: String,
@@ -58,8 +64,13 @@ struct Shared {
 struct NativeFileMetadata {
     logical_size: u64,
     allocated_size: u64,
+    volume_id_high: u64,
+    volume_id_low: u64,
     ubiquitous: libc::c_int,
     placeholder: libc::c_int,
+    resource_fork: libc::c_int,
+    snapshot: libc::c_int,
+    external_volume: libc::c_int,
 }
 
 extern "C" {
@@ -120,6 +131,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         gaps: Mutex::new(Vec::new()),
         cursor: Mutex::new(load_cursor(&config.data_dir.join("fsevents.cursor"))),
         endpoint_counts: endpoint_lane.counters.clone(),
+        logical_changes: AtomicU64::new(0),
         started: Instant::now(),
         export_dir: config.export_dir.clone(),
         build_hash,
@@ -164,6 +176,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 fn prepare_directory(path: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o750))?;
+    set_admin_group(path)?;
     Ok(())
 }
 
@@ -180,7 +193,7 @@ fn start_ipc(
     }
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
-    set_admin_group(&socket);
+    set_admin_group(&socket)?;
     listener.set_nonblocking(true)?;
     Ok(std::thread::Builder::new()
         .name("collector-ipc".into())
@@ -198,20 +211,17 @@ fn start_ipc(
         })?)
 }
 
-fn set_admin_group(path: &Path) {
-    let Ok(name) = CString::new("admin") else {
-        return;
-    };
+fn set_admin_group(path: &Path) -> anyhow::Result<()> {
+    let name = CString::new("admin")?;
     let group = unsafe { libc::getgrnam(name.as_ptr()) };
     if group.is_null() {
-        return;
+        anyhow::bail!("admin group is unavailable");
     }
-    let Ok(file_name) = CString::new(path.as_os_str().as_bytes()) else {
-        return;
-    };
-    unsafe {
-        libc::chown(file_name.as_ptr(), u32::MAX, (*group).gr_gid);
+    let file_name = CString::new(path.as_os_str().as_bytes())?;
+    if unsafe { libc::chown(file_name.as_ptr(), u32::MAX, (*group).gr_gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
+    Ok(())
 }
 
 fn handle_connection(mut stream: UnixStream, shared: &Shared) {
@@ -285,6 +295,7 @@ fn read_request(stream: &mut UnixStream) -> std::io::Result<String> {
 }
 
 fn status(shared: &Shared) -> anyhow::Result<CollectorStatus> {
+    drain_fsevent_binding_drops(shared);
     Ok(CollectorStatus {
         schema: SCHEMA_VERSION.into(),
         running: true,
@@ -302,6 +313,7 @@ fn status(shared: &Shared) -> anyhow::Result<CollectorStatus> {
 }
 
 fn export(shared: &Shared) -> anyhow::Result<PathBuf> {
+    drain_fsevent_binding_drops(shared);
     let now = utc_ns();
     let bundle = ObservationBundle {
         manifest: BundleManifest {
@@ -325,7 +337,7 @@ fn export(shared: &Shared) -> anyhow::Result<PathBuf> {
         .join(format!("observation-{now}.eidos-observation.zst"));
     eidos_observe::write_bundle(&file, &bundle)?;
     fs::set_permissions(&file, fs::Permissions::from_mode(0o640))?;
-    set_admin_group(&file);
+    set_admin_group(&file)?;
     Ok(file)
 }
 
@@ -355,17 +367,19 @@ async fn run_fsevents(
             }
             batch = stream.next() => {
                 let Some(batch) = batch else { break };
-                let mut last_id = None;
+                let batch_received = Instant::now();
                 for event in batch {
-                    last_id = Some(event.id);
+                    let backlog_age = bucket_age(batch_received.elapsed().as_secs());
                     process_event(
                         &shared,
                         event,
                         &mut state,
                         &mut pending_rename,
+                        backlog_age,
                     )?;
                 }
-                if let Some(id) = last_id {
+                let id = unsafe { FSEventsGetCurrentEventId() };
+                if id != kFSEventStreamEventIdSinceNow {
                     let cursor = FeedCursor {
                         feed: FeedKind::Fsevents,
                         version: 1,
@@ -387,6 +401,7 @@ fn process_event(
     event: fsevent_stream::stream::Event,
     state: &mut LogicalState,
     pending_rename: &mut Option<(Instant, eidos_observe::ObjectToken)>,
+    backlog_age: AgeBucket,
 ) -> anyhow::Result<()> {
     update_health_flags(shared, event.flags)?;
     let key = shared.key.lock().expect("study key lock");
@@ -432,22 +447,36 @@ fn process_event(
         None
     };
     let extension = event.path.extension().and_then(|value| value.to_str());
+    let metadata = native_metadata(&event.path);
     let record = ObservationRecord::LogicalChange(LogicalChange {
         at: time_anchor(),
         object: object.clone(),
         subtree: subtree.clone(),
         operation,
         rename_pair,
-        size: SizeBucket::Unknown,
+        size: metadata
+            .as_ref()
+            .map(|value| bucket_size(value.logical_size))
+            .unwrap_or(SizeBucket::Unknown),
         extension: bucket_extension(extension),
         depth: bucket_depth(event.path.components().count().saturating_sub(1)),
         edit_count: CountBucket::from(edit_count),
         delete_recreate_age,
         fan_out: CountBucket::from(children),
-        backlog_age: AgeBucket::Immediate,
+        backlog_age,
     });
     shared.spool.lock().expect("spool lock").append(&record)?;
-    observe_apfs(shared, &event, object, subtree)?;
+    shared.logical_changes.fetch_add(1, Ordering::Relaxed);
+    let volume = metadata
+        .as_ref()
+        .map(|value| {
+            let mut identity = [0; 16];
+            identity[..8].copy_from_slice(&value.volume_id_high.to_le_bytes());
+            identity[8..].copy_from_slice(&value.volume_id_low.to_le_bytes());
+            key.token("volume", &identity)
+        })
+        .unwrap_or_else(|| subtree.clone());
+    observe_apfs(shared, &event, object, volume, metadata.as_ref())?;
     Ok(())
 }
 
@@ -521,6 +550,10 @@ fn update_health_flags(shared: &Shared, flags: StreamFlags) -> anyhow::Result<()
         drops.root_changes += 1;
         gap = Some(GapCause::RootChanged);
     }
+    if flags.contains(StreamFlags::IDS_WRAPPED) {
+        drops.overflows += 1;
+        gap = Some(GapCause::FeedOverflow);
+    }
     drop(drops);
     if let Some(cause) = gap {
         shared.gaps.lock().expect("gaps lock").push(CaptureGap {
@@ -539,11 +572,30 @@ fn update_health_flags(shared: &Shared, flags: StreamFlags) -> anyhow::Result<()
     Ok(())
 }
 
+fn drain_fsevent_binding_drops(shared: &Shared) {
+    let dropped = FSEVENT_BINDING_DROPS.swap(0, Ordering::Relaxed);
+    if dropped == 0 {
+        return;
+    }
+    let now = time_anchor();
+    let mut drops = shared.drops.lock().expect("drops lock");
+    drops.user = drops.user.saturating_add(dropped);
+    drops.overflows = drops.overflows.saturating_add(1);
+    drop(drops);
+    shared.gaps.lock().expect("gaps lock").push(CaptureGap {
+        started_monotonic_ns: now.monotonic_ns,
+        ended_monotonic_ns: now.monotonic_ns,
+        cause: GapCause::UserDrop,
+        estimated_events: None,
+    });
+}
+
 fn observe_apfs(
     shared: &Shared,
     event: &fsevent_stream::stream::Event,
     object: eidos_observe::ObjectToken,
     volume: eidos_observe::ObjectToken,
+    metadata: Option<&NativeFileMetadata>,
 ) -> anyhow::Result<()> {
     let mut kinds = Vec::new();
     if event.flags.contains(StreamFlags::ITEM_CLONED) {
@@ -558,8 +610,7 @@ fn observe_apfs(
     if event.path.extension().is_some_and(|value| value == "app") {
         kinds.push(ApfsKind::Package);
     }
-    let metadata = native_metadata(&event.path);
-    if let Some(metadata) = &metadata {
+    if let Some(metadata) = metadata {
         if metadata.logical_size > metadata.allocated_size.saturating_mul(2)
             && metadata.logical_size > 0
         {
@@ -567,6 +618,15 @@ fn observe_apfs(
         }
         if metadata.placeholder != 0 {
             kinds.push(ApfsKind::CloudPlaceholder);
+        }
+        if metadata.resource_fork != 0 {
+            kinds.push(ApfsKind::ResourceFork);
+        }
+        if metadata.snapshot != 0 {
+            kinds.push(ApfsKind::Snapshot);
+        }
+        if metadata.external_volume != 0 {
+            kinds.push(ApfsKind::ExternalVolume);
         }
     }
     for kind in kinds {
@@ -577,7 +637,6 @@ fn observe_apfs(
             kind,
             prevalence: CountBucket::One,
             size: metadata
-                .as_ref()
                 .map(|value| bucket_size(value.logical_size))
                 .unwrap_or(SizeBucket::Unknown),
         });
@@ -606,6 +665,7 @@ async fn run_health(
                 if changed.is_err() || *shutdown.borrow() { break; }
             }
             _ = interval.tick() => {
+                drain_fsevent_binding_drops(&shared);
                 let wall = SystemTime::now();
                 let monotonic = Instant::now();
                 let wall_elapsed = wall.duration_since(prior_wall).unwrap_or_default();
@@ -618,10 +678,12 @@ async fn run_health(
                 }
                 append_health(&shared, LifecycleEvent::Heartbeat, None)?;
                 let endpoint = shared.endpoint_counts.snapshot();
+                let changed_objects = shared.logical_changes.swap(0, Ordering::Relaxed);
                 if endpoint.opens > prior_endpoint.opens
                     || endpoint.closes > prior_endpoint.closes
                     || endpoint.mappings > prior_endpoint.mappings
                     || endpoint.executions > prior_endpoint.executions
+                    || changed_objects > 0
                 {
                     let record = ObservationRecord::Workload(WorkloadSummary {
                         at: time_anchor(),
@@ -630,7 +692,7 @@ async fn run_health(
                         closes: CountBucket::from(endpoint.closes - prior_endpoint.closes),
                         mappings: CountBucket::from(endpoint.mappings - prior_endpoint.mappings),
                         executions: CountBucket::from(endpoint.executions - prior_endpoint.executions),
-                        changed_objects: CountBucket::Zero,
+                        changed_objects: CountBucket::from(changed_objects),
                     });
                     shared.spool.lock().expect("spool lock").append(&record)?;
                 }
@@ -742,7 +804,7 @@ fn save_cursor(file: &Path, value: u64) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{increment, LogicalState};
+    use super::{increment, native_metadata, LogicalState};
     use eidos_observe::StudyKey;
 
     fn token(value: u64) -> eidos_observe::ObjectToken {
@@ -759,5 +821,21 @@ mod tests {
         assert!(!state.edits.contains(&token(0)));
         assert!(state.edits.contains(&token(99)));
         assert_eq!(increment(&mut state.edits, token(99)), 2);
+    }
+
+    #[test]
+    fn metadata_reports_keyable_volume_and_resource_fork_facts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("juniper.dat");
+        std::fs::write(&file, b"fixture").unwrap();
+        let status = std::process::Command::new("/usr/bin/xattr")
+            .args(["-w", "com.apple.ResourceFork", "fixture"])
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let metadata = native_metadata(&file).unwrap();
+        assert_ne!((metadata.volume_id_high, metadata.volume_id_low), (0, 0));
+        assert_ne!(metadata.resource_fork, 0);
     }
 }

@@ -35,3 +35,6 @@ security-framework = "3.7"
 
 [build-dependencies]
 cc = "1.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }

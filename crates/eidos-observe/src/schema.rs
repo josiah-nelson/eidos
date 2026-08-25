@@ -229,6 +229,7 @@ pub struct ApfsObservation {
     pub at: TimeAnchor,
     pub volume: ObjectToken,
     pub object: ObjectToken,
+    #[serde(rename = "apfs_kind")]
     pub kind: ApfsKind,
     pub prevalence: CountBucket,
     pub size: SizeBucket,

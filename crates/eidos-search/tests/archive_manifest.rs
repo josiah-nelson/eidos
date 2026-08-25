@@ -3,19 +3,30 @@
 //! text still indexes as text, corrupt directories fail cleanly, and
 //! manifests survive a content reindex through `requeue_archives`.
 
+#[cfg(windows)]
 use eidos_archive::fixture::{build, Entry};
+#[cfg(windows)]
 use eidos_catalog::archive::{ArchiveMember, MemberQuery};
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::{Catalog, NewSource};
+#[cfg(windows)]
 use eidos_content::Limits;
 use eidos_domain::*;
+#[cfg(windows)]
 use eidos_query::parse;
+#[cfg(windows)]
 use eidos_search::exec::{search_with_content, ExecOptions};
+#[cfg(windows)]
 use eidos_search::pipeline::drain_content_jobs;
+#[cfg(windows)]
 use eidos_search::{CatalogIndex, ContentIndex};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
 use std::sync::Arc;
 
+#[cfg(windows)]
 struct Fx {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -32,6 +43,7 @@ fn write(p: &Path, body: &[u8]) {
     std::fs::write(p, body).unwrap();
 }
 
+#[cfg(windows)]
 fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");
@@ -40,7 +52,7 @@ fn fixture() -> Fx {
             Entry::file("readme.txt", b"hello"),
             Entry::dir("src/"),
             Entry::file("src/lib/mod.rs", b"fn x() {}"),
-            Entry::file("10.0.0.7 (01)/asset.bin", &[0u8; 1000]),
+            Entry::file("192.0.2.7 (01)/asset.bin", &[0u8; 1000]),
             Entry::file("../escape.txt", b"x"),
         ],
         b"built for tests",
@@ -95,6 +107,7 @@ fn fixture() -> Fx {
     }
 }
 
+#[cfg(windows)]
 impl Fx {
     fn extract_all(&self) {
         self.catalog
@@ -125,6 +138,7 @@ impl Fx {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn containers_get_manifests_and_members() {
     let fx = fixture();
@@ -177,7 +191,7 @@ fn containers_get_manifests_and_members() {
     assert_eq!(
         names,
         vec![
-            ("10.0.0.7 (01)", true),
+            ("192.0.2.7 (01)", true),
             ("src", true),
             ("escape.txt", false),
             ("readme.txt", false)
@@ -278,6 +292,7 @@ fn containers_get_manifests_and_members() {
     assert_eq!(stats.declared_size, 1017, "tool.zip 1015 + Plugin.VSIX 2");
 }
 
+#[cfg(windows)]
 #[test]
 fn reindex_and_requeue_rebuild_manifests() {
     let fx = fixture();
@@ -309,6 +324,7 @@ fn reindex_and_requeue_rebuild_manifests() {
     assert_eq!(fx.catalog.requeue_archives(None).unwrap(), 0);
 }
 
+#[cfg(windows)]
 #[test]
 fn requeue_backfills_an_existing_manifest_without_virtual_rows() {
     let fx = fixture();
@@ -344,6 +360,7 @@ fn requeue_backfills_an_existing_manifest_without_virtual_rows() {
         .is_some());
 }
 
+#[cfg(windows)]
 #[test]
 fn stale_archive_generation_is_not_published() {
     let fx = fixture();
@@ -390,6 +407,7 @@ fn stale_archive_generation_is_not_published() {
     assert_eq!(current.content_state, ContentState::Pending);
 }
 
+#[cfg(windows)]
 #[test]
 fn manifest_rows_persist_in_batches_and_published_retries_are_idempotent() {
     let fx = fixture();
@@ -623,6 +641,7 @@ fn mixed_extension_hard_link_priority_matches_rendered_path() {
     assert_eq!(priority, expected as i64);
 }
 
+#[cfg(windows)]
 #[test]
 fn projection_rows_agree_between_rebuild_and_incremental_for_virtual_members() {
     let fx = fixture();
