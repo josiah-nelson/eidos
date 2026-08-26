@@ -7,11 +7,18 @@ WiX v7 authoring for the eidos setup:
 | `Eidos.Msi` | `eidos.msi` | The Windows Installer package (dual-scope) |
 | `Eidos.Setup.Ui` | `eidos-setup-ui.exe` | The guided UI: a .NET Framework 4.7.2 WPF bootstrapper application |
 | `Eidos.Bundle` | `eidos-setup.exe` | The product: Burn engine + UI + MSI (+ .NET prerequisite) |
+| `Eidos.Collector.Msi` | `eidos-collector.msi` | The observatory collector package (per-machine) |
+| `Eidos.Collector.Bundle` | `eidos-collector-setup.exe` | The collector setup: Burn engine + standard BA + MSI |
 
 ```powershell
-.\installer\build.ps1              # web UI + release eidos.exe + installer\out\{eidos.msi,eidos-setup.exe}
+.\installer\build.ps1              # web UI + release eidos.exe + installer\out\*
 .\installer\build.ps1 -SkipWeb -SkipRust
 ```
+
+The two products are independent and share only `eidos.exe`: the indexer
+setup installs the `eidos` service and the web UI, the collector setup
+installs the `eidos-collector` service. A host can have either, both, or
+neither. Each `-Skip` switch turns off exactly one artifact.
 
 ## The setup (`eidos-setup.exe`)
 
@@ -81,6 +88,59 @@ msiexec /i eidos.msi ALLUSERS=1 EIDOS_PORT=7700        # per-machine (elevated)
 msiexec /x eidos.msi EIDOS_REMOVE_DATA=1               # uninstall and delete data
 ```
 
+## The collector setup (`eidos-collector-setup.exe`)
+
+For putting the observatory collector on hosts that have no build tree. It is
+per-machine only, has no prerequisites and no interactive choices, and uses
+the WiX standard bootstrapper application: a fleet install passes what it
+needs on the command line.
+
+```powershell
+eidos-collector-setup.exe /quiet EIDOS_STUDY_KEY=<64 hex> `
+    EIDOS_LANES=usn,etw EIDOS_UPLOAD=\\fileserver\share\eidos EIDOS_UPLOAD_HOUR=3
+eidos-collector-setup.exe /quiet /uninstall                              # keeps the data
+eidos-collector-setup.exe /quiet /uninstall EIDOS_COLLECTOR_REMOVE_DATA=1
+msiexec /i eidos-collector.msi /qn EIDOS_LANES=usn                       # for a management tool
+```
+
+`eidos-collector.msi` installs `eidos.exe` into `%ProgramFiles%\eidos-collector`,
+registers the `eidos-collector` service (LocalSystem, delayed automatic start,
+restart three times at 30-second intervals, three-minute pre-shutdown window),
+and runs two deferred commands between `InstallFiles` and `InstallServices`:
+
+- `eidos observe init` — creates the data directory, restricts it to SYSTEM
+  and Administrators, and creates or imports the DPAPI machine-scope study
+  key. `EIDOS_STUDY_KEY` is `Hidden`, and the custom action hides its target,
+  so the key reaches neither a verbose log nor the ARP registry.
+- `eidos observe configure` — writes `config.json`, and only when at least one
+  of `EIDOS_LANES`, `EIDOS_UPLOAD` and `EIDOS_UPLOAD_HOUR` was given: the
+  command line is assembled from the properties that were actually passed, so
+  an upgrade that names none of them leaves a host's runtime `observe lanes`
+  choices alone. Only the install and data directories are remembered in
+  `HKLM\Software\eidos-collector`; lanes and upload deliberately are not,
+  because after the first install `config.json` is the authority.
+
+`EIDOS_UPLOAD=none` turns the daily upload off and clears the destination;
+an empty property cannot mean that, because Windows Installer cannot tell an
+empty property from an absent one, and absent has to keep meaning "leave this
+host alone". A destination must not end in a backslash: it would escape the
+closing quote of the command line the package builds, and `observe configure`
+rejects what arrives rather than storing a destination that never resolves.
+
+A study key passed to a host that already has a different one fails the
+install instead of rotating it. The key is kept out of the installer log
+(`Hidden`, plus `HideTarget` on the action that consumes it — verified by
+grepping a `/l*v` log for it), but it is still visible for the moment it is
+an argument to anything that can read another process's command line.
+
+Uninstall stops and removes the service and keeps the data directory —
+study key included, so a reinstall keeps earlier object tokens comparable —
+unless `EIDOS_COLLECTOR_REMOVE_DATA=1`, which runs `eidos observe purge`
+after `DeleteServices`. That is a command rather than `util:RemoveFolderEx`
+for a reason: a Windows Installer file list is built before the service
+stops, so the spool's write-ahead log, a log line, or a moved cursor written
+in between outlives the list and keeps the directory alive.
+
 ## Authoring notes
 
 - `eidos.exe` appears in two components with mutually exclusive conditions
@@ -94,4 +154,14 @@ msiexec /x eidos.msi EIDOS_REMOVE_DATA=1               # uninstall and delete da
 - The web UI is embedded in `eidos.exe`; the package carries three files.
 - `build.ps1` deletes `Eidos.Msi\obj` before building: WiX's incremental
   build does not notice a changed `BinDir` and would reuse the previously
-  bound executable.
+  bound executable. The same applies to the collector projects.
+- The collector package is `Scope="perMachine"` with a `Privileged` launch
+  condition: the collector is a LocalSystem service and there is nothing to
+  install for a single user.
+- Service and purge arguments spell the data directory `"[DATAFOLDER]."` for
+  the same reason as above, and `observe` normalises that spelling before
+  anything else touches the path.
+- `EIDOS_COLLECTOR_DATADIR` and `EIDOS_COLLECTOR_INSTALLDIR` are remembered in
+  component-owned registry values, so an uninstall forgets them even when it
+  keeps the data. A host installed with a custom data directory needs the same
+  property again on a reinstall, or it starts a fresh study in ProgramData.

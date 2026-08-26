@@ -205,13 +205,78 @@ eidos observe uninstall            # keeps the data directory and key
 `eidos observe run` runs the same daemon in the foreground for testing.
 `eidos observe init --key-hex <64 hex>` imports a cohort-shared key so
 content fingerprints compare across hosts; otherwise the key is random.
-`eidos observe configure` writes lanes, upload destination and hour, and
-excluded volumes into `config.json`, which the collector reads at its next
-start.
+`eidos observe configure` writes the same choices the installer writes —
+lanes, upload destination and hour, excluded volumes — into `config.json`,
+which the collector reads at its next start.
 
 Data lives in `C:\ProgramData\eidos-collector` (ACL: SYSTEM and
 Administrators only): the DPAPI-protected key, `config.json`, the SQLite
 spool ring, per-volume feed cursors, staged exports, and seven days of logs.
+
+### Fleet install
+
+`eidos-collector-setup.exe` installs the collector on a host with no build
+tree: one signed executable carrying a per-machine MSI, and no prerequisites
+to install first. It reaches the same end state as `observe init` followed by
+`observe install --start-now` — executable in `%ProgramFiles%\eidos-collector`,
+data directory created and locked down, study key in place, `config.json`
+written, service registered and started.
+
+```powershell
+eidos-collector-setup.exe                     # one screen, then install
+eidos-collector-setup.exe /quiet EIDOS_STUDY_KEY=<64 hex> `
+    EIDOS_LANES=usn,etw EIDOS_UPLOAD=\\fileserver\share\eidos EIDOS_UPLOAD_HOUR=3
+eidos-collector-setup.exe /quiet /uninstall   # keeps the data directory
+eidos-collector-setup.exe /quiet /uninstall EIDOS_COLLECTOR_REMOVE_DATA=1
+```
+
+| Variable | Meaning |
+|---|---|
+| `EIDOS_STUDY_KEY` | cohort key, 64 hex characters; a per-host key is generated when omitted. Hidden, so it stays out of the installer log |
+| `EIDOS_LANES` | lanes to enable: `usn,etw,content,enumeration`, or `all` / `none` |
+| `EIDOS_UPLOAD` | daily upload destination, typically a UNC share; `none` turns the upload off and clears it. Give it without a trailing backslash — one escapes the closing quote of the command line the installer builds, and the install fails rather than storing a broken destination |
+| `EIDOS_UPLOAD_HOUR` | local hour, 0-23, at or after which that upload runs |
+| `EIDOS_COLLECTOR_INSTALLDIR`, `EIDOS_COLLECTOR_DATADIR` | program and data directories |
+| `EIDOS_COLLECTOR_START` | `0` registers the service without starting it. Not remembered: pass it again on an upgrade, or the upgrade starts it |
+| `EIDOS_COLLECTOR_REMOVE_DATA` | `1` deletes the data directory on uninstall |
+
+Give every host in a cohort the same study key, and enable the L2 lanes only
+on the hosts whose role calls for them. Passing the key again on a later
+install is safe: a host that already has that key keeps it, and one that has
+a *different* key fails the install rather than rotating quietly and splitting
+its own tokens in two. Replacing a key on purpose is
+`eidos observe init --force --key-hex ...` on the host.
+
+The key is hidden from the installer log, but it is still an argument on the
+command line of the setup process and of the `observe init` it runs, so it is
+visible for that moment to anything on the host that can read another
+process's command line — which on Windows means administrators and SYSTEM.
+On a shared administrative host, prefer initialising the key by hand.
+
+If a host is installed with a custom `EIDOS_COLLECTOR_DATADIR`, pass it again
+on any later reinstall: the remembered value lives in the package's own
+registry key, which an uninstall removes even when it keeps the data. Without
+it a reinstall starts a fresh study in the default location. Lanes and upload are written only
+when they are named, so a later upgrade that names neither leaves the
+configuration a host is running with alone, including runtime
+`observe lanes` changes; after the first install, `config.json` is the
+authority.
+
+The MSI inside the setup can also be deployed on its own, which is what a
+management tool wants:
+
+```powershell
+msiexec /i eidos-collector.msi /qn EIDOS_LANES=usn EIDOS_UPLOAD=\\fileserver\share\eidos
+msiexec /x eidos-collector.msi /qn EIDOS_COLLECTOR_REMOVE_DATA=1
+```
+
+It is per-machine and must be installed elevated. The collector package and
+the indexer package (`eidos.msi`, `eidos-setup.exe`) are independent: a host
+can run either, both, or neither.
+
+Uninstall stops and removes the service and keeps the data directory —
+including the study key, so a reinstall keeps earlier tokens comparable —
+unless `EIDOS_COLLECTOR_REMOVE_DATA=1` says otherwise.
 
 ### Lanes
 

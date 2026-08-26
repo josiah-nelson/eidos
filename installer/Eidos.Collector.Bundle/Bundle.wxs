@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  eidos-collector-setup.exe: the fleet installer for the observatory
+  collector.
+
+  One self-contained, signed executable per host. The chain is a single
+  per-machine MSI, so the bundle is the WiX standard bootstrapper
+  application - there is nothing to choose interactively that a fleet
+  install would not pass on the command line:
+
+    eidos-collector-setup.exe /quiet EIDOS_STUDY_KEY=<64 hex> ^
+        EIDOS_LANES=usn,etw EIDOS_UPLOAD=\\fileserver\share\eidos
+    eidos-collector-setup.exe /quiet /uninstall EIDOS_COLLECTOR_REMOVE_DATA=1
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+
+  <Bundle Id="Eidos.Collector.Setup"
+          Name="eidos observatory collector"
+          Manufacturer="eidos"
+          Version="$(var.Version)"
+          UpgradeCode="5D2B93F8-29ED-4E6C-B101-1355B4A36F3A"
+          IconSourceFile="..\Eidos.Msi\eidos.ico"
+          AboutUrl="https://github.com/josiah-nelson/eidos"
+          HelpUrl="https://github.com/josiah-nelson/eidos/blob/main/docs/observatory.md"
+          Condition="VersionNT64"
+          Compressed="yes"
+          DisableModify="yes">
+
+    <bal:Condition Condition="VersionNT64" Message="The eidos collector requires 64-bit Windows." />
+
+    <!-- Study set-up, passed straight through to the package. -->
+    <Variable Name="EIDOS_STUDY_KEY" Value="" Hidden="yes" bal:Overridable="yes" />
+    <Variable Name="EIDOS_LANES" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_UPLOAD" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_UPLOAD_HOUR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_COLLECTOR_INSTALLDIR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_COLLECTOR_DATADIR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_COLLECTOR_START" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_COLLECTOR_REMOVE_DATA" Value="" bal:Overridable="yes" />
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="hyperlinkLicense"
+          LicenseUrl="https://github.com/josiah-nelson/eidos/blob/main/LICENSE"
+          SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <MsiPackage Id="EidosCollectorMsi" SourceFile="$(var.MsiPath)" Vital="yes" Compressed="yes" Visible="no">
+        <MsiProperty Name="EIDOS_STUDY_KEY" Value="[EIDOS_STUDY_KEY]" Condition="EIDOS_STUDY_KEY &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_LANES" Value="[EIDOS_LANES]" Condition="EIDOS_LANES &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_UPLOAD" Value="[EIDOS_UPLOAD]" Condition="EIDOS_UPLOAD &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_UPLOAD_HOUR" Value="[EIDOS_UPLOAD_HOUR]" Condition="EIDOS_UPLOAD_HOUR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_COLLECTOR_INSTALLDIR" Value="[EIDOS_COLLECTOR_INSTALLDIR]" Condition="EIDOS_COLLECTOR_INSTALLDIR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_COLLECTOR_DATADIR" Value="[EIDOS_COLLECTOR_DATADIR]" Condition="EIDOS_COLLECTOR_DATADIR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_COLLECTOR_START" Value="[EIDOS_COLLECTOR_START]" Condition="EIDOS_COLLECTOR_START &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_COLLECTOR_REMOVE_DATA" Value="[EIDOS_COLLECTOR_REMOVE_DATA]" Condition="EIDOS_COLLECTOR_REMOVE_DATA &lt;&gt; &quot;&quot;" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

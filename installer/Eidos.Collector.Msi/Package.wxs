@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  eidos observatory collector package.
+
+  Per-machine only: the collector is the LocalSystem service `eidos-collector`
+  and there is nothing meaningful to install for a single user. The package
+  installs the executable, registers the service, and runs the two commands
+  that set a host up for the study before it first starts:
+
+      eidos observe init       study key (DPAPI machine scope) + locked ACL
+      eidos observe configure  lanes, upload destination and hour
+
+  Public properties (install folder and data directory are remembered in
+  HKLM\Software\eidos-collector so upgrade, repair and uninstall find them):
+
+    EIDOS_COLLECTOR_INSTALLDIR   install folder (default Program Files\eidos-collector)
+    EIDOS_COLLECTOR_DATADIR      spool, key, configuration, exports, logs
+                                 (default %ProgramData%\eidos-collector)
+    EIDOS_STUDY_KEY              cohort study key, 64 hex characters (hidden);
+                                 a per-host key is generated when omitted
+    EIDOS_LANES                  lanes to enable: usn,etw,content,enumeration
+                                 or all / none
+    EIDOS_UPLOAD                 directory the daily bundle is copied into,
+                                 typically a UNC share; empty leaves it off
+    EIDOS_UPLOAD_HOUR            local hour, 0-23, for the daily upload
+    EIDOS_COLLECTOR_START        1 = start the service at the end of install
+    EIDOS_COLLECTOR_REMOVE_DATA  1 = delete the data directory on uninstall
+
+  Lanes and upload are only written when they are given: after the install,
+  config.json is the authority, so an upgrade that names nothing leaves a
+  host's `observe lanes` choices alone.
+
+  Nothing here reads or writes an observed volume; the only directories
+  touched are the install folder and the data directory.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package Id="Eidos.Collector"
+           Name="eidos observatory collector"
+           Manufacturer="eidos"
+           Version="$(var.Version)"
+           UpgradeCode="0FB99891-CFD0-4706-AC24-57D6BE0525D8"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+
+    <SummaryInformation Description="eidos observatory collector" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of the eidos observatory collector is already installed. Uninstall it first to install this version." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Launch Condition="VersionNT64" Message="The eidos collector requires 64-bit Windows." />
+    <Launch Condition="Privileged" Message="The eidos collector installs a LocalSystem service and must be installed elevated." />
+    <!--
+      Checked here rather than in the command that would reject it later: a
+      launch condition fails before RemoveExistingProducts, so a fleet typo
+      stops the upgrade instead of unwinding it.
+    -->
+    <Launch Condition="NOT EIDOS_UPLOAD_HOUR OR (EIDOS_UPLOAD_HOUR &gt;= 0 AND EIDOS_UPLOAD_HOUR &lt;= 23)"
+            Message="EIDOS_UPLOAD_HOUR must be an hour of the day, 0-23." />
+
+    <Icon Id="eidos.ico" SourceFile="..\Eidos.Msi\eidos.ico" />
+    <Property Id="ARPPRODUCTICON" Value="eidos.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/josiah-nelson/eidos" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/josiah-nelson/eidos/blob/main/docs/observatory.md" />
+
+    <!-- ===== choices ===================================================== -->
+
+    <Property Id="EIDOS_COLLECTOR_INSTALLDIR" Secure="yes">
+      <RegistrySearch Id="CollectorInstallDir" Root="HKLM" Key="Software\eidos-collector" Name="InstallDir" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="EIDOS_COLLECTOR_DATADIR" Secure="yes">
+      <RegistrySearch Id="CollectorDataDir" Root="HKLM" Key="Software\eidos-collector" Name="DataDir" Type="raw" Bitness="always64" />
+    </Property>
+    <!-- Never remembered: the key is imported once and lives under DPAPI.
+         Hidden keeps it out of the verbose log (MsiHiddenProperties). -->
+    <Property Id="EIDOS_STUDY_KEY" Secure="yes" Hidden="yes" />
+    <!-- Never remembered: config.json is the authority once a host runs. -->
+    <Property Id="EIDOS_LANES" Secure="yes" />
+    <Property Id="EIDOS_UPLOAD" Secure="yes" />
+    <Property Id="EIDOS_UPLOAD_HOUR" Secure="yes" />
+    <Property Id="EIDOS_COLLECTOR_START" Value="1" Secure="yes" />
+    <!-- Read on uninstall only, by the purge command below. -->
+    <Property Id="EIDOS_COLLECTOR_REMOVE_DATA" Secure="yes" />
+
+    <!-- A property passed empty (PROP="") clears the default above. -->
+    <SetProperty Id="EIDOS_COLLECTOR_START" Action="DefaultStart" Value="1" Before="CostInitialize" Sequence="both" Condition="NOT EIDOS_COLLECTOR_START" />
+
+    <!-- ===== directories ================================================= -->
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="eidos-collector" />
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="eidos-collector" />
+    </StandardDirectory>
+
+    <SetDirectory Id="INSTALLFOLDER" Value="[EIDOS_COLLECTOR_INSTALLDIR]" Condition="EIDOS_COLLECTOR_INSTALLDIR" />
+    <SetDirectory Id="DATAFOLDER" Value="[EIDOS_COLLECTOR_DATADIR]" Condition="EIDOS_COLLECTOR_DATADIR" />
+
+    <!-- ===== program files =============================================== -->
+
+    <!--
+      The service registration mirrors `eidos observe install`: LocalSystem,
+      delayed automatic start, restart three times at 30-second intervals,
+      and a pre-shutdown window so the daemon can close its spool cleanly.
+      Directory properties end in a backslash, which would escape the closing
+      quote, so the data directory is written as "[DATAFOLDER]." - the
+      collector normalises that spelling.
+    -->
+    <Component Id="CollectorExe" Directory="INSTALLFOLDER" Guid="56F3FB83-367B-4A1E-84DB-6DD98D9CDA93">
+      <File Id="CollectorExe" Name="eidos.exe" Source="$(var.BinDir)\eidos.exe" KeyPath="yes" />
+      <ServiceInstall Id="CollectorService"
+                      Name="eidos-collector"
+                      DisplayName="eidos observatory collector"
+                      Description="Bounded, privacy-preserving workload observation for an explicitly initialized eidos study. Local only; no listener, and no upload beyond the configured share."
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="normal"
+                      Arguments="observe run --service --data-dir &quot;[DATAFOLDER].&quot;"
+                      Vital="yes">
+        <ServiceConfig DelayedAutoStart="yes" PreShutdownDelay="180000" OnInstall="yes" OnReinstall="yes" />
+        <util:ServiceConfig FirstFailureActionType="restart"
+                            SecondFailureActionType="restart"
+                            ThirdFailureActionType="restart"
+                            RestartServiceDelayInSeconds="30"
+                            ResetPeriodInDays="1" />
+      </ServiceInstall>
+      <!-- Stop on upgrade and uninstall; remove the registration on uninstall. -->
+      <ServiceControl Id="CollectorServiceStop" Name="eidos-collector" Stop="both" Remove="uninstall" Wait="yes" />
+    </Component>
+
+    <!--
+      Starting is a separate, conditioned component: a failed start fails
+      (and rolls back) the install rather than leaving a registered but
+      broken collector on a fleet host.
+    -->
+    <Component Id="CollectorServiceStart" Directory="INSTALLFOLDER" Guid="B62C3E71-23A8-4E9F-8532-3C438A7F5E00" Condition="EIDOS_COLLECTOR_START=1">
+      <RegistryValue Root="HKLM" Key="Software\eidos-collector" Name="StartService" Type="integer" Value="1" KeyPath="yes" />
+      <ServiceControl Id="CollectorServiceStart" Name="eidos-collector" Start="install" Wait="yes" />
+    </Component>
+
+    <Component Id="Readme" Directory="INSTALLFOLDER">
+      <File Name="README.md" Source="$(var.RepoRoot)\README.md" />
+    </Component>
+    <Component Id="License" Directory="INSTALLFOLDER">
+      <File Name="LICENSE" Source="$(var.RepoRoot)\LICENSE" />
+    </Component>
+
+    <!-- ===== data directory ============================================== -->
+
+    <!--
+      Created here so the package owns it; `observe init` restricts the ACL
+      to SYSTEM and Administrators before the study key is written into it.
+    -->
+    <Component Id="DataFolder" Directory="DATAFOLDER" Guid="488927E1-A71D-440E-893F-0CE2E6E5C6E1">
+      <CreateFolder />
+      <RegistryValue Root="HKLM" Key="Software\eidos-collector" Name="DataDir" Type="string" Value="[DATAFOLDER]" KeyPath="yes" />
+    </Component>
+
+    <!-- ===== remembered settings ========================================= -->
+
+    <Component Id="Settings" Directory="INSTALLFOLDER" Guid="A84CE1E2-7CF1-4B6B-B918-335D8D51CFB9">
+      <RegistryKey Root="HKLM" Key="Software\eidos-collector">
+        <RegistryValue Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RegistryValue Name="Version" Type="string" Value="$(var.Version)" />
+      </RegistryKey>
+    </Component>
+
+    <!-- ===== study set-up ================================================ -->
+
+    <!--
+      Two deferred, non-impersonated commands run between InstallFiles and
+      InstallServices, so the key and the configuration are in place before
+      the service is registered and started. Both are idempotent.
+
+      Importing is never forced. `observe init` keeps a key that is already
+      the one being imported and fails on one that is not, so a repair or an
+      upgrade cannot quietly split a host's tokens in two because the wrong
+      key reached it. Replacing a key stays a deliberate act, asked for by
+      hand at the collector's own command line.
+    -->
+    <SetProperty Id="InitCollector" Action="InitWithKey" Sequence="execute" Before="InitCollector"
+                 Condition="EIDOS_STUDY_KEY"
+                 Value="&quot;[INSTALLFOLDER]eidos.exe&quot; observe init --key-hex [EIDOS_STUDY_KEY] --data-dir &quot;[DATAFOLDER].&quot;" />
+    <SetProperty Id="InitCollector" Action="InitWithoutKey" Sequence="execute" Before="InitCollector"
+                 Condition="NOT EIDOS_STUDY_KEY"
+                 Value="&quot;[INSTALLFOLDER]eidos.exe&quot; observe init --data-dir &quot;[DATAFOLDER].&quot;" />
+
+    <!--
+      The configuration command line is assembled from the properties that
+      were actually given, so an upgrade that names none of them does not
+      overwrite the choices a host is running with.
+    -->
+    <SetProperty Id="ConfigureCollector" Action="ConfigureBase" Sequence="execute" Before="ConfigureLanes"
+                 Condition="EIDOS_LANES OR EIDOS_UPLOAD OR EIDOS_UPLOAD_HOUR"
+                 Value="&quot;[INSTALLFOLDER]eidos.exe&quot; observe configure --data-dir &quot;[DATAFOLDER].&quot;" />
+    <SetProperty Id="ConfigureCollector" Action="ConfigureLanes" Sequence="execute" Before="ConfigureUpload"
+                 Condition="ConfigureCollector AND EIDOS_LANES"
+                 Value="[ConfigureCollector] --lanes &quot;[EIDOS_LANES]&quot;" />
+    <!--
+      `EIDOS_UPLOAD=none` turns the daily upload off and clears the
+      destination, the way `EIDOS_LANES=none` turns the lanes off. An empty
+      property cannot mean it: to Windows Installer an empty property and an
+      absent one are the same thing, and absent has to keep meaning "leave
+      this host's configuration alone".
+    -->
+    <SetProperty Id="ConfigureCollector" Action="ConfigureUploadOff" Sequence="execute" Before="ConfigureUpload"
+                 Condition="ConfigureCollector AND EIDOS_UPLOAD~=&quot;none&quot;"
+                 Value="[ConfigureCollector] --upload-destination &quot;&quot;" />
+    <SetProperty Id="ConfigureCollector" Action="ConfigureUpload" Sequence="execute" Before="ConfigureUploadHour"
+                 Condition="ConfigureCollector AND EIDOS_UPLOAD AND NOT EIDOS_UPLOAD~=&quot;none&quot;"
+                 Value="[ConfigureCollector] --upload-destination &quot;[EIDOS_UPLOAD]&quot;" />
+    <SetProperty Id="ConfigureCollector" Action="ConfigureUploadHour" Sequence="execute" Before="InitCollector"
+                 Condition="ConfigureCollector AND EIDOS_UPLOAD_HOUR"
+                 Value="[ConfigureCollector] --upload-hour [EIDOS_UPLOAD_HOUR]" />
+
+    <!-- HideTarget keeps the study key out of the log even at /l*v. -->
+    <CustomAction Id="InitCollector" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+                  Execute="deferred" Impersonate="no" Return="check" HideTarget="yes" />
+    <CustomAction Id="ConfigureCollector" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
+    <!--
+      Deleting the data directory, when the uninstall was asked to.
+
+      A Windows Installer file list is built before the service stops, so
+      anything the collector writes in between - the spool's write-ahead log,
+      a log line, a moved cursor - outlives the list and keeps the directory
+      alive. This runs once the service has been stopped and deleted, and
+      before the executable it needs is removed. Never during an upgrade: the
+      spool, the cursors and the study key are the point of the study.
+    -->
+    <SetProperty Id="PurgeCollectorData" Sequence="execute" Before="PurgeCollectorData"
+                 Condition="EIDOS_COLLECTOR_REMOVE_DATA=1 AND REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"
+                 Value="&quot;[INSTALLFOLDER]eidos.exe&quot; observe purge --data-dir &quot;[DATAFOLDER].&quot;" />
+    <CustomAction Id="PurgeCollectorData" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="InitCollector" After="InstallFiles" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="ConfigureCollector" After="InitCollector" Condition="ConfigureCollector AND NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="PurgeCollectorData" After="DeleteServices" Condition="PurgeCollectorData" />
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

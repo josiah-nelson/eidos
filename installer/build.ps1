@@ -1,10 +1,14 @@
 # Build the eidos Windows installer.
 #
-#   .\installer\build.ps1                      # web UI + release exe + MSI + setup UI + bundle
+#   .\installer\build.ps1                      # web UI + release exe + every artifact
 #   .\installer\build.ps1 -SkipWeb -SkipRust   # reuse web\dist and target\release\eidos.exe
 #   .\installer\build.ps1 -SkipWeb -SkipRust -SkipBundle      # stop before the bundle (CI signs first)
 #   .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipUi # bundle only, from signed parts
 #   .\installer\build.ps1 -SkipWeb -SkipRust -BinDir target\debug
+#
+# The indexer setup (eidos.msi, eidos-setup.exe) and the collector setup
+# (eidos-collector.msi, eidos-collector-setup.exe) are independent; each
+# -Skip switch turns off exactly one artifact.
 #
 # Requires: Node.js, Rust, .NET SDK 8+ (WiX v7 is restored from NuGet; the
 # OSMF EULA is accepted in the project files). Output: installer\out\.
@@ -14,6 +18,8 @@ param(
     [switch]$SkipMsi,
     [switch]$SkipUi,
     [switch]$SkipBundle,
+    [switch]$SkipCollectorMsi,
+    [switch]$SkipCollectorBundle,
     [string]$BinDir = "",
     [string]$Configuration = "Release"
 )
@@ -95,4 +101,25 @@ if (-not $SkipBundle) {
             -p:Version=$msiVersion -p:MsiPath="$out\eidos.msi" -p:BaDir=$baDir -p:OutDir="$out\"
     }
     Write-Host "Setup: $out\eidos-setup.exe" -ForegroundColor Green
+}
+
+if (-not $SkipCollectorMsi) {
+    Clean "Eidos.Collector.Msi"
+    Step "dotnet build Eidos.Collector.Msi" {
+        dotnet build (Join-Path $PSScriptRoot "Eidos.Collector.Msi\Eidos.Collector.Msi.wixproj") `
+            -c $Configuration -nologo -v minimal `
+            -p:Version=$msiVersion -p:BinDir=$BinDir -p:OutDir="$out\"
+    }
+    Write-Host "Collector MSI: $out\eidos-collector.msi" -ForegroundColor Green
+}
+
+if (-not $SkipCollectorBundle) {
+    if (-not (Test-Path (Join-Path $out "eidos-collector.msi"))) { throw "missing $out\eidos-collector.msi" }
+    Clean "Eidos.Collector.Bundle"
+    Step "dotnet build Eidos.Collector.Bundle" {
+        dotnet build (Join-Path $PSScriptRoot "Eidos.Collector.Bundle\Eidos.Collector.Bundle.wixproj") `
+            -c $Configuration -nologo -v minimal `
+            -p:Version=$msiVersion -p:MsiPath="$out\eidos-collector.msi" -p:OutDir="$out\"
+    }
+    Write-Host "Collector setup: $out\eidos-collector-setup.exe" -ForegroundColor Green
 }

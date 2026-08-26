@@ -1,0 +1,19 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <!--
+    eidos-collector-setup.exe: Burn bundle carrying eidos-collector.msi.
+    Built by installer\build.ps1 after the collector MSI.
+  -->
+  <PropertyGroup>
+    <AcceptEula>wix7</AcceptEula>
+    <OutputType>Bundle</OutputType>
+    <OutputName>eidos-collector-setup</OutputName>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <Version Condition="'$(Version)' == ''">0.5.0</Version>
+    <MsiPath Condition="'$(MsiPath)' == ''">$(MSBuildThisFileDirectory)..\out\eidos-collector.msi</MsiPath>
+    <DefineConstants>$(DefineConstants);Version=$(Version);MsiPath=$(MsiPath)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.BootstrapperApplications.wixext" Version="7.0.0" />
+  </ItemGroup>
+</Project>
