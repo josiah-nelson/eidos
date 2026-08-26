@@ -53,6 +53,8 @@ pub struct FeedStatus {
     pub last_batch: Option<Instant>,
     pub overflows: u64,
     pub recreations: u64,
+    /// Content nominations dropped because the probe queue was saturated.
+    pub probe_dropped: u64,
 }
 
 impl FeedStatus {
@@ -68,6 +70,7 @@ impl FeedStatus {
             last_batch: None,
             overflows: 0,
             recreations: 0,
+            probe_dropped: 0,
         }
     }
 }
@@ -89,6 +92,8 @@ pub struct Shared {
     pub volumes: Mutex<Vec<VolumeFacts>>,
     pub feeds: Mutex<BTreeMap<String, FeedStatus>>,
     pub etw: Mutex<EtwView>,
+    /// Candidates for the content probe, installed by the lane supervisor.
+    pub content_tx: Mutex<Option<std::sync::mpsc::SyncSender<crate::content_probe::Candidate>>>,
     /// True while an ETW window is tracing; drives `LaneStates::etw`.
     pub etw_window_open: AtomicBool,
     pub shutdown: AtomicBool,
@@ -288,6 +293,7 @@ pub fn run(
             state: "off".into(),
             ..EtwView::default()
         }),
+        content_tx: Mutex::new(None),
         etw_window_open: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
         started: Instant::now(),
@@ -619,6 +625,7 @@ fn status(shared: &Shared) -> CollectorStatus {
                 last_batch_s_ago: f.last_batch.map(|t| t.elapsed().as_secs()),
                 overflows: f.overflows,
                 recreations: f.recreations,
+                probe_dropped: f.probe_dropped,
             })
             .collect(),
         etw: shared.etw.lock().unwrap().clone(),

@@ -7,14 +7,22 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub fn start(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
+    let (content_tx, content_rx) = std::sync::mpsc::sync_channel(crate::content_probe::QUEUE_DEPTH);
+    *shared.content_tx.lock().unwrap() = Some(content_tx);
     vec![
+        crate::content_probe::start(shared.clone(), content_rx),
         crate::usn_lane::start(shared.clone()),
-        crate::access_lane::start(shared),
+        crate::access_lane::start(shared.clone()),
+        crate::enumeration_probe::start(shared),
     ]
 }
 
-pub fn probe_now(_shared: &Arc<Shared>, _volume: Option<&str>) -> Response {
-    Response::Error {
-        message: "the enumeration probe is not available in this build".into(),
+pub fn probe_now(shared: &Arc<Shared>, volume: Option<&str>) -> Response {
+    if crate::enumeration_probe::run_detached(shared.clone(), volume.map(str::to_string)) {
+        Response::Accepted
+    } else {
+        Response::Error {
+            message: "an enumeration probe is already running".into(),
+        }
     }
 }

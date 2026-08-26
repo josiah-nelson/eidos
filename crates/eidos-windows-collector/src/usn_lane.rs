@@ -309,6 +309,7 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                                 if let Some(change) =
                                     analyzer.observe(key, &view, facts, now.clone())
                                 {
+                                    nominate(&shared, &volume, &view, &change, &mut counters);
                                     changes.push(ObservationRecord::LogicalChange(change));
                                 }
                             }
@@ -363,6 +364,7 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                         s.logical_changes = counters.logical_changes;
                         s.lag_bytes = lag;
                         s.last_batch = Some(Instant::now());
+                        s.probe_dropped = counters.probe_dropped;
                     });
                 }
             }
@@ -426,6 +428,51 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
     tracing::info!(root = %volume.root(), records = counters.records, "usn reader stopped");
 }
 
+/// Offer a closed-after-write file to the content probe when that lane is
+/// on and the deterministic sample selects the object.
+fn nominate(
+    shared: &Shared,
+    volume: &VolumeFacts,
+    view: &RecordView<'_>,
+    change: &eidos_observe::LogicalChange,
+    counters: &mut Counters,
+) {
+    use eidos_observe::ChangeOperation;
+    if view.is_directory
+        || !matches!(
+            change.operation,
+            ChangeOperation::Create | ChangeOperation::Update
+        )
+    {
+        return;
+    }
+    let (enabled, percent) = {
+        let config = shared.config.lock().unwrap();
+        (
+            config.lanes.content.enabled,
+            config.lanes.content.sample_percent,
+        )
+    };
+    if !enabled
+        || !crate::content_probe::selected(shared, volume.guid_path.as_bytes(), view.frn, percent)
+    {
+        return;
+    }
+    if let Some(sender) = shared.content_tx.lock().unwrap().as_ref() {
+        crate::content_probe::offer(
+            sender,
+            crate::content_probe::Candidate {
+                device: volume.device.clone(),
+                volume_id: volume.guid_path.as_bytes().to_vec(),
+                frn: view.frn,
+                extension: change.extension,
+                queued: Instant::now(),
+            },
+            &mut counters.probe_dropped,
+        );
+    }
+}
+
 #[derive(Default)]
 struct Counters {
     batches: u64,
@@ -438,6 +485,7 @@ struct Counters {
     spool_failures: u64,
     coalesced_total: u64,
     unavailable: bool,
+    probe_dropped: u64,
 }
 
 fn flush_interval(
