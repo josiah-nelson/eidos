@@ -12,12 +12,35 @@ impl StudyKey {
     }
 
     pub fn token(&self, domain: &'static str, value: &[u8]) -> ObjectToken {
-        let mut input = Vec::with_capacity(domain.len() + value.len() + 1);
-        input.extend_from_slice(domain.as_bytes());
-        input.push(0);
-        input.extend_from_slice(value);
-        let digest = blake3::keyed_hash(&self.0, &input);
-        ObjectToken::from_digest(digest.as_bytes())
+        let mut hasher = self.hasher(domain);
+        hasher.update(value);
+        hasher.finish()
+    }
+
+    /// Streaming form of [`StudyKey::token`] for large inputs such as file
+    /// content; the result equals `token(domain, all_bytes)`.
+    pub fn hasher(&self, domain: &'static str) -> TokenHasher {
+        let mut hasher = blake3::Hasher::new_keyed(&self.0);
+        hasher.update(domain.as_bytes());
+        hasher.update(&[0]);
+        TokenHasher(hasher)
+    }
+}
+
+pub struct TokenHasher(blake3::Hasher);
+
+impl TokenHasher {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub fn finish(&self) -> ObjectToken {
+        ObjectToken::from_digest(self.0.finalize().as_bytes())
+    }
+
+    /// Raw keyed digest for in-memory comparison (never persisted directly).
+    pub fn finish_digest(&self) -> [u8; 32] {
+        *self.0.finalize().as_bytes()
     }
 }
 
@@ -97,18 +120,33 @@ pub fn bucket_extension(extension: Option<&str>) -> ExtensionBucket {
         .to_ascii_lowercase()
         .as_str()
     {
-        "txt" | "md" | "pdf" | "doc" | "docx" | "rtf" => ExtensionBucket::Document,
-        "c" | "h" | "cc" | "cpp" | "go" | "java" | "js" | "py" | "rs" | "ts" => {
+        "txt" | "md" | "pdf" | "doc" | "docx" | "rtf" | "odt" | "xls" | "xlsx" | "ppt" | "pptx"
+        | "csv" | "epub" | "one" | "pages" | "numbers" | "key" => ExtensionBucket::Document,
+        "c" | "h" | "cc" | "cpp" | "hpp" | "cs" | "go" | "java" | "kt" | "js" | "jsx" | "ts"
+        | "tsx" | "py" | "rs" | "rb" | "php" | "swift" | "m" | "sh" | "ps1" | "psm1" | "bat"
+        | "cmd" | "sql" | "vue" | "html" | "css" | "scss" | "xml" | "proto" => {
             ExtensionBucket::Source
         }
-        "zip" | "tar" | "gz" | "7z" | "dmg" => ExtensionBucket::Archive,
-        "gif" | "heic" | "jpeg" | "jpg" | "png" | "svg" => ExtensionBucket::Image,
-        "aac" | "mov" | "mp3" | "mp4" | "wav" => ExtensionBucket::AudioVideo,
-        "app" | "bin" | "dll" | "dylib" | "exe" => ExtensionBucket::Executable,
-        "db" | "sqlite" | "sqlite3" => ExtensionBucket::Database,
-        "conf" | "ini" | "json" | "plist" | "toml" | "yaml" | "yml" => {
-            ExtensionBucket::Configuration
+        "zip" | "tar" | "gz" | "tgz" | "7z" | "rar" | "xz" | "bz2" | "zst" | "cab" | "dmg"
+        | "jar" | "nupkg" | "whl" => ExtensionBucket::Archive,
+        "gif" | "heic" | "jpeg" | "jpg" | "png" | "svg" | "webp" | "bmp" | "tif" | "tiff"
+        | "psd" | "ico" | "raw" | "cr2" | "nef" => ExtensionBucket::Image,
+        "aac" | "mov" | "mp3" | "mp4" | "wav" | "mkv" | "avi" | "flac" | "m4a" | "webm" | "ogg"
+        | "wmv" | "wma" => ExtensionBucket::AudioVideo,
+        "app" | "bin" | "dll" | "dylib" | "so" | "exe" | "sys" | "msi" | "msix" | "appx"
+        | "com" | "scr" => ExtensionBucket::Executable,
+        "db" | "sqlite" | "sqlite3" | "mdb" | "accdb" | "ldb" | "edb" | "sdf" | "wal" => {
+            ExtensionBucket::Database
         }
+        "conf" | "ini" | "json" | "plist" | "toml" | "yaml" | "yml" | "cfg" | "reg"
+        | "properties" | "env" => ExtensionBucket::Configuration,
+        "o" | "obj" | "rlib" | "rmeta" | "pdb" | "ilk" | "lib" | "a" | "class" | "pyc" | "d"
+        | "exp" | "tlog" | "idb" | "pch" | "ipch" | "cache" | "node" => ExtensionBucket::Build,
+        "vhd" | "vhdx" | "avhdx" | "vmdk" | "vdi" | "qcow2" | "iso" | "img" | "wim" | "esd"
+        | "vmem" | "vmsn" | "vsv" => ExtensionBucket::DiskImage,
+        "log" | "etl" | "evtx" | "trace" | "dmp" => ExtensionBucket::Log,
+        "tmp" | "temp" | "bak" | "swp" | "part" | "crdownload" | "partial" | "lock" | "lck"
+        | "download" | "old" | "orig" => ExtensionBucket::Temporary,
         _ => ExtensionBucket::Other,
     }
 }

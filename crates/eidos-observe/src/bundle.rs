@@ -88,6 +88,7 @@ pub enum BundleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::families::*;
     use crate::privacy::StudyKey;
     use crate::schema::*;
 
@@ -111,31 +112,263 @@ mod tests {
                         running_as_root: false,
                     },
                     apfs: true,
+                    windows: Some(WindowsCapabilities {
+                        usn: UsnState::Available,
+                        etw: EtwState::Off,
+                        running_as_system: true,
+                        elevated: true,
+                        study_key_available: true,
+                    }),
                 },
                 capture_gaps: Vec::new(),
                 drops: DropCounters::default(),
                 units: Units::default(),
             },
-            records: vec![
-                ObservationRecord::Mark(MarkRecord {
-                    at: TimeAnchor {
-                        monotonic_ns: 10,
-                        utc_ns: 20,
-                    },
-                    marker: key.token("mark", b"phase-a"),
+            records: every_record_kind(&key),
+        }
+    }
+
+    /// One record of every variant, so the inspector and the raw-field
+    /// check cover the whole durable schema. Adding a variant without
+    /// adding it here fails `every_variant_is_covered`.
+    fn every_record_kind(key: &StudyKey) -> Vec<ObservationRecord> {
+        let at = TimeAnchor {
+            monotonic_ns: 10,
+            utc_ns: 20,
+        };
+        let volume = key.token("volume", b"volume-a");
+        let object = key.token("object", b"object-a");
+        let mut histogram = Histogram::new();
+        histogram.observe(3);
+        vec![
+            ObservationRecord::Health(HealthRecord {
+                at: at.clone(),
+                os_build: "0.0".into(),
+                machine: MachineKind::Unknown,
+                lifecycle: LifecycleEvent::Started,
+                clean_prior_shutdown: None,
+                feed_cursor: None,
+                drops: DropCounters::default(),
+                cpu_millis: 0,
+                resident_bytes_bucket: SizeBucket::B1M,
+            }),
+            ObservationRecord::LogicalChange(LogicalChange {
+                at: at.clone(),
+                object: object.clone(),
+                subtree: key.token("subtree", b"dir-a"),
+                operation: ChangeOperation::Update,
+                rename_pair: None,
+                size: SizeBucket::B1K,
+                extension: ExtensionBucket::Source,
+                depth: DepthBucket::Shallow,
+                edit_count: CountBucket::One,
+                delete_recreate_age: None,
+                fan_out: CountBucket::One,
+                backlog_age: AgeBucket::Immediate,
+            }),
+            ObservationRecord::Workload(WorkloadSummary {
+                at: at.clone(),
+                process: ProcessClass::Other,
+                opens: CountBucket::Zero,
+                closes: CountBucket::Zero,
+                mappings: CountBucket::Zero,
+                executions: CountBucket::Zero,
+                changed_objects: CountBucket::Zero,
+            }),
+            ObservationRecord::Apfs(ApfsObservation {
+                at: at.clone(),
+                volume: volume.clone(),
+                object: object.clone(),
+                kind: ApfsKind::Sparse,
+                prevalence: CountBucket::One,
+                size: SizeBucket::B4K,
+            }),
+            ObservationRecord::Mark(MarkRecord {
+                at: at.clone(),
+                marker: key.token("mark", b"phase-a"),
+            }),
+            ObservationRecord::Volume(VolumeObservation {
+                at: at.clone(),
+                volume: volume.clone(),
+                event: VolumeEvent::Inventory,
+                filesystem: FilesystemKind::Ntfs,
+                drive: DriveKind::Fixed,
+                bus: BusKind::Nvme,
+                media: MediaKind::Solid,
+                capacity: CapacityBucket::T1,
+                free: PercentBucket::Under50,
+                bytes_per_cluster: 4096,
+                case_sensitive: Some(false),
+                supports_usn: true,
+                supports_file_ids: true,
+                supports_sparse: true,
+                supports_reparse_points: true,
+                supports_hard_links: true,
+                compressed: false,
+                journal: Some(JournalShape {
+                    maximum_size: SizeBucket::B64M,
+                    allocation_delta: SizeBucket::B16M,
+                    span: SizeBucket::B16M,
+                    max_major_version: 3,
                 }),
-                ObservationRecord::Apfs(ApfsObservation {
-                    at: TimeAnchor {
-                        monotonic_ns: 11,
-                        utc_ns: 21,
-                    },
-                    volume: key.token("volume", b"volume-a"),
-                    object: key.token("object", b"object-a"),
-                    kind: ApfsKind::Sparse,
-                    prevalence: CountBucket::One,
-                    size: SizeBucket::B4K,
+            }),
+            ObservationRecord::FeedHealth(FeedHealthRecord {
+                at: at.clone(),
+                volume: volume.clone(),
+                feed: FeedKind::Usn,
+                state: FeedState::Live,
+                cursor: Some(FeedCursor {
+                    feed: FeedKind::Usn,
+                    version: 1,
+                    opaque: "opaque".into(),
                 }),
-            ],
+                lag: SizeBucket::Zero,
+                fill: PercentBucket::Under10,
+                batches: 1,
+                records: 2,
+                logical_changes: 1,
+                coalesced: 1,
+                overflows: 0,
+                recreations: 0,
+                read_errors: 0,
+                backlog_ms: histogram.clone(),
+            }),
+            ObservationRecord::Rate(RateSummary {
+                at: at.clone(),
+                volume: volume.clone(),
+                interval_s: 60,
+                records: 2,
+                logical_changes: 1,
+                per_second: histogram.clone(),
+                operations: OperationCounts::default(),
+                coalesced: CoalescingWindows::default(),
+                tombstones: 0,
+                hot_objects: 0,
+                directories_touched: 0,
+                recreates: 0,
+                extensions: vec![(ExtensionBucket::Source, 1)],
+                sizes: vec![(SizeBucket::B1K, 1)],
+                depths: vec![(DepthBucket::Shallow, 1)],
+                max_backlog: AgeBucket::Immediate,
+            }),
+            ObservationRecord::Reasons(ReasonSummary {
+                at: at.clone(),
+                volume: volume.clone(),
+                interval_s: 60,
+                combinations: vec![(0x8000_0002, 1)],
+                close_records: 1,
+                intermediate_records: 1,
+                directory_records: 0,
+            }),
+            ObservationRecord::Access(AccessSummary {
+                at: at.clone(),
+                interval_s: 60,
+                process: ProcessClass::Build,
+                process_starts: 1,
+                opens: 1,
+                reads: 1,
+                writes: 1,
+                closes: 1,
+                deletes: 0,
+                renames: 0,
+                read_bytes: 10,
+                write_bytes: 10,
+                distinct_objects: 1,
+                read_write_objects: 1,
+                read_size: histogram.clone(),
+                write_size: histogram.clone(),
+                extensions: vec![(ExtensionBucket::Build, 1)],
+            }),
+            ObservationRecord::Content(ContentObservation {
+                at: at.clone(),
+                volume: volume.clone(),
+                object: object.clone(),
+                size: SizeBucket::B64K,
+                extension: ExtensionBucket::Source,
+                outcome: ContentOutcome::Measured,
+                fingerprint: Some(key.token("content", b"bytes")),
+                chunker: ChunkerKind::FastCdc {
+                    min: 4096,
+                    average: 16384,
+                    max: 65536,
+                },
+                chunks: 3,
+                chunk_size: histogram.clone(),
+                reused_chunks: 1,
+                reuse_runs: histogram.clone(),
+                compressed: PercentBucket::Under50,
+                read_ms: 1,
+                text_like: Some(true),
+            }),
+            ObservationRecord::Enumeration(EnumerationProbe {
+                at: at.clone(),
+                volume: volume.clone(),
+                duration_ms: 1,
+                cpu_ms: 1,
+                files: 1,
+                directories: 1,
+                errors: 0,
+                max_depth: DepthBucket::Medium,
+                fan_out: histogram.clone(),
+                sizes: vec![(SizeBucket::B1K, 1)],
+                extensions: vec![(ExtensionBucket::Other, 1)],
+                reparse_points: 0,
+                placeholders: 0,
+                sparse: 0,
+                compressed: 0,
+                encrypted: 0,
+                offline: 0,
+                hard_linked: 0,
+                under_allocated: 0,
+            }),
+            ObservationRecord::Resource(ResourceSample {
+                at,
+                interval_s: 60,
+                collector: ProcessResources::default(),
+                system: HostResources {
+                    cpu_busy_percent: 5,
+                    memory_used_percent: 50,
+                    memory_total: CapacityBucket::G64,
+                    logical_processors: 8,
+                    uptime: AgeBucket::Days,
+                    on_battery: None,
+                    slept_ms: 0,
+                },
+                lanes: LaneStates::default(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_variant_is_covered() {
+        let key = StudyKey::from_bytes([3; 32]);
+        let kinds: BTreeSet<String> = every_record_kind(&key)
+            .iter()
+            .map(|record| {
+                serde_json::to_value(record).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let expected = [
+            "health",
+            "logical_change",
+            "workload",
+            "apfs",
+            "mark",
+            "volume",
+            "feed_health",
+            "rate",
+            "reasons",
+            "access",
+            "content",
+            "enumeration",
+            "resource",
+        ];
+        assert_eq!(kinds.len(), expected.len());
+        for name in expected {
+            assert!(kinds.contains(name), "{name} missing from the fixture");
         }
     }
 
@@ -172,10 +405,28 @@ mod tests {
         collect_fields("", &value, &mut fields);
         for field in fields {
             let leaf = field.rsplit('.').next().unwrap_or(&field);
-            assert!(!matches!(
-                leaf,
-                "path" | "filename" | "hostname" | "username" | "arguments" | "content" | "ip"
-            ));
+            assert!(
+                !matches!(
+                    leaf,
+                    "path"
+                        | "filename"
+                        | "name"
+                        | "hostname"
+                        | "username"
+                        | "host"
+                        | "arguments"
+                        | "command_line"
+                        | "image"
+                        | "content"
+                        | "ip"
+                        | "serial"
+                        | "volume_serial"
+                        | "journal_id"
+                        | "frn"
+                        | "pid"
+                ),
+                "raw identity field {field}"
+            );
         }
     }
 }
