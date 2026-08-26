@@ -65,6 +65,10 @@ impl VolumeFacts {
         matches!(self.drive, DriveKind::Fixed | DriveKind::Removable)
             && matches!(self.filesystem, FilesystemKind::Ntfs | FilesystemKind::Refs)
             && self.supports_usn()
+            // A volume whose journal is inactive is re-evaluated when the
+            // inventory sees one; an unqueryable journal gets a reader so
+            // the reason is recorded.
+            && (self.journal.is_some() || self.journal_error.is_some())
     }
 
     pub fn matches_exclusion(&self, exclusion: &str) -> bool {

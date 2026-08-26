@@ -78,36 +78,49 @@ impl Spool {
     }
 
     pub fn append(&mut self, record: &ObservationRecord) -> Result<(), SpoolError> {
+        self.append_all(std::slice::from_ref(record))
+    }
+
+    /// Append a batch in one transaction (one durable commit for the whole
+    /// batch); high-rate feeds hand over hundreds of records at a time.
+    pub fn append_all(&mut self, records: &[ObservationRecord]) -> Result<(), SpoolError> {
+        if records.is_empty() {
+            return Ok(());
+        }
         let elapsed_ns = self
             .retention_started
             .elapsed()
             .as_nanos()
             .min(i64::MAX as u128) as i64;
         self.append_at(
-            record,
+            records,
             self.retention_epoch_utc_ns.saturating_add(elapsed_ns),
         )
     }
 
     fn append_at(
         &mut self,
-        record: &ObservationRecord,
+        records: &[ObservationRecord],
         retention_utc_ns: i64,
     ) -> Result<(), SpoolError> {
-        let body = serde_json::to_vec(record)?;
-        let body_bytes = i64::try_from(body.len()).unwrap_or(i64::MAX);
-        let detailed = record.is_detailed();
         // Retention follows ingestion time, not an event-controlled clock. A
         // replayed, future-dated, or out-of-order anchor cannot move the ring's
         // cutoff and delete otherwise valid history.
         let transaction = self.connection.transaction()?;
         let mut detailed_bytes = self.detailed_bytes;
-        transaction.execute(
-            "INSERT INTO observations(utc_ns, detailed, bytes, body) VALUES (?1, ?2, ?3, ?4)",
-            params![retention_utc_ns, detailed, body_bytes, body],
-        )?;
-        if detailed {
-            detailed_bytes = detailed_bytes.saturating_add(body_bytes);
+        {
+            let mut insert = transaction.prepare_cached(
+                "INSERT INTO observations(utc_ns, detailed, bytes, body) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for record in records {
+                let body = serde_json::to_vec(record)?;
+                let body_bytes = i64::try_from(body.len()).unwrap_or(i64::MAX);
+                let detailed = record.is_detailed();
+                insert.execute(params![retention_utc_ns, detailed, body_bytes, body])?;
+                if detailed {
+                    detailed_bytes = detailed_bytes.saturating_add(body_bytes);
+                }
+            }
         }
         let detailed_cutoff = retention_utc_ns.saturating_sub(self.limits.detailed_max_age_ns);
         let expired_detailed_bytes: i64 = transaction.query_row(
@@ -319,7 +332,7 @@ mod tests {
         for sequence in 0..20 {
             spool
                 .append_at(
-                    &change(i64::MAX - sequence, &format!("token-{sequence:02}")),
+                    &[change(i64::MAX - sequence, &format!("token-{sequence:02}"))],
                     now - 1_900_000_000 + sequence * 100_000_000,
                 )
                 .unwrap();
@@ -351,7 +364,7 @@ mod tests {
         assert_eq!(spool.stats().unwrap().detailed_records, 3);
         spool
             .append_at(
-                &change(i64::MAX, "later-future-anchor"),
+                &[change(i64::MAX, "later-future-anchor")],
                 now + 20_000_000_000,
             )
             .unwrap();
@@ -385,7 +398,7 @@ mod tests {
         };
         let mut spool = Spool::open(&file, limits).unwrap();
         spool
-            .append_at(&change(i64::MAX, "before-reopen"), 1_000)
+            .append_at(&[change(i64::MAX, "before-reopen")], 1_000)
             .unwrap();
         drop(spool);
 
