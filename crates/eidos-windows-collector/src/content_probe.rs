@@ -46,19 +46,24 @@ pub struct Candidate {
 
 /// Deterministic sampling on the object identity so the same objects are
 /// followed over time (needed for chunk-reuse measurement).
-pub fn selected(shared: &Shared, volume_id: &[u8], frn: u128, sample_percent: u8) -> bool {
+/// Takes the key by reference rather than reaching for it through `Shared`:
+/// the USN reader calls this with the key already held, and the shared mutex
+/// is not reentrant - locking it a second time on the same thread parks that
+/// thread for good.
+pub fn selected(
+    key: &eidos_observe::StudyKey,
+    volume_id: &[u8],
+    frn: u128,
+    sample_percent: u8,
+) -> bool {
     if sample_percent >= 100 {
         return true;
     }
     let mut identity = volume_id.to_vec();
     identity.extend_from_slice(&frn.to_le_bytes());
-    shared
-        .with_key(|key| {
-            let mut hasher = key.hasher("sample");
-            hasher.update(&identity);
-            (hasher.finish_digest()[0] as u32 * 100 / 256) < sample_percent as u32
-        })
-        .unwrap_or(false)
+    let mut hasher = key.hasher("sample");
+    hasher.update(&identity);
+    (hasher.finish_digest()[0] as u32 * 100 / 256) < sample_percent as u32
 }
 
 pub fn offer(sender: &SyncSender<Candidate>, candidate: Candidate, dropped: &mut u64) {

@@ -97,7 +97,14 @@ pub struct Shared {
     pub content_tx: Mutex<Option<std::sync::mpsc::SyncSender<crate::content_probe::Candidate>>>,
     /// True while an ETW window is tracing; drives `LaneStates::etw`.
     pub etw_window_open: AtomicBool,
-    pub shutdown: AtomicBool,
+    /// None of the mutexes above may be held while another is taken, and
+    /// none may be taken twice on one thread: they guard independent state,
+    /// they are not reentrant, and the lanes reach for them in whatever order
+    /// their work happens to need.
+    ///
+    /// Shared with the pipe server, which parks in a blocking accept and
+    /// only leaves it when this flag is set and `pipe::poke` wakes it.
+    pub shutdown: Arc<AtomicBool>,
     pub started: Instant,
     pub build_hash: String,
     pub facts: HostFacts,
@@ -163,6 +170,23 @@ impl Shared {
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Sleep in short slices so a stop is not delayed by a whole tick, and
+    /// report whether the collector is stopping. Every supervisor loop waits
+    /// this way: the service control manager gives a stop seconds, not
+    /// minutes, and an installer replacing the service gives it less.
+    pub fn sleep_unless_stopping(&self, total: Duration) -> bool {
+        const SLICE: Duration = Duration::from_millis(250);
+        let mut slept = Duration::ZERO;
+        while slept < total {
+            if self.is_shutting_down() {
+                return true;
+            }
+            std::thread::sleep(SLICE);
+            slept += SLICE;
+        }
+        self.is_shutting_down()
     }
 
     /// Append a batch, retrying briefly before reporting it lost.
@@ -297,7 +321,7 @@ pub fn run(
         }),
         content_tx: Mutex::new(None),
         etw_window_open: AtomicBool::new(false),
-        shutdown: AtomicBool::new(false),
+        shutdown: Arc::new(AtomicBool::new(false)),
         started: Instant::now(),
         build_hash,
         facts,
@@ -328,9 +352,12 @@ pub fn run(
     );
 
     let pipe_thread = {
+        // The server's flag is the daemon's own: a private one would leave
+        // the accept loop parked forever and `join` below would never return.
+        let shutdown = shared.shutdown.clone();
         let shared = shared.clone();
         pipe::serve(
-            Arc::new(AtomicBool::new(false)),
+            shutdown,
             Arc::new(move |request| handle_request(&shared, request)),
         )?
     };
@@ -440,13 +467,11 @@ fn run_health(shared: Arc<Shared>) {
     let mut last_cpu_ms = resources::sample_process().cpu_ms;
     while !shared.is_shutting_down() {
         std::thread::sleep(Duration::from_secs(1));
-        let (intervals, key_missing) = {
-            let config = shared.config.lock().unwrap();
-            (
-                config.intervals.clone(),
-                shared.key.lock().unwrap().is_none(),
-            )
-        };
+        // One at a time: the USN reader holds `key` across a batch and
+        // needs `config` inside it, so holding `config` here while reaching
+        // for `key` deadlocks both threads.
+        let intervals = shared.config.lock().unwrap().intervals.clone();
+        let key_missing = shared.key.lock().unwrap().is_none();
 
         // Wall clock versus monotonic drift beyond five seconds is a clock
         // jump (NTP step, manual change, or resume without a power event).
@@ -676,4 +701,132 @@ pub(crate) fn stage_export(shared: &Shared) -> anyhow::Result<PathBuf> {
 
 pub fn export_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("exports")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Another collector already owns the machine-wide control pipe, so this
+    /// process cannot bind it. Listing the pipe filesystem answers that
+    /// without connecting to whoever is serving.
+    fn pipe_already_served() -> bool {
+        std::fs::read_dir(r"\\.\pipe\")
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.file_name() == crate::SERVICE_NAME)
+            })
+            .unwrap_or(false)
+    }
+
+    /// A working collector must return from `run` within seconds of a Stop.
+    ///
+    /// Everything about a stop is on a clock somebody else holds: the service
+    /// control manager gives it seconds, and an installer replacing the
+    /// service gives it less before failing with error 1921 and rolling the
+    /// upgrade back. Three ways to lose that race have been paid for already,
+    /// and none of them shows up in a collector that is asked to stop the
+    /// instant it starts:
+    ///
+    /// - the pipe server parking forever in its accept, because it was handed
+    ///   a shutdown flag that nothing sets;
+    /// - supervisor loops that only look at the flag once a tick;
+    /// - the USN reader taking the study key a second time on its own thread,
+    ///   through the content lane's sampler, on the first create it nominates.
+    ///
+    /// So this test gives the collector a key, turns the content lane on,
+    /// makes some churn for the reader to analyse, and lets every thread
+    /// settle into its own work before asking for a stop. The churn is
+    /// best-effort - a host that will not open its journal simply has less to
+    /// analyse - but the promptness is not.
+    ///
+    /// A stop that never finishes also never writes the clean-shutdown
+    /// marker, so the next start declares a capture gap that never happened.
+    #[test]
+    fn a_working_collector_stops_promptly_and_marks_a_clean_shutdown() {
+        let _guard = crate::pipe::test_lock();
+        if pipe_already_served() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("collector");
+        let churn_dir = temp.path().join("churn");
+        std::fs::create_dir_all(&churn_dir).unwrap();
+        crate::keystore::create(&data_dir, Some([7u8; 32]), true).unwrap();
+        let mut config = crate::config::CollectorConfig::default();
+        config.lanes.content.enabled = true;
+        // Under 100, so the sampler actually runs for every nomination.
+        config.lanes.content.sample_percent = 50;
+        config.save(&data_dir).unwrap();
+
+        let marker = data_dir.join("clean-shutdown");
+        let (control_tx, control_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let running = data_dir.clone();
+        let daemon = std::thread::spawn(move || {
+            run(Options { data_dir: running }, control_rx, move || {
+                let _ = ready_tx.send(());
+            })
+        });
+        // Either it comes up, or it fails fast (another collector owns the
+        // pipe after all): waiting the whole minute for a thread that has
+        // already returned an error tells nobody anything.
+        let ready_by = Instant::now() + Duration::from_secs(60);
+        while ready_rx.try_recv().is_err() {
+            if daemon.is_finished() {
+                daemon
+                    .join()
+                    .unwrap()
+                    .expect("the collector failed to start");
+                panic!("the collector returned before it was ready");
+            }
+            assert!(
+                Instant::now() < ready_by,
+                "the collector never reported itself running"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        for index in 0..64 {
+            let _ = std::fs::write(churn_dir.join(format!("{index}.txt")), b"observed change");
+        }
+        // Long enough for the reader to analyse that churn and for every
+        // supervisor to be inside a tick rather than at the top of its loop.
+        std::thread::sleep(Duration::from_secs(3));
+        // Off-thread and bounded: the defects this test exists for wedge the
+        // threads a status request has to wait on - the health thread holds
+        // `config` while it blocks, and building a status takes `config` -
+        // so asking for one on this thread would hang the test instead of
+        // failing it.
+        let answered = {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::client::request(&crate::protocol::Request::Status).is_ok());
+            });
+            rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
+        };
+        assert!(
+            answered,
+            "the control pipe must answer before the stop is asked for"
+        );
+
+        let asked = Instant::now();
+        control_tx.send(ControlEvent::Stop).unwrap();
+        let deadline = asked + Duration::from_secs(10);
+        while !daemon.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            daemon.is_finished(),
+            "run did not return within 10s of Stop ({}s and counting); the SCM would give up on the service first",
+            asked.elapsed().as_secs()
+        );
+        daemon.join().unwrap().unwrap();
+        assert!(
+            marker.exists(),
+            "a clean stop must leave the marker that keeps the next start from declaring a gap"
+        );
+    }
 }

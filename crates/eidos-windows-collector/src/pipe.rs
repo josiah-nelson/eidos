@@ -62,6 +62,19 @@ pub type Handler = Arc<dyn Fn(Request) -> Response + Send + Sync>;
 #[cfg(test)]
 static ACTIVE_PROBE: Mutex<Option<Arc<AtomicUsize>>> = Mutex::new(None);
 
+/// The one machine-wide pipe name means no two servers may run at once,
+/// here or in another module's tests.
+#[cfg(test)]
+pub(crate) static PIPE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take the pipe lock, ignoring poisoning from an unrelated failure.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    PIPE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A pipe instance handle owned by the server thread.
 struct Instance(windows_sys::Win32::Foundation::HANDLE);
 
@@ -324,13 +337,9 @@ mod tests {
     use crate::client;
 
     /// Both tests bind the one machine-wide pipe name, so they must not run
-    /// at the same time: concurrent servers would answer each other's clients.
-    static PIPE: Mutex<()> = Mutex::new(());
-
-    /// Take the pipe lock, ignoring poisoning from an unrelated failure.
-    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        PIPE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    /// at the same time: concurrent servers would answer each other's
+    /// clients. `daemon`'s stop test takes the same lock.
+    use super::test_lock as exclusive;
 
     /// A local user with only read access can open the pipe and never send a
     /// frame. Those connections must stay capped, must be reclaimed once their

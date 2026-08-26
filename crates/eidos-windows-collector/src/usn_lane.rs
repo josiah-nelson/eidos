@@ -127,7 +127,9 @@ pub fn start(shared: Arc<Shared>) -> JoinHandle<()> {
                         readers.insert(guid, Reader { cancel, thread });
                     }
                 }
-                std::thread::sleep(Duration::from_secs(5));
+                if shared.sleep_unless_stopping(Duration::from_secs(5)) {
+                    break;
+                }
             }
             for (_, reader) in readers.drain() {
                 reader.cancel.cancel();
@@ -288,6 +290,21 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                     counters.batches += 1;
                     counters.records += records.len() as u64;
                     let lookup = records.len() <= FACT_LOOKUP_BATCH_LIMIT;
+                    // Read before the key is held. The health thread takes
+                    // `config` and then `key`; taking them the other way
+                    // round here would wedge both threads, and with them
+                    // every stop.
+                    let sampling = {
+                        let config = shared.config.lock().unwrap();
+                        config
+                            .lanes
+                            .content
+                            .enabled
+                            .then_some(config.lanes.content.sample_percent)
+                    };
+                    // Cloned here for the same reason: `nominate` runs with
+                    // the key held and must take no lock of its own.
+                    let nominations = sampling.and(shared.content_tx.lock().unwrap().clone());
                     {
                         let key = shared.key.lock().unwrap();
                         if let Some(key) = key.as_ref() {
@@ -309,7 +326,15 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                                 if let Some(change) =
                                     analyzer.observe(key, &view, facts, now.clone())
                                 {
-                                    nominate(&shared, &volume, &view, &change, &mut counters);
+                                    nominate(
+                                        &volume,
+                                        &view,
+                                        &change,
+                                        key,
+                                        sampling,
+                                        nominations.as_ref(),
+                                        &mut counters,
+                                    );
                                     changes.push(ObservationRecord::LogicalChange(change));
                                 }
                             }
@@ -430,11 +455,17 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
 
 /// Offer a closed-after-write file to the content probe when that lane is
 /// on and the deterministic sample selects the object.
+/// `sampling` is the content lane's sample rate and `sender` the probe's
+/// queue, both read once per batch by the caller. This runs with the study
+/// key held, so it takes no lock of its own - not the key it is given, and
+/// not the queue it sends to.
 fn nominate(
-    shared: &Shared,
     volume: &VolumeFacts,
     view: &RecordView<'_>,
     change: &eidos_observe::LogicalChange,
+    key: &eidos_observe::StudyKey,
+    sampling: Option<u8>,
+    sender: Option<&std::sync::mpsc::SyncSender<crate::content_probe::Candidate>>,
     counters: &mut Counters,
 ) {
     use eidos_observe::ChangeOperation;
@@ -446,19 +477,13 @@ fn nominate(
     {
         return;
     }
-    let (enabled, percent) = {
-        let config = shared.config.lock().unwrap();
-        (
-            config.lanes.content.enabled,
-            config.lanes.content.sample_percent,
-        )
+    let (Some(percent), Some(sender)) = (sampling, sender) else {
+        return;
     };
-    if !enabled
-        || !crate::content_probe::selected(shared, volume.guid_path.as_bytes(), view.frn, percent)
-    {
+    if !crate::content_probe::selected(key, volume.guid_path.as_bytes(), view.frn, percent) {
         return;
     }
-    if let Some(sender) = shared.content_tx.lock().unwrap().as_ref() {
+    {
         crate::content_probe::offer(
             sender,
             crate::content_probe::Candidate {
