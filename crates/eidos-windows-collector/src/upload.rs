@@ -5,18 +5,25 @@
 //! without anyone visiting each host.
 //!
 //! `destination` is an ordinary directory path — typically a UNC share such
-//! as `\\fileserver\share\eidos`. The service runs as LocalSystem, so a share
-//! must grant write access to the machine account, not to the operator who
-//! configured it.
+//! as `\\fileserver\share\eidos`. The collector runs as LocalSystem, so a
+//! share must grant write access to the machine account, not to the operator
+//! who configured it.
 //!
 //! Uploads are deliberately unhurried: the scheduler checks the clock once a
 //! minute, a day's upload is attempted a bounded number of times, and every
 //! staged bundle that has not yet been copied is retried on the next run, so a
 //! share that is offline for a day catches up rather than losing that day.
+//!
+//! The copying itself runs on a detached thread. A stalled SMB operation is
+//! not interruptible, and the daemon joins its lane threads on shutdown, so
+//! the supervised thread here only ever watches the clock — it must never be
+//! the thread sitting inside a network filesystem call when the service is
+//! asked to stop.
 
 use crate::daemon::{stage_export, Shared};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -27,6 +34,10 @@ const TICK: Duration = Duration::from_secs(60);
 /// alone.
 const BUNDLE_SUFFIX: &str = ".eidos-observation.zst";
 
+/// True while a delivery is in flight, so a slow share cannot accumulate
+/// overlapping runs.
+static UPLOADING: AtomicBool = AtomicBool::new(false);
+
 pub fn start(shared: Arc<Shared>) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("collector-upload".into())
@@ -34,24 +45,25 @@ pub fn start(shared: Arc<Shared>) -> JoinHandle<()> {
         .expect("spawn upload scheduler")
 }
 
-/// The day an upload last succeeded, and how many times it has been tried
-/// today, so a failing share is retried a bounded number of times.
+/// Where the day's delivery has got to.
 #[derive(Default)]
 struct Progress {
+    /// The day this progress describes.
     day: Option<i64>,
+    /// Attempts made today, bounded by `upload.attempts`.
     attempts: u32,
+    /// Today's delivery finished with nothing left behind.
+    done: bool,
 }
 
 fn scheduler(shared: Arc<Shared>) {
-    let mut progress = Progress::default();
+    let progress = Arc::new(Mutex::new(Progress::default()));
     while !shared.is_shutting_down() {
         if sleep_unless_stopping(&shared, TICK) {
             return;
         }
-        let settings = {
-            let config = shared.config.lock().unwrap();
-            config.upload.clone()
-        };
+        let settings = shared.config.lock().unwrap().upload.clone();
+
         // Keep the status view honest even on ticks that do nothing, so
         // `observe status` shows what is configured and what is waiting.
         let waiting = pending(&shared.export_dir).len() as u64;
@@ -67,48 +79,90 @@ fn scheduler(shared: Arc<Shared>) {
             continue;
         };
         let today = day_key(&now);
-        if progress.day != Some(today) {
-            // A new day resets the attempt budget.
-            progress = Progress {
-                day: None,
-                attempts: 0,
-            };
-        }
-        if progress.day == Some(today)
-            || u32::from(now.wHour) < settings.hour
-            || progress.attempts >= settings.attempts.max(1)
-        {
+
+        let due = {
+            let mut progress = progress.lock().unwrap();
+            if progress.day != Some(today) {
+                // A new day restores the attempt budget.
+                *progress = Progress {
+                    day: Some(today),
+                    attempts: 0,
+                    done: false,
+                };
+            }
+            !progress.done
+                && u32::from(now.wHour) >= settings.hour
+                && progress.attempts < settings.attempts.max(1)
+        };
+        if !due || UPLOADING.swap(true, Ordering::AcqRel) {
             continue;
         }
-        progress.attempts += 1;
-        match run(&shared, &settings) {
-            Ok(uploaded) => {
-                progress.day = Some(today);
-                let remaining = pending(&shared.export_dir).len() as u64;
-                set_view(&shared, |v| {
-                    v.last_error = None;
-                    v.last_upload_utc_ns = Some(shared.anchor().utc_ns);
-                    v.uploaded_total += uploaded;
-                    v.pending = remaining;
-                });
-                tracing::info!(uploaded, "daily upload complete");
+        progress.lock().unwrap().attempts += 1;
+
+        // Detached: a stalled share must not hold up an SCM stop.
+        let spawned = {
+            let shared = shared.clone();
+            let progress = progress.clone();
+            std::thread::Builder::new()
+                .name("collector-upload-run".into())
+                .spawn(move || {
+                    deliver(&shared, &settings, &progress, today);
+                    UPLOADING.store(false, Ordering::Release);
+                })
+        };
+        if spawned.is_err() {
+            UPLOADING.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn deliver(
+    shared: &Arc<Shared>,
+    settings: &crate::config::UploadConfig,
+    progress: &Mutex<Progress>,
+    today: i64,
+) {
+    match run(shared, settings) {
+        Ok(uploaded) => {
+            // Only a run that left nothing behind finishes the day, and only
+            // the day it was started for: a delivery that straddles midnight
+            // must not mark the new day complete.
+            let mut progress = progress.lock().unwrap();
+            if progress.day == Some(today) {
+                progress.done = true;
             }
-            Err(error) => {
-                let message = error.to_string();
-                tracing::error!(
-                    error = %message,
-                    attempt = progress.attempts,
-                    "daily upload failed"
-                );
-                set_view(&shared, |v| v.last_error = Some(message));
-            }
+            drop(progress);
+            let remaining = pending(&shared.export_dir).len() as u64;
+            set_view(shared, |v| {
+                v.last_error = None;
+                v.last_upload_utc_ns = Some(shared.anchor().utc_ns);
+                v.uploaded_total += uploaded;
+                v.pending = remaining;
+            });
+            tracing::info!(uploaded, "daily upload complete");
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let attempts = progress.lock().unwrap().attempts;
+            tracing::error!(error = %message, attempt = attempts, "daily upload failed");
+            set_view(shared, |v| v.last_error = Some(message));
         }
     }
 }
 
 /// Stage today's bundle, then copy every bundle still waiting in the export
 /// directory — including any left behind by a previous failure.
+///
+/// Returns the number delivered, and fails if *any* bundle could not be, so a
+/// partially delivered backlog is retried rather than counted as a finished
+/// day.
 fn run(shared: &Arc<Shared>, settings: &crate::config::UploadConfig) -> anyhow::Result<u64> {
+    // Without a study key there is no per-host identity, and two keyless
+    // collectors sharing a destination would each mistake the other's bundle
+    // for their own already-delivered copy.
+    let Some(prefix) = host_prefix(shared) else {
+        anyhow::bail!("no study key: run `eidos observe init` before enabling upload");
+    };
     let destination = Path::new(settings.destination.trim());
     std::fs::create_dir_all(destination).map_err(|error| {
         anyhow::anyhow!(
@@ -118,7 +172,6 @@ fn run(shared: &Arc<Shared>, settings: &crate::config::UploadConfig) -> anyhow::
     })?;
     stage_export(shared)?;
 
-    let prefix = host_prefix(shared);
     let mut uploaded = 0;
     let mut failure = None;
     for bundle in pending(&shared.export_dir) {
@@ -143,8 +196,8 @@ fn run(shared: &Arc<Shared>, settings: &crate::config::UploadConfig) -> anyhow::
         }
     }
     match failure {
-        Some(error) if uploaded == 0 => Err(error),
-        _ => Ok(uploaded),
+        Some(error) => Err(error.context(format!("{uploaded} bundle(s) delivered before this"))),
+        None => Ok(uploaded),
     }
 }
 
@@ -178,7 +231,8 @@ fn copy_one(bundle: &Path, destination: &Path, prefix: &str) -> anyhow::Result<(
         .ok_or_else(|| anyhow::anyhow!("unreadable bundle name"))?;
     let final_path = destination.join(format!("{prefix}-{name}"));
     if final_path.exists() {
-        // Already delivered on an earlier run whose local cleanup failed.
+        // Already delivered on an earlier run whose local cleanup failed. The
+        // prefix is host-specific, so this really is our own copy.
         return Ok(());
     }
     let temporary = destination.join(format!("{prefix}-{name}.part"));
@@ -194,10 +248,10 @@ fn copy_one(bundle: &Path, destination: &Path, prefix: &str) -> anyhow::Result<(
 
 /// A stable, keyed per-host prefix so several collectors can share one
 /// directory without colliding, and without putting a host name on the share.
-fn host_prefix(shared: &Arc<Shared>) -> String {
-    shared
-        .with_key(|key| key.token("upload-host", b"collector").encoded()[..16].to_string())
-        .unwrap_or_else(|| "unkeyed".into())
+/// `None` when no study key is loaded, which makes the identity unavailable
+/// rather than shared.
+fn host_prefix(shared: &Arc<Shared>) -> Option<String> {
+    shared.with_key(|key| key.token("upload-host", b"collector").encoded()[..16].to_string())
 }
 
 fn set_view(shared: &Shared, f: impl FnOnce(&mut crate::protocol::UploadView)) {
@@ -317,5 +371,25 @@ mod tests {
         copy_one(&file, &share, "aaaaaaaaaaaaaaaa").unwrap();
         copy_one(&file, &share, "bbbbbbbbbbbbbbbb").unwrap();
         assert_eq!(pending(&share).len(), 2);
+    }
+
+    /// A backlog that is only partly delivered must not finish the day, or the
+    /// bundles left behind wait until tomorrow while the status says the
+    /// upload succeeded.
+    #[test]
+    fn a_partly_delivered_backlog_is_a_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged");
+        let share = temp.path().join("share");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::create_dir_all(&share).unwrap();
+
+        let good = bundle(&staged, "observation-1-0000.eidos-observation.zst", b"ok");
+        assert!(copy_one(&good, &share, "host").is_ok());
+
+        // A directory where a bundle should be: the copy cannot succeed.
+        let broken = staged.join("observation-2-0000.eidos-observation.zst");
+        std::fs::create_dir_all(&broken).unwrap();
+        assert!(copy_one(&broken, &share, "host").is_err());
     }
 }

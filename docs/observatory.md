@@ -288,7 +288,13 @@ was already delivered is not copied again.
 Delivery is unhurried and forgiving: the day's upload is retried up to
 `attempts` times, and any bundle still staged locally — including one left by
 an earlier failure — is retried on the next run, so a share that is offline
-for a day catches up rather than losing that day. `remove_after_upload`
+for a day catches up rather than losing that day. A run that delivers only
+part of a backlog counts as a failure, so the rest is retried instead of
+waiting until tomorrow behind a success.
+
+Upload requires a study key, because the per-host prefix is derived from it;
+run `eidos observe init` first. The copying runs on its own thread so a
+stalled share cannot delay the service stopping. `remove_after_upload`
 deletes the local copy once it has been delivered; leave it off to keep
 bundles on the host as well. `eidos observe status` reports the destination,
 the last successful upload, how many bundles are waiting, and why the last
