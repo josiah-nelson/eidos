@@ -238,17 +238,24 @@ fn measure(
         shared.with_key(|key| (key.hasher("content"), key.hasher("chunk")))?;
     let mut buffer = vec![0u8; 1 << 20];
     let mut total = 0u64;
+    // Set when the allowance ran out with the file still going.
+    let mut truncated = false;
     let mut text_sample: Option<bool> = None;
     let mut chunk_bytes: Vec<u8> = Vec::with_capacity(params.max);
     loop {
         // Read no further than the allowance. Filling a whole buffer first and
         // checking afterwards would let a single file overshoot its own limit,
-        // or the hour's, by the buffer size. The `max(1)` leaves room for one
-        // byte past the allowance, which is what distinguishes a file that
-        // ends exactly on the bound from one that runs past it.
+        // or the hour's, by the buffer size.
         let file_left = max_bytes.saturating_sub(total);
         let hour_left = hourly.saturating_sub(budget.spent.saturating_add(total));
-        let want = file_left.min(hour_left).min(buffer.len() as u64).max(1) as usize;
+        let want = file_left.min(hour_left).min(buffer.len() as u64) as usize;
+        if want == 0 {
+            // Nothing left to spend. Whether this file ended exactly on the
+            // bound or would have run past it is answered by its length, so
+            // the classification costs no further reading.
+            truncated = file.metadata().map(|m| m.len() > total).unwrap_or(true);
+            break;
+        }
         let read = match file.read(&mut buffer[..want]) {
             Ok(0) => break,
             Ok(read) => read,
@@ -264,12 +271,6 @@ fn measure(
             text_sample = looks_textual(&bytes[..read.min(8192)]);
         }
         total += read as u64;
-        // A file can grow after its size snapshot, or between the precheck and
-        // this read, so the running total is what the budget must be held to.
-        if total > max_bytes || budget.spent.saturating_add(total) > hourly {
-            budget.spent = budget.spent.saturating_add(total);
-            return Some(base(ContentOutcome::SkippedTooLarge, total));
-        }
         fingerprint.update(bytes);
         let _ = encoder.write_all(bytes);
         // Chunk digests are computed over each closed chunk's bytes.
@@ -287,6 +288,12 @@ fn measure(
             chunk_bytes.clear();
         });
         chunk_bytes.extend_from_slice(&bytes[consumed_in_piece..]);
+    }
+    if truncated {
+        // A file the budget could not finish is not a measurement of that
+        // file, so it is reported as skipped rather than as a short one.
+        budget.spent = budget.spent.saturating_add(total);
+        return Some(base(ContentOutcome::SkippedTooLarge, total));
     }
     if let Some(last) = chunker.finish() {
         chunk_hasher.update(&chunk_bytes);
