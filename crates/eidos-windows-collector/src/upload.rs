@@ -26,6 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use windows_sys::Win32::System::SystemInformation::{
+    ComputerNameDnsFullyQualified, GetComputerNameExW,
+};
 
 /// How often the scheduler looks at the clock.
 const TICK: Duration = Duration::from_secs(60);
@@ -122,8 +125,14 @@ fn deliver(
     progress: &Mutex<Progress>,
     today: i64,
 ) {
-    match run(shared, settings) {
-        Ok(uploaded) => {
+    let (uploaded, failure) = run(shared, settings);
+    let remaining = pending(&shared.export_dir).len() as u64;
+
+    // Bundles that reached the share count whether or not their siblings did:
+    // a mixed run still delivered them, and undercounting would make the
+    // totals disagree with what is on the share.
+    match failure {
+        None => {
             // Only a run that left nothing behind finishes the day, and only
             // the day it was started for: a delivery that straddles midnight
             // must not mark the new day complete.
@@ -132,7 +141,6 @@ fn deliver(
                 progress.done = true;
             }
             drop(progress);
-            let remaining = pending(&shared.export_dir).len() as u64;
             set_view(shared, |v| {
                 v.last_error = None;
                 v.last_upload_utc_ns = Some(shared.anchor().utc_ns);
@@ -141,11 +149,23 @@ fn deliver(
             });
             tracing::info!(uploaded, "daily upload complete");
         }
-        Err(error) => {
+        Some(error) => {
             let message = error.to_string();
             let attempts = progress.lock().unwrap().attempts;
-            tracing::error!(error = %message, attempt = attempts, "daily upload failed");
-            set_view(shared, |v| v.last_error = Some(message));
+            tracing::error!(
+                error = %message,
+                attempt = attempts,
+                uploaded,
+                "daily upload incomplete"
+            );
+            set_view(shared, |v| {
+                v.last_error = Some(message);
+                v.uploaded_total += uploaded;
+                v.pending = remaining;
+                if uploaded > 0 {
+                    v.last_upload_utc_ns = Some(shared.anchor().utc_ns);
+                }
+            });
         }
     }
 }
@@ -153,24 +173,38 @@ fn deliver(
 /// Stage today's bundle, then copy every bundle still waiting in the export
 /// directory — including any left behind by a previous failure.
 ///
-/// Returns the number delivered, and fails if *any* bundle could not be, so a
-/// partially delivered backlog is retried rather than counted as a finished
-/// day.
-fn run(shared: &Arc<Shared>, settings: &crate::config::UploadConfig) -> anyhow::Result<u64> {
+/// Returns how many were delivered together with the first failure, if any.
+/// A run that could not deliver everything is a failure — the backlog must be
+/// retried rather than counted as a finished day — but what did land is still
+/// reported, because it is on the share either way.
+fn run(
+    shared: &Arc<Shared>,
+    settings: &crate::config::UploadConfig,
+) -> (u64, Option<anyhow::Error>) {
     // Without a study key there is no per-host identity, and two keyless
     // collectors sharing a destination would each mistake the other's bundle
     // for their own already-delivered copy.
     let Some(prefix) = host_prefix(shared) else {
-        anyhow::bail!("no study key: run `eidos observe init` before enabling upload");
+        return (
+            0,
+            Some(anyhow::anyhow!(
+                "no study key or host identity: run `eidos observe init` before enabling upload"
+            )),
+        );
     };
     let destination = Path::new(settings.destination.trim());
-    std::fs::create_dir_all(destination).map_err(|error| {
-        anyhow::anyhow!(
-            "cannot reach the upload destination {}: {error}",
-            destination.display()
-        )
-    })?;
-    stage_export(shared)?;
+    if let Err(error) = std::fs::create_dir_all(destination) {
+        return (
+            0,
+            Some(anyhow::anyhow!(
+                "cannot reach the upload destination {}: {error}",
+                destination.display()
+            )),
+        );
+    }
+    if let Err(error) = stage_export(shared) {
+        return (0, Some(error));
+    }
 
     let mut uploaded = 0;
     let mut failure = None;
@@ -195,10 +229,7 @@ fn run(shared: &Arc<Shared>, settings: &crate::config::UploadConfig) -> anyhow::
             Err(error) => failure = Some(error),
         }
     }
-    match failure {
-        Some(error) => Err(error.context(format!("{uploaded} bundle(s) delivered before this"))),
-        None => Ok(uploaded),
-    }
+    (uploaded, failure)
 }
 
 /// Bundles waiting in the export directory, oldest first.
@@ -248,10 +279,50 @@ fn copy_one(bundle: &Path, destination: &Path, prefix: &str) -> anyhow::Result<(
 
 /// A stable, keyed per-host prefix so several collectors can share one
 /// directory without colliding, and without putting a host name on the share.
-/// `None` when no study key is loaded, which makes the identity unavailable
-/// rather than shared.
+///
+/// The study key cannot supply this on its own: a cohort deliberately shares
+/// one key so content fingerprints compare across hosts, so keying a constant
+/// would give every host in that cohort the same prefix — and each would then
+/// mistake another's bundle for its own delivered copy. The machine's name is
+/// the distinguishing input; it never leaves the host, because what reaches
+/// the share is the keyed token of it.
+///
+/// `None` when either the key or the host identity is unavailable, which
+/// leaves the collector without an identity rather than with a shared one.
 fn host_prefix(shared: &Arc<Shared>) -> Option<String> {
-    shared.with_key(|key| key.token("upload-host", b"collector").encoded()[..16].to_string())
+    let host = machine_name()?;
+    shared.with_key(|key| key.token("upload-host", host.as_bytes()).encoded()[..16].to_string())
+}
+
+/// The machine's fully qualified name, used only as keyed token input.
+fn machine_name() -> Option<String> {
+    let mut size: u32 = 0;
+    // SAFETY: the first call only asks for the required buffer size.
+    unsafe {
+        GetComputerNameExW(
+            ComputerNameDnsFullyQualified,
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; size as usize];
+    // SAFETY: the buffer is sized as the call just requested.
+    let ok = unsafe {
+        GetComputerNameExW(
+            ComputerNameDnsFullyQualified,
+            buffer.as_mut_ptr(),
+            &mut size,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    buffer.truncate(size as usize);
+    let name = String::from_utf16_lossy(&buffer);
+    (!name.is_empty()).then_some(name)
 }
 
 fn set_view(shared: &Shared, f: impl FnOnce(&mut crate::protocol::UploadView)) {
@@ -371,6 +442,18 @@ mod tests {
         copy_one(&file, &share, "aaaaaaaaaaaaaaaa").unwrap();
         copy_one(&file, &share, "bbbbbbbbbbbbbbbb").unwrap();
         assert_eq!(pending(&share).len(), 2);
+    }
+
+    /// Two hosts sharing a cohort study key must still get different prefixes,
+    /// or each treats the other's bundle as its own delivered copy.
+    #[test]
+    fn the_machine_name_separates_hosts_that_share_a_key() {
+        let key = eidos_observe::StudyKey::from_bytes([7; 32]);
+        let one = key.token("upload-host", b"host-one.example").encoded()[..16].to_string();
+        let two = key.token("upload-host", b"host-two.example").encoded()[..16].to_string();
+        assert_ne!(one, two);
+        // And the share never sees the name itself.
+        assert!(!one.contains("host"));
     }
 
     /// A backlog that is only partly delivered must not finish the day, or the
