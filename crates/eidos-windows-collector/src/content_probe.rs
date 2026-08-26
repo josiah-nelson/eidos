@@ -241,7 +241,15 @@ fn measure(
     let mut text_sample: Option<bool> = None;
     let mut chunk_bytes: Vec<u8> = Vec::with_capacity(params.max);
     loop {
-        let read = match file.read(&mut buffer) {
+        // Read no further than the allowance. Filling a whole buffer first and
+        // checking afterwards would let a single file overshoot its own limit,
+        // or the hour's, by the buffer size. The `max(1)` leaves room for one
+        // byte past the allowance, which is what distinguishes a file that
+        // ends exactly on the bound from one that runs past it.
+        let file_left = max_bytes.saturating_sub(total);
+        let hour_left = hourly.saturating_sub(budget.spent.saturating_add(total));
+        let want = file_left.min(hour_left).min(buffer.len() as u64).max(1) as usize;
+        let read = match file.read(&mut buffer[..want]) {
             Ok(0) => break,
             Ok(read) => read,
             Err(_) => {
