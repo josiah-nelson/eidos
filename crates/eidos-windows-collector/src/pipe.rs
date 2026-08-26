@@ -285,15 +285,23 @@ fn create_instance() -> std::io::Result<Instance> {
 }
 
 fn serve_client(mut file: std::fs::File, handler: Handler) {
-    let response = match read_frame(&mut file) {
-        Ok(body) => match serde_json::from_slice::<Request>(&body) {
-            Ok(request) => handler(request),
-            Err(error) => Response::Error {
-                message: format!("malformed request: {error}"),
-            },
-        },
+    let body = match read_frame(&mut file) {
+        Ok(body) => body,
+        Err(error) => {
+            // A client that never delivered a request gets no answer. Writing
+            // one would park this thread in `FlushFileBuffers` until a client
+            // that is not reading decides to read, which is exactly the client
+            // the deadline just cancelled.
+            tracing::debug!(error = %error, "pipe client sent no usable request");
+            // SAFETY: the file wraps a connected pipe instance.
+            unsafe { DisconnectNamedPipe(file.as_raw_handle() as _) };
+            return;
+        }
+    };
+    let response = match serde_json::from_slice::<Request>(&body) {
+        Ok(request) => handler(request),
         Err(error) => Response::Error {
-            message: format!("unreadable request: {error}"),
+            message: format!("malformed request: {error}"),
         },
     };
     match encode(&response) {
