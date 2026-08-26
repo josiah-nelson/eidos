@@ -179,3 +179,89 @@ sudo scripts/macos/uninstall.sh --purge-data
 
 The keychain item is intentionally preserved in both cases. Remove it through
 Keychain Access only when prior study tokens no longer need to remain stable.
+
+## Windows collector
+
+The Windows lane set runs as the `eidos-collector` service (LocalSystem,
+delayed automatic start, restart on failure) and is controlled over a local
+named pipe by `eidos observe` from an elevated prompt. It has no listener,
+upload, or remote control. Install and run:
+
+```powershell
+eidos observe init                 # DPAPI machine-scope study key + default config
+eidos observe install --start-now  # register and start the service
+eidos observe status               # capabilities, feeds, lanes, ring usage
+eidos observe mark vm-snapshot     # keyed phase marker
+eidos observe lanes --etw on       # switch lanes at run time
+eidos observe probe                # one read-only enumeration of each fixed volume
+eidos observe export -o study.eidos-observation.zst
+eidos observe inspect study.eidos-observation.zst
+eidos observe uninstall            # keeps the data directory and key
+```
+
+`eidos observe run` runs the same daemon in the foreground for testing.
+`eidos observe init --key-hex <64 hex>` imports a cohort-shared key so
+content fingerprints compare across hosts; otherwise the key is random.
+
+Data lives in `C:\ProgramData\eidos-collector` (ACL: SYSTEM and
+Administrators only): the DPAPI-protected key, `config.json`, the SQLite
+spool ring, per-volume feed cursors, staged exports, and seven days of logs.
+
+### Lanes
+
+Always on (L0): OS build and update revision, hypervisor bit, processor and
+memory shape, uptime, cumulative sleep (interrupt-time bias), power source,
+elevation and SYSTEM facts, clock jumps and resumes, clean/unclean shutdown,
+upgrade detection, per-interval collector and host resource samples tagged
+with the lanes in force, and a volume inventory (filesystem, drive and bus
+kind, seek penalty, capacity and free buckets, feature flags, journal
+shape) diffed every scan for mount, unmount, and journal recreation.
+
+USN change lane (L1, on by default): one reader per journaled local volume.
+Object identity is the keyed token of `(volume GUID, file reference
+number)`; no path is resolved for files, and names are used only to pick an
+extension bucket and to key a delete/recreate lookup. Records carry
+create/update/delete/rename/metadata/hard-link/stream operations, rename
+pairing with the old parent subtree, hot edit counts, fan-out, size and
+depth buckets (one attribute-only open by id with `OPEN_REPARSE_POINT`,
+memoised, skipped for oversized batches), and backlog age. Per-interval
+summaries add per-second histograms, operation counts, distinct objects at
+1 s/10 s/60 s/10 min/1 h coalescing windows (the shadow-sync row saving),
+tombstones, hot objects, recreates, reason-bit combinations, and feed
+health with lag, fill, and backlog histograms. Overflow and journal
+recreation become capture gaps; the cursor survives restarts.
+
+ETW access lane (L2, off by default): a real-time session over
+`Microsoft-Windows-Kernel-File` and `Kernel-Process`, decoded through TDH
+metadata, run in randomized windows (`minutes_per_hour`, 60 for
+continuous). Events are attributed to coarse process classes (system,
+indexer, security, build, development, shell, productivity, browser, media,
+cloud sync, backup, virtualization) or a keyed image token, and summarised
+per class: opens, reads, writes, closes, deletes, renames, byte totals,
+I/O-size histograms, distinct and read-then-written objects, and extension
+buckets learned at open. Lost events count as kernel drops; access denied
+and session conflicts are recorded as capability facts.
+
+Content economics probe (L2, off by default): a deterministic sample of
+files closed after a write is read under an hourly byte budget and size
+cap after a settle delay. Placeholder, offline, and reparse-point objects
+are recognised from a non-hydrating attribute snapshot and skipped. Each
+measured object records FastCDC chunk count and size histogram, a keyed
+whole-content fingerprint, chunk reuse against the previous observation of
+the same object (edit locality) with run lengths, zstd ratio, and a text
+heuristic.
+
+Enumeration probe (L2, off by default; also on demand): a read-only walk
+of a fixed volume with the production lister, timed with CPU cost, giving
+file and directory counts, fan-out and depth, size and extension buckets,
+and reparse/placeholder/sparse/compressed/encrypted/offline counts.
+
+### Privacy contract on Windows
+
+Before a durable write: object, subtree, volume, image, content, chunk, and
+marker identities become domain-separated keyed BLAKE3 tokens; sizes,
+ages, depths, extensions, counts, and ratios become buckets or aggregate
+histograms; raw USN records, ETW payloads, paths, image names, and file
+bytes are dropped. Aggregate counts (events per interval, files per volume)
+are exact because they name no object. `eidos observe status` may show
+drive letters to the operator; exports never do.

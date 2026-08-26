@@ -11,6 +11,7 @@
 
 pub mod access;
 pub mod analytics;
+pub mod cdc;
 pub mod client;
 pub mod config;
 pub mod protocol;
@@ -18,7 +19,11 @@ pub mod protocol;
 #[cfg(windows)]
 pub mod access_lane;
 #[cfg(windows)]
+pub mod content_probe;
+#[cfg(windows)]
 pub mod daemon;
+#[cfg(windows)]
+pub mod enumeration_probe;
 #[cfg(windows)]
 pub mod etw;
 #[cfg(windows)]

@@ -89,6 +89,8 @@ pub struct Shared {
     pub volumes: Mutex<Vec<VolumeFacts>>,
     pub feeds: Mutex<BTreeMap<String, FeedStatus>>,
     pub etw: Mutex<EtwView>,
+    /// Candidates for the content probe, installed by the lane supervisor.
+    pub content_tx: Mutex<Option<std::sync::mpsc::SyncSender<crate::content_probe::Candidate>>>,
     /// True while an ETW window is tracing; drives `LaneStates::etw`.
     pub etw_window_open: AtomicBool,
     pub shutdown: AtomicBool,
@@ -288,6 +290,7 @@ pub fn run(
             state: "off".into(),
             ..EtwView::default()
         }),
+        content_tx: Mutex::new(None),
         etw_window_open: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
         started: Instant::now(),
