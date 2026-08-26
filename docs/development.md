@@ -20,6 +20,17 @@ with no change feed.
 
 ## Commands
 
+Install the pre-push hook once per clone. CI lints Windows but does not test
+it (see `docs/adr/0019`), so on a Windows machine this hook is the only
+automated check that runs the suite on Windows before code lands:
+
+```powershell
+git config core.hooksPath scripts/hooks
+```
+
+It runs `check.ps1 -SkipWeb -SkipRelease` on pushes that touch Rust, skips
+pushes that do not, and is bypassed for one push with `git push --no-verify`.
+
 ```powershell
 # Windows. One-shot: format check, clippy (deny warnings), all tests,
 # release build, web lint+test+build
@@ -140,7 +151,9 @@ cargo test -p eidos-service export_api_contract --lib
 ```
 
 The generated file is checked in but must never be edited by hand. Both CI
-and `scripts/check.ps1` rerun the export and fail if it changes. Rust-owned
+and `scripts/check.ps1` rerun the export and fail if it changes. CI checks it
+after the suite rather than before, so contract drift shows up at the end of
+the macOS lane. Rust-owned
 types are imported from that file; view state and other UI-only types stay in
 `web/src/api.ts`.
 
@@ -501,7 +514,7 @@ crates/
   eidos-cli       the `eidos` binary
 web/              Vite + React + TypeScript UI
 docs/             public documentation and ADRs
-scripts/          check.ps1
+scripts/          check.ps1, check.sh, hooks/
 ```
 
 ## Conventions

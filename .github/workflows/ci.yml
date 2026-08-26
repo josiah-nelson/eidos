@@ -57,12 +57,17 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test -p eidos-service export_api_contract --lib
-      - run: git diff --exit-code -- web/src/generated/api.ts
       # The macOS adapters (getattrlistbulk enumeration, the FSEvents feed)
       # only exist on this lane, and the shared filesystem and change
       # contracts must hold on both platforms rather than on Windows alone.
       - run: cargo test
+      # export_api_contract is an eidos-service lib test, so the run above
+      # has already regenerated the contract; checking it here rather than
+      # in a step of its own avoids a second build of eidos-service and its
+      # dependencies, which cost more than two minutes on this runner. The
+      # cost is learning about contract drift after the suite instead of
+      # before it, and scripts/check.ps1 already catches it before a commit.
+      - run: git diff --exit-code -- web/src/generated/api.ts
 
   web:
     name: web
