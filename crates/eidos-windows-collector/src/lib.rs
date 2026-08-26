@@ -9,13 +9,18 @@
 //! Platform-neutral logic (configuration, protocol, change analytics) is
 //! compiled and tested everywhere; the native lanes are `cfg(windows)`.
 
+pub mod access;
 pub mod analytics;
 pub mod client;
 pub mod config;
 pub mod protocol;
 
 #[cfg(windows)]
+pub mod access_lane;
+#[cfg(windows)]
 pub mod daemon;
+#[cfg(windows)]
+pub mod etw;
 #[cfg(windows)]
 pub mod hostfacts;
 #[cfg(windows)]
