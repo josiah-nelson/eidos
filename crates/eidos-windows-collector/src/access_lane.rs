@@ -266,7 +266,15 @@ fn flush(shared: &Shared, aggregator: &mut AccessAggregator, elapsed: Duration) 
     if !shared.append_all_retrying(&records) {
         let lost = records.len() as u64;
         shared.drops.lock().unwrap().user += lost;
-        shared.add_gap(GapCause::UserDrop, shared.anchor().monotonic_ns, None);
+        // The gap must span the interval these summaries covered, not the
+        // instant the loss was noticed: `add_gap` stamps the end itself, so
+        // passing the current anchor as the start would describe a
+        // zero-duration hole and name no observation period at all.
+        let started = shared
+            .anchor()
+            .monotonic_ns
+            .saturating_sub(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+        shared.add_gap(GapCause::UserDrop, started, Some(lost));
         tracing::error!(
             lost,
             "access interval discarded after repeated spool failures"
