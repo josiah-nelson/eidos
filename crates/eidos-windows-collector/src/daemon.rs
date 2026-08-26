@@ -20,7 +20,7 @@ use eidos_observe::{
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -75,6 +75,8 @@ impl FeedStatus {
 pub struct Shared {
     pub data_dir: PathBuf,
     pub export_dir: PathBuf,
+    /// Held for the duration of a staged export.
+    pub export_lock: Mutex<()>,
     pub key: Mutex<Option<StudyKey>>,
     pub spool: Mutex<Spool>,
     pub config: Mutex<CollectorConfig>,
@@ -237,6 +239,7 @@ pub fn run(
     let shared = Arc::new(Shared {
         data_dir: data_dir.clone(),
         export_dir,
+        export_lock: Mutex::new(()),
         key: Mutex::new(key),
         spool: Mutex::new(spool),
         config: Mutex::new(config),
@@ -592,7 +595,13 @@ fn status(shared: &Shared) -> CollectorStatus {
     }
 }
 
-fn stage_export(shared: &Shared) -> anyhow::Result<PathBuf> {
+/// Distinguishes exports staged within the same second.
+static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn stage_export(shared: &Shared) -> anyhow::Result<PathBuf> {
+    // One export at a time: concurrent requests otherwise duplicate a full
+    // pass over the ring, and used to race for the same staged path.
+    let _staging = shared.export_lock.lock().unwrap();
     let manifest = BundleManifest {
         schema: SCHEMA_VERSION.into(),
         build_hash: shared.build_hash.clone(),
@@ -603,9 +612,12 @@ fn stage_export(shared: &Shared) -> anyhow::Result<PathBuf> {
         drops: shared.drops.lock().unwrap().clone(),
         units: Units::default(),
     };
+    // The sequence keeps two exports in the same wall-clock second from
+    // deriving one path, where the second silently replaced the first.
     let file = shared.export_dir.join(format!(
-        "observation-{}.eidos-observation.zst",
-        utc_now_ns() / 1_000_000_000
+        "observation-{}-{:04}.eidos-observation.zst",
+        utc_now_ns() / 1_000_000_000,
+        EXPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed) % 10_000
     ));
     // Stream straight off the ring on a read-only connection: the export
     // neither takes the append lock nor holds the spool in memory, so a

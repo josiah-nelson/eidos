@@ -3,11 +3,16 @@
 //! a request at all) to administrators and SYSTEM only, and
 //! `PIPE_REJECT_REMOTE_CLIENTS` keeps it local.
 //!
-//! That descriptor still grants *read* access to Everyone, so any local user
-//! can occupy a pipe instance without ever sending a frame. Connections are
-//! therefore capped, and a connection that has not delivered a complete
-//! request within `CLIENT_DEADLINE` has its blocking read cancelled so its
-//! slot returns to the pool.
+//! The *default* descriptor would also grant read access to Everyone, which
+//! let any local user occupy a pipe instance without ever sending a frame, so
+//! the pipe is created with an explicit descriptor instead: SYSTEM and the
+//! local Administrators group, nobody else. The control plane has no
+//! unprivileged callers, and `observe` already documents that it must be run
+//! elevated, so this costs nothing and removes the reach entirely.
+//!
+//! The connection cap and the read deadline below are kept as a second line:
+//! they bound a buggy or wedged administrative client, which the descriptor
+//! cannot.
 
 use crate::protocol::{encode, read_frame, Request, Response, MAX_FRAME_BYTES};
 use crate::PIPE_NAME;
@@ -18,9 +23,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_PIPE_CONNECTED,
-    HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS,
+    ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{FlushFileBuffers, PIPE_ACCESS_DUPLEX};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
@@ -34,6 +43,10 @@ use windows_sys::Win32::System::IO::CancelSynchronousIo;
 /// keep an unprivileged local user from growing threads and pipe instances
 /// without bound.
 const MAX_CONCURRENT_CLIENTS: usize = 16;
+
+/// Grant the pipe to SYSTEM (`SY`) and the local Administrators group (`BA`)
+/// only, with a protected DACL so inherited entries cannot widen it.
+const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
 /// A connection that has not delivered a complete request frame within this
 /// long has its blocking read cancelled.
@@ -216,9 +229,43 @@ pub fn poke() {
         .open(PIPE_NAME);
 }
 
+/// A security descriptor built from [`PIPE_SDDL`], freed on drop.
+struct Descriptor(*mut std::ffi::c_void);
+
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        unsafe { LocalFree(self.0) };
+    }
+}
+
+fn descriptor() -> std::io::Result<Descriptor> {
+    let sddl: Vec<u16> = PIPE_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: NUL-terminated SDDL; the allocation is owned by `Descriptor`.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut raw,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Descriptor(raw))
+}
+
 fn create_instance() -> std::io::Result<Instance> {
     let name: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: NUL-terminated name; default security attributes.
+    let descriptor = descriptor()?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    // SAFETY: NUL-terminated name; the descriptor outlives this call.
     let handle = unsafe {
         CreateNamedPipeW(
             name.as_ptr(),
@@ -228,7 +275,7 @@ fn create_instance() -> std::io::Result<Instance> {
             MAX_FRAME_BYTES as u32,
             MAX_FRAME_BYTES as u32,
             0,
-            std::ptr::null(),
+            &attributes,
         )
     };
     if handle == INVALID_HANDLE_VALUE {
@@ -316,7 +363,7 @@ mod tests {
         );
 
         // The deadline returns the slots even though no client sent anything.
-        let drained = Instant::now() + Duration::from_secs(10);
+        let drained = Instant::now() + Duration::from_secs(30);
         while active.load(Ordering::Acquire) > 0 && Instant::now() < drained {
             std::thread::sleep(Duration::from_millis(50));
         }
