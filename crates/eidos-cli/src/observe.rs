@@ -27,12 +27,22 @@ enum ObserveCommand {
     /// Create the study key (login keychain on macOS; DPAPI machine scope
     /// on Windows) and the default configuration.
     Init(InitArgs),
+    /// Windows: write the collector configuration (lanes, upload, excluded
+    /// volumes) to the data directory, so an unattended install can set a
+    /// host up before the service first starts.
+    #[cfg(windows)]
+    Configure(ConfigureArgs),
     /// Windows: register the collector as a LocalSystem service.
     #[cfg(windows)]
     Install(InstallArgs),
     /// Windows: stop and remove the collector service (data is kept).
     #[cfg(windows)]
     Uninstall,
+    /// Windows: delete a collector data directory - spool, cursors, staged
+    /// exports, logs, configuration, and the study key. The service must be
+    /// removed first, and prior object tokens become unlinkable.
+    #[cfg(windows)]
+    Purge(PurgeArgs),
     /// Windows: start the collector service.
     #[cfg(windows)]
     Start,
@@ -122,6 +132,59 @@ pub struct InstallArgs {
 
 #[cfg(windows)]
 #[derive(Debug, Args)]
+pub struct PurgeArgs {
+    #[command(flatten)]
+    data: DataDirArgs,
+    /// Delete the directory even though it holds none of the collector's own
+    /// files.
+    #[arg(long)]
+    force: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Args)]
+pub struct ConfigureArgs {
+    #[command(flatten)]
+    data: DataDirArgs,
+    /// Exactly the lanes to enable: a comma-separated list of `usn`, `etw`,
+    /// `content`, `enumeration`, or `all` / `none`. The individual switches
+    /// below are applied afterwards and win.
+    #[arg(long, value_name = "LIST")]
+    lanes: Option<String>,
+    /// L1: USN journal change traces on every journaled local volume.
+    #[arg(long, value_name = "on|off", value_parser = parse_switch)]
+    usn: Option<bool>,
+    /// L2: ETW file-access lane, traced in randomized windows.
+    #[arg(long, value_name = "on|off", value_parser = parse_switch)]
+    etw: Option<bool>,
+    /// L2: content economics probe on files closed after a write.
+    #[arg(long, value_name = "on|off", value_parser = parse_switch)]
+    content: Option<bool>,
+    /// L2: periodic read-only enumeration of each fixed volume.
+    #[arg(long, value_name = "on|off", value_parser = parse_switch)]
+    enumeration: Option<bool>,
+    /// Directory the daily bundle is copied into, typically a UNC share that
+    /// grants write access to the machine account. A non-empty value turns
+    /// the upload on; an empty one turns it off and clears the destination.
+    #[arg(long, value_name = "PATH")]
+    upload_destination: Option<String>,
+    /// Local hour, 0-23, at or after which the day's upload runs.
+    #[arg(long, value_name = "HOUR")]
+    upload_hour: Option<u32>,
+    /// Delivery attempts per day before the bundle waits for tomorrow.
+    #[arg(long, value_name = "COUNT")]
+    upload_attempts: Option<u32>,
+    /// Turn the daily upload on or off without changing the destination.
+    #[arg(long, value_name = "on|off", value_parser = parse_switch)]
+    upload: Option<bool>,
+    /// Drive letter or volume GUID path to leave alone entirely; repeat to
+    /// name several. Giving any replaces the current list.
+    #[arg(long = "exclude-volume", value_name = "VOLUME")]
+    exclude_volumes: Vec<String>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Args)]
 pub struct LanesArgs {
     #[arg(long, value_parser = parse_switch)]
     usn: Option<bool>,
@@ -178,6 +241,7 @@ fn inspect(bundle: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(windows)]
 mod windows {
     use super::*;
+    use anyhow::Context;
     use eidos_windows_collector::client::{expect_accepted, request};
     use eidos_windows_collector::protocol::{Request, Response};
     use eidos_windows_collector::{keystore, service};
@@ -185,8 +249,10 @@ mod windows {
     pub fn run(command: ObserveCommand, log_filter: &str) -> anyhow::Result<()> {
         match command {
             ObserveCommand::Init(args) => init(args),
+            ObserveCommand::Configure(args) => configure(args),
             ObserveCommand::Install(args) => service::install(&args.data.data_dir, args.start_now),
             ObserveCommand::Uninstall => service::uninstall(),
+            ObserveCommand::Purge(args) => purge(args),
             ObserveCommand::Start => service::start(),
             ObserveCommand::Stop => service::stop(),
             ObserveCommand::Lanes(args) => expect_accepted(request(&Request::SetLanes {
@@ -199,12 +265,12 @@ mod windows {
                 expect_accepted(request(&Request::Probe { volume })?)
             }
             ObserveCommand::Run(args) => {
+                let data_dir = service::normalize_data_dir(&args.data.data_dir)?;
                 if args.service {
-                    let _guard =
-                        eidos_windows_collector::log::init(&args.data.data_dir, log_filter, false)?;
-                    service::run_service(args.data.data_dir)
+                    let _guard = eidos_windows_collector::log::init(&data_dir, log_filter, false)?;
+                    service::run_service(data_dir)
                 } else {
-                    foreground(args.data.data_dir)
+                    foreground(data_dir)
                 }
             }
             ObserveCommand::Status(_) => match request(&Request::Status)? {
@@ -241,7 +307,23 @@ mod windows {
             Some(hex) => Some(parse_key(&hex)?),
             None => None,
         };
-        let data_dir = &args.data.data_dir;
+        // An unattended install passes the cohort key on every run, including
+        // repairs and upgrades. Importing the key a host already has is a
+        // no-op; importing a different one silently splits that host's tokens
+        // in two, so it has to be asked for.
+        if let Some(imported) = imported {
+            if let Some(existing) = existing_key_matches(&args.data.data_dir, imported)? {
+                if !existing && !args.force {
+                    anyhow::bail!(
+                        "a different study key already exists in {}; --force replaces it, and every token this host has already written becomes unlinkable from the ones it writes next",
+                        args.data.data_dir.display()
+                    );
+                }
+            }
+        }
+        // Restrict the ACL first: the key blob must never sit in a directory
+        // that inherits read access for every user on the machine.
+        let data_dir = &service::prepare_data_dir(&args.data.data_dir)?;
         let created = keystore::create(data_dir, imported, args.force)?;
         let config = eidos_windows_collector::config::CollectorConfig::load(data_dir)?;
         if !eidos_windows_collector::config::CollectorConfig::path(data_dir).exists() {
@@ -262,6 +344,24 @@ mod windows {
         Ok(())
     }
 
+    /// `Some(true)` when the stored key is the one being imported, `Some(false)`
+    /// when it is a different key, `None` when there is no key yet. Compared
+    /// through a token, because a study key deliberately exposes no bytes.
+    fn existing_key_matches(
+        data_dir: &std::path::Path,
+        imported: [u8; 32],
+    ) -> anyhow::Result<Option<bool>> {
+        const PROBE: &str = "key-identity";
+        let Some(existing) = keystore::load(data_dir)? else {
+            return Ok(None);
+        };
+        let mine = eidos_observe::StudyKey::from_bytes(imported);
+        Ok(Some(
+            existing.token(PROBE, b"eidos-observe/1").encoded()
+                == mine.token(PROBE, b"eidos-observe/1").encoded(),
+        ))
+    }
+
     fn parse_key(hex: &str) -> anyhow::Result<[u8; 32]> {
         let hex = hex.trim();
         if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -272,6 +372,174 @@ mod windows {
             *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)?;
         }
         Ok(key)
+    }
+
+    /// Delete a collector data directory.
+    ///
+    /// The uninstaller calls this once the service is gone, because a
+    /// Windows Installer file list is computed before the service stops:
+    /// everything the collector writes in between - the spool's write-ahead
+    /// log, a log line, a moved cursor - would survive it and keep the
+    /// directory alive.
+    fn purge(args: PurgeArgs) -> anyhow::Result<()> {
+        let data_dir = service::normalize_data_dir(&args.data.data_dir)?;
+        if !data_dir.exists() {
+            println!("{} does not exist", data_dir.display());
+            return Ok(());
+        }
+        if let Some(state) = service::registration()? {
+            anyhow::bail!(
+                "service {} is still installed ({state}); run `eidos observe uninstall` first",
+                eidos_windows_collector::SERVICE_NAME
+            );
+        }
+        if !holds_collector_data(&data_dir) && !args.force {
+            anyhow::bail!(
+                "{} holds no study key, configuration or spool; pass --force to delete it anyway",
+                data_dir.display()
+            );
+        }
+        std::fs::remove_dir_all(&data_dir)
+            .with_context(|| format!("removing {}", data_dir.display()))?;
+        println!("removed {}", data_dir.display());
+        Ok(())
+    }
+
+    /// A guard against deleting a directory that was never the collector's:
+    /// the data directory is an installer property, and a mistyped one must
+    /// not take a directory of someone else's files with it.
+    fn holds_collector_data(dir: &std::path::Path) -> bool {
+        // Names only this collector writes. `config.json` is deliberately not
+        // among them: it is every application's file name, and a mistyped
+        // data directory must not be deletable because it happens to hold one.
+        [eidos_windows_collector::keystore::KEY_FILE, "spool.db"]
+            .iter()
+            .any(|name| dir.join(name).exists())
+    }
+
+    /// Write the configuration file the collector reads at start-up. Lanes
+    /// can also be switched at run time over the pipe (`observe lanes`);
+    /// everything else here takes effect the next time the service starts.
+    fn configure(args: ConfigureArgs) -> anyhow::Result<()> {
+        use eidos_windows_collector::config::CollectorConfig;
+
+        let data_dir = service::normalize_data_dir(&args.data.data_dir)?;
+        if !data_dir.exists() {
+            anyhow::bail!(
+                "no collector data directory at {}; run `eidos observe init` first",
+                data_dir.display()
+            );
+        }
+        let mut config = CollectorConfig::load(&data_dir)?;
+
+        if let Some(list) = &args.lanes {
+            let (usn, etw, content, enumeration) = parse_lanes(list)?;
+            config.lanes.usn = usn;
+            config.lanes.etw.enabled = etw;
+            config.lanes.content.enabled = content;
+            config.lanes.enumeration.enabled = enumeration;
+        }
+        if let Some(on) = args.usn {
+            config.lanes.usn = on;
+        }
+        if let Some(on) = args.etw {
+            config.lanes.etw.enabled = on;
+        }
+        if let Some(on) = args.content {
+            config.lanes.content.enabled = on;
+        }
+        if let Some(on) = args.enumeration {
+            config.lanes.enumeration.enabled = on;
+        }
+
+        if let Some(destination) = args.upload_destination {
+            let destination = destination.trim().to_string();
+            // A path ending in a backslash escapes the closing quote of a
+            // Windows command line, and everything after it arrives inside
+            // this one argument. Refuse it rather than store a destination
+            // that will never resolve: an installer that passed
+            // `\\fileserver\share\` should fail, not configure a host
+            // whose uploads quietly go nowhere.
+            if destination.contains('"') {
+                anyhow::bail!(
+                    "the upload destination contains a quote, which usually means it was given with a trailing backslash: {destination:?}"
+                );
+            }
+            config.upload.enabled = !destination.is_empty();
+            config.upload.destination = destination;
+        }
+        if let Some(hour) = args.upload_hour {
+            if hour > 23 {
+                anyhow::bail!("--upload-hour must be an hour of the day, 0-23");
+            }
+            config.upload.hour = hour;
+        }
+        if let Some(attempts) = args.upload_attempts {
+            if attempts == 0 {
+                anyhow::bail!("--upload-attempts must be at least 1");
+            }
+            config.upload.attempts = attempts;
+        }
+        if let Some(on) = args.upload {
+            if on && config.upload.destination.is_empty() {
+                anyhow::bail!("--upload on needs a destination; pass --upload-destination");
+            }
+            config.upload.enabled = on;
+        }
+        if !args.exclude_volumes.is_empty() {
+            config.exclude_volumes = args.exclude_volumes;
+        }
+
+        config.save(&data_dir)?;
+
+        let shown = |on: bool| if on { "on" } else { "off" };
+        println!("{}", CollectorConfig::path(&data_dir).display());
+        println!(
+            "lanes: usn {}, etw {}, content {}, enumeration {}",
+            shown(config.lanes.usn),
+            shown(config.lanes.etw.enabled),
+            shown(config.lanes.content.enabled),
+            shown(config.lanes.enumeration.enabled)
+        );
+        if config.upload.enabled {
+            println!(
+                "upload: {} at {:02}:00 local, {} attempts",
+                config.upload.destination, config.upload.hour, config.upload.attempts
+            );
+        } else {
+            println!("upload: off");
+        }
+        if !config.exclude_volumes.is_empty() {
+            println!("excluded volumes: {}", config.exclude_volumes.join(", "));
+        }
+        if let Some(state) = service::registration()? {
+            if state != "Stopped" {
+                println!(
+                    "service {} is {state}; the new configuration is read at its next start",
+                    eidos_windows_collector::SERVICE_NAME
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A `usn,etw` style lane list: the set named is exactly the set enabled.
+    fn parse_lanes(list: &str) -> anyhow::Result<(bool, bool, bool, bool)> {
+        let (mut usn, mut etw, mut content, mut enumeration) = (false, false, false, false);
+        for name in list.split(',') {
+            match name.trim().to_ascii_lowercase().as_str() {
+                "" | "none" => {}
+                "all" => (usn, etw, content, enumeration) = (true, true, true, true),
+                "usn" => usn = true,
+                "etw" => etw = true,
+                "content" => content = true,
+                "enumeration" => enumeration = true,
+                other => anyhow::bail!(
+                    "unknown lane {other:?}; expected usn, etw, content, enumeration, all or none"
+                ),
+            }
+        }
+        Ok((usn, etw, content, enumeration))
     }
 
     /// Foreground collector with Ctrl-C as the stop control; the same
