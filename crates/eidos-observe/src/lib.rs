@@ -18,4 +18,4 @@ pub use privacy::{
     bucket_age, bucket_depth, bucket_extension, bucket_size, ObjectToken, StudyKey, TokenHasher,
 };
 pub use schema::*;
-pub use spool::{Spool, SpoolLimits, SpoolStats};
+pub use spool::{export_bundle, Spool, SpoolLimits, SpoolStats};

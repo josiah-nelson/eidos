@@ -12,11 +12,11 @@ use crate::protocol::{
 use crate::resources;
 use crate::volumes::{self, VolumeFacts};
 use eidos_observe::{
-    bucket_age, bucket_capacity, bucket_size, write_bundle, BundleManifest, Capabilities,
+    bucket_age, bucket_capacity, bucket_size, export_bundle, BundleManifest, Capabilities,
     CaptureGap, DropCounters, EndpointSecurityCapability, EndpointSecurityState, EtwState,
     FeedState, GapCause, HealthRecord, HostResources, LaneStates, LifecycleEvent, MarkRecord,
-    ObjectToken, ObservationBundle, ObservationRecord, ResourceSample, Spool, StudyKey, TimeAnchor,
-    Units, UsnState, VolumeEvent, WindowsCapabilities, SCHEMA_VERSION,
+    ObjectToken, ObservationRecord, ResourceSample, Spool, StudyKey, TimeAnchor, Units, UsnState,
+    VolumeEvent, WindowsCapabilities, SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -593,7 +593,6 @@ fn status(shared: &Shared) -> CollectorStatus {
 }
 
 fn stage_export(shared: &Shared) -> anyhow::Result<PathBuf> {
-    let records = shared.spool.lock().unwrap().records()?;
     let manifest = BundleManifest {
         schema: SCHEMA_VERSION.into(),
         build_hash: shared.build_hash.clone(),
@@ -604,13 +603,15 @@ fn stage_export(shared: &Shared) -> anyhow::Result<PathBuf> {
         drops: shared.drops.lock().unwrap().clone(),
         units: Units::default(),
     };
-    let bundle = ObservationBundle { manifest, records };
     let file = shared.export_dir.join(format!(
         "observation-{}.eidos-observation.zst",
         utc_now_ns() / 1_000_000_000
     ));
-    write_bundle(&file, &bundle)?;
-    tracing::info!(records = bundle.records.len(), file = %file.display(), "export staged");
+    // Stream straight off the ring on a read-only connection: the export
+    // neither takes the append lock nor holds the spool in memory, so a
+    // multi-gigabyte ring cannot stall or exhaust the collector.
+    let records = export_bundle(&shared.data_dir.join("spool.db"), &manifest, &file)?;
+    tracing::info!(records, file = %file.display(), "export staged");
     Ok(file)
 }
 

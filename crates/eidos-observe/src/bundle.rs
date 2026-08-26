@@ -387,6 +387,56 @@ mod tests {
         assert_eq!(inspection.fields, exact.into_iter().collect::<Vec<_>>());
     }
 
+    /// The streaming export must produce exactly the bundle the materialising
+    /// path would have written, for every record variant in the fixture.
+    #[test]
+    fn streamed_export_matches_a_materialised_bundle() {
+        let expected = bundle();
+        let temp = tempfile::tempdir().unwrap();
+        let spool_file = temp.path().join("spool.db");
+        {
+            let mut spool = crate::spool::Spool::open(
+                &spool_file,
+                crate::spool::SpoolLimits {
+                    detailed_max_bytes: 1 << 30,
+                    detailed_max_age_ns: i64::MAX,
+                    summary_max_age_ns: i64::MAX,
+                },
+            )
+            .unwrap();
+            for record in &expected.records {
+                spool.append(record).unwrap();
+            }
+        }
+
+        let out = temp.path().join("streamed.eidos-observation.zst");
+        let written = crate::spool::export_bundle(&spool_file, &expected.manifest, &out).unwrap();
+        assert_eq!(written as usize, expected.records.len());
+
+        let streamed = read_bundle(&out).unwrap();
+        assert_eq!(streamed, expected);
+
+        // And an empty ring still yields a well-formed, readable bundle.
+        let empty_file = temp.path().join("empty.db");
+        drop(
+            crate::spool::Spool::open(
+                &empty_file,
+                crate::spool::SpoolLimits {
+                    detailed_max_bytes: 1 << 20,
+                    detailed_max_age_ns: i64::MAX,
+                    summary_max_age_ns: i64::MAX,
+                },
+            )
+            .unwrap(),
+        );
+        let empty_out = temp.path().join("empty.eidos-observation.zst");
+        assert_eq!(
+            crate::spool::export_bundle(&empty_file, &expected.manifest, &empty_out).unwrap(),
+            0
+        );
+        assert!(read_bundle(&empty_out).unwrap().records.is_empty());
+    }
+
     #[test]
     fn complete_bundle_atomically_replaces_an_existing_file() {
         let temp = tempfile::tempdir().unwrap();
