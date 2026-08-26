@@ -1,0 +1,619 @@
+//! The collector process: shared state, always-on L0 sampling (health,
+//! resources, volume inventory, lifecycle), the control-pipe handler,
+//! export staging, and lane supervision.
+
+use crate::config::CollectorConfig;
+use crate::hostfacts::{self, CpuSampler, HostFacts};
+use crate::keystore;
+use crate::pipe;
+use crate::protocol::{
+    CollectorStatus, EtwView, FeedView, ProcessView, Request, Response, SpoolView, VolumeView,
+};
+use crate::resources;
+use crate::volumes::{self, VolumeFacts};
+use eidos_observe::{
+    bucket_age, bucket_capacity, bucket_size, write_bundle, BundleManifest, Capabilities,
+    CaptureGap, DropCounters, EndpointSecurityCapability, EndpointSecurityState, EtwState,
+    FeedState, GapCause, HealthRecord, HostResources, LaneStates, LifecycleEvent, MarkRecord,
+    ObjectToken, ObservationBundle, ObservationRecord, ResourceSample, Spool, StudyKey, TimeAnchor,
+    Units, UsnState, VolumeEvent, WindowsCapabilities, SCHEMA_VERSION,
+};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlEvent {
+    Stop,
+    Shutdown,
+    Suspend,
+    Resume,
+    PowerStatusChange,
+}
+
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub data_dir: PathBuf,
+}
+
+/// Per-volume feed status kept for `observe status`; the durable form is
+/// `FeedHealthRecord`.
+#[derive(Debug, Clone)]
+pub struct FeedStatus {
+    pub root: String,
+    pub state: FeedState,
+    pub detail: Option<String>,
+    pub batches: u64,
+    pub records: u64,
+    pub logical_changes: u64,
+    pub lag_bytes: u64,
+    pub last_batch: Option<Instant>,
+    pub overflows: u64,
+    pub recreations: u64,
+}
+
+impl FeedStatus {
+    pub fn new(root: String) -> Self {
+        Self {
+            root,
+            state: FeedState::Starting,
+            detail: None,
+            batches: 0,
+            records: 0,
+            logical_changes: 0,
+            lag_bytes: 0,
+            last_batch: None,
+            overflows: 0,
+            recreations: 0,
+        }
+    }
+}
+
+pub struct Shared {
+    pub data_dir: PathBuf,
+    pub export_dir: PathBuf,
+    pub key: Mutex<Option<StudyKey>>,
+    pub spool: Mutex<Spool>,
+    pub config: Mutex<CollectorConfig>,
+    pub capabilities: Mutex<Capabilities>,
+    pub drops: Mutex<DropCounters>,
+    pub gaps: Mutex<Vec<CaptureGap>>,
+    pub volumes: Mutex<Vec<VolumeFacts>>,
+    pub feeds: Mutex<BTreeMap<String, FeedStatus>>,
+    pub etw: Mutex<EtwView>,
+    pub shutdown: AtomicBool,
+    pub started: Instant,
+    pub build_hash: String,
+    pub facts: HostFacts,
+}
+
+impl Shared {
+    /// Monotonic time is boot-relative (`GetTickCount64`), so anchors stay
+    /// comparable across collector restarts within one boot.
+    pub fn anchor(&self) -> TimeAnchor {
+        TimeAnchor {
+            monotonic_ns: hostfacts::uptime_ms().saturating_mul(1_000_000),
+            utc_ns: utc_now_ns(),
+        }
+    }
+
+    pub fn append(&self, record: ObservationRecord) {
+        if let Err(error) = self.spool.lock().unwrap().append(&record) {
+            tracing::error!(error = %error, "spool append failed");
+            self.drops.lock().unwrap().user += 1;
+        }
+    }
+
+    pub fn with_key<T>(&self, f: impl FnOnce(&StudyKey) -> T) -> Option<T> {
+        self.key.lock().unwrap().as_ref().map(f)
+    }
+
+    pub fn token(&self, domain: &'static str, value: &[u8]) -> Option<ObjectToken> {
+        self.with_key(|key| key.token(domain, value))
+    }
+
+    pub fn add_gap(&self, cause: GapCause, started_monotonic_ns: u64, estimated: Option<u64>) {
+        let ended = self.anchor().monotonic_ns;
+        self.gaps.lock().unwrap().push(CaptureGap {
+            started_monotonic_ns,
+            ended_monotonic_ns: ended,
+            cause,
+            estimated_events: estimated,
+        });
+        let mut drops = self.drops.lock().unwrap();
+        match cause {
+            GapCause::FeedOverflow | GapCause::JournalRecreated => drops.overflows += 1,
+            GapCause::RootChanged => drops.root_changes += 1,
+            GapCause::KernelDrop => drops.kernel += 1,
+            _ => {}
+        }
+    }
+
+    pub fn config_hash(&self) -> String {
+        self.config.lock().unwrap().hash()
+    }
+
+    pub fn lanes(&self) -> LaneStates {
+        self.config.lock().unwrap().lane_states()
+    }
+
+    pub fn lane_enabled(&self, lane: impl Fn(&CollectorConfig) -> bool) -> bool {
+        lane(&self.config.lock().unwrap())
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    fn health(&self, lifecycle: LifecycleEvent, clean_prior_shutdown: Option<bool>) {
+        let process = resources::sample_process();
+        self.append(ObservationRecord::Health(HealthRecord {
+            at: self.anchor(),
+            os_build: self.facts.os_build.clone(),
+            machine: self.facts.machine,
+            lifecycle,
+            clean_prior_shutdown,
+            feed_cursor: None,
+            drops: self.drops.lock().unwrap().clone(),
+            cpu_millis: process.cpu_ms,
+            resident_bytes_bucket: bucket_size(process.working_set_bytes),
+        }));
+    }
+}
+
+pub fn utc_now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+pub fn build_hash() -> String {
+    blake3::hash(
+        option_env!("EIDOS_BUILD_REVISION")
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+            .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
+pub fn run(
+    options: Options,
+    control: Receiver<ControlEvent>,
+    on_ready: impl FnOnce(),
+) -> anyhow::Result<()> {
+    let data_dir = options.data_dir;
+    let export_dir = data_dir.join("exports");
+    std::fs::create_dir_all(&export_dir)?;
+
+    let config = CollectorConfig::load(&data_dir)?;
+    if !CollectorConfig::path(&data_dir).exists() {
+        config.save(&data_dir)?;
+    }
+    let clean_marker = data_dir.join("clean-shutdown");
+    let clean_prior_shutdown = clean_marker.exists();
+    if clean_prior_shutdown {
+        std::fs::remove_file(&clean_marker)?;
+    }
+    let build_hash = build_hash();
+    let build_marker = data_dir.join("build.hash");
+    let upgraded = match std::fs::read_to_string(&build_marker) {
+        Ok(previous) => previous.trim() != build_hash,
+        Err(_) => false,
+    };
+    std::fs::write(&build_marker, &build_hash)?;
+
+    let spool = Spool::open(&data_dir.join("spool.db"), config.spool_limits())?;
+    let key = match keystore::load(&data_dir) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::error!(error = %error, "study key unusable; collecting health only");
+            None
+        }
+    };
+    let facts = hostfacts::host_facts();
+    let inventory = volumes::enumerate();
+    let capabilities = Capabilities {
+        fsevents: false,
+        endpoint_security: EndpointSecurityCapability {
+            state: EndpointSecurityState::Off,
+            entitlement_claimed: false,
+            tcc_full_disk_access: None,
+            running_as_root: facts.local_system,
+        },
+        apfs: false,
+        windows: Some(WindowsCapabilities {
+            usn: usn_state(&inventory),
+            etw: EtwState::Off,
+            running_as_system: facts.local_system,
+            elevated: facts.elevated,
+            study_key_available: key.is_some(),
+        }),
+    };
+    let shared = Arc::new(Shared {
+        data_dir: data_dir.clone(),
+        export_dir,
+        key: Mutex::new(key),
+        spool: Mutex::new(spool),
+        config: Mutex::new(config),
+        capabilities: Mutex::new(capabilities),
+        drops: Mutex::new(DropCounters::default()),
+        gaps: Mutex::new(Vec::new()),
+        volumes: Mutex::new(Vec::new()),
+        feeds: Mutex::new(BTreeMap::new()),
+        etw: Mutex::new(EtwView {
+            state: "off".into(),
+            ..EtwView::default()
+        }),
+        shutdown: AtomicBool::new(false),
+        started: Instant::now(),
+        build_hash,
+        facts,
+    });
+    if !clean_prior_shutdown && std::fs::metadata(data_dir.join("spool.db")).is_ok() {
+        // The previous incarnation died without its marker; its last
+        // record is the best estimate of when capture stopped.
+        let last = shared.spool.lock().unwrap().latest().ok().flatten();
+        if let Some(last) = last {
+            shared.add_gap(GapCause::UncleanShutdown, last.at().monotonic_ns, None);
+        }
+    }
+    shared.health(LifecycleEvent::Started, Some(clean_prior_shutdown));
+    if upgraded {
+        shared.health(LifecycleEvent::Upgraded, None);
+    }
+    if shared.key.lock().unwrap().is_none() {
+        shared.add_gap(GapCause::KeyUnavailable, shared.anchor().monotonic_ns, None);
+    }
+    apply_inventory(&shared, inventory, true);
+    tracing::info!(
+        os = %shared.facts.os_build,
+        machine = ?shared.facts.machine,
+        local_system = shared.facts.local_system,
+        key = shared.key.lock().unwrap().is_some(),
+        volumes = shared.volumes.lock().unwrap().len(),
+        "collector started"
+    );
+
+    let pipe_thread = {
+        let shared = shared.clone();
+        pipe::serve(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(move |request| handle_request(&shared, request)),
+        )?
+    };
+    let health_thread = {
+        let shared = shared.clone();
+        std::thread::Builder::new()
+            .name("collector-health".into())
+            .spawn(move || run_health(shared))?
+    };
+    let lane_threads = crate::lanes::start(shared.clone());
+    on_ready();
+
+    loop {
+        match control.recv_timeout(Duration::from_secs(1)) {
+            Ok(ControlEvent::Stop) => {
+                tracing::info!("stop requested");
+                break;
+            }
+            Ok(ControlEvent::Shutdown) => {
+                tracing::info!("system shutdown");
+                shared.health(LifecycleEvent::Shutdown, None);
+                break;
+            }
+            Ok(ControlEvent::Suspend) => shared.health(LifecycleEvent::Sleep, None),
+            Ok(ControlEvent::Resume) => shared.health(LifecycleEvent::Wake, None),
+            Ok(ControlEvent::PowerStatusChange) => {
+                shared.health(LifecycleEvent::PowerStatusChange, None)
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    shared.shutdown.store(true, Ordering::Release);
+    pipe::poke();
+    for thread in lane_threads {
+        let _ = thread.join();
+    }
+    let _ = health_thread.join();
+    let _ = pipe_thread.join();
+    shared.health(LifecycleEvent::Heartbeat, None);
+    std::fs::write(clean_marker, b"clean\n")?;
+    tracing::info!("collector stopped");
+    Ok(())
+}
+
+fn usn_state(inventory: &[VolumeFacts]) -> UsnState {
+    let candidates: Vec<&VolumeFacts> =
+        inventory.iter().filter(|v| v.is_feed_candidate()).collect();
+    if candidates.is_empty() {
+        return if inventory.iter().any(|v| v.supports_usn()) {
+            UsnState::NoJournaledVolume
+        } else {
+            UsnState::Unsupported
+        };
+    }
+    if candidates.iter().any(|v| v.journal.is_some()) {
+        UsnState::Available
+    } else if candidates.iter().any(|v| {
+        v.journal_error
+            .as_deref()
+            .is_some_and(|e| e.contains("access denied"))
+    }) {
+        UsnState::AccessDenied
+    } else {
+        UsnState::NoJournaledVolume
+    }
+}
+
+/// Record inventory changes and replace the cached volume list.
+fn apply_inventory(shared: &Shared, inventory: Vec<VolumeFacts>, initial: bool) {
+    let events = if initial {
+        inventory
+            .iter()
+            .map(|v| (VolumeEvent::Inventory, v.clone()))
+            .collect()
+    } else {
+        volumes::diff(&shared.volumes.lock().unwrap(), &inventory)
+    };
+    let excluded = shared.config.lock().unwrap().exclude_volumes.clone();
+    for (event, volume) in events {
+        if excluded.iter().any(|e| volume.matches_exclusion(e)) {
+            continue;
+        }
+        let at = shared.anchor();
+        if let Some(record) = shared.with_key(|key| volume.observation(key, event, at)) {
+            shared.append(ObservationRecord::Volume(record));
+        }
+        match event {
+            VolumeEvent::Mounted => shared.health(LifecycleEvent::Mounted, None),
+            VolumeEvent::Unmounted => shared.health(LifecycleEvent::Unmounted, None),
+            _ => {}
+        }
+    }
+    if let Some(windows) = shared.capabilities.lock().unwrap().windows.as_mut() {
+        windows.usn = usn_state(&inventory);
+    }
+    *shared.volumes.lock().unwrap() = inventory;
+}
+
+fn run_health(shared: Arc<Shared>) {
+    let mut cpu = CpuSampler::new();
+    let mut last_heartbeat = Instant::now();
+    let mut last_resource = Instant::now();
+    let mut last_volume_scan = Instant::now();
+    let mut last_slept_ms = hostfacts::slept_ms();
+    let mut last_wall = (Instant::now(), utc_now_ns());
+    let mut last_cpu_ms = resources::sample_process().cpu_ms;
+    while !shared.is_shutting_down() {
+        std::thread::sleep(Duration::from_secs(1));
+        let (intervals, key_missing) = {
+            let config = shared.config.lock().unwrap();
+            (
+                config.intervals.clone(),
+                shared.key.lock().unwrap().is_none(),
+            )
+        };
+
+        // Wall clock versus monotonic drift beyond five seconds is a clock
+        // jump (NTP step, manual change, or resume without a power event).
+        let now_wall = utc_now_ns();
+        let expected = last_wall.1 + last_wall.0.elapsed().as_nanos() as i64;
+        if (now_wall - expected).abs() > 5_000_000_000 {
+            let slept = hostfacts::slept_ms();
+            if slept > last_slept_ms {
+                tracing::info!(slept_ms = slept - last_slept_ms, "resume detected");
+                shared.health(LifecycleEvent::Wake, None);
+            } else {
+                tracing::info!(delta_ms = (now_wall - expected) / 1_000_000, "clock jump");
+                shared.add_gap(GapCause::ClockJump, shared.anchor().monotonic_ns, None);
+                shared.health(LifecycleEvent::ClockJump, None);
+            }
+            last_slept_ms = slept;
+        }
+        last_wall = (Instant::now(), now_wall);
+
+        if key_missing {
+            if let Ok(Some(key)) = keystore::load(&shared.data_dir) {
+                tracing::info!("study key became available");
+                *shared.key.lock().unwrap() = Some(key);
+                if let Some(windows) = shared.capabilities.lock().unwrap().windows.as_mut() {
+                    windows.study_key_available = true;
+                }
+                let inventory = shared.volumes.lock().unwrap().clone();
+                apply_inventory(&shared, inventory, true);
+            }
+        }
+        if last_volume_scan.elapsed() >= Duration::from_secs(intervals.volume_scan_s.max(5) as u64)
+        {
+            last_volume_scan = Instant::now();
+            apply_inventory(&shared, volumes::enumerate(), false);
+        }
+        if last_resource.elapsed() >= Duration::from_secs(intervals.resource_s.max(10) as u64) {
+            let interval_s = last_resource.elapsed().as_secs() as u32;
+            last_resource = Instant::now();
+            let mut process = resources::sample_process();
+            let total_cpu = process.cpu_ms;
+            process.cpu_ms = total_cpu.saturating_sub(last_cpu_ms);
+            last_cpu_ms = total_cpu;
+            let (memory_total, memory_used_percent) = hostfacts::memory();
+            shared.append(ObservationRecord::Resource(ResourceSample {
+                at: shared.anchor(),
+                interval_s,
+                collector: process,
+                system: HostResources {
+                    cpu_busy_percent: cpu.busy_percent(),
+                    memory_used_percent,
+                    memory_total: bucket_capacity(memory_total),
+                    logical_processors: shared.facts.logical_processors,
+                    uptime: bucket_age(hostfacts::uptime_ms() / 1_000),
+                    on_battery: hostfacts::on_battery(),
+                    slept_ms: hostfacts::slept_ms(),
+                },
+                lanes: shared.lanes(),
+            }));
+        }
+        if last_heartbeat.elapsed() >= Duration::from_secs(intervals.heartbeat_s.max(30) as u64) {
+            last_heartbeat = Instant::now();
+            shared.health(LifecycleEvent::Heartbeat, None);
+        }
+    }
+}
+
+fn handle_request(shared: &Arc<Shared>, request: Request) -> Response {
+    match request {
+        Request::Status => Response::Status {
+            status: Box::new(status(shared)),
+        },
+        Request::Mark { label } => match shared.token("mark", label.as_bytes()) {
+            Some(marker) => {
+                shared.append(ObservationRecord::Mark(MarkRecord {
+                    at: shared.anchor(),
+                    marker,
+                }));
+                Response::Accepted
+            }
+            None => Response::Error {
+                message: "no study key; run `eidos observe init` first".into(),
+            },
+        },
+        Request::Export => match stage_export(shared) {
+            Ok(staged_file) => Response::Exported { staged_file },
+            Err(error) => Response::Error {
+                message: format!("export failed: {error:#}"),
+            },
+        },
+        Request::SetLanes {
+            usn,
+            etw,
+            content,
+            enumeration,
+        } => {
+            let mut config = shared.config.lock().unwrap();
+            if let Some(usn) = usn {
+                config.lanes.usn = usn;
+            }
+            if let Some(etw) = etw {
+                config.lanes.etw.enabled = etw;
+            }
+            if let Some(content) = content {
+                config.lanes.content.enabled = content;
+            }
+            if let Some(enumeration) = enumeration {
+                config.lanes.enumeration.enabled = enumeration;
+            }
+            match config.save(&shared.data_dir) {
+                Ok(()) => Response::Accepted,
+                Err(error) => Response::Error {
+                    message: format!("configuration not saved: {error}"),
+                },
+            }
+        }
+        Request::Probe { volume } => crate::lanes::probe_now(shared, volume.as_deref()),
+    }
+}
+
+fn status(shared: &Shared) -> CollectorStatus {
+    let spool = shared.spool.lock().unwrap();
+    let stats = spool.stats().ok();
+    drop(spool);
+    let file_bytes = ["spool.db", "spool.db-wal"]
+        .iter()
+        .filter_map(|name| std::fs::metadata(shared.data_dir.join(name)).ok())
+        .map(|m| m.len())
+        .sum();
+    let config = shared.config.lock().unwrap();
+    let excluded = config.exclude_volumes.clone();
+    let lanes = config.lane_states();
+    let config_hash = config.hash();
+    drop(config);
+    let feeds = shared.feeds.lock().unwrap();
+    let process = resources::sample_process();
+    CollectorStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        build_hash: shared.build_hash.clone(),
+        config_hash,
+        uptime_s: shared.started.elapsed().as_secs(),
+        capabilities: shared.capabilities.lock().unwrap().clone(),
+        lanes,
+        spool: SpoolView {
+            records: stats.map(|s| s.records).unwrap_or(0),
+            detailed_records: stats.map(|s| s.detailed_records).unwrap_or(0),
+            detailed_bytes: stats.map(|s| s.detailed_bytes).unwrap_or(0),
+            oldest_utc_ns: stats.and_then(|s| s.oldest_utc_ns),
+            newest_utc_ns: stats.and_then(|s| s.newest_utc_ns),
+            file_bytes,
+        },
+        drops: shared.drops.lock().unwrap().clone(),
+        capture_gaps: shared.gaps.lock().unwrap().len(),
+        volumes: shared
+            .volumes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|v| VolumeView {
+                root: v.root().to_string(),
+                filesystem: v.filesystem_name.clone(),
+                drive: format!("{:?}", v.drive).to_ascii_lowercase(),
+                bus: format!("{:?}", v.bus).to_ascii_lowercase(),
+                media: format!("{:?}", v.media).to_ascii_lowercase(),
+                journaled: v.journal.is_some(),
+                excluded: excluded.iter().any(|e| v.matches_exclusion(e)),
+            })
+            .collect(),
+        feeds: feeds
+            .values()
+            .map(|f| FeedView {
+                root: f.root.clone(),
+                state: format!("{:?}", f.state).to_ascii_lowercase(),
+                detail: f.detail.clone(),
+                batches: f.batches,
+                records: f.records,
+                logical_changes: f.logical_changes,
+                lag_bytes: f.lag_bytes,
+                last_batch_s_ago: f.last_batch.map(|t| t.elapsed().as_secs()),
+                overflows: f.overflows,
+                recreations: f.recreations,
+            })
+            .collect(),
+        etw: shared.etw.lock().unwrap().clone(),
+        collector: ProcessView {
+            cpu_ms: process.cpu_ms,
+            working_set_bytes: process.working_set_bytes,
+            private_bytes: process.private_bytes,
+            handles: process.handles,
+            threads: process.threads,
+        },
+    }
+}
+
+fn stage_export(shared: &Shared) -> anyhow::Result<PathBuf> {
+    let records = shared.spool.lock().unwrap().records()?;
+    let manifest = BundleManifest {
+        schema: SCHEMA_VERSION.into(),
+        build_hash: shared.build_hash.clone(),
+        config_hash: shared.config_hash(),
+        created: shared.anchor(),
+        capabilities: shared.capabilities.lock().unwrap().clone(),
+        capture_gaps: shared.gaps.lock().unwrap().clone(),
+        drops: shared.drops.lock().unwrap().clone(),
+        units: Units::default(),
+    };
+    let bundle = ObservationBundle { manifest, records };
+    let file = shared.export_dir.join(format!(
+        "observation-{}.eidos-observation.zst",
+        utc_now_ns() / 1_000_000_000
+    ));
+    write_bundle(&file, &bundle)?;
+    tracing::info!(records = bundle.records.len(), file = %file.display(), "export staged");
+    Ok(file)
+}
+
+pub fn export_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("exports")
+}

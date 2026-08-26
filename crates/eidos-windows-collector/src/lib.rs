@@ -14,15 +14,25 @@ pub mod config;
 pub mod protocol;
 
 #[cfg(windows)]
+pub mod daemon;
+#[cfg(windows)]
 pub mod hostfacts;
 #[cfg(windows)]
 pub mod keystore;
 #[cfg(windows)]
+pub mod lanes;
+#[cfg(windows)]
+pub mod log;
+#[cfg(windows)]
+pub mod pipe;
+#[cfg(windows)]
 pub mod resources;
+#[cfg(windows)]
+pub mod service;
 #[cfg(windows)]
 pub mod volumes;
 
 /// Service name registered with the SCM and the pipe name it listens on.
 pub const SERVICE_NAME: &str = "eidos-collector";
-pub const PIPE_NAME: &str = r"\.\pipe\eidos-collector";
+pub const PIPE_NAME: &str = r"\\.\pipe\eidos-collector";
 pub const DEFAULT_DATA_DIR: &str = r"C:\ProgramData\eidos-collector";
