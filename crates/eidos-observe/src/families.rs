@@ -64,7 +64,15 @@ impl Histogram {
         for (index, count) in self.counts.iter().enumerate() {
             seen += count;
             if seen >= target {
-                return if index == 0 { 0 } else { 1u64 << index };
+                return if index == 0 {
+                    0
+                } else if index == Self::BUCKETS - 1 {
+                    // The final bucket is open-ended; its true upper bound is
+                    // the largest observation, not 2^(BUCKETS-1).
+                    self.max
+                } else {
+                    1u64 << index
+                };
             }
         }
         self.max
@@ -481,7 +489,9 @@ mod tests {
         assert_eq!(histogram.counts[3], 2);
         assert_eq!(histogram.counts[Histogram::BUCKETS - 1], 1);
         assert_eq!(histogram.percentile_bound(50), 8);
-        assert_eq!(histogram.percentile_bound(100), 1 << 23);
+        // The top bucket is open-ended, so its bound is the observed max
+        // rather than the 2^23 bucket floor.
+        assert_eq!(histogram.percentile_bound(100), 1 << 40);
         assert_eq!(Histogram::default().percentile_bound(99), 0);
         let mut lazy = Histogram::default();
         lazy.observe(5);
