@@ -16,6 +16,40 @@ pub struct CollectorConfig {
     /// Drive letters or volume GUID paths to leave alone entirely. Local
     /// only; never exported.
     pub exclude_volumes: Vec<String>,
+    /// Where and when finished bundles are delivered.
+    pub upload: UploadConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UploadConfig {
+    pub enabled: bool,
+    /// Directory the daily bundle is copied into — typically a UNC share such
+    /// as `\\fileserver\share\eidos`. The collector runs as LocalSystem, so a
+    /// share must grant write access to the machine account rather than to the
+    /// operator who configured it. Local only; never exported.
+    pub destination: String,
+    /// Local hour, 0-23, at or after which the day's upload runs.
+    pub hour: u32,
+    /// Attempts per day before leaving it until tomorrow. Bundles that were
+    /// not delivered stay staged and are retried on the next run.
+    pub attempts: u32,
+    /// Delete the staged bundle once it has been delivered.
+    pub remove_after_upload: bool,
+}
+
+impl Default for UploadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            destination: String::new(),
+            // Off-hours by default, so a fleet is not copying bundles while
+            // the workload it measures is busiest.
+            hour: 3,
+            attempts: 3,
+            remove_after_upload: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,8 +197,19 @@ impl CollectorConfig {
     }
 
     /// Stable hash of the collection-affecting configuration.
+    ///
+    /// Upload settings are deliberately excluded: where a bundle is delivered
+    /// says nothing about how it was collected, and pointing the collector at
+    /// a different share should not make every later bundle look as though it
+    /// came from a different collection configuration.
     pub fn hash(&self) -> String {
-        let canonical = serde_json::to_vec(self).unwrap_or_default();
+        let canonical = serde_json::to_vec(&(
+            &self.lanes,
+            &self.intervals,
+            &self.spool,
+            &self.exclude_volumes,
+        ))
+        .unwrap_or_default();
         blake3::hash(&canonical).to_hex().to_string()
     }
 

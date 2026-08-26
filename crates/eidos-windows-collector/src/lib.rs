@@ -41,6 +41,8 @@ pub mod resources;
 #[cfg(windows)]
 pub mod service;
 #[cfg(windows)]
+pub mod upload;
+#[cfg(windows)]
 pub mod usn_lane;
 #[cfg(windows)]
 pub mod volumes;

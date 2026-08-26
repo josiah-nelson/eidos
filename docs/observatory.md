@@ -184,8 +184,10 @@ Keychain Access only when prior study tokens no longer need to remain stable.
 
 The Windows lane set runs as the `eidos-collector` service (LocalSystem,
 delayed automatic start, restart on failure) and is controlled over a local
-named pipe by `eidos observe` from an elevated prompt. It has no listener,
-upload, or remote control. Install and run:
+named pipe by `eidos observe` from an elevated prompt. It has no listener and
+no remote control; its only outbound path is the optional scheduled upload
+described below, which the collector initiates and which is off by default.
+Install and run:
 
 ```powershell
 eidos observe init                 # DPAPI machine-scope study key + default config
@@ -255,6 +257,49 @@ Enumeration probe (L2, off by default; also on demand): a read-only walk
 of a fixed volume with the production lister, timed with CPU cost, giving
 file and directory counts, fan-out and depth, size and extension buckets,
 and reparse/placeholder/sparse/compressed/encrypted/offline counts.
+
+### Scheduled upload
+
+A fleet is easier to collect from than to visit. With `upload.enabled`, the
+collector stages a bundle once a day at or after `upload.hour` (local time)
+and copies it to `upload.destination` — an ordinary directory path, typically
+a UNC share:
+
+```json
+"upload": {
+  "enabled": true,
+  "destination": "\\\\fileserver\\share\\eidos",
+  "hour": 3,
+  "attempts": 3,
+  "remove_after_upload": true
+}
+```
+
+The service runs as LocalSystem, so a share must grant write access to the
+**machine account** (`DOMAIN\HOST$`), not to the operator who configured it;
+this is the usual reason a first upload fails with access denied.
+
+Each bundle is copied under a temporary `.part` name and renamed into place,
+so a reader on the share never sees a half-written file. Names are prefixed
+with a keyed per-host token, so many collectors can share one directory
+without colliding and without putting host names on the share. A bundle that
+was already delivered is not copied again.
+
+Delivery is unhurried and forgiving: the day's upload is retried up to
+`attempts` times, and any bundle still staged locally — including one left by
+an earlier failure — is retried on the next run, so a share that is offline
+for a day catches up rather than losing that day. `remove_after_upload`
+deletes the local copy once it has been delivered; leave it off to keep
+bundles on the host as well. `eidos observe status` reports the destination,
+the last successful upload, how many bundles are waiting, and why the last
+attempt failed.
+
+`upload.destination` is local configuration and is never exported, and the
+upload path changes nothing about what is collected: it copies the same
+bundle `eidos observe export` produces, so the privacy contract below applies
+to it unchanged. Upload settings are excluded from the manifest's
+configuration hash for the same reason — where a bundle is delivered says
+nothing about how it was collected.
 
 ### Privacy contract on Windows
 

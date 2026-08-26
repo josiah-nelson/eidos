@@ -83,6 +83,7 @@ pub struct Shared {
     pub export_dir: PathBuf,
     /// Held for the duration of a staged export.
     pub export_lock: Mutex<()>,
+    pub upload: Mutex<crate::protocol::UploadView>,
     pub key: Mutex<Option<StudyKey>>,
     pub spool: Mutex<Spool>,
     pub config: Mutex<CollectorConfig>,
@@ -281,6 +282,7 @@ pub fn run(
         data_dir: data_dir.clone(),
         export_dir,
         export_lock: Mutex::new(()),
+        upload: Mutex::new(crate::protocol::UploadView::default()),
         key: Mutex::new(key),
         spool: Mutex::new(spool),
         config: Mutex::new(config),
@@ -629,6 +631,7 @@ fn status(shared: &Shared) -> CollectorStatus {
             })
             .collect(),
         etw: shared.etw.lock().unwrap().clone(),
+        upload: shared.upload.lock().unwrap().clone(),
         collector: ProcessView {
             cpu_ms: process.cpu_ms,
             working_set_bytes: process.working_set_bytes,
