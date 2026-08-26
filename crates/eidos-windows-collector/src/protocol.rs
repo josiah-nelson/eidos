@@ -57,7 +57,20 @@ pub struct CollectorStatus {
     pub volumes: Vec<VolumeView>,
     pub feeds: Vec<FeedView>,
     pub etw: EtwView,
+    pub upload: UploadView,
     pub collector: ProcessView,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadView {
+    pub enabled: bool,
+    pub destination: String,
+    pub last_upload_utc_ns: Option<i64>,
+    pub uploaded_total: u64,
+    /// Why the most recent attempt failed, cleared by the next success.
+    pub last_error: Option<String>,
+    /// Bundles staged locally and not yet delivered.
+    pub pending: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

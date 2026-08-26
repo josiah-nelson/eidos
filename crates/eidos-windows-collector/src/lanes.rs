@@ -13,7 +13,8 @@ pub fn start(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
         crate::content_probe::start(shared.clone(), content_rx),
         crate::usn_lane::start(shared.clone()),
         crate::access_lane::start(shared.clone()),
-        crate::enumeration_probe::start(shared),
+        crate::enumeration_probe::start(shared.clone()),
+        crate::upload::start(shared),
     ]
 }
 
