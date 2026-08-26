@@ -89,6 +89,8 @@ pub struct Shared {
     pub volumes: Mutex<Vec<VolumeFacts>>,
     pub feeds: Mutex<BTreeMap<String, FeedStatus>>,
     pub etw: Mutex<EtwView>,
+    /// True while an ETW window is tracing; drives `LaneStates::etw`.
+    pub etw_window_open: AtomicBool,
     pub shutdown: AtomicBool,
     pub started: Instant,
     pub build_hash: String,
@@ -141,8 +143,12 @@ impl Shared {
         self.config.lock().unwrap().hash()
     }
 
+    /// Lane states as they are in force now: the ETW flag is true only
+    /// while a window is tracing, not merely when the lane is enabled.
     pub fn lanes(&self) -> LaneStates {
-        self.config.lock().unwrap().lane_states()
+        let mut lanes = self.config.lock().unwrap().lane_states();
+        lanes.etw = self.etw_window_open.load(Ordering::Acquire);
+        lanes
     }
 
     pub fn lane_enabled(&self, lane: impl Fn(&CollectorConfig) -> bool) -> bool {
@@ -282,6 +288,7 @@ pub fn run(
             state: "off".into(),
             ..EtwView::default()
         }),
+        etw_window_open: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
         started: Instant::now(),
         build_hash,

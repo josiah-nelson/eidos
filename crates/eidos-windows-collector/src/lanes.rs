@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub fn start(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
-    vec![crate::usn_lane::start(shared)]
+    vec![
+        crate::usn_lane::start(shared.clone()),
+        crate::access_lane::start(shared),
+    ]
 }
 
 pub fn probe_now(_shared: &Arc<Shared>, _volume: Option<&str>) -> Response {
