@@ -135,7 +135,10 @@ pub fn diff(previous: &[VolumeFacts], current: &[VolumeFacts]) -> Vec<(VolumeEve
             Some(before) => {
                 let event = match (before.journal, volume.journal) {
                     (None, Some(_)) => Some(VolumeEvent::JournalCreated),
-                    (Some(_), None) if volume.journal_error.is_some() => {
+                    // A journal that queried cleanly but is no longer active
+                    // really is gone. A query that failed says nothing about
+                    // the journal, so it must not be reported as a deletion.
+                    (Some(_), None) if volume.journal_error.is_none() => {
                         Some(VolumeEvent::JournalDeleted)
                     }
                     (Some(a), Some(b)) if a.journal_id != b.journal_id => {
@@ -459,6 +462,18 @@ mod tests {
             diff(&[b], &[facts("b", Some(5))])[0].0,
             VolumeEvent::JournalCreated
         );
+        // A journal queried as inactive is a deletion; a journal whose query
+        // failed is unknown and must stay silent.
+        let deleted = facts("a", None);
+        assert_eq!(
+            diff(std::slice::from_ref(&a), &[deleted])[0].0,
+            VolumeEvent::JournalDeleted
+        );
+        let unreadable = VolumeFacts {
+            journal_error: Some("access denied".into()),
+            ..facts("a", None)
+        };
+        assert!(diff(std::slice::from_ref(&a), &[unreadable]).is_empty());
         assert!(a.matches_exclusion("q:"));
         assert!(a.matches_exclusion(r"Q:\"));
         assert!(!a.matches_exclusion("r:"));
