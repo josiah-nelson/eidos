@@ -116,7 +116,10 @@ impl CoalescingWindow {
 pub struct ChangeAnalyzer {
     volume_id: Vec<u8>,
     interval_started_s: i64,
-    pending_rename: Option<(u128, u128, i64)>,
+    /// Old-name records awaiting their close, keyed by file reference. A
+    /// single volume-wide slot dropped the pairing whenever two renames
+    /// interleaved, which is ordinary on a busy volume.
+    pending_renames: LruCache<u128, (u128, i64)>,
     edit_counts: LruCache<u128, u32>,
     recent_deletes: LruCache<[u8; 32], i64>,
     fan_out: LruCache<u128, u32>,
@@ -157,7 +160,7 @@ impl ChangeAnalyzer {
         Self {
             volume_id: volume_id.to_vec(),
             interval_started_s: now_s,
-            pending_rename: None,
+            pending_renames: LruCache::new(cap),
             edit_counts: LruCache::new(cap),
             recent_deletes: LruCache::new(cap),
             fan_out: LruCache::new(cap),
@@ -228,7 +231,8 @@ impl ChangeAnalyzer {
         self.max_backlog_s = self.max_backlog_s.max(backlog_ns / 1_000_000_000);
 
         if record.reason & REASON_RENAME_OLD_NAME != 0 && record.reason & REASON_CLOSE == 0 {
-            self.pending_rename = Some((record.frn, record.parent_frn, record.usn));
+            self.pending_renames
+                .put(record.frn, (record.parent_frn, record.usn));
         }
         if record.reason & REASON_CLOSE == 0 {
             self.intermediate_records += 1;
@@ -283,19 +287,14 @@ impl ChangeAnalyzer {
             }),
             _ => None,
         };
-        let rename_pair = match (operation, self.pending_rename.take()) {
-            (ChangeOperation::Rename, Some((frn, old_parent, _))) if frn == record.frn => {
-                Some(key.token("subtree", &self.identity(old_parent)))
-            }
-            (_, pending) => {
-                // Keep an unrelated pending rename for its own close record.
-                if let Some(pending) = pending {
-                    if pending.0 != record.frn {
-                        self.pending_rename = Some(pending);
-                    }
-                }
-                None
-            }
+        // Only this object's own old-name record is consumed; renames of
+        // other files keep waiting for their own close.
+        let rename_pair = match operation {
+            ChangeOperation::Rename => self
+                .pending_renames
+                .pop(&record.frn)
+                .map(|(old_parent, _)| key.token("subtree", &self.identity(old_parent))),
+            _ => None,
         };
         let extension = if record.is_directory {
             ExtensionBucket::None
@@ -561,6 +560,58 @@ mod tests {
         assert_eq!(output.rate.interval_s, 60);
         assert_eq!(output.rate.per_second.total, 60);
         assert_eq!(output.rate.per_second.counts[0], 59);
+    }
+
+    /// Two files renamed at once is ordinary on a busy volume. Each close
+    /// must pair with its own old-name record, not with whichever one arrived
+    /// most recently.
+    #[test]
+    fn interleaved_renames_keep_their_own_old_subtree() {
+        let key = key();
+        let mut analyzer = ChangeAnalyzer::new(b"vol", 0);
+        let facts = ObjectFacts::default();
+
+        // Both old-name records arrive before either close.
+        analyzer.observe(
+            &key,
+            &record(1, 9, 20, REASON_RENAME_OLD_NAME, "a.txt"),
+            facts,
+            at(1),
+        );
+        analyzer.observe(
+            &key,
+            &record(2, 8, 21, REASON_RENAME_OLD_NAME, "b.txt"),
+            facts,
+            at(1),
+        );
+
+        let first = analyzer
+            .observe(
+                &key,
+                &record(3, 9, 30, REASON_RENAME_NEW_NAME | REASON_CLOSE, "a2.txt"),
+                facts,
+                at(1),
+            )
+            .unwrap();
+        let second = analyzer
+            .observe(
+                &key,
+                &record(4, 8, 31, REASON_RENAME_NEW_NAME | REASON_CLOSE, "b2.txt"),
+                facts,
+                at(1),
+            )
+            .unwrap();
+
+        // The single-slot version lost the first file's pairing entirely.
+        assert_eq!(
+            first.rename_pair,
+            Some(key.token("subtree", &analyzer.identity(20)))
+        );
+        assert_eq!(
+            second.rename_pair,
+            Some(key.token("subtree", &analyzer.identity(21)))
+        );
+        assert_ne!(first.rename_pair, second.rename_pair);
     }
 
     #[test]

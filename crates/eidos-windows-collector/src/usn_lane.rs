@@ -12,8 +12,8 @@ use eidos_observe::{
     PercentBucket,
 };
 use eidos_scanner::usn::{
-    query_journal, read_journal_wait, snapshot_by_id, JournalCancellation, ReadOutcome, UsnError,
-    VolumeHandle,
+    query_journal, read_journal_wait_timeout, snapshot_by_id, JournalCancellation, ReadOutcome,
+    UsnError, VolumeHandle,
 };
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
@@ -232,14 +232,20 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
         let (Some(vol), Some(position)) = (handle.as_ref(), cursor) else {
             continue;
         };
-        match read_journal_wait(
+        // Wake at least once per summary interval: a volume with no activity
+        // still owes rate summaries and feed-health records.
+        let idle_wake = shared.config.lock().unwrap().intervals.rate_s.max(10) as u64;
+        match read_journal_wait_timeout(
             vol,
             position.journal_id,
             position.next_usn,
             &mut buffer,
             &cancel,
+            Duration::from_secs(idle_wake),
         ) {
-            Ok(ReadOutcome::Records { records, next_usn }) => {
+            // Nothing arrived in time; fall through to the periodic flush.
+            Ok(None) => {}
+            Ok(Some(ReadOutcome::Records { records, next_usn })) => {
                 let now = shared.anchor();
                 if !records.is_empty() {
                     last_record_monotonic = now.monotonic_ns;
@@ -276,11 +282,16 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                         }
                     }
                     counters.logical_changes += changes.len() as u64;
-                    if !changes.is_empty() {
-                        if let Err(error) = shared.spool.lock().unwrap().append_all(&changes) {
-                            tracing::error!(error = %error, "spool batch failed");
-                            shared.drops.lock().unwrap().user += changes.len() as u64;
-                        }
+                    if !changes.is_empty() && !shared.append_all_retrying(&changes) {
+                        // The cursor advances past this batch either way, so
+                        // the hole has to be declared in the bundle rather
+                        // than left for a restart to skip silently.
+                        shared.drops.lock().unwrap().user += changes.len() as u64;
+                        shared.add_gap(
+                            GapCause::UserDrop,
+                            last_record_monotonic,
+                            Some(now.monotonic_ns),
+                        );
                     }
                 }
                 let advanced = Cursor {
@@ -305,7 +316,7 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                     s.last_batch = Some(Instant::now());
                 });
             }
-            Ok(ReadOutcome::EntryDeleted) => {
+            Ok(Some(ReadOutcome::EntryDeleted)) => {
                 tracing::warn!(root = %volume.root(), "journal overflowed");
                 shared.add_gap(GapCause::FeedOverflow, last_record_monotonic, None);
                 counters.overflows += 1;
@@ -315,7 +326,7 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                 });
                 handle = None;
             }
-            Ok(ReadOutcome::JournalChanged) => {
+            Ok(Some(ReadOutcome::JournalChanged)) => {
                 tracing::warn!(root = %volume.root(), "journal recreated");
                 shared.add_gap(GapCause::JournalRecreated, last_record_monotonic, None);
                 counters.recreations += 1;

@@ -72,6 +72,9 @@ impl FeedStatus {
     }
 }
 
+/// How many times a failed spool batch is retried before it is declared lost.
+const SPOOL_RETRIES: u32 = 3;
+
 pub struct Shared {
     pub data_dir: PathBuf,
     pub export_dir: PathBuf,
@@ -148,6 +151,33 @@ impl Shared {
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Append a batch, retrying briefly before reporting it lost.
+    ///
+    /// A lane that has already drained its journal batch or its aggregator
+    /// cannot reproduce these records, and its cursor moves on regardless, so
+    /// a transient spool error must not quietly discard them. Callers report
+    /// the loss when this returns `false`.
+    pub fn append_all_retrying(&self, records: &[ObservationRecord]) -> bool {
+        for attempt in 1..=SPOOL_RETRIES {
+            match self.spool.lock().unwrap().append_all(records) {
+                Ok(()) => return true,
+                Err(error) => {
+                    tracing::error!(error = %error, attempt, "spool batch failed")
+                }
+            }
+            if attempt == SPOOL_RETRIES {
+                break;
+            }
+            for _ in 0..10 {
+                if self.is_shutting_down() {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        false
     }
 
     fn health(&self, lifecycle: LifecycleEvent, clean_prior_shutdown: Option<bool>) {

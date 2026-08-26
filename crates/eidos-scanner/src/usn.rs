@@ -20,7 +20,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING,
     ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE,
     ERROR_NOT_FOUND, ERROR_NO_MORE_FILES, GENERIC_READ, INVALID_HANDLE_VALUE, WAIT_FAILED,
-    WAIT_OBJECT_0,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ExtendedFileIdType, FileAttributeTagInfo, FileBasicInfo, FileIdInfo,
@@ -302,7 +302,8 @@ pub fn read_journal(
     start_usn: i64,
     buf: &mut [u8],
 ) -> Result<ReadOutcome, UsnError> {
-    read_journal_opts(vol, journal_id, start_usn, buf, None)
+    read_journal_opts(vol, journal_id, start_usn, buf, None, INFINITE)
+        .map(|outcome| outcome.expect("an infinite wait cannot time out"))
 }
 
 /// Like [`read_journal`], but when the journal is drained the call remains
@@ -319,10 +320,38 @@ pub fn read_journal_wait(
     if cancel.is_cancelled() {
         return Err(UsnError::Cancelled);
     }
-    let outcome = read_journal_opts(vol, journal_id, start_usn, buf, Some(cancel))?;
+    let outcome = read_journal_opts(vol, journal_id, start_usn, buf, Some(cancel), INFINITE)?
+        .expect("an infinite wait cannot time out");
     // DeviceIoControl may complete synchronously, in which case the wait on
     // the cancellation event is bypassed. Never hand that batch to the
     // caller after a concurrent shutdown/remove request has won the race.
+    if cancel.is_cancelled() {
+        Err(UsnError::Cancelled)
+    } else {
+        Ok(outcome)
+    }
+}
+
+/// Like [`read_journal_wait`], but gives up after `timeout` and returns `None`
+/// instead of staying parked in the kernel.
+///
+/// A reader that only ever wakes on journal activity cannot do its periodic
+/// work — flushing rate summaries and feed-health records — on a volume that
+/// happens to be quiet. The pending read is cancelled on timeout and nothing
+/// is consumed, so the next call resumes from the same `start_usn`.
+pub fn read_journal_wait_timeout(
+    vol: &VolumeHandle,
+    journal_id: u64,
+    start_usn: i64,
+    buf: &mut [u8],
+    cancel: &JournalCancellation,
+    timeout: std::time::Duration,
+) -> Result<Option<ReadOutcome>, UsnError> {
+    if cancel.is_cancelled() {
+        return Err(UsnError::Cancelled);
+    }
+    let millis = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+    let outcome = read_journal_opts(vol, journal_id, start_usn, buf, Some(cancel), millis)?;
     if cancel.is_cancelled() {
         Err(UsnError::Cancelled)
     } else {
@@ -336,7 +365,8 @@ fn read_journal_opts(
     start_usn: i64,
     buf: &mut [u8],
     cancel: Option<&JournalCancellation>,
-) -> Result<ReadOutcome, UsnError> {
+    timeout_ms: u32,
+) -> Result<Option<ReadOutcome>, UsnError> {
     let req = READ_USN_JOURNAL_DATA_V1 {
         StartUsn: start_usn,
         ReasonMask: 0xFFFF_FFFF,
@@ -396,13 +426,23 @@ fn read_journal_opts(
             let handles = [io_event.as_ref().expect("event").0, cancel.event.0];
             // SAFETY: both handles stay live for this wait; wait for either
             // journal completion or the manual-reset cancellation event.
-            match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) } {
+            match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, timeout_ms) } {
                 WAIT_OBJECT_0 => {
                     // SAFETY: the I/O event is signaled; retrieve its result.
                     if unsafe { GetOverlappedResult(vol.raw(), &overlapped, &mut returned, 0) } == 0
                     {
-                        return read_failure(unsafe { GetLastError() }, start_usn, &vol.root);
+                        return read_failure(unsafe { GetLastError() }, start_usn, &vol.root)
+                            .map(Some);
                     }
+                }
+                WAIT_TIMEOUT => {
+                    // SAFETY: cancel this exact operation, then wait for its
+                    // completion before its buffer and OVERLAPPED are dropped.
+                    unsafe {
+                        CancelIoEx(vol.raw(), &overlapped);
+                        GetOverlappedResult(vol.raw(), &overlapped, &mut returned, 1);
+                    }
+                    return Ok(None);
                 }
                 value if value == WAIT_OBJECT_0 + 1 => {
                     // SAFETY: cancel this exact operation, then wait for its
@@ -423,15 +463,15 @@ fn read_journal_opts(
                 _ => unreachable!("two-handle wait returned an invalid index"),
             }
         } else {
-            return read_failure(code, start_usn, &vol.root);
+            return read_failure(code, start_usn, &vol.root).map(Some);
         }
     }
     let returned = returned as usize;
     if returned < 8 {
-        return Ok(ReadOutcome::Records {
+        return Ok(Some(ReadOutcome::Records {
             records: Vec::new(),
             next_usn: start_usn,
-        });
+        }));
     }
     let next_usn = i64::from_le_bytes(buf[0..8].try_into().expect("8 bytes"));
     let mut records = Vec::new();
@@ -447,7 +487,7 @@ fn read_journal_opts(
         }
         off += len;
     }
-    Ok(ReadOutcome::Records { records, next_usn })
+    Ok(Some(ReadOutcome::Records { records, next_usn }))
 }
 
 fn read_failure(code: u32, start_usn: i64, root: &str) -> Result<ReadOutcome, UsnError> {
