@@ -18,6 +18,11 @@ pub fn start(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
 }
 
 pub fn probe_now(shared: &Arc<Shared>, volume: Option<&str>) -> Response {
-    crate::enumeration_probe::run_detached(shared.clone(), volume.map(str::to_string));
-    Response::Accepted
+    if crate::enumeration_probe::run_detached(shared.clone(), volume.map(str::to_string)) {
+        Response::Accepted
+    } else {
+        Response::Error {
+            message: "an enumeration probe is already running".into(),
+        }
+    }
 }

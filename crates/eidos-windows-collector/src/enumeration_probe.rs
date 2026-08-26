@@ -13,6 +13,7 @@ use eidos_observe::{
 use eidos_scanner::default_lister;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -46,16 +47,41 @@ fn scheduler(shared: Arc<Shared>) {
         }
         if last_run.elapsed() >= Duration::from_secs(every_hours as u64 * 3600) {
             last_run = Instant::now();
+            if RUNNING.swap(true, Ordering::AcqRel) {
+                // An on-demand probe is already walking; let it stand in for
+                // this scheduled run rather than doubling the load.
+                continue;
+            }
             run_all(&shared, None);
+            RUNNING.store(false, Ordering::Release);
         }
     }
 }
 
+/// True while a probe is walking, so repeated requests cannot multiply the
+/// scans. A full-volume walk is the most expensive thing the collector does,
+/// and overlapping walks contend for the same disk and distort each other's
+/// measurements.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
 /// Run probes now on a background thread; `volume` narrows to one root.
-pub fn run_detached(shared: Arc<Shared>, volume: Option<String>) {
-    let _ = std::thread::Builder::new()
+/// A request that arrives while a probe is already running is declined rather
+/// than queued: the caller wants a current picture, and one is already coming.
+pub fn run_detached(shared: Arc<Shared>, volume: Option<String>) -> bool {
+    if RUNNING.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let spawned = std::thread::Builder::new()
         .name("enumeration-probe".into())
-        .spawn(move || run_all(&shared, volume.as_deref()));
+        .spawn(move || {
+            run_all(&shared, volume.as_deref());
+            RUNNING.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        RUNNING.store(false, Ordering::Release);
+        return false;
+    }
+    true
 }
 
 fn run_all(shared: &Shared, only: Option<&str>) {

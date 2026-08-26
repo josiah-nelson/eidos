@@ -53,6 +53,8 @@ pub struct FeedStatus {
     pub last_batch: Option<Instant>,
     pub overflows: u64,
     pub recreations: u64,
+    /// Content nominations dropped because the probe queue was saturated.
+    pub probe_dropped: u64,
 }
 
 impl FeedStatus {
@@ -68,6 +70,7 @@ impl FeedStatus {
             last_batch: None,
             overflows: 0,
             recreations: 0,
+            probe_dropped: 0,
         }
     }
 }
@@ -622,6 +625,7 @@ fn status(shared: &Shared) -> CollectorStatus {
                 last_batch_s_ago: f.last_batch.map(|t| t.elapsed().as_secs()),
                 overflows: f.overflows,
                 recreations: f.recreations,
+                probe_dropped: f.probe_dropped,
             })
             .collect(),
         etw: shared.etw.lock().unwrap().clone(),

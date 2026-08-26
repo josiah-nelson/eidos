@@ -93,6 +93,8 @@ pub struct FeedView {
     pub last_batch_s_ago: Option<u64>,
     pub overflows: u64,
     pub recreations: u64,
+    /// Sampled content candidates dropped because the probe queue was full.
+    pub probe_dropped: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

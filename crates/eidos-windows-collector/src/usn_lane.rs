@@ -364,6 +364,7 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                         s.logical_changes = counters.logical_changes;
                         s.lag_bytes = lag;
                         s.last_batch = Some(Instant::now());
+                        s.probe_dropped = counters.probe_dropped;
                     });
                 }
             }

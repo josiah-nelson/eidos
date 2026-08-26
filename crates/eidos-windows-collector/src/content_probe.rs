@@ -244,14 +244,22 @@ fn measure(
         let read = match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(_) => return Some(base(ContentOutcome::Error, snapshot.size)),
+            Err(_) => {
+                // Bytes already read cost the same whether or not the file
+                // finished, so charge them before giving up.
+                budget.spent = budget.spent.saturating_add(total);
+                return Some(base(ContentOutcome::Error, snapshot.size));
+            }
         };
         let bytes = &buffer[..read];
         if text_sample.is_none() {
             text_sample = looks_textual(&bytes[..read.min(8192)]);
         }
         total += read as u64;
-        if total > max_bytes {
+        // A file can grow after its size snapshot, or between the precheck and
+        // this read, so the running total is what the budget must be held to.
+        if total > max_bytes || budget.spent.saturating_add(total) > hourly {
+            budget.spent = budget.spent.saturating_add(total);
             return Some(base(ContentOutcome::SkippedTooLarge, total));
         }
         fingerprint.update(bytes);
@@ -285,9 +293,11 @@ fn measure(
         Some(old) => reuse(old, &chunk_digests),
         None => (0, Histogram::new()),
     };
+    // Count every chunk the file produced; `remembered` is only the bounded
+    // history kept for the next reuse comparison.
+    let chunks = chunk_digests.len() as u32;
     let mut remembered = chunk_digests;
     remembered.truncate(MAX_REMEMBERED_CHUNKS);
-    let chunks = remembered.len() as u32;
     previous.put(key, remembered);
 
     Some(ContentObservation {
