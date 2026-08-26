@@ -1,3 +1,7 @@
+use crate::families::{
+    AccessSummary, ContentObservation, EnumerationProbe, FeedHealthRecord, RateSummary,
+    ReasonSummary, ResourceSample, VolumeObservation,
+};
 use crate::privacy::ObjectToken;
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +47,40 @@ pub struct Capabilities {
     pub fsevents: bool,
     pub endpoint_security: EndpointSecurityCapability,
     pub apfs: bool,
+    /// Present only in bundles produced by the Windows collector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<WindowsCapabilities>,
+}
+
+/// Windows lanes are independent facts: the USN journal needs volume
+/// management rights, the ETW session needs the Performance Log Users right
+/// or SYSTEM, and the DPAPI study key must decrypt under the service account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsCapabilities {
+    pub usn: UsnState,
+    pub etw: EtwState,
+    pub running_as_system: bool,
+    pub elevated: bool,
+    pub study_key_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsnState {
+    Available,
+    AccessDenied,
+    NoJournaledVolume,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EtwState {
+    Off,
+    Available,
+    AccessDenied,
+    SessionConflict,
+    InternalError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +108,10 @@ pub enum GapCause {
     UncleanShutdown,
     CollectorStopped,
     KeyUnavailable,
+    /// The USN journal was deleted and recreated (new journal id).
+    JournalRecreated,
+    /// The native feed could not be opened (rights, offline volume).
+    FeedUnavailable,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,21 +166,46 @@ pub enum ObservationRecord {
     Workload(WorkloadSummary),
     Apfs(ApfsObservation),
     Mark(MarkRecord),
+    Volume(VolumeObservation),
+    FeedHealth(FeedHealthRecord),
+    Rate(RateSummary),
+    Reasons(ReasonSummary),
+    Access(AccessSummary),
+    Content(ContentObservation),
+    Enumeration(EnumerationProbe),
+    Resource(ResourceSample),
 }
 
 impl ObservationRecord {
+    /// Detailed records are per-object and live in the shorter ring;
+    /// summaries are aggregates and keep the longer retention.
     pub fn is_detailed(&self) -> bool {
-        matches!(self, Self::LogicalChange(_) | Self::Apfs(_))
+        matches!(
+            self,
+            Self::LogicalChange(_) | Self::Apfs(_) | Self::Content(_)
+        )
+    }
+
+    pub fn at(&self) -> &TimeAnchor {
+        match self {
+            Self::Health(value) => &value.at,
+            Self::LogicalChange(value) => &value.at,
+            Self::Workload(value) => &value.at,
+            Self::Apfs(value) => &value.at,
+            Self::Mark(value) => &value.at,
+            Self::Volume(value) => &value.at,
+            Self::FeedHealth(value) => &value.at,
+            Self::Rate(value) => &value.at,
+            Self::Reasons(value) => &value.at,
+            Self::Access(value) => &value.at,
+            Self::Content(value) => &value.at,
+            Self::Enumeration(value) => &value.at,
+            Self::Resource(value) => &value.at,
+        }
     }
 
     pub fn utc_ns(&self) -> i64 {
-        match self {
-            Self::Health(value) => value.at.utc_ns,
-            Self::LogicalChange(value) => value.at.utc_ns,
-            Self::Workload(value) => value.at.utc_ns,
-            Self::Apfs(value) => value.at.utc_ns,
-            Self::Mark(value) => value.at.utc_ns,
-        }
+        self.at().utc_ns
     }
 }
 
@@ -174,6 +241,12 @@ pub enum LifecycleEvent {
     ClockJump,
     Mounted,
     Unmounted,
+    /// Stop requested by system shutdown rather than by an operator.
+    Shutdown,
+    /// AC/battery transition or low-battery notification.
+    PowerStatusChange,
+    /// The collector's build hash differs from the previous run's.
+    Upgraded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +272,13 @@ pub enum ChangeOperation {
     Update,
     Delete,
     Rename,
+    /// Attribute, timestamp, security, or reparse-point change without a
+    /// data change.
+    Metadata,
+    /// Hard link added or removed.
+    HardLink,
+    /// Named (alternate) stream change.
+    Stream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +302,22 @@ pub enum ProcessClass {
     Browser,
     Other,
     SigningToken(ObjectToken),
+    /// Compilers, linkers, build drivers, package managers.
+    Build,
+    /// Search indexers, thumbnail/metadata scanners (including eidos).
+    Indexer,
+    /// Backup and imaging agents.
+    Backup,
+    /// Cloud file-sync clients.
+    CloudSync,
+    /// Anti-malware and security agents.
+    Security,
+    /// Shell, explorer, terminals, launchers.
+    Shell,
+    /// Virtual machine hosts and container runtimes.
+    Virtualization,
+    /// Keyed token of the image file name when no class matched.
+    ImageToken(ObjectToken),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,5 +431,11 @@ pub enum ExtensionBucket {
     Executable,
     Database,
     Configuration,
+    /// Compiler and build-system intermediates.
+    Build,
+    /// Virtual disks, installation images, VM state.
+    DiskImage,
+    Log,
+    Temporary,
     Other,
 }

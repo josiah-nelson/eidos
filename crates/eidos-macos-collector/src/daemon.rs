@@ -106,6 +106,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             running_as_root,
         },
         apfs: true,
+        windows: None,
     };
     let build_hash = blake3::hash(
         option_env!("EIDOS_BUILD_REVISION")
