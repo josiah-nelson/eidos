@@ -247,6 +247,9 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
             Ok(None) => {}
             Ok(Some(ReadOutcome::Records { records, next_usn })) => {
                 let now = shared.anchor();
+                // Cleared when a batch cannot be persisted, which pins the
+                // cursor until the spool recovers.
+                let mut durable = true;
                 if !records.is_empty() {
                     last_record_monotonic = now.monotonic_ns;
                     counters.batches += 1;
@@ -282,39 +285,51 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                         }
                     }
                     counters.logical_changes += changes.len() as u64;
-                    if !changes.is_empty() && !shared.append_all_retrying(&changes) {
-                        // The cursor advances past this batch either way, so
-                        // the hole has to be declared in the bundle rather
-                        // than left for a restart to skip silently.
-                        shared.drops.lock().unwrap().user += changes.len() as u64;
-                        shared.add_gap(
-                            GapCause::UserDrop,
-                            last_record_monotonic,
-                            Some(now.monotonic_ns),
-                        );
+                    if !changes.is_empty() {
+                        durable = shared.append_all_retrying(&changes);
                     }
                 }
-                let advanced = Cursor {
-                    journal_id: position.journal_id,
-                    next_usn,
-                };
-                cursor = Some(advanced);
-                if last_cursor_save.elapsed() >= Duration::from_secs(1) {
-                    save_cursor(&cursor_file, &advanced);
-                    last_cursor_save = Instant::now();
+                if !durable {
+                    // Hold the cursor where it is. Advancing past records that
+                    // were not durably spooled would skip them on restart, and
+                    // an in-memory gap marker beside a persisted cursor is
+                    // exactly the evidence a crash destroys. Re-reading the
+                    // same range costs nothing and loses nothing.
+                    counters.spool_failures += 1;
+                    tracing::error!(
+                        root = %volume.root(),
+                        "holding the journal cursor: the spool is not accepting writes"
+                    );
+                    set_status(&shared, &volume, |s| {
+                        s.state = FeedState::Starting;
+                        s.detail = Some("spool writes are failing".into());
+                    });
+                    if wait_or_stop(&shared, &cancel, 15) {
+                        break;
+                    }
+                } else {
+                    let advanced = Cursor {
+                        journal_id: position.journal_id,
+                        next_usn,
+                    };
+                    cursor = Some(advanced);
+                    if last_cursor_save.elapsed() >= Duration::from_secs(1) {
+                        save_cursor(&cursor_file, &advanced);
+                        last_cursor_save = Instant::now();
+                    }
+                    let lag = query_journal(vol)
+                        .ok()
+                        .map(|live| live.next_usn.saturating_sub(next_usn).max(0) as u64)
+                        .unwrap_or(0);
+                    set_status(&shared, &volume, |s| {
+                        s.state = FeedState::Live;
+                        s.batches = counters.batches;
+                        s.records = counters.records;
+                        s.logical_changes = counters.logical_changes;
+                        s.lag_bytes = lag;
+                        s.last_batch = Some(Instant::now());
+                    });
                 }
-                let lag = query_journal(vol)
-                    .ok()
-                    .map(|live| live.next_usn.saturating_sub(next_usn).max(0) as u64)
-                    .unwrap_or(0);
-                set_status(&shared, &volume, |s| {
-                    s.state = FeedState::Live;
-                    s.batches = counters.batches;
-                    s.records = counters.records;
-                    s.logical_changes = counters.logical_changes;
-                    s.lag_bytes = lag;
-                    s.last_batch = Some(Instant::now());
-                });
             }
             Ok(Some(ReadOutcome::EntryDeleted)) => {
                 tracing::warn!(root = %volume.root(), "journal overflowed");
@@ -385,6 +400,7 @@ struct Counters {
     recreations: u64,
     read_errors: u64,
     dropped_without_key: u64,
+    spool_failures: u64,
     coalesced_total: u64,
     unavailable: bool,
 }
