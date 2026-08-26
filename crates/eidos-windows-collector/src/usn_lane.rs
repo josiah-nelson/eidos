@@ -157,6 +157,9 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
     let mut last_flush = Instant::now();
     let mut last_health = Instant::now();
     let mut last_cursor_save = Instant::now();
+    // An analysed batch the spool has not accepted yet, with the cursor it
+    // would advance to once it does.
+    let mut pending: Option<(Vec<ObservationRecord>, Cursor)> = None;
     let mut counters = Counters::default();
     let mut last_record_monotonic = shared.anchor().monotonic_ns;
     set_status(&shared, &volume, |s| s.state = FeedState::Starting);
@@ -232,17 +235,46 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
         let (Some(vol), Some(position)) = (handle.as_ref(), cursor) else {
             continue;
         };
+
+        // A batch that would not persist is kept, not re-derived. Re-reading
+        // the range would put the same records through the analyzer a second
+        // time and count the same filesystem activity twice in every rate,
+        // reason, operation, edit, fan-out, tombstone, and coalescing figure.
+        if let Some((batch, advanced)) = pending.take() {
+            if shared.append_all_retrying(&batch) {
+                cursor = Some(advanced);
+                save_cursor(&cursor_file, &advanced);
+                last_cursor_save = Instant::now();
+                set_status(&shared, &volume, |s| {
+                    s.state = FeedState::Live;
+                    s.detail = None;
+                    s.last_batch = Some(Instant::now());
+                });
+            } else {
+                pending = Some((batch, advanced));
+                if wait_or_stop(&shared, &cancel, 15) {
+                    break;
+                }
+            }
+        }
+
         // Wake at least once per summary interval: a volume with no activity
         // still owes rate summaries and feed-health records.
         let idle_wake = shared.config.lock().unwrap().intervals.rate_s.max(10) as u64;
-        match read_journal_wait_timeout(
-            vol,
-            position.journal_id,
-            position.next_usn,
-            &mut buffer,
-            &cancel,
-            Duration::from_secs(idle_wake),
-        ) {
+        let outcome = if pending.is_some() {
+            // Hold here until the spool takes what is already analysed.
+            Ok(None)
+        } else {
+            read_journal_wait_timeout(
+                vol,
+                position.journal_id,
+                position.next_usn,
+                &mut buffer,
+                &cancel,
+                Duration::from_secs(idle_wake),
+            )
+        };
+        match outcome {
             // Nothing arrived in time; fall through to the periodic flush.
             Ok(None) => {}
             Ok(Some(ReadOutcome::Records { records, next_usn })) => {
@@ -250,12 +282,12 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                 // Cleared when a batch cannot be persisted, which pins the
                 // cursor until the spool recovers.
                 let mut durable = true;
+                let mut changes = Vec::new();
                 if !records.is_empty() {
                     last_record_monotonic = now.monotonic_ns;
                     counters.batches += 1;
                     counters.records += records.len() as u64;
                     let lookup = records.len() <= FACT_LOOKUP_BATCH_LIMIT;
-                    let mut changes = Vec::new();
                     {
                         let key = shared.key.lock().unwrap();
                         if let Some(key) = key.as_ref() {
@@ -289,17 +321,24 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                         durable = shared.append_all_retrying(&changes);
                     }
                 }
+                let advanced = Cursor {
+                    journal_id: position.journal_id,
+                    next_usn,
+                };
                 if !durable {
-                    // Hold the cursor where it is. Advancing past records that
-                    // were not durably spooled would skip them on restart, and
-                    // an in-memory gap marker beside a persisted cursor is
-                    // exactly the evidence a crash destroys. Re-reading the
-                    // same range costs nothing and loses nothing.
+                    // Hold the cursor and the batch together. Advancing past
+                    // records that were not durably spooled would skip them on
+                    // restart, and an in-memory gap marker beside a persisted
+                    // cursor is exactly the evidence a crash destroys. Keeping
+                    // the analysed batch means the retry costs no re-analysis;
+                    // a restart re-reads the range against a fresh analyzer,
+                    // which is equally correct.
                     counters.spool_failures += 1;
                     tracing::error!(
                         root = %volume.root(),
                         "holding the journal cursor: the spool is not accepting writes"
                     );
+                    pending = Some((changes, advanced));
                     set_status(&shared, &volume, |s| {
                         s.state = FeedState::Starting;
                         s.detail = Some("spool writes are failing".into());
@@ -308,10 +347,6 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                         break;
                     }
                 } else {
-                    let advanced = Cursor {
-                        journal_id: position.journal_id,
-                        next_usn,
-                    };
                     cursor = Some(advanced);
                     if last_cursor_save.elapsed() >= Duration::from_secs(1) {
                         save_cursor(&cursor_file, &advanced);

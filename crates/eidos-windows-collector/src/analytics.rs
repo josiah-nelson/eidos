@@ -287,13 +287,14 @@ impl ChangeAnalyzer {
             }),
             _ => None,
         };
-        // Only this object's own old-name record is consumed; renames of
-        // other files keep waiting for their own close.
-        let rename_pair = match operation {
-            ChangeOperation::Rename => self
-                .pending_renames
-                .pop(&record.frn)
-                .map(|(old_parent, _)| key.token("subtree", &self.identity(old_parent))),
+        // Any close for this object consumes its pending old-name record, so a
+        // rename that never completed cannot be left behind for a later object
+        // that Windows gives the same file reference number. Renames of other
+        // files keep waiting for their own close.
+        let rename_pair = match (self.pending_renames.pop(&record.frn), operation) {
+            (Some((old_parent, _)), ChangeOperation::Rename) => {
+                Some(key.token("subtree", &self.identity(old_parent)))
+            }
             _ => None,
         };
         let extension = if record.is_directory {
@@ -612,6 +613,44 @@ mod tests {
             Some(key.token("subtree", &analyzer.identity(21)))
         );
         assert_ne!(first.rename_pair, second.rename_pair);
+    }
+
+    /// A rename that never completes must not leave its old parent behind for
+    /// whatever object Windows next gives that file reference number.
+    #[test]
+    fn an_abandoned_rename_does_not_leak_into_a_reused_reference() {
+        let key = key();
+        let mut analyzer = ChangeAnalyzer::new(b"vol", 0);
+        let facts = ObjectFacts::default();
+
+        // Old-name record, then a close that turns out to be an ordinary write.
+        analyzer.observe(
+            &key,
+            &record(1, 9, 20, REASON_RENAME_OLD_NAME, "a.txt"),
+            facts,
+            at(1),
+        );
+        let write = analyzer
+            .observe(
+                &key,
+                &record(2, 9, 20, REASON_DATA_EXTEND | REASON_CLOSE, "a.txt"),
+                facts,
+                at(1),
+            )
+            .unwrap();
+        assert_eq!(write.rename_pair, None);
+
+        // The reference number is reused; its rename pairs with nothing.
+        let reused = analyzer
+            .observe(
+                &key,
+                &record(3, 9, 40, REASON_RENAME_NEW_NAME | REASON_CLOSE, "b.txt"),
+                facts,
+                at(2),
+            )
+            .unwrap();
+        assert_eq!(reused.operation, ChangeOperation::Rename);
+        assert_eq!(reused.rename_pair, None);
     }
 
     #[test]
