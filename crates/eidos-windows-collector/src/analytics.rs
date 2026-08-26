@@ -32,6 +32,12 @@ pub const REASON_HARD_LINK_CHANGE: u32 = 0x0001_0000;
 pub const REASON_STREAM_CHANGE: u32 = 0x0020_0000;
 pub const REASON_CLOSE: u32 = 0x8000_0000;
 
+/// How much journal an old-name record may wait through before it is treated
+/// as belonging to a file reference number that has since been reused. USNs
+/// are byte offsets, so this is a megabyte of journal — generous for a pair
+/// emitted by one operation, negligible against reuse.
+const RENAME_PAIR_SPAN: i64 = 1 << 20;
+
 const DATA_MASK: u32 = REASON_DATA_OVERWRITE | REASON_DATA_EXTEND | REASON_DATA_TRUNCATION;
 const STREAM_MASK: u32 = REASON_NAMED_DATA_OVERWRITE
     | REASON_NAMED_DATA_EXTEND
@@ -287,15 +293,28 @@ impl ChangeAnalyzer {
             }),
             _ => None,
         };
-        // Any close for this object consumes its pending old-name record, so a
-        // rename that never completed cannot be left behind for a later object
-        // that Windows gives the same file reference number. Renames of other
-        // files keep waiting for their own close.
-        let rename_pair = match (self.pending_renames.pop(&record.frn), operation) {
-            (Some((old_parent, _)), ChangeOperation::Rename) => {
-                Some(key.token("subtree", &self.identity(old_parent)))
+        // A rename's two records are emitted together, so an old-name record
+        // still waiting after this much journal has gone by cannot belong to
+        // the object closing now — most likely Windows has reused the file
+        // reference number. Distance separates that from the ordinary case of
+        // an unrelated close arriving between the pair.
+        let rename_pair = match self.pending_renames.pop(&record.frn) {
+            Some((old_parent, old_usn)) => {
+                let paired = record.usn.saturating_sub(old_usn) <= RENAME_PAIR_SPAN;
+                match (paired, operation) {
+                    (true, ChangeOperation::Rename) => {
+                        Some(key.token("subtree", &self.identity(old_parent)))
+                    }
+                    // Its own rename has not arrived yet; keep waiting.
+                    (true, _) => {
+                        self.pending_renames.put(record.frn, (old_parent, old_usn));
+                        None
+                    }
+                    // Too far behind to describe this object.
+                    (false, _) => None,
+                }
             }
-            _ => None,
+            None => None,
         };
         let extension = if record.is_directory {
             ExtensionBucket::None
@@ -615,6 +634,43 @@ mod tests {
         assert_ne!(first.rename_pair, second.rename_pair);
     }
 
+    /// An unrelated close between an old-name record and its rename is
+    /// ordinary; the pairing must survive it.
+    #[test]
+    fn a_close_between_the_pair_does_not_break_it() {
+        let key = key();
+        let mut analyzer = ChangeAnalyzer::new(b"vol", 0);
+        let facts = ObjectFacts::default();
+
+        analyzer.observe(
+            &key,
+            &record(1, 9, 20, REASON_RENAME_OLD_NAME, "a.txt"),
+            facts,
+            at(1),
+        );
+        // A write closes first.
+        analyzer.observe(
+            &key,
+            &record(2, 9, 20, REASON_DATA_EXTEND | REASON_CLOSE, "a.txt"),
+            facts,
+            at(1),
+        );
+        // The rename still pairs with the old parent.
+        let renamed = analyzer
+            .observe(
+                &key,
+                &record(3, 9, 30, REASON_RENAME_NEW_NAME | REASON_CLOSE, "b.txt"),
+                facts,
+                at(1),
+            )
+            .unwrap();
+        assert_eq!(renamed.operation, ChangeOperation::Rename);
+        assert_eq!(
+            renamed.rename_pair,
+            Some(key.token("subtree", &analyzer.identity(20)))
+        );
+    }
+
     /// A rename that never completes must not leave its old parent behind for
     /// whatever object Windows next gives that file reference number.
     #[test]
@@ -640,11 +696,18 @@ mod tests {
             .unwrap();
         assert_eq!(write.rename_pair, None);
 
-        // The reference number is reused; its rename pairs with nothing.
+        // Much later in the journal the reference number is reused; its
+        // rename pairs with nothing.
         let reused = analyzer
             .observe(
                 &key,
-                &record(3, 9, 40, REASON_RENAME_NEW_NAME | REASON_CLOSE, "b.txt"),
+                &record(
+                    1 << 22,
+                    9,
+                    40,
+                    REASON_RENAME_NEW_NAME | REASON_CLOSE,
+                    "b.txt",
+                ),
                 facts,
                 at(2),
             )
