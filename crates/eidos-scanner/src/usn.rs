@@ -175,7 +175,7 @@ impl JournalCancellation {
         }
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::Acquire)
     }
 }
