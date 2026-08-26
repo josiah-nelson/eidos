@@ -101,7 +101,10 @@ pub struct EtwView {
     pub window_open: bool,
     pub next_window_s: Option<u64>,
     pub events: u64,
+    /// Events the kernel reported losing before the consumer saw them.
     pub lost_events: u64,
+    /// Events the consumer dropped because the aggregator was behind.
+    pub queue_dropped: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

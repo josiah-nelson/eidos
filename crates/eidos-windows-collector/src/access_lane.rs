@@ -6,7 +6,7 @@
 use crate::access::{process_class, AccessAggregator};
 use crate::daemon::Shared;
 use crate::etw::{self, Session, TraceEvent};
-use eidos_observe::{EtwState, ObservationRecord, ProcessClass};
+use eidos_observe::{EtwState, GapCause, ObservationRecord, ProcessClass};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
@@ -125,15 +125,25 @@ fn set_view(shared: &Shared, f: impl FnOnce(&mut crate::protocol::EtwView)) {
     f(&mut shared.etw.lock().unwrap());
 }
 
+/// Upper bound on events queued between the ETW consumer and the aggregator.
+/// Sized to absorb an ordinary burst; beyond it events are dropped and counted
+/// rather than allowed to grow the collector's memory without limit.
+const QUEUE_DEPTH: usize = 65_536;
+
 fn run_window(shared: &Arc<Shared>, window_end: Instant) -> Result<(), u32> {
     let session = Session::start()?;
-    let (sender, receiver) = mpsc::channel::<TraceEvent>();
+    // Bounded: sustained file activity can outrun the aggregator, and an
+    // unbounded queue would hold every event and process-image string until
+    // the collector was killed. Overflow is dropped and counted instead.
+    let (sender, receiver) = mpsc::sync_channel::<TraceEvent>(QUEUE_DEPTH);
     let events = Arc::new(AtomicU64::new(0));
+    let queue_dropped = Arc::new(AtomicU64::new(0));
     let consumer = {
         let events = events.clone();
+        let queue_dropped = queue_dropped.clone();
         std::thread::Builder::new()
             .name("etw-consumer".into())
-            .spawn(move || etw::consume(sender, events))
+            .spawn(move || etw::consume(sender, events, queue_dropped))
             .map_err(|_| 8u32)?
     };
     let mut aggregator = AccessAggregator::new();
@@ -205,15 +215,23 @@ fn run_window(shared: &Arc<Shared>, window_end: Instant) -> Result<(), u32> {
     if lost > 0 {
         shared.drops.lock().unwrap().kernel += lost as u64;
     }
+    // Queue overflow is a collector-side loss, not a kernel one; keep the two
+    // distinguishable in the bundle and in `observe status`.
+    let overflowed = queue_dropped.load(Ordering::Acquire);
+    if overflowed > 0 {
+        shared.drops.lock().unwrap().user += overflowed;
+    }
     set_view(shared, |v| {
         v.state = "scheduled".into();
         v.window_open = false;
         v.events = received;
         v.lost_events += lost as u64;
+        v.queue_dropped += overflowed;
     });
     tracing::info!(
         received,
         lost,
+        queue_dropped = overflowed,
         unattributed = aggregator.unattributed,
         "ETW window closed"
     );
@@ -242,8 +260,17 @@ fn flush(shared: &Shared, aggregator: &mut AccessAggregator, elapsed: Duration) 
         .into_iter()
         .map(ObservationRecord::Access)
         .collect();
-    if let Err(error) = shared.spool.lock().unwrap().append_all(&records) {
-        tracing::error!(error = %error, "spool access batch failed");
+    // `aggregator.flush` has already drained every class, so these summaries
+    // cannot be reproduced; retry before giving up, and declare the loss so a
+    // missing interval is visible rather than silently absent.
+    if !shared.append_all_retrying(&records) {
+        let lost = records.len() as u64;
+        shared.drops.lock().unwrap().user += lost;
+        shared.add_gap(GapCause::UserDrop, shared.anchor().monotonic_ns, None);
+        tracing::error!(
+            lost,
+            "access interval discarded after repeated spool failures"
+        );
     }
 }
 

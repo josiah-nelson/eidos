@@ -8,7 +8,7 @@
 use crate::access::{AccessEvent, AccessKind};
 use eidos_observe::{bucket_extension, ExtensionBucket};
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::Mutex;
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER};
@@ -253,6 +253,16 @@ impl Session {
 
     pub fn stop(mut self) -> u32 {
         let lost = self.events_lost();
+        self.teardown();
+        lost
+    }
+
+    /// Disable the providers and stop the session. Idempotent: a session that
+    /// has already been torn down carries a zeroed handle and does nothing.
+    fn teardown(&mut self) {
+        if self.handle.Value == 0 {
+            return;
+        }
         // SAFETY: handle from StartTraceW; providers are disabled first so
         // a later session start does not inherit their enable state.
         unsafe {
@@ -284,7 +294,17 @@ impl Session {
             );
         }
         self.handle = CONTROLTRACE_HANDLE { Value: 0 };
-        lost
+    }
+}
+
+impl Drop for Session {
+    /// A session that started but was never handed back to the caller — a
+    /// provider that would not enable, a consumer thread that would not spawn
+    /// — must not be left running with nobody draining it. Without this the
+    /// named session and its providers survived until the next window's
+    /// stale-session sweep, costing an observation window and ETW resources.
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 
@@ -306,20 +326,24 @@ pub fn stop_stale_session() {
 // ----- consumer ---------------------------------------------------------------
 
 struct ConsumerState {
-    sender: Sender<TraceEvent>,
+    sender: SyncSender<TraceEvent>,
     layouts: Mutex<HashMap<(u128, u16, u8), Option<Layout>>>,
     pub events: std::sync::atomic::AtomicU64,
+    /// Events discarded because the aggregator was not keeping up.
+    pub dropped: std::sync::atomic::AtomicU64,
 }
 
 /// Blocks in `ProcessTrace` until the session stops; run on its own thread.
 pub fn consume(
-    sender: Sender<TraceEvent>,
+    sender: SyncSender<TraceEvent>,
     events: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), u32> {
     let state = Box::new(ConsumerState {
         sender,
         layouts: Mutex::new(HashMap::new()),
         events: std::sync::atomic::AtomicU64::new(0),
+        dropped: std::sync::atomic::AtomicU64::new(0),
     });
     let mut name = wide(SESSION_NAME);
     // SAFETY: the logfile struct is zero-initialised and fully specified.
@@ -345,6 +369,10 @@ pub fn consume(
     let state = unsafe { Box::from_raw(state_ptr) };
     events.store(
         state.events.load(std::sync::atomic::Ordering::Relaxed),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    dropped.store(
+        state.dropped.load(std::sync::atomic::Ordering::Relaxed),
         std::sync::atomic::Ordering::Relaxed,
     );
     if status != 0 {
@@ -450,7 +478,14 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     } else {
         return;
     };
-    let _ = state.sender.send(event);
+    // Never block the ETW callback: a full queue drops the event and counts
+    // it, which keeps the loss bounded and visible instead of letting the
+    // backlog grow without limit.
+    if state.sender.try_send(event).is_err() {
+        state
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Extension bucket of an NT path (`\Device\HarddiskVolumeN\...`); the path
