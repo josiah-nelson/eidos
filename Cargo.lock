@@ -886,6 +886,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidos-windows-collector"
+version = "0.5.0-dev"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "eidos-domain",
+ "eidos-observe",
+ "eidos-scanner",
+ "getrandom 0.4.3",
+ "lru",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "windows-service",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

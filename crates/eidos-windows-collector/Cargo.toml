@@ -1,0 +1,37 @@
+[package]
+name = "eidos-windows-collector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windows observatory collector: USN, ETW, volume, and resource measurement lanes for a bounded, privacy-preserving workload study"
+
+[dependencies]
+eidos-domain = { workspace = true }
+eidos-observe = { workspace = true }
+eidos-scanner = { workspace = true }
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+getrandom = { workspace = true }
+lru = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+
+
+[target.'cfg(windows)'.dependencies]
+windows-service = { workspace = true }
+windows-sys = { workspace = true, features = [
+    "Win32_Security_Cryptography",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

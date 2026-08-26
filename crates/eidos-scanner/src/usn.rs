@@ -82,9 +82,24 @@ impl VolumeHandle {
         Self::open_with_flags(volume_root, FILE_FLAG_OVERLAPPED)
     }
 
+    /// Open a volume by its device path, e.g. `\\?\Volume{guid}` (no
+    /// trailing separator), for volumes that have no drive letter.
+    pub fn open_device(device: &str, waitable: bool) -> Result<VolumeHandle, UsnError> {
+        let flags = if waitable { FILE_FLAG_OVERLAPPED } else { 0 };
+        Self::open_device_with_flags(device, device, flags)
+    }
+
     fn open_with_flags(volume_root: &str, flags: u32) -> Result<VolumeHandle, UsnError> {
         let letter = volume_root.trim_end_matches('\\');
         let device = format!("\\\\.\\{letter}");
+        Self::open_device_with_flags(volume_root, &device, flags)
+    }
+
+    fn open_device_with_flags(
+        volume_root: &str,
+        device: &str,
+        flags: u32,
+    ) -> Result<VolumeHandle, UsnError> {
         let mut wide: Vec<u16> = std::ffi::OsStr::new(&device).encode_wide().collect();
         wide.push(0);
         // SAFETY: NUL-terminated path; no security attributes.
