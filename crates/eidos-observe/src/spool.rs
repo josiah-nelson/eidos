@@ -1,5 +1,6 @@
-use crate::schema::ObservationRecord;
+use crate::schema::{BundleManifest, ObservationRecord, SCHEMA_VERSION};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::io::Write;
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -215,12 +216,64 @@ fn prune_detailed_bytes(
     Ok(removed_bytes)
 }
 
+/// Write an observation bundle straight from a spool file, without going
+/// through the collector's live `Spool`.
+///
+/// The export opens its own read-only connection, so it neither takes the
+/// append lock nor blocks collection while it runs — WAL lets the reader see a
+/// consistent snapshot beside the writer. Record bodies are already stored
+/// serialized, so they stream to the encoder untouched and the export holds
+/// one record in memory at a time however large the ring has grown.
+pub fn export_bundle(
+    spool_file: &Path,
+    manifest: &BundleManifest,
+    out: &Path,
+) -> Result<u64, SpoolError> {
+    if manifest.schema != SCHEMA_VERSION {
+        return Err(SpoolError::Schema(manifest.schema.clone()));
+    }
+    let connection = Connection::open_with_flags(
+        spool_file,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let parent = out.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut written = 0u64;
+    {
+        let output = std::io::BufWriter::new(temporary.as_file_mut());
+        let mut encoder = zstd::stream::write::Encoder::new(output, 9)?;
+        encoder.write_all(b"{\"manifest\":")?;
+        serde_json::to_writer(&mut encoder, manifest)?;
+        encoder.write_all(b",\"records\":[")?;
+        let mut statement =
+            connection.prepare("SELECT body FROM observations ORDER BY sequence")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let body: Vec<u8> = row.get(0)?;
+            if written > 0 {
+                encoder.write_all(b",")?;
+            }
+            encoder.write_all(&body)?;
+            written += 1;
+        }
+        encoder.write_all(b"]}")?;
+        encoder.finish()?.flush()?;
+    }
+    temporary.as_file().sync_all()?;
+    temporary.persist(out).map_err(|error| error.error)?;
+    Ok(written)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpoolError {
     #[error(transparent)]
     Database(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("bundle schema {0} is not {SCHEMA_VERSION}")]
+    Schema(String),
 }
 
 #[cfg(test)]

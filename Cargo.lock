@@ -703,6 +703,7 @@ dependencies = [
  "eidos-scanner",
  "eidos-search",
  "eidos-service",
+ "eidos-windows-collector",
  "libc",
  "mimalloc",
  "regex",
@@ -901,6 +902,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "windows-service",
  "windows-sys 0.61.2",
 ]

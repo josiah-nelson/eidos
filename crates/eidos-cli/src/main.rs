@@ -257,6 +257,15 @@ fn main() -> anyhow::Result<()> {
             return service::run(args.clone(), cli.log.clone(), cli.log_json);
         }
     }
+    // The Windows collector service likewise logs to its own data directory.
+    if let Command::Observe(args) = &cli.command {
+        if args.is_service_entry() {
+            let Command::Observe(args) = cli.command else {
+                unreachable!()
+            };
+            return observe::run(args, &cli.log);
+        }
+    }
     let _log_guard = match &cli.command {
         Command::Serve(args) => {
             logging::init(&cli.log, cli.log_json, args.log_dir.as_deref(), true)?
@@ -270,7 +279,7 @@ fn main() -> anyhow::Result<()> {
         Command::Activity(args) => activity::run(args),
         Command::Archive(args) => archive::run(args),
         Command::Content(args) => content::run(args),
-        Command::Observe(args) => observe::run(args),
+        Command::Observe(args) => observe::run(args, &cli.log),
         #[cfg(any(windows, target_os = "macos"))]
         Command::Service(args) => service::run(args, cli.log, cli.log_json),
         Command::Search(args) => {

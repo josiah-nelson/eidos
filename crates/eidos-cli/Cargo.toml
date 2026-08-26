@@ -32,6 +32,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+eidos-windows-collector = { workspace = true }
 windows-service = { workspace = true }
 # Interactive password prompt for `eidos service install --account user`.
 rpassword = "7"
