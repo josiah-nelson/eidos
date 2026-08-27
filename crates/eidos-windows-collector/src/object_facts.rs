@@ -175,6 +175,11 @@ pub struct Lookup<'a> {
     sizes: &'a mut LruCache<u128, u64>,
     depths: &'a mut LruCache<u128, usize>,
     walked: HashSet<u128>,
+    /// Cache entries populated by a directory walk in this batch. The LRUs
+    /// live across batches, but an older entry is never eligible as a fact
+    /// for a new close event.
+    fresh_sizes: HashSet<u128>,
+    fresh_depths: HashSet<u128>,
 }
 
 impl<'a> Lookup<'a> {
@@ -183,6 +188,8 @@ impl<'a> Lookup<'a> {
             sizes,
             depths,
             walked: HashSet::new(),
+            fresh_sizes: HashSet::new(),
+            fresh_depths: HashSet::new(),
         }
     }
 
@@ -193,28 +200,24 @@ impl<'a> Lookup<'a> {
         frn: u128,
         parent_frn: u128,
     ) -> (Option<u64>, Option<usize>) {
-        if let Some(size) = self.sizes.get(&frn).copied() {
-            return (Some(size), self.depth_only(vol, parent_frn));
-        }
-        // One walk per parent per batch, filling the size of every sibling
-        // that changed in the same batch along the way.
+        // Always refresh a changed object's parent once in the current batch.
+        // A persistent LRU hit is only a storage hit, never freshness proof:
+        // the same FRN may have been written to a different size since the
+        // preceding batch.
         if self.walked.insert(parent_frn) {
             self.walk(vol, parent_frn);
         }
-        (
-            self.sizes.get(&frn).copied(),
-            self.depths.get(&parent_frn).copied(),
-        )
-    }
-
-    fn depth_only(&mut self, vol: &VolumeHandle, parent_frn: u128) -> Option<usize> {
-        if let Some(depth) = self.depths.get(&parent_frn).copied() {
-            return Some(depth);
-        }
-        if self.walked.insert(parent_frn) {
-            self.walk(vol, parent_frn);
-        }
-        self.depths.get(&parent_frn).copied()
+        let size = if self.fresh_sizes.contains(&frn) {
+            self.sizes.get(&frn).copied()
+        } else {
+            None
+        };
+        let depth = if self.fresh_depths.contains(&parent_frn) {
+            self.depths.get(&parent_frn).copied()
+        } else {
+            None
+        };
+        (size, depth)
     }
 
     /// Open the parent once: take its depth from its own path, and the size
@@ -225,10 +228,13 @@ impl<'a> Lookup<'a> {
         };
         if let Some(depth) = directory_path(&dir).as_deref().map(path_depth) {
             self.depths.put(parent_frn, depth);
+            self.fresh_depths.insert(parent_frn);
         }
         let sizes = &mut *self.sizes;
+        let fresh_sizes = &mut self.fresh_sizes;
         for_each_child(&dir, |frn, size| {
             sizes.put(frn, size);
+            fresh_sizes.insert(frn);
             true
         });
     }
@@ -381,6 +387,31 @@ mod tests {
             1,
             "the second sibling must not walk the parent again"
         );
+    }
+
+    /// A persistent cache is storage, not freshness: a later batch must
+    /// enumerate the parent again after the same file changes size.
+    #[test]
+    fn a_later_batch_refreshes_a_rewritten_files_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((vol, frn, parent)) = subject(temp.path(), "rewrite.bin", &[1u8; 10]) else {
+            return;
+        };
+
+        let (mut sizes, mut depths) = caches();
+        {
+            let mut first_batch = Lookup::new(&mut sizes, &mut depths);
+            assert_eq!(first_batch.facts(&vol, frn, parent).0, Some(10));
+        }
+
+        let path = temp.path().join("rewrite.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&[2u8; 73]).unwrap();
+        drop(file);
+        assert_eq!(frn_of(&path), Some(frn), "the rewrite must retain its FRN");
+
+        let mut second_batch = Lookup::new(&mut sizes, &mut depths);
+        assert_eq!(second_batch.facts(&vol, frn, parent).0, Some(73));
     }
 
     #[test]
