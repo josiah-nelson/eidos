@@ -178,7 +178,9 @@ pub struct ConfigureArgs {
     #[arg(long, value_name = "on|off", value_parser = parse_switch)]
     upload: Option<bool>,
     /// Drive letter or volume GUID path to leave alone entirely; repeat to
-    /// name several. Giving any replaces the current list.
+    /// name several. Giving any replaces the current list, and the single
+    /// value `none` clears it - an empty list cannot say that, because
+    /// giving nothing has to keep meaning "leave this host alone".
     #[arg(long = "exclude-volume", value_name = "VOLUME")]
     exclude_volumes: Vec<String>,
 }
@@ -393,6 +395,14 @@ mod windows {
                 eidos_windows_collector::SERVICE_NAME
             );
         }
+        // A registration check alone is not enough: `observe run` serves the
+        // same control pipe and holds the same data directory with no service
+        // registered at all, and deleting a live spool out from under it
+        // would take some of its files before an open one stopped the walk.
+        // If anything answers the pipe, a collector is using this directory.
+        if request(&Request::Status).is_ok() {
+            anyhow::bail!("a collector is running and using this data directory; stop it first");
+        }
         if !holds_collector_data(&data_dir) && !args.force {
             anyhow::bail!(
                 "{} holds no study key, configuration or spool; pass --force to delete it anyway",
@@ -487,7 +497,16 @@ mod windows {
             config.upload.enabled = on;
         }
         if !args.exclude_volumes.is_empty() {
-            config.exclude_volumes = args.exclude_volumes;
+            // `none` is the way to say "exclude nothing", for the same reason
+            // `EIDOS_UPLOAD=none` exists: absent has to keep meaning "do not
+            // touch", so emptiness needs a spelling of its own.
+            let clearing = args.exclude_volumes.len() == 1
+                && args.exclude_volumes[0].trim().eq_ignore_ascii_case("none");
+            config.exclude_volumes = if clearing {
+                Vec::new()
+            } else {
+                args.exclude_volumes
+            };
         }
 
         config.save(&data_dir)?;

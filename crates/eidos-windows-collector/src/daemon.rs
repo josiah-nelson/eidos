@@ -583,19 +583,29 @@ fn handle_request(shared: &Arc<Shared>, request: Request) -> Response {
             enumeration,
         } => {
             let mut config = shared.config.lock().unwrap();
+            // Start from what is on disk, not from the copy this daemon has
+            // been holding since it started. `observe configure` writes the
+            // same file - upload settings, excluded volumes - and saving the
+            // in-memory copy over it would silently revert whatever it wrote
+            // since the last start. Lanes are the only field this request
+            // owns, so they are the only field taken from memory.
+            let mut updated =
+                CollectorConfig::load(&shared.data_dir).unwrap_or_else(|_| config.clone());
+            updated.lanes = config.lanes.clone();
             if let Some(usn) = usn {
-                config.lanes.usn = usn;
+                updated.lanes.usn = usn;
             }
             if let Some(etw) = etw {
-                config.lanes.etw.enabled = etw;
+                updated.lanes.etw.enabled = etw;
             }
             if let Some(content) = content {
-                config.lanes.content.enabled = content;
+                updated.lanes.content.enabled = content;
                 shared.content_enabled.store(content, Ordering::Release);
             }
             if let Some(enumeration) = enumeration {
-                config.lanes.enumeration.enabled = enumeration;
+                updated.lanes.enumeration.enabled = enumeration;
             }
+            *config = updated;
             match config.save(&shared.data_dir) {
                 Ok(()) => Response::Accepted,
                 Err(error) => Response::Error {
@@ -831,5 +841,75 @@ mod tests {
             marker.exists(),
             "a clean stop must leave the marker that keeps the next start from declaring a gap"
         );
+    }
+
+    /// `observe configure` writes the same file this daemon holds in memory,
+    /// so a later runtime lane change must not save a stale copy over it.
+    ///
+    /// The unattended install path depends on this: a host is configured
+    /// before the service starts, an administrator changes a lane later, and
+    /// the upload destination the fleet set must still be there afterwards.
+    #[test]
+    fn a_lane_change_keeps_what_configure_wrote() {
+        let _guard = crate::pipe::test_lock();
+        if crate::pipe::already_served() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("collector");
+        crate::keystore::create(&data_dir, Some([9u8; 32]), true).unwrap();
+        crate::config::CollectorConfig::default()
+            .save(&data_dir)
+            .unwrap();
+
+        let (control_tx, control_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let running = data_dir.clone();
+        let daemon = std::thread::spawn(move || {
+            run(Options { data_dir: running }, control_rx, move || {
+                let _ = ready_tx.send(());
+            })
+        });
+        if ready_rx.recv_timeout(Duration::from_secs(60)).is_err() {
+            control_tx.send(ControlEvent::Stop).unwrap();
+            let _ = daemon.join();
+            panic!("the collector never reported itself running");
+        }
+
+        // Stand in for `observe configure`, which writes the file directly
+        // while the service is running.
+        let mut on_disk = crate::config::CollectorConfig::load(&data_dir).unwrap();
+        on_disk.upload.destination = r"\fileserver\share\eidos".into();
+        on_disk.upload.enabled = true;
+        on_disk.exclude_volumes = vec!["Z:".to_string()];
+        on_disk.save(&data_dir).unwrap();
+
+        let answered = {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    crate::client::request(&crate::protocol::Request::SetLanes {
+                        usn: None,
+                        etw: Some(true),
+                        content: None,
+                        enumeration: None,
+                    })
+                    .is_ok(),
+                );
+            });
+            rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
+        };
+
+        let after = crate::config::CollectorConfig::load(&data_dir).unwrap();
+        control_tx.send(ControlEvent::Stop).unwrap();
+        let _ = daemon.join();
+
+        assert!(answered, "the lane change must be accepted");
+        assert!(after.lanes.etw.enabled, "the lane change must be applied");
+        assert_eq!(
+            after.upload.destination, r"\fileserver\share\eidos",
+            "a lane change must not revert what configure wrote"
+        );
+        assert_eq!(after.exclude_volumes, vec!["Z:".to_string()]);
     }
 }
