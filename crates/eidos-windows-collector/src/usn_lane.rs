@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Above this many records in one batch the per-object size/depth lookups
-/// are skipped so a burst cannot turn into a burst of opens.
+/// Above this many records in one batch the size/depth lookups are skipped
+/// so a burst cannot turn into excessive parent-directory enumeration.
 const FACT_LOOKUP_BATCH_LIMIT: usize = 2_000;
 const READ_BUFFER: usize = 1024 * 1024;
 const CURSOR_VERSION: u16 = 1;
@@ -297,31 +297,36 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                     // change still takes effect within this batch.
                     let sample_percent = shared.config.lock().unwrap().lanes.content.sample_percent;
                     let nominations = shared.content_tx.lock().unwrap().clone();
-                    let want_facts = records.len() <= FACT_LOOKUP_BATCH_LIMIT;
-                    // Resolved before the study key is taken. Reading facts
-                    // from the parent directory is a far longer operation
-                    // than the per-file attribute read it replaced, and
-                    // holding the key across a directory walk would stall
-                    // every thread that needs it - a status request among
-                    // them. One `Lookup` for the batch, so a churning
-                    // directory is walked once however many of its children
-                    // changed.
-                    let facts: Vec<ObjectFacts> = {
-                        let mut lookup =
-                            crate::object_facts::Lookup::new(&mut size_cache, &mut depth_cache);
-                        records
-                            .iter()
-                            .map(|record| {
-                                let view = view_of(record);
-                                if want_facts && ChangeAnalyzer::wants_facts(&view) {
-                                    object_facts(vol, &view, &mut lookup)
-                                } else {
-                                    ObjectFacts::default()
-                                }
-                            })
-                            .collect()
-                    };
-                    {
+                    // Do not enumerate directories when this batch cannot
+                    // produce keyed detail. This is only an availability
+                    // snapshot: the key is acquired again for analysis so no
+                    // lock is held across filesystem I/O.
+                    let key_available = shared.key.lock().unwrap().is_some();
+                    if key_available {
+                        let want_facts = records.len() <= FACT_LOOKUP_BATCH_LIMIT;
+                        // Resolved before the study key is taken. Reading facts
+                        // from the parent directory is a far longer operation
+                        // than the per-file attribute read it replaced, and
+                        // holding the key across a directory walk would stall
+                        // every thread that needs it - a status request among
+                        // them. One `Lookup` for the batch, so a churning
+                        // directory is walked once however many of its children
+                        // changed.
+                        let facts: Vec<ObjectFacts> = {
+                            let mut lookup =
+                                crate::object_facts::Lookup::new(&mut size_cache, &mut depth_cache);
+                            records
+                                .iter()
+                                .map(|record| {
+                                    let view = view_of(record);
+                                    if want_facts && ChangeAnalyzer::wants_facts(&view) {
+                                        object_facts(vol, &view, &mut lookup)
+                                    } else {
+                                        ObjectFacts::default()
+                                    }
+                                })
+                                .collect()
+                        };
                         let key = shared.key.lock().unwrap();
                         if let Some(key) = key.as_ref() {
                             for (record, facts) in records.iter().zip(facts) {
@@ -343,8 +348,11 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                                 }
                             }
                         } else {
+                            // The key became unavailable during fact lookup.
                             counters.dropped_without_key += records.len() as u64;
                         }
+                    } else {
+                        counters.dropped_without_key += records.len() as u64;
                     }
                     counters.logical_changes += changes.len() as u64;
                     if !changes.is_empty() {
@@ -630,9 +638,6 @@ fn wait_or_stop(shared: &Shared, cancel: &JournalCancellation, seconds: u64) -> 
     false
 }
 
-/// Size and depth for a closed file: one open-by-id with
-/// `FILE_READ_ATTRIBUTES` and `OPEN_REPARSE_POINT` (never hydrates a
-/// placeholder), memoised per reference number.
 /// The analyzer's borrowed view of one journal record.
 fn view_of(record: &eidos_scanner::usn::UsnRecord) -> RecordView<'_> {
     RecordView {
