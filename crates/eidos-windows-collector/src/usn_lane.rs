@@ -12,8 +12,8 @@ use eidos_observe::{
     PercentBucket,
 };
 use eidos_scanner::usn::{
-    query_journal, read_journal_wait_timeout, snapshot_by_id, JournalCancellation, ReadOutcome,
-    UsnError, VolumeHandle,
+    query_journal, read_journal_wait_timeout, JournalCancellation, ReadOutcome, UsnError,
+    VolumeHandle,
 };
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
@@ -289,7 +289,6 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                     last_record_monotonic = now.monotonic_ns;
                     counters.batches += 1;
                     counters.records += records.len() as u64;
-                    let lookup = records.len() <= FACT_LOOKUP_BATCH_LIMIT;
                     // Read stable settings and clone the sender before the
                     // key is held. The health thread can take `config` and
                     // then `key`; taking them the other way round here would
@@ -298,25 +297,36 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                     // change still takes effect within this batch.
                     let sample_percent = shared.config.lock().unwrap().lanes.content.sample_percent;
                     let nominations = shared.content_tx.lock().unwrap().clone();
+                    let want_facts = records.len() <= FACT_LOOKUP_BATCH_LIMIT;
+                    // Resolved before the study key is taken. Reading facts
+                    // from the parent directory is a far longer operation
+                    // than the per-file attribute read it replaced, and
+                    // holding the key across a directory walk would stall
+                    // every thread that needs it - a status request among
+                    // them. One `Lookup` for the batch, so a churning
+                    // directory is walked once however many of its children
+                    // changed.
+                    let facts: Vec<ObjectFacts> = {
+                        let mut lookup =
+                            crate::object_facts::Lookup::new(&mut size_cache, &mut depth_cache);
+                        records
+                            .iter()
+                            .map(|record| {
+                                let view = view_of(record);
+                                if want_facts && ChangeAnalyzer::wants_facts(&view) {
+                                    object_facts(vol, &view, &mut lookup)
+                                } else {
+                                    ObjectFacts::default()
+                                }
+                            })
+                            .collect()
+                    };
                     {
                         let key = shared.key.lock().unwrap();
                         if let Some(key) = key.as_ref() {
-                            for record in &records {
+                            for (record, facts) in records.iter().zip(facts) {
                                 let sampling = shared.content_enabled().then_some(sample_percent);
-                                let view = RecordView {
-                                    usn: record.usn,
-                                    frn: record.frn,
-                                    parent_frn: record.parent_frn,
-                                    reason: record.reason,
-                                    is_directory: record.is_directory(),
-                                    name: &record.name,
-                                    timestamp_ns: record.timestamp.0,
-                                };
-                                let facts = if lookup && ChangeAnalyzer::wants_facts(&view) {
-                                    object_facts(vol, &view, &mut size_cache, &mut depth_cache)
-                                } else {
-                                    ObjectFacts::default()
-                                };
+                                let view = view_of(record);
                                 if let Some(change) =
                                     analyzer.observe(key, &view, facts, now.clone())
                                 {
@@ -623,61 +633,40 @@ fn wait_or_stop(shared: &Shared, cancel: &JournalCancellation, seconds: u64) -> 
 /// Size and depth for a closed file: one open-by-id with
 /// `FILE_READ_ATTRIBUTES` and `OPEN_REPARSE_POINT` (never hydrates a
 /// placeholder), memoised per reference number.
+/// The analyzer's borrowed view of one journal record.
+fn view_of(record: &eidos_scanner::usn::UsnRecord) -> RecordView<'_> {
+    RecordView {
+        usn: record.usn,
+        frn: record.frn,
+        parent_frn: record.parent_frn,
+        reason: record.reason,
+        is_directory: record.is_directory(),
+        name: &record.name,
+        timestamp_ns: record.timestamp.0,
+    }
+}
+
+/// Size and depth for one changed object.
+///
+/// Reads them from the object's *parent directory*, never from the object.
+/// Opening the file here is what used to make the collector break other
+/// software on the host: a handle held on a file - however permissive its
+/// sharing flags - turns a concurrent delete into a delete-pending and makes
+/// the next create on that path fail with ACCESS_DENIED. Facts are wanted on
+/// close records, which is precisely when a writer is most likely to be about
+/// to delete and recreate. See `object_facts` for the whole argument.
 fn object_facts(
     vol: &VolumeHandle,
     record: &RecordView<'_>,
-    size_cache: &mut LruCache<u128, u64>,
-    depth_cache: &mut LruCache<u128, usize>,
+    lookup: &mut crate::object_facts::Lookup<'_>,
 ) -> ObjectFacts {
-    let size = match snapshot_by_id(vol, record.frn) {
-        Ok(Some(snapshot)) => {
-            size_cache.put(record.frn, snapshot.size);
-            Some(snapshot.size)
-        }
-        _ => size_cache.get(&record.frn).copied(),
-    };
-    let depth = match depth_cache.get(&record.parent_frn) {
-        Some(depth) => Some(*depth),
-        None => match snapshot_by_id(vol, record.parent_frn) {
-            Ok(Some(parent)) => {
-                let depth = parent.path.as_deref().map(path_depth).unwrap_or(0);
-                depth_cache.put(record.parent_frn, depth);
-                Some(depth)
-            }
-            _ => None,
-        },
-    };
+    let (size, depth) = lookup.facts(vol, record.frn, record.parent_frn);
     ObjectFacts { size, depth }
-}
-
-/// Depth of a directory below its volume root: `\\?\D:\a\b` is 2.
-fn path_depth(path: &str) -> usize {
-    let stripped = path
-        .strip_prefix(r"\\?\")
-        .unwrap_or(path)
-        .trim_end_matches('\\');
-    let Some((_, rest)) = stripped.split_once('\\') else {
-        return 0;
-    };
-    if rest.is_empty() {
-        0
-    } else {
-        rest.matches('\\').count() + 1
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn depth_counts_components_below_the_root() {
-        assert_eq!(path_depth(r"\\?\D:"), 0);
-        assert_eq!(path_depth(r"\\?\D:\"), 0);
-        assert_eq!(path_depth(r"\\?\D:\a"), 1);
-        assert_eq!(path_depth(r"\\?\D:\a\b\c"), 3);
-        assert_eq!(path_depth(r"\\?\Volume{x}\a\b"), 2);
-    }
 
     #[test]
     fn cursor_is_opaque_and_round_trips() {

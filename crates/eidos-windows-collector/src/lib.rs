@@ -35,6 +35,7 @@ pub mod lanes;
 #[cfg(windows)]
 pub mod log;
 #[cfg(windows)]
+pub mod object_facts;
 pub mod pipe;
 #[cfg(windows)]
 pub mod resources;
