@@ -75,6 +75,24 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// A collector outside this process already owns the machine-wide pipe name.
+///
+/// Failing to create an instance is not a reliable signal: the pipe grants
+/// the local Administrators group full control, so an elevated test run can
+/// successfully add a *second* listening instance to the running service's
+/// pipe and then race it for every client that connects. Listing the pipe
+/// filesystem answers the question without connecting to whoever is serving.
+#[cfg(test)]
+pub(crate) fn already_served() -> bool {
+    std::fs::read_dir(r"\\.\pipe\")
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name() == crate::SERVICE_NAME)
+        })
+        .unwrap_or(false)
+}
+
 /// A pipe instance handle owned by the server thread.
 struct Instance(windows_sys::Win32::Foundation::HANDLE);
 
@@ -105,6 +123,37 @@ fn prune(live: &mut Vec<LiveClient>) {
             true
         }
     });
+}
+
+/// The accept thread's own handle, so a stop can cancel the blocking
+/// `ConnectNamedPipe` it is parked in.
+#[derive(Default)]
+struct AcceptThread(Mutex<Option<HANDLE>>);
+
+// SAFETY: a thread handle is a kernel object usable from any thread; this
+// holds exactly one reference to it and closes it once.
+unsafe impl Send for AcceptThread {}
+unsafe impl Sync for AcceptThread {}
+
+impl AcceptThread {
+    /// Cancel whatever blocking call the accept thread is inside, if it has
+    /// registered itself and is in one. Doing neither is not an error: a
+    /// thread that is running rather than blocked reaches the top of its loop
+    /// and sees the shutdown flag on its own.
+    fn cancel(&self) {
+        if let Some(handle) = *self.0.lock().unwrap() {
+            // SAFETY: a duplicated handle owned here and still open;
+            // cancelling a thread with no pending I/O simply fails.
+            unsafe { CancelSynchronousIo(handle) };
+        }
+    }
+
+    fn close(&self) {
+        if let Some(handle) = self.0.lock().unwrap().take() {
+            // SAFETY: the duplicate is owned here and dropped once.
+            unsafe { CloseHandle(handle) };
+        }
+    }
 }
 
 /// Duplicate the calling thread's pseudo-handle into a real handle the reaper
@@ -149,9 +198,54 @@ fn reap(clients: Arc<Mutex<Vec<LiveClient>>>, shutdown: Arc<AtomicBool>) {
     }
 }
 
+/// How long [`Server::stop`] keeps trying to wake the accept loop before it
+/// gives up and leaves the thread behind. The process is on its way out by
+/// then, and a stop that returns late still beats one that never returns.
+const STOP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// A running pipe server. Stopping it goes through [`Server::stop`], which is
+/// the only way to be sure the accept loop actually left `ConnectNamedPipe`.
+pub struct Server {
+    thread: JoinHandle<()>,
+    accept: Arc<AcceptThread>,
+}
+
+impl Server {
+    /// Wake the accept loop and wait for it, without trusting a single wake.
+    ///
+    /// The caller has already set the shutdown flag. Two things can wake the
+    /// loop and neither is enough alone: `poke` connects to a listening
+    /// instance, but finds none in the moment between one instance being
+    /// handed to a client and the next being created, and its failure is not
+    /// reported anywhere; `AcceptThread::cancel` unblocks a thread already
+    /// inside `ConnectNamedPipe`, but does nothing to one that has not
+    /// entered it yet. Between the two every state is covered, because a
+    /// thread that is running rather than blocked reaches the top of the loop
+    /// and sees the flag - so this retries both until the thread is gone.
+    ///
+    /// A single best-effort `poke` was not enough: a stop landing in the gap
+    /// between instances left the loop parked forever and the join with it,
+    /// which is exactly the hang this whole change exists to remove.
+    pub fn stop(self) {
+        let deadline = Instant::now() + STOP_DEADLINE;
+        while !self.thread.is_finished() {
+            poke();
+            self.accept.cancel();
+            if Instant::now() >= deadline {
+                tracing::warn!("the pipe accept loop did not stop; leaving it behind");
+                self.accept.close();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = self.thread.join();
+        self.accept.close();
+    }
+}
+
 /// Start accepting connections. Returns once the first pipe instance exists,
 /// so a client that races the service start finds the pipe.
-pub fn serve(shutdown: Arc<AtomicBool>, handler: Handler) -> std::io::Result<JoinHandle<()>> {
+pub fn serve(shutdown: Arc<AtomicBool>, handler: Handler) -> std::io::Result<Server> {
     let first = create_instance()?;
     let clients: Arc<Mutex<Vec<LiveClient>>> = Arc::new(Mutex::new(Vec::new()));
     let active = Arc::new(AtomicUsize::new(0));
@@ -166,9 +260,14 @@ pub fn serve(shutdown: Arc<AtomicBool>, handler: Handler) -> std::io::Result<Joi
             .name("collector-pipe-reaper".into())
             .spawn(move || reap(clients, shutdown))?;
     }
-    std::thread::Builder::new()
+    let accept = Arc::new(AcceptThread::default());
+    let registration = accept.clone();
+    let thread = std::thread::Builder::new()
         .name("collector-pipe".into())
         .spawn(move || {
+            // Registered before the first accept, so a stop arriving early
+            // has something to cancel.
+            *registration.0.lock().unwrap() = current_thread_handle();
             let mut instance = Some(first);
             while !shutdown.load(Ordering::Acquire) {
                 let Instance(handle) = match instance.take() {
@@ -182,7 +281,17 @@ pub fn serve(shutdown: Arc<AtomicBool>, handler: Handler) -> std::io::Result<Joi
                         }
                     },
                 };
-                // SAFETY: handle from CreateNamedPipeW; blocking connect.
+                // Creating an instance can take long enough for a stop to
+                // land in between; checking here narrows the window that
+                // `Server::stop`'s cancel is left to cover.
+                if shutdown.load(Ordering::Acquire) {
+                    // SAFETY: handle owned here.
+                    unsafe { CloseHandle(handle) };
+                    break;
+                }
+                // SAFETY: handle from CreateNamedPipeW; blocking connect. A
+                // cancelled connect returns ERROR_OPERATION_ABORTED, which
+                // falls through to the shutdown check below.
                 let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0
                     || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
                 if !connected || shutdown.load(Ordering::Acquire) {
@@ -230,7 +339,8 @@ pub fn serve(shutdown: Arc<AtomicBool>, handler: Handler) -> std::io::Result<Joi
                     active.fetch_sub(1, Ordering::AcqRel);
                 }
             }
-        })
+        })?;
+    Ok(Server { thread, accept })
 }
 
 /// Unblock a server thread waiting in `ConnectNamedPipe` after the shutdown
@@ -348,6 +458,9 @@ mod tests {
     #[test]
     fn stalled_readers_are_capped_and_cancelled() {
         let _guard = exclusive();
+        if already_served() {
+            return;
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let handler: Handler = Arc::new(|_| Response::Accepted);
         let server = match serve(shutdown.clone(), handler) {
@@ -398,13 +511,15 @@ mod tests {
 
         drop(stalled);
         shutdown.store(true, Ordering::Release);
-        poke();
-        let _ = server.join();
+        server.stop();
     }
 
     #[test]
     fn serves_a_status_request_and_rejects_malformed_frames() {
         let _guard = exclusive();
+        if already_served() {
+            return;
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let handler: Handler = Arc::new(|request| match request {
             Request::Mark { label } => Response::Error { message: label },
@@ -443,7 +558,35 @@ mod tests {
             Response::Error { .. }
         ));
         shutdown.store(true, Ordering::Release);
-        poke();
-        server.join().unwrap();
+        server.stop();
+    }
+
+    /// `stop` must return even when nothing ever connects and the flag is set
+    /// while the accept loop is parked. The bound is the point: the old stop
+    /// path could block here forever.
+    #[test]
+    fn stop_returns_promptly_from_a_parked_accept_loop() {
+        let _guard = exclusive();
+        if already_served() {
+            return;
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handler: Handler = Arc::new(|_| Response::Accepted);
+        let server = match serve(shutdown.clone(), handler) {
+            Ok(server) => server,
+            // Another collector owns the pipe on this host.
+            Err(error) if error.raw_os_error() == Some(5) => return,
+            Err(error) => panic!("{error}"),
+        };
+        // Let the accept loop reach ConnectNamedPipe and park there.
+        std::thread::sleep(Duration::from_millis(250));
+        shutdown.store(true, Ordering::Release);
+        let asked = Instant::now();
+        server.stop();
+        assert!(
+            asked.elapsed() < STOP_DEADLINE,
+            "stop took {:?}, so it fell back on the deadline instead of waking the loop",
+            asked.elapsed()
+        );
     }
 }

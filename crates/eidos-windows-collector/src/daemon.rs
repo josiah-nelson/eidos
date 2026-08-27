@@ -103,7 +103,8 @@ pub struct Shared {
     /// their work happens to need.
     ///
     /// Shared with the pipe server, which parks in a blocking accept and
-    /// only leaves it when this flag is set and `pipe::poke` wakes it.
+    /// only leaves it when this flag is set and something wakes it; see
+    /// `pipe::Server::stop`, which does not trust one wake to land.
     pub shutdown: Arc<AtomicBool>,
     pub started: Instant,
     pub build_hash: String,
@@ -351,7 +352,7 @@ pub fn run(
         "collector started"
     );
 
-    let pipe_thread = {
+    let pipe_server = {
         // The server's flag is the daemon's own: a private one would leave
         // the accept loop parked forever and `join` below would never return.
         let shutdown = shared.shutdown.clone();
@@ -396,7 +397,9 @@ pub fn run(
         let _ = thread.join();
     }
     let _ = health_thread.join();
-    let _ = pipe_thread.join();
+    // Not a plain join: the accept loop has to be woken, and a single poke
+    // can miss it entirely. `stop` keeps waking it until it is gone.
+    pipe_server.stop();
     shared.health(LifecycleEvent::Heartbeat, None);
     std::fs::write(clean_marker, b"clean\n")?;
     tracing::info!("collector stopped");
@@ -708,19 +711,6 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// Another collector already owns the machine-wide control pipe, so this
-    /// process cannot bind it. Listing the pipe filesystem answers that
-    /// without connecting to whoever is serving.
-    fn pipe_already_served() -> bool {
-        std::fs::read_dir(r"\\.\pipe\")
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .any(|entry| entry.file_name() == crate::SERVICE_NAME)
-            })
-            .unwrap_or(false)
-    }
-
     /// A working collector must return from `run` within seconds of a Stop.
     ///
     /// Everything about a stop is on a clock somebody else holds: the service
@@ -747,7 +737,7 @@ mod tests {
     #[test]
     fn a_working_collector_stops_promptly_and_marks_a_clean_shutdown() {
         let _guard = crate::pipe::test_lock();
-        if pipe_already_served() {
+        if crate::pipe::already_served() {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
