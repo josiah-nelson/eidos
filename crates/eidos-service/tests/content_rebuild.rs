@@ -28,7 +28,9 @@ const NOTES: usize = 30;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn serial_fixture() -> MutexGuard<'static, ()> {
-    TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 struct Env {
