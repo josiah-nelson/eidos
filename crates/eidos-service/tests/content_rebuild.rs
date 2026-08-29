@@ -15,10 +15,23 @@ use eidos_service::state::AppState;
 use eidos_service::ServiceConfig;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const NOTES: usize = 30;
+
+// Each case opens a Tantivy writer with its own worker pool and then starts
+// the service's background threads. Running all five at once is needlessly
+// hostile to the smaller Windows runner and can turn the teardown deadline
+// into a cascade of false failures. The production concurrency contract is
+// exercised inside each case; only the independent fixtures are serialised.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn serial_fixture() -> MutexGuard<'static, ()> {
+    TEST_LOCK.lock().expect(
+        "an earlier content rebuild fixture panicked; do not start another while its workers may still be running",
+    )
+}
 
 struct Env {
     _dir: tempfile::TempDir,
@@ -145,6 +158,7 @@ fn lose_index(data: &Path) {
 
 #[test]
 fn lost_index_is_rebuilt_before_readiness_and_restart_is_clean() {
+    let _serial = serial_fixture();
     let e = indexed_env();
     lose_index(&e.data);
 
@@ -195,6 +209,7 @@ fn lost_index_is_rebuilt_before_readiness_and_restart_is_clean() {
 
 #[test]
 fn workers_and_commits_wait_for_the_rebuild_then_resume() {
+    let _serial = serial_fixture();
     let e = indexed_env();
     lose_index(&e.data);
     // A new file is queued for extraction while the rebuild is pending.
@@ -263,6 +278,7 @@ fn workers_and_commits_wait_for_the_rebuild_then_resume() {
 
 #[test]
 fn rebuild_failure_is_visible_and_retried_at_the_next_start() {
+    let _serial = serial_fixture();
     let e = indexed_env();
     lose_index(&e.data);
 
@@ -321,6 +337,7 @@ fn rebuild_failure_is_visible_and_retried_at_the_next_start() {
 
 #[test]
 fn shutdown_during_rebuild_leaves_it_pending_for_the_next_start() {
+    let _serial = serial_fixture();
     let e = indexed_env();
     lose_index(&e.data);
 
@@ -369,6 +386,7 @@ fn shutdown_during_rebuild_leaves_it_pending_for_the_next_start() {
 
 #[test]
 fn torn_marker_still_schedules_a_rebuild() {
+    let _serial = serial_fixture();
     let e = indexed_env();
     // The index is intact, but a crash left a truncated marker behind.
     std::fs::write(content_dir(&e.data).join(REBUILD_MARKER), b"{\"chunks\": 3").unwrap();
