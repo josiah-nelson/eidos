@@ -290,25 +290,19 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                     counters.batches += 1;
                     counters.records += records.len() as u64;
                     let lookup = records.len() <= FACT_LOOKUP_BATCH_LIMIT;
-                    // Read before the key is held. The health thread takes
-                    // `config` and then `key`; taking them the other way
-                    // round here would wedge both threads, and with them
-                    // every stop.
-                    let sampling = {
-                        let config = shared.config.lock().unwrap();
-                        config
-                            .lanes
-                            .content
-                            .enabled
-                            .then_some(config.lanes.content.sample_percent)
-                    };
-                    // Cloned here for the same reason: `nominate` runs with
-                    // the key held and must take no lock of its own.
-                    let nominations = sampling.and(shared.content_tx.lock().unwrap().clone());
+                    // Read stable settings and clone the sender before the
+                    // key is held. The health thread can take `config` and
+                    // then `key`; taking them the other way round here would
+                    // wedge both threads, and with them every stop. Lane
+                    // enablement itself is mirrored atomically so a runtime
+                    // change still takes effect within this batch.
+                    let sample_percent = shared.config.lock().unwrap().lanes.content.sample_percent;
+                    let nominations = shared.content_tx.lock().unwrap().clone();
                     {
                         let key = shared.key.lock().unwrap();
                         if let Some(key) = key.as_ref() {
                             for record in &records {
+                                let sampling = shared.content_enabled().then_some(sample_percent);
                                 let view = RecordView {
                                     usn: record.usn,
                                     frn: record.frn,

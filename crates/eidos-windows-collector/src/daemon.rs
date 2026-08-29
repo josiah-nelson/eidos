@@ -95,6 +95,12 @@ pub struct Shared {
     pub etw: Mutex<EtwView>,
     /// Candidates for the content probe, installed by the lane supervisor.
     pub content_tx: Mutex<Option<std::sync::mpsc::SyncSender<crate::content_probe::Candidate>>>,
+    /// Mirrors the content lane switch for the USN reader's inner loop. The
+    /// reader holds `key` while analysing a batch and therefore cannot take
+    /// `config`, whose opposite lock order in the health thread would
+    /// deadlock the collector. Keeping the switch atomic lets a runtime lane
+    /// change take effect at the next record instead of the next batch.
+    content_enabled: AtomicBool,
     /// True while an ETW window is tracing; drives `LaneStates::etw`.
     pub etw_window_open: AtomicBool,
     /// None of the mutexes above may be held while another is taken, and
@@ -167,6 +173,10 @@ impl Shared {
 
     pub fn lane_enabled(&self, lane: impl Fn(&CollectorConfig) -> bool) -> bool {
         lane(&self.config.lock().unwrap())
+    }
+
+    pub fn content_enabled(&self) -> bool {
+        self.content_enabled.load(Ordering::Acquire)
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -303,6 +313,7 @@ pub fn run(
             study_key_available: key.is_some(),
         }),
     };
+    let content_enabled = config.lanes.content.enabled;
     let shared = Arc::new(Shared {
         data_dir: data_dir.clone(),
         export_dir,
@@ -321,6 +332,7 @@ pub fn run(
             ..EtwView::default()
         }),
         content_tx: Mutex::new(None),
+        content_enabled: AtomicBool::new(content_enabled),
         etw_window_open: AtomicBool::new(false),
         shutdown: Arc::new(AtomicBool::new(false)),
         started: Instant::now(),
@@ -579,6 +591,7 @@ fn handle_request(shared: &Arc<Shared>, request: Request) -> Response {
             }
             if let Some(content) = content {
                 config.lanes.content.enabled = content;
+                shared.content_enabled.store(content, Ordering::Release);
             }
             if let Some(enumeration) = enumeration {
                 config.lanes.enumeration.enabled = enumeration;
