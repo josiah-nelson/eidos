@@ -395,13 +395,16 @@ mod windows {
                 eidos_windows_collector::SERVICE_NAME
             );
         }
-        // A registration check alone is not enough: `observe run` serves the
-        // same control pipe and holds the same data directory with no service
-        // registered at all, and deleting a live spool out from under it
-        // would take some of its files before an open one stopped the walk.
-        // If anything answers the pipe, a collector is using this directory.
-        if request(&Request::Status).is_ok() {
-            anyhow::bail!("a collector is running and using this data directory; stop it first");
+        // A registration check alone is not enough: `observe run` has no SCM
+        // registration. The pipe is machine-wide, though, so only reject the
+        // purge when the answering collector identifies this exact directory;
+        // an unrelated foreground collector must not block cleanup here.
+        if let Ok(Response::Status { status }) = request(&Request::Status) {
+            if same_data_dir(&data_dir, &status.data_dir) {
+                anyhow::bail!(
+                    "a collector is running and using this data directory; stop it first"
+                );
+            }
         }
         if !holds_collector_data(&data_dir) && !args.force {
             anyhow::bail!(
@@ -427,6 +430,15 @@ mod windows {
             .any(|name| dir.join(name).exists())
     }
 
+    fn same_data_dir(left: &std::path::Path, right: &std::path::Path) -> bool {
+        match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => left
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&right.to_string_lossy()),
+        }
+    }
+
     /// Write the configuration file the collector reads at start-up. Lanes
     /// can also be switched at run time over the pipe (`observe lanes`);
     /// everything else here takes effect the next time the service starts.
@@ -440,76 +452,75 @@ mod windows {
                 data_dir.display()
             );
         }
-        let mut config = CollectorConfig::load(&data_dir)?;
+        let config = CollectorConfig::edit_locked(&data_dir, move |config| {
+            if let Some(list) = &args.lanes {
+                let (usn, etw, content, enumeration) = parse_lanes(list)?;
+                config.lanes.usn = usn;
+                config.lanes.etw.enabled = etw;
+                config.lanes.content.enabled = content;
+                config.lanes.enumeration.enabled = enumeration;
+            }
+            if let Some(on) = args.usn {
+                config.lanes.usn = on;
+            }
+            if let Some(on) = args.etw {
+                config.lanes.etw.enabled = on;
+            }
+            if let Some(on) = args.content {
+                config.lanes.content.enabled = on;
+            }
+            if let Some(on) = args.enumeration {
+                config.lanes.enumeration.enabled = on;
+            }
 
-        if let Some(list) = &args.lanes {
-            let (usn, etw, content, enumeration) = parse_lanes(list)?;
-            config.lanes.usn = usn;
-            config.lanes.etw.enabled = etw;
-            config.lanes.content.enabled = content;
-            config.lanes.enumeration.enabled = enumeration;
-        }
-        if let Some(on) = args.usn {
-            config.lanes.usn = on;
-        }
-        if let Some(on) = args.etw {
-            config.lanes.etw.enabled = on;
-        }
-        if let Some(on) = args.content {
-            config.lanes.content.enabled = on;
-        }
-        if let Some(on) = args.enumeration {
-            config.lanes.enumeration.enabled = on;
-        }
-
-        if let Some(destination) = args.upload_destination {
-            let destination = destination.trim().to_string();
-            // A path ending in a backslash escapes the closing quote of a
-            // Windows command line, and everything after it arrives inside
-            // this one argument. Refuse it rather than store a destination
-            // that will never resolve: an installer that passed
-            // `\\fileserver\share\` should fail, not configure a host
-            // whose uploads quietly go nowhere.
-            if destination.contains('"') {
-                anyhow::bail!(
-                    "the upload destination contains a quote, which usually means it was given with a trailing backslash: {destination:?}"
-                );
+            if let Some(destination) = args.upload_destination {
+                let destination = destination.trim().to_string();
+                // A path ending in a backslash escapes the closing quote of a
+                // Windows command line, and everything after it arrives inside
+                // this one argument. Refuse it rather than store a destination
+                // that will never resolve: an installer that passed
+                // `\\fileserver\share\` should fail, not configure a host
+                // whose uploads quietly go nowhere.
+                if destination.contains('"') {
+                    anyhow::bail!(
+                        "the upload destination contains a quote, which usually means it was given with a trailing backslash: {destination:?}"
+                    );
+                }
+                config.upload.enabled = !destination.is_empty();
+                config.upload.destination = destination;
             }
-            config.upload.enabled = !destination.is_empty();
-            config.upload.destination = destination;
-        }
-        if let Some(hour) = args.upload_hour {
-            if hour > 23 {
-                anyhow::bail!("--upload-hour must be an hour of the day, 0-23");
+            if let Some(hour) = args.upload_hour {
+                if hour > 23 {
+                    anyhow::bail!("--upload-hour must be an hour of the day, 0-23");
+                }
+                config.upload.hour = hour;
             }
-            config.upload.hour = hour;
-        }
-        if let Some(attempts) = args.upload_attempts {
-            if attempts == 0 {
-                anyhow::bail!("--upload-attempts must be at least 1");
+            if let Some(attempts) = args.upload_attempts {
+                if attempts == 0 {
+                    anyhow::bail!("--upload-attempts must be at least 1");
+                }
+                config.upload.attempts = attempts;
             }
-            config.upload.attempts = attempts;
-        }
-        if let Some(on) = args.upload {
-            if on && config.upload.destination.is_empty() {
-                anyhow::bail!("--upload on needs a destination; pass --upload-destination");
+            if let Some(on) = args.upload {
+                if on && config.upload.destination.is_empty() {
+                    anyhow::bail!("--upload on needs a destination; pass --upload-destination");
+                }
+                config.upload.enabled = on;
             }
-            config.upload.enabled = on;
-        }
-        if !args.exclude_volumes.is_empty() {
-            // `none` is the way to say "exclude nothing", for the same reason
-            // `EIDOS_UPLOAD=none` exists: absent has to keep meaning "do not
-            // touch", so emptiness needs a spelling of its own.
-            let clearing = args.exclude_volumes.len() == 1
-                && args.exclude_volumes[0].trim().eq_ignore_ascii_case("none");
-            config.exclude_volumes = if clearing {
-                Vec::new()
-            } else {
-                args.exclude_volumes
-            };
-        }
-
-        config.save(&data_dir)?;
+            if !args.exclude_volumes.is_empty() {
+                // `none` is the way to say "exclude nothing", for the same
+                // reason `EIDOS_UPLOAD=none` exists: absent has to keep meaning
+                // "do not touch", so emptiness needs a spelling of its own.
+                let clearing = args.exclude_volumes.len() == 1
+                    && args.exclude_volumes[0].trim().eq_ignore_ascii_case("none");
+                config.exclude_volumes = if clearing {
+                    Vec::new()
+                } else {
+                    args.exclude_volumes
+                };
+            }
+            Ok(())
+        })?;
 
         let shown = |on: bool| if on { "on" } else { "off" };
         println!("{}", CollectorConfig::path(&data_dir).display());
@@ -596,6 +607,23 @@ mod windows {
                 });
             })?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn data_directory_identity_distinguishes_collectors() {
+            let temp = tempfile::tempdir().unwrap();
+            let active = temp.path().join("active");
+            let inactive = temp.path().join("inactive");
+            std::fs::create_dir_all(&active).unwrap();
+            std::fs::create_dir_all(&inactive).unwrap();
+
+            assert!(same_data_dir(&active, &active.join(".")));
+            assert!(!same_data_dir(&active, &inactive));
+        }
     }
 }
 

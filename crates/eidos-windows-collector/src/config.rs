@@ -5,6 +5,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+const CONFIG_LOCK_FILE: &str = ".config.lock";
+
 pub const CONFIG_FILE: &str = "config.json";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +199,22 @@ impl CollectorConfig {
         Ok(())
     }
 
+    /// Atomically perform a read-modify-write against every collector process
+    /// using this data directory. `observe configure` and the daemon's lane
+    /// handler run in different processes, so the daemon's in-memory mutex is
+    /// not enough to keep one from saving over the other's update.
+    #[cfg(windows)]
+    pub fn edit_locked(
+        data_dir: &Path,
+        edit: impl FnOnce(&mut Self) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
+        let _lock = ConfigLock::acquire(data_dir)?;
+        let mut config = Self::load(data_dir)?;
+        edit(&mut config)?;
+        config.save(data_dir)?;
+        Ok(config)
+    }
+
     /// Stable hash of the collection-affecting configuration.
     ///
     /// Upload settings are deliberately excluded: where a bundle is delivered
@@ -232,6 +251,51 @@ impl CollectorConfig {
     }
 }
 
+#[cfg(windows)]
+struct ConfigLock {
+    // Closing the handle releases every byte-range lock it owns, including
+    // during unwinding or process termination.
+    _file: std::fs::File,
+}
+
+#[cfg(windows)]
+impl ConfigLock {
+    fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
+        };
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let path = data_dir.join(CONFIG_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .with_context(|| format!("opening configuration lock {}", path.display()))?;
+        let mut overlapped = OVERLAPPED::default();
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if locked == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("locking configuration {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +324,52 @@ mod tests {
 
         std::fs::write(CollectorConfig::path(temp.path()), b"{not json").unwrap();
         assert!(CollectorConfig::load(temp.path()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_edits_preserve_concurrent_changes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        CollectorConfig::default().save(temp.path()).unwrap();
+        let first_dir = temp.path().to_path_buf();
+        let second_dir = first_dir.clone();
+        let (first_locked_tx, first_locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            CollectorConfig::edit_locked(&first_dir, |config| {
+                config.upload.destination = r"\\fileserver\share\eidos".into();
+                first_locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        first_locked_rx.recv().unwrap();
+
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            CollectorConfig::edit_locked(&second_dir, |config| {
+                config.lanes.etw.enabled = true;
+                Ok(())
+            })
+            .unwrap();
+            second_done_tx.send(()).unwrap();
+        });
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the second edit must wait for the first process lock"
+        );
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let config = CollectorConfig::load(temp.path()).unwrap();
+        assert_eq!(config.upload.destination, r"\\fileserver\share\eidos");
+        assert!(config.lanes.etw.enabled);
     }
 }

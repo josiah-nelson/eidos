@@ -583,31 +583,34 @@ fn handle_request(shared: &Arc<Shared>, request: Request) -> Response {
             enumeration,
         } => {
             let mut config = shared.config.lock().unwrap();
-            // Start from what is on disk, not from the copy this daemon has
-            // been holding since it started. `observe configure` writes the
-            // same file - upload settings, excluded volumes - and saving the
-            // in-memory copy over it would silently revert whatever it wrote
-            // since the last start. Lanes are the only field this request
-            // owns, so they are the only field taken from memory.
-            let mut updated =
-                CollectorConfig::load(&shared.data_dir).unwrap_or_else(|_| config.clone());
-            updated.lanes = config.lanes.clone();
-            if let Some(usn) = usn {
-                updated.lanes.usn = usn;
-            }
-            if let Some(etw) = etw {
-                updated.lanes.etw.enabled = etw;
-            }
-            if let Some(content) = content {
-                updated.lanes.content.enabled = content;
-                shared.content_enabled.store(content, Ordering::Release);
-            }
-            if let Some(enumeration) = enumeration {
-                updated.lanes.enumeration.enabled = enumeration;
-            }
-            *config = updated;
-            match config.save(&shared.data_dir) {
-                Ok(()) => Response::Accepted,
+            // The file lock spans load through save, coordinating this daemon
+            // with `observe configure` in another process. A load error is
+            // returned instead of silently replacing a malformed or
+            // temporarily unreadable file with stale in-memory settings.
+            match CollectorConfig::edit_locked(&shared.data_dir, |updated| {
+                updated.lanes = config.lanes.clone();
+                if let Some(usn) = usn {
+                    updated.lanes.usn = usn;
+                }
+                if let Some(etw) = etw {
+                    updated.lanes.etw.enabled = etw;
+                }
+                if let Some(content) = content {
+                    updated.lanes.content.enabled = content;
+                }
+                if let Some(enumeration) = enumeration {
+                    updated.lanes.enumeration.enabled = enumeration;
+                }
+                Ok(())
+            }) {
+                Ok(updated) => {
+                    let content_enabled = updated.lanes.content.enabled;
+                    *config = updated;
+                    shared
+                        .content_enabled
+                        .store(content_enabled, Ordering::Release);
+                    Response::Accepted
+                }
                 Err(error) => Response::Error {
                     message: format!("configuration not saved: {error}"),
                 },
@@ -636,6 +639,7 @@ fn status(shared: &Shared) -> CollectorStatus {
     CollectorStatus {
         version: env!("CARGO_PKG_VERSION").into(),
         build_hash: shared.build_hash.clone(),
+        data_dir: shared.data_dir.clone(),
         config_hash,
         uptime_s: shared.started.elapsed().as_secs(),
         capabilities: shared.capabilities.lock().unwrap().clone(),
@@ -876,6 +880,13 @@ mod tests {
             panic!("the collector never reported itself running");
         }
 
+        let Response::Status { status } =
+            crate::client::request(&crate::protocol::Request::Status).unwrap()
+        else {
+            panic!("the running collector did not return status");
+        };
+        assert_eq!(status.data_dir, data_dir);
+
         // Stand in for `observe configure`, which writes the file directly
         // while the service is running.
         let mut on_disk = crate::config::CollectorConfig::load(&data_dir).unwrap();
@@ -901,9 +912,6 @@ mod tests {
         };
 
         let after = crate::config::CollectorConfig::load(&data_dir).unwrap();
-        control_tx.send(ControlEvent::Stop).unwrap();
-        let _ = daemon.join();
-
         assert!(answered, "the lane change must be accepted");
         assert!(after.lanes.etw.enabled, "the lane change must be applied");
         assert_eq!(
@@ -911,5 +919,35 @@ mod tests {
             "a lane change must not revert what configure wrote"
         );
         assert_eq!(after.exclude_volumes, vec!["Z:".to_string()]);
+
+        let malformed = b"{not json";
+        std::fs::write(crate::config::CollectorConfig::path(&data_dir), malformed).unwrap();
+        let (malformed_tx, malformed_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = malformed_tx.send(crate::client::request(
+                &crate::protocol::Request::SetLanes {
+                    usn: None,
+                    etw: None,
+                    content: Some(true),
+                    enumeration: None,
+                },
+            ));
+        });
+        let malformed_response = malformed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the malformed configuration request timed out")
+            .expect("the pipe request itself failed");
+        assert!(
+            matches!(malformed_response, Response::Error { .. }),
+            "a malformed on-disk configuration must be reported, not replaced"
+        );
+        assert_eq!(
+            std::fs::read(crate::config::CollectorConfig::path(&data_dir)).unwrap(),
+            malformed,
+            "the failed lane change must preserve the malformed file for diagnosis"
+        );
+
+        control_tx.send(ControlEvent::Stop).unwrap();
+        let _ = daemon.join();
     }
 }

@@ -47,6 +47,10 @@ pub enum Response {
 pub struct CollectorStatus {
     pub version: String,
     pub build_hash: String,
+    /// Normalized local path owned by this collector process. It lets local
+    /// maintenance distinguish an active custom data directory from another
+    /// inactive directory on a host with one machine-wide control pipe.
+    pub data_dir: PathBuf,
     pub config_hash: String,
     pub uptime_s: u64,
     pub capabilities: Capabilities,
