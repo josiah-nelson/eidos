@@ -62,7 +62,7 @@ struct Progress {
 fn scheduler(shared: Arc<Shared>) {
     let progress = Arc::new(Mutex::new(Progress::default()));
     while !shared.is_shutting_down() {
-        if sleep_unless_stopping(&shared, TICK) {
+        if shared.sleep_unless_stopping(TICK) {
             return;
         }
         let settings = shared.config.lock().unwrap().upload.clone();
@@ -327,21 +327,6 @@ fn machine_name() -> Option<String> {
 
 fn set_view(shared: &Shared, f: impl FnOnce(&mut crate::protocol::UploadView)) {
     f(&mut shared.upload.lock().unwrap());
-}
-
-/// Sleep in short slices so shutdown is not delayed by a whole tick. Returns
-/// true when the collector is stopping.
-fn sleep_unless_stopping(shared: &Shared, total: Duration) -> bool {
-    let slice = Duration::from_millis(250);
-    let mut slept = Duration::ZERO;
-    while slept < total {
-        if shared.is_shutting_down() {
-            return true;
-        }
-        std::thread::sleep(slice);
-        slept += slice;
-    }
-    shared.is_shutting_down()
 }
 
 fn day_key(now: &windows_sys::Win32::Foundation::SYSTEMTIME) -> i64 {

@@ -33,7 +33,9 @@ fn scheduler(shared: Arc<Shared>) {
     // every volume immediately; `observe probe` exists for that.
     let mut last_run = Instant::now();
     while !shared.is_shutting_down() {
-        std::thread::sleep(Duration::from_secs(30));
+        if shared.sleep_unless_stopping(Duration::from_secs(30)) {
+            break;
+        }
         let (enabled, every_hours) = {
             let config = shared.config.lock().unwrap();
             (
