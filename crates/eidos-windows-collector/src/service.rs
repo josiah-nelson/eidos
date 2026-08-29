@@ -26,9 +26,7 @@ const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: i32 = 1063;
 
 pub fn install(data_dir: &Path, start_now: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating eidos.exe")?;
-    let data_dir = absolute(data_dir)?;
-    std::fs::create_dir_all(&data_dir)?;
-    restrict_acl(&data_dir)?;
+    let data_dir = prepare_data_dir(data_dir)?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -185,6 +183,25 @@ fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Absolute, verbatim-free spelling of a data directory given on the command
+/// line. An installer-supplied path carries a trailing `.` - a directory
+/// property ends in a backslash, which would escape the closing quote - and
+/// every command that touches the data directory agrees on one spelling.
+pub fn normalize_data_dir(path: &Path) -> anyhow::Result<PathBuf> {
+    absolute(path)
+}
+
+/// Create the data directory and lock it down before anything sensitive is
+/// written into it. Both `install` and `init` call this: the study key is
+/// written first, and the default ProgramData ACL would leave the blob and
+/// the spool readable by every user on the machine.
+pub fn prepare_data_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let data_dir = absolute(data_dir)?;
+    std::fs::create_dir_all(&data_dir)?;
+    restrict_acl(&data_dir)?;
+    Ok(data_dir)
 }
 
 /// SYSTEM and Administrators only; the spool holds tokenised but still
@@ -370,4 +387,20 @@ fn describe(error: windows_service::Error) -> anyhow::Error {
 /// Lets the foreground runner reuse the same control channel shape.
 pub fn control_channel() -> (Sender<ControlEvent>, mpsc::Receiver<ControlEvent>) {
     mpsc::channel()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The installer spells the data directory `"[DATAFOLDER]."`: a directory
+    /// property ends in a backslash, which would escape the closing quote of
+    /// the service arguments. The collector must see the plain directory.
+    #[test]
+    fn normalize_strips_the_installer_dot() {
+        assert_eq!(
+            normalize_data_dir(Path::new(r"C:\ProgramData\eidos-collector\.")).unwrap(),
+            PathBuf::from(r"C:\ProgramData\eidos-collector")
+        );
+    }
 }

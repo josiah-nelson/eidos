@@ -191,6 +191,7 @@ Install and run:
 
 ```powershell
 eidos observe init                 # DPAPI machine-scope study key + default config
+eidos observe configure --lanes usn,etw   # lanes, upload: written to config.json
 eidos observe install --start-now  # register and start the service
 eidos observe status               # capabilities, feeds, lanes, ring usage
 eidos observe mark vm-snapshot     # keyed phase marker
@@ -204,6 +205,9 @@ eidos observe uninstall            # keeps the data directory and key
 `eidos observe run` runs the same daemon in the foreground for testing.
 `eidos observe init --key-hex <64 hex>` imports a cohort-shared key so
 content fingerprints compare across hosts; otherwise the key is random.
+`eidos observe configure` writes lanes, upload destination and hour, and
+excluded volumes into `config.json`, which the collector reads at its next
+start.
 
 Data lives in `C:\ProgramData\eidos-collector` (ACL: SYSTEM and
 Administrators only): the DPAPI-protected key, `config.json`, the SQLite
