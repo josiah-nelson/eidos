@@ -313,8 +313,12 @@ fn read_volume(shared: Arc<Shared>, volume: VolumeFacts, cancel: Arc<JournalCanc
                         // directory is walked once however many of its children
                         // changed.
                         let facts: Vec<ObjectFacts> = {
-                            let mut lookup =
-                                crate::object_facts::Lookup::new(&mut size_cache, &mut depth_cache);
+                            let should_stop = || shared.is_shutting_down() || cancel.is_cancelled();
+                            let mut lookup = crate::object_facts::Lookup::with_stop(
+                                &mut size_cache,
+                                &mut depth_cache,
+                                &should_stop,
+                            );
                             records
                                 .iter()
                                 .map(|record| {

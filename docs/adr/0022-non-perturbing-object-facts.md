@@ -57,9 +57,17 @@ one call. The parent's own path gives the depth. This costs one short-lived
 handle on a directory instead of one handle per file, and a directory is not
 what a churning workload deletes and recreates.
 
+The parent is opened with `FILE_FLAG_OPEN_REPARSE_POINT`. Normal reparse
+processing could redirect the open or activate a cloud/filter provider; when
+the parent itself is a reparse point, losing its facts is preferable to making
+the observer invoke that provider.
+
 It is also cheaper. One `Lookup` per batch tracks the parents already walked,
 so a build directory producing thousands of close records in one batch is
-enumerated once rather than opened once per file.
+enumerated once rather than opened once per file. Both each directory and the
+whole batch have entry budgets, and the walk checks the reader's stop signal
+at every entry. The record-count cutoff by itself is not a work bound because
+each record can have a different parent.
 
 **The lookup happens before the study key is taken.** A directory walk is far
 longer than the attribute read it replaced, and the first version of this
@@ -84,9 +92,11 @@ documented rather than hidden.
   bucketed to twelve power-of-four ranges before it is recorded; trading some
   of that fidelity for not perturbing the host is the right way round for an
   observatory, but it is a real trade and not a free one.
-- A directory with more children than `MAX_ENTRIES_PER_DIRECTORY` is
-  abandoned part-way rather than walked to the end, so objects in very large
-  directories may have no size. The handle should not be held that long.
+- A directory with more children than `MAX_ENTRIES_PER_DIRECTORY`, or a batch
+  that exhausts `MAX_ENTRIES_PER_BATCH`, is abandoned part-way rather than
+  walked to the end, so objects in very large or high-cardinality batches may
+  have no size. The handle should not be held that long, and the temporary
+  fresh-ID set must stay bounded.
 - The invariant is still not enforced by the compiler. `eidos-scanner`'s
   file-opening primitives remain reachable from the collector; nothing but
   this document and the tests stops the next lane from reaching for one.

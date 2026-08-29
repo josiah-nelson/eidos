@@ -36,9 +36,9 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     ExtendedFileIdType, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo,
     GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OpenFileById,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_EXTD_DIR_INFO,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_DESCRIPTOR,
+    FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
 use eidos_scanner::usn::VolumeHandle;
@@ -51,6 +51,13 @@ const ENUM_BUFFER: usize = 64 * 1024;
 /// million children is not worth walking for one file's size bucket, and the
 /// handle should not be held that long. Callers get `None` and carry on.
 const MAX_ENTRIES_PER_DIRECTORY: usize = 20_000;
+
+/// Bound the total enumeration work and temporary identity set for one USN
+/// batch. The record limit alone is not a work limit: every changed record
+/// can have a different parent, and every parent can contain 20,000 entries.
+/// Matching the persistent size cache also ensures the fresh-ID set cannot
+/// grow beyond the storage it qualifies.
+const MAX_ENTRIES_PER_BATCH: usize = 65_536;
 
 /// An open directory handle, closed on drop.
 struct Directory(HANDLE);
@@ -84,7 +91,7 @@ fn open_directory(vol: &VolumeHandle, frn: u128) -> Option<Directory> {
             FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
-            FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
         )
     };
     (handle != INVALID_HANDLE_VALUE).then_some(Directory(handle))
@@ -180,17 +187,45 @@ pub struct Lookup<'a> {
     /// for a new close event.
     fresh_sizes: HashSet<u128>,
     fresh_depths: HashSet<u128>,
+    remaining_entries: usize,
+    should_stop: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<'a> Lookup<'a> {
     pub fn new(sizes: &'a mut LruCache<u128, u64>, depths: &'a mut LruCache<u128, usize>) -> Self {
+        Self::with_options(sizes, depths, MAX_ENTRIES_PER_BATCH, None)
+    }
+
+    /// A lookup that abandons filesystem work as soon as the reader is asked
+    /// to stop. The callback is checked before every parent and every entry,
+    /// so shutdown is not pinned behind a large directory walk.
+    pub fn with_stop(
+        sizes: &'a mut LruCache<u128, u64>,
+        depths: &'a mut LruCache<u128, usize>,
+        should_stop: &'a dyn Fn() -> bool,
+    ) -> Self {
+        Self::with_options(sizes, depths, MAX_ENTRIES_PER_BATCH, Some(should_stop))
+    }
+
+    fn with_options(
+        sizes: &'a mut LruCache<u128, u64>,
+        depths: &'a mut LruCache<u128, usize>,
+        remaining_entries: usize,
+        should_stop: Option<&'a dyn Fn() -> bool>,
+    ) -> Self {
         Self {
             sizes,
             depths,
             walked: HashSet::new(),
             fresh_sizes: HashSet::new(),
             fresh_depths: HashSet::new(),
+            remaining_entries,
+            should_stop,
         }
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.should_stop.is_some_and(|stop| stop())
     }
 
     /// Size and depth for one changed object, opening nothing but its parent.
@@ -204,8 +239,18 @@ impl<'a> Lookup<'a> {
         // A persistent LRU hit is only a storage hit, never freshness proof:
         // the same FRN may have been written to a different size since the
         // preceding batch.
-        if self.walked.insert(parent_frn) {
+        if self.stop_requested() {
+            return (None, None);
+        }
+        if !self.walked.contains(&parent_frn) {
+            if self.remaining_entries == 0 {
+                return (None, None);
+            }
+            self.walked.insert(parent_frn);
             self.walk(vol, parent_frn);
+        }
+        if self.stop_requested() {
+            return (None, None);
         }
         let size = if self.fresh_sizes.contains(&frn) {
             self.sizes.get(&frn).copied()
@@ -223,16 +268,28 @@ impl<'a> Lookup<'a> {
     /// Open the parent once: take its depth from its own path, and the size
     /// of every child from one enumeration.
     fn walk(&mut self, vol: &VolumeHandle, parent_frn: u128) {
+        if self.remaining_entries == 0 || self.stop_requested() {
+            return;
+        }
         let Some(dir) = open_directory(vol, parent_frn) else {
             return;
         };
+        if self.should_stop.is_some_and(|stop| stop()) {
+            return;
+        }
         if let Some(depth) = directory_path(&dir).as_deref().map(path_depth) {
             self.depths.put(parent_frn, depth);
             self.fresh_depths.insert(parent_frn);
         }
         let sizes = &mut *self.sizes;
         let fresh_sizes = &mut self.fresh_sizes;
+        let remaining_entries = &mut self.remaining_entries;
+        let should_stop = self.should_stop;
         for_each_child(&dir, |frn, size| {
+            if *remaining_entries == 0 || should_stop.is_some_and(|stop| stop()) {
+                return false;
+            }
+            *remaining_entries -= 1;
             sizes.put(frn, size);
             fresh_sizes.insert(frn);
             true
@@ -412,6 +469,40 @@ mod tests {
 
         let mut second_batch = Lookup::new(&mut sizes, &mut depths);
         assert_eq!(second_batch.facts(&vol, frn, parent).0, Some(73));
+    }
+
+    #[test]
+    fn one_batch_never_exceeds_its_entry_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((vol, frn, parent)) = subject(temp.path(), "first.bin", &[1]) else {
+            return;
+        };
+        for index in 0..8 {
+            std::fs::write(temp.path().join(format!("sibling-{index}.bin")), [2]).unwrap();
+        }
+
+        let (mut sizes, mut depths) = caches();
+        let mut lookup = Lookup::with_options(&mut sizes, &mut depths, 2, None);
+        let _ = lookup.facts(&vol, frn, parent);
+        assert_eq!(lookup.remaining_entries, 0);
+        assert!(lookup.fresh_sizes.len() <= 2);
+        let cached = *lookup.fresh_sizes.iter().next().unwrap();
+        assert!(lookup.facts(&vol, cached, parent).0.is_some());
+    }
+
+    #[test]
+    fn a_stop_request_skips_directory_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((vol, frn, parent)) = subject(temp.path(), "stop.bin", &[1]) else {
+            return;
+        };
+
+        let (mut sizes, mut depths) = caches();
+        let stop = || true;
+        let mut lookup = Lookup::with_stop(&mut sizes, &mut depths, &stop);
+        assert_eq!(lookup.facts(&vol, frn, parent), (None, None));
+        assert!(lookup.walked.is_empty());
+        assert!(lookup.fresh_sizes.is_empty());
     }
 
     #[test]

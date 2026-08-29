@@ -229,8 +229,9 @@ number)`; no path is resolved for files, and names are used only to pick an
 extension bucket and to key a delete/recreate lookup. Records carry
 create/update/delete/rename/metadata/hard-link/stream operations, rename
 pairing with the old parent subtree, hot edit counts, fan-out, size and
-depth buckets (one attribute-only open by id with `OPEN_REPARSE_POINT`,
-memoised, skipped for oversized batches), and backlog age. Per-interval
+depth buckets (one non-reparse parent-directory enumeration per changed
+parent, bounded per directory and batch, skipped for oversized batches), and
+backlog age. Per-interval
 summaries add per-second histograms, operation counts, distinct objects at
 1 s/10 s/60 s/10 min/1 h coalescing windows (the shadow-sync row saving),
 tombstones, hot objects, recreates, reason-bit combinations, and feed
