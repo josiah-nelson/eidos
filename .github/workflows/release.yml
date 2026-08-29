@@ -115,7 +115,7 @@ jobs:
 
       - name: Build setup UI
         shell: pwsh
-        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipBundle
+        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipBundle -SkipCollectorMsi -SkipCollectorBundle
 
       - name: Sign eidos.exe and the setup UI
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
@@ -145,11 +145,11 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
-      - name: Build MSI (binds the signed executable)
+      - name: Build both MSIs (binding the signed executable)
         shell: pwsh
-        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipUi -SkipBundle
+        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipUi -SkipBundle -SkipCollectorBundle
 
-      - name: Sign eidos.msi
+      - name: Sign both MSIs
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -158,7 +158,9 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          files: ${{ github.workspace }}\installer\out\eidos.msi
+          files: |
+            ${{ github.workspace }}\installer\out\eidos.msi
+            ${{ github.workspace }}\installer\out\eidos-collector.msi
           file-digest: SHA256
           timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
           timestamp-digest: SHA256
@@ -175,17 +177,18 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
-      - name: Build bundle (from the signed MSI and UI)
+      - name: Build both bundles (from the signed MSIs and UI)
         shell: pwsh
-        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipUi
+        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipUi -SkipCollectorMsi
 
-      - name: Detach the Burn engine
+      - name: Detach the Burn engines
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force installer\out\engine | Out-Null
           wix burn detach installer\out\eidos-setup.exe -engine installer\out\engine\burn-engine.exe
+          wix burn detach installer\out\eidos-collector-setup.exe -engine installer\out\engine\burn-engine-collector.exe
 
-      - name: Sign the Burn engine
+      - name: Sign the Burn engines
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -194,7 +197,9 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          files: ${{ github.workspace }}\installer\out\engine\burn-engine.exe
+          files: |
+            ${{ github.workspace }}\installer\out\engine\burn-engine.exe
+            ${{ github.workspace }}\installer\out\engine\burn-engine-collector.exe
           file-digest: SHA256
           timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
           timestamp-digest: SHA256
@@ -211,7 +216,7 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
-      - name: Reattach the signed engine
+      - name: Reattach the signed engines
         id: names
         shell: pwsh
         env:
@@ -225,12 +230,18 @@ jobs:
           $version = $version -replace '[^0-9A-Za-z._-]', '-'
           $setup = "installer\out\eidos-$version-setup.exe"
           $msi = "installer\out\eidos-$version.msi"
+          $collectorSetup = "installer\out\eidos-collector-$version-setup.exe"
+          $collectorMsi = "installer\out\eidos-collector-$version.msi"
           wix burn reattach installer\out\eidos-setup.exe -engine installer\out\engine\burn-engine.exe -o $setup
+          wix burn reattach installer\out\eidos-collector-setup.exe -engine installer\out\engine\burn-engine-collector.exe -o $collectorSetup
           Copy-Item installer\out\eidos.msi $msi
+          Copy-Item installer\out\eidos-collector.msi $collectorMsi
           "setup=$setup" >> $env:GITHUB_OUTPUT
           "msi=$msi" >> $env:GITHUB_OUTPUT
+          "collector_setup=$collectorSetup" >> $env:GITHUB_OUTPUT
+          "collector_msi=$collectorMsi" >> $env:GITHUB_OUTPUT
 
-      - name: Sign the setup bundle
+      - name: Sign both setup bundles
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -239,7 +250,9 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          files: ${{ github.workspace }}\${{ steps.names.outputs.setup }}
+          files: |
+            ${{ github.workspace }}\${{ steps.names.outputs.setup }}
+            ${{ github.workspace }}\${{ steps.names.outputs.collector_setup }}
           file-digest: SHA256
           timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
           timestamp-digest: SHA256
@@ -262,6 +275,8 @@ jobs:
         env:
           SETUP: ${{ steps.names.outputs.setup }}
           MSI: ${{ steps.names.outputs.msi }}
+          COLLECTOR_SETUP: ${{ steps.names.outputs.collector_setup }}
+          COLLECTOR_MSI: ${{ steps.names.outputs.collector_msi }}
         run: |
           function Assert-Signed([string]$path) {
             $signature = Get-AuthenticodeSignature -LiteralPath $path
@@ -278,8 +293,11 @@ jobs:
           Assert-Signed $env:MSI
           Assert-Signed 'installer\out\engine\burn-engine.exe'
           Assert-Signed $env:SETUP
+          Assert-Signed $env:COLLECTOR_MSI
+          Assert-Signed 'installer\out\engine\burn-engine-collector.exe'
+          Assert-Signed $env:COLLECTOR_SETUP
 
-          foreach ($file in @($env:SETUP, $env:MSI)) {
+          foreach ($file in @($env:SETUP, $env:MSI, $env:COLLECTOR_SETUP, $env:COLLECTOR_MSI)) {
             $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $([IO.Path]::GetFileName($file))" | Set-Content -LiteralPath "$file.sha256" -NoNewline
           }
@@ -292,8 +310,14 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           SETUP: ${{ steps.names.outputs.setup }}
           MSI: ${{ steps.names.outputs.msi }}
+          COLLECTOR_SETUP: ${{ steps.names.outputs.collector_setup }}
+          COLLECTOR_MSI: ${{ steps.names.outputs.collector_msi }}
         run: |
-          $assets = @($env:SETUP, "$env:SETUP.sha256", $env:MSI, "$env:MSI.sha256")
+          $assets = @(
+            $env:SETUP, "$env:SETUP.sha256", $env:MSI, "$env:MSI.sha256",
+            $env:COLLECTOR_SETUP, "$env:COLLECTOR_SETUP.sha256",
+            $env:COLLECTOR_MSI, "$env:COLLECTOR_MSI.sha256"
+          )
 
           # gh exits non-zero when the tag has no release yet; that is the
           # ordinary path for a plain `git push origin v1.2.3`.
@@ -325,3 +349,7 @@ jobs:
             ${{ steps.names.outputs.setup }}.sha256
             ${{ steps.names.outputs.msi }}
             ${{ steps.names.outputs.msi }}.sha256
+            ${{ steps.names.outputs.collector_setup }}
+            ${{ steps.names.outputs.collector_setup }}.sha256
+            ${{ steps.names.outputs.collector_msi }}
+            ${{ steps.names.outputs.collector_msi }}.sha256

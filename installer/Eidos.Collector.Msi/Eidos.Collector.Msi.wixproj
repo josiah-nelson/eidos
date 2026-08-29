@@ -1,0 +1,30 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <!--
+    eidos observatory collector package (per-machine only).
+
+    Build through installer\build.ps1, which supplies Version and BinDir, or
+    directly:  dotnet build -c Release -p:Version=0.5.0 -p:BinDir=..\..\target\release
+  -->
+  <PropertyGroup>
+    <!-- WiX v7 requires an explicit Open Source Maintenance Fee EULA gesture. -->
+    <AcceptEula>wix7</AcceptEula>
+    <OutputName>eidos-collector</OutputName>
+    <OutputType>Package</OutputType>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <Version Condition="'$(Version)' == ''">0.5.0</Version>
+    <BinDir Condition="'$(BinDir)' == ''">$(MSBuildThisFileDirectory)..\..\target\release</BinDir>
+    <RepoRoot>$(MSBuildThisFileDirectory)..\..</RepoRoot>
+    <DefineConstants>$(DefineConstants);Version=$(Version);BinDir=$(BinDir);RepoRoot=$(RepoRoot)</DefineConstants>
+    <!--
+      WIX1149: the MSI-native ServiceConfig (MsiServiceConfig table) carries
+      an old SDK caveat, but it is the only way to set delayed auto-start and
+      the pre-shutdown delay without a custom action; util:ServiceConfig
+      covers failure actions only. Both are verified after install.
+    -->
+    <SuppressSpecificWarnings>1149</SuppressSpecificWarnings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="7.0.0" />
+  </ItemGroup>
+</Project>

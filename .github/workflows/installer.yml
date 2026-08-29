@@ -45,7 +45,7 @@ jobs:
         env:
           EIDOS_REQUIRE_WEB: "1"
         run: cargo build --locked --bin eidos
-      - name: Build MSI, setup UI and bundle
+      - name: Build both MSIs, the setup UI and both bundles
         shell: pwsh
         run: .\installer\build.ps1 -SkipWeb -SkipRust -BinDir target\debug
       - name: Silent per-user install, health check, uninstall
@@ -71,9 +71,91 @@ jobs:
           if (Get-Process eidos -ErrorAction SilentlyContinue) { throw "eidos.exe still running after uninstall" }
           if (Test-Path "$env:LOCALAPPDATA\eidos") { throw "data directory left behind" }
           if (Test-Path "$env:LOCALAPPDATA\Programs\eidos") { throw "program directory left behind" }
+      - name: Silent collector install and status
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          function Run-Setup([string]$exe, [string]$arguments) {
+            $p = [Diagnostics.Process]::Start($exe, $arguments)
+            if (-not $p.WaitForExit(480000)) { $p.Kill(); throw "collector setup did not finish: $arguments" }
+            return $p.ExitCode
+          }
+          $log = "$env:RUNNER_TEMP\eidos-collector-ci.log"
+          $key = '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff'
+          $setup = "installer\out\eidos-collector-setup.exe"
+          $code = Run-Setup $setup "/quiet /log `"$log`" EIDOS_STUDY_KEY=$key EIDOS_LANES=usn,content EIDOS_UPLOAD=$env:RUNNER_TEMP\drop EIDOS_UPLOAD_HOUR=0"
+          if ($code -ne 0) { Get-Content $log | Select-Object -Last 40; throw "install exit $code" }
+
+          $state = (Get-Service eidos-collector).Status
+          if ($state -ne 'Running') { throw "service is $state" }
+          $status = & 'C:\Program Files\eidos-collector\eidos.exe' observe status | ConvertFrom-Json
+          if (-not $status.capabilities.windows.study_key_available) { throw "the study key was not imported" }
+          if (-not $status.lanes.usn) { throw "the usn lane is off" }
+          $config = Get-Content 'C:\ProgramData\eidos-collector\config.json' -Raw | ConvertFrom-Json
+          if (-not $config.lanes.content.enabled) { throw "EIDOS_LANES did not reach config.json" }
+          # 0 is a legitimate hour, and a bundle variable holding "0" is
+          # false to Burn unless the condition compares it as a string.
+          if ($config.upload.hour -ne 0) { throw "EIDOS_UPLOAD_HOUR=0 did not reach config.json" }
+
+      - name: Collector upgrade keeps the host's own configuration
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          # A runtime choice the upgrade must not overwrite, and the identity
+          # it must not rotate.
+          & 'C:\Program Files\eidos-collector\eidos.exe' observe lanes --enumeration on
+          $before = Get-Content 'C:\ProgramData\eidos-collector\config.json' -Raw | ConvertFrom-Json
+          $key = (Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash
+
+          # Real work in flight, so the upgrade has to stop a collector that
+          # is doing something: an unstoppable service fails the upgrade with
+          # error 1921 and rolls it back.
+          1..200 | ForEach-Object { Set-Content "$env:RUNNER_TEMP\churn-$_.txt" "change $_" }
+          Start-Sleep -Seconds 10
+
+          $out = "$env:GITHUB_WORKSPACE\installer\out\upgrade"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          foreach ($project in 'Eidos.Collector.Msi', 'Eidos.Collector.Bundle') {
+            Remove-Item -Recurse -Force "installer\$project\obj", "installer\$project\bin" -ErrorAction SilentlyContinue
+          }
+          dotnet build installer\Eidos.Collector.Msi\Eidos.Collector.Msi.wixproj -c Release -nologo -v minimal `
+            -p:Version=99.0.0 -p:BinDir="$env:GITHUB_WORKSPACE\target\debug" -p:OutDir="$out\"
+          dotnet build installer\Eidos.Collector.Bundle\Eidos.Collector.Bundle.wixproj -c Release -nologo -v minimal `
+            -p:Version=99.0.0 -p:MsiPath="$out\eidos-collector.msi" -p:OutDir="$out\"
+
+          # No properties: the upgrade must leave every choice alone.
+          $log = "$env:RUNNER_TEMP\eidos-collector-upgrade.log"
+          $p = [Diagnostics.Process]::Start("$out\eidos-collector-setup.exe", "/quiet /log `"$log`"")
+          if (-not $p.WaitForExit(480000)) { $p.Kill(); throw "the upgrade did not finish" }
+          if ($p.ExitCode -ne 0) { Get-Content $log | Select-Object -Last 60; throw "upgrade exit $($p.ExitCode)" }
+
+          if ((Get-Service eidos-collector).Status -ne 'Running') { throw "the service is not running after the upgrade" }
+          if ((Get-ItemProperty 'HKLM:\Software\eidos-collector').Version -ne '99.0.0') { throw "the upgrade did not replace the product" }
+          $after = Get-Content 'C:\ProgramData\eidos-collector\config.json' -Raw | ConvertFrom-Json
+          if (-not $after.lanes.enumeration.enabled) { throw "the upgrade overwrote a runtime lane change" }
+          if ($after.upload.destination -ne $before.upload.destination) { throw "the upgrade changed the upload destination" }
+          if ($after.upload.hour -ne $before.upload.hour) { throw "the upgrade changed the upload hour" }
+          if ((Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash -ne $key) { throw "the upgrade replaced the study key" }
+
+      - name: Collector uninstall removes the service and the data
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $log = "$env:RUNNER_TEMP\eidos-collector-uninstall.log"
+          $setup = "installer\out\upgrade\eidos-collector-setup.exe"
+          $p = [Diagnostics.Process]::Start($setup, "/quiet /uninstall /log `"$log`" EIDOS_COLLECTOR_REMOVE_DATA=1")
+          if (-not $p.WaitForExit(480000)) { $p.Kill(); throw "the uninstall did not finish" }
+          if ($p.ExitCode -ne 0) { Get-Content $log | Select-Object -Last 60; throw "uninstall exit $($p.ExitCode)" }
+          if (Get-Service eidos-collector -ErrorAction SilentlyContinue) { throw "the service is still registered" }
+          if (Get-Process eidos -ErrorAction SilentlyContinue) { throw "eidos.exe still running after uninstall" }
+          if (Test-Path 'C:\ProgramData\eidos-collector') { throw "data directory left behind" }
+          if (Test-Path 'C:\Program Files\eidos-collector') { throw "program directory left behind" }
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: eidos-setup-unsigned
           path: |
             installer/out/eidos-setup.exe
             installer/out/eidos.msi
+            installer/out/eidos-collector-setup.exe
+            installer/out/eidos-collector.msi
