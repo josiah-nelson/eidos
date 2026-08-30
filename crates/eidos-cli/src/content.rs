@@ -1,5 +1,5 @@
-//! `eidos content`: operator controls for content jobs in the running
-//! service (currently retrying failures).
+//! `eidos content`: operator controls for content work in the running
+//! service — pausing and resuming extraction, and retrying failures.
 
 use anyhow::{bail, Context};
 use clap::{Args, Subcommand};
@@ -15,6 +15,29 @@ pub struct ContentArgs {
 
 #[derive(Subcommand, Debug)]
 enum ContentCommand {
+    /// Report what extraction is doing and how complete content search is.
+    Status {
+        /// Print the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop claiming new content jobs.
+    ///
+    /// Batches already claimed finish, commit, and publish normally, so
+    /// nothing in flight is abandoned. The queue is left alone and the pause
+    /// survives a service restart — `eidos content resume` is the only way
+    /// back.
+    Pause {
+        /// Print the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Claim content jobs again after a pause.
+    Resume {
+        /// Print the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
     /// Requeue failed content work: one job by id, or a whole source.
     ///
     /// Transient failures already retry on their own; this is for the
@@ -50,6 +73,16 @@ enum ContentCommand {
 
 pub fn run(args: ContentArgs) -> anyhow::Result<()> {
     match args.command {
+        ContentCommand::Status { json } => {
+            let value: serde_json::Value = ureq::get(format!("{}/api/content/status", args.url))
+                .call()
+                .context("read content status")?
+                .body_mut()
+                .read_json()?;
+            print_status(&value, json)?;
+        }
+        ContentCommand::Pause { json } => switch(&args.url, "pause", json)?,
+        ContentCommand::Resume { json } => switch(&args.url, "resume", json)?,
         ContentCommand::Retry {
             job,
             source,
@@ -88,6 +121,33 @@ pub fn run(args: ContentArgs) -> anyhow::Result<()> {
                 print_report(&value);
             }
         }
+    }
+    Ok(())
+}
+
+/// Flip the pause and report the state that came back, so the operator sees
+/// in one step whether workers stopped outright or are still draining.
+fn switch(base: &str, action: &str, json: bool) -> anyhow::Result<()> {
+    let value: serde_json::Value = ureq::post(format!("{base}/api/content/{action}"))
+        .send_empty()
+        .with_context(|| format!("{action} content extraction"))?
+        .body_mut()
+        .read_json()?;
+    print_status(&value, json)
+}
+
+fn print_status(v: &serde_json::Value, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(v)?);
+        return Ok(());
+    }
+    println!(
+        "content: {}  search: {}",
+        v["flow"].as_str().unwrap_or("unknown"),
+        v["search"].as_str().unwrap_or("unknown"),
+    );
+    if let Some(detail) = v["detail"].as_str() {
+        println!("  {detail}");
     }
     Ok(())
 }

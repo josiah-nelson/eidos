@@ -6,7 +6,7 @@ export type ApiInt = string;
 
 export type ActivitySourceView = { source_id: SourceId, name: string, state: SourceState, content_enabled: boolean, content_concurrency: number, content_reserved: number, content_peak_reserved: number, jobs_queued: ApiInt, jobs_running: ApiInt, jobs_failed: ApiInt, jobs_failed_bytes: ApiInt, content_states: { [key in string]: ApiInt }, content_bytes_indexed: ApiInt, reconciliation_deferred?: ReconciliationDeferral, };
 
-export type ActivityView = { content_enabled: boolean, startup_recovery: StartupRecovery, jobs: JobCounts, content: ContentStats, archives: ArchiveStats, workers: ContentWorkersView, follower: FollowerView, content_index_documents: ApiInt, content_rebuild: RebuildStatus, admission: AdmissionView, catalog_writer: CatalogWriterStats, sources: Array<ActivitySourceView>, recent_failures: Array<JobRecord>, };
+export type ActivityView = { content_enabled: boolean, content_status: ContentStatusView, startup_recovery: StartupRecovery, jobs: JobCounts, content: ContentStats, archives: ArchiveStats, workers: ContentWorkersView, follower: FollowerView, content_index_documents: ApiInt, content_rebuild: RebuildStatus, admission: AdmissionView, catalog_writer: CatalogWriterStats, sources: Array<ActivitySourceView>, recent_failures: Array<JobRecord>, };
 
 export type AddSourceBody = { name: string, root_path: string, kind?: SourceKind | null, aliases: Array<string>, scan: boolean, };
 
@@ -40,15 +40,21 @@ export type ChildrenQuery = { sort: ChildSort, desc: boolean, offset: ApiInt, li
 
 export type ChildrenView = { path: string | null, parent_id: ObjectId | null, source: SourceCompleteness, rows: Array<ChildRow>, total: ApiInt, offset: ApiInt, };
 
+export type ContentFlow = "disabled" | "stopped" | "draining" | "waiting" | "running";
+
 export type ContentId = string;
 
 export type ContentPolicyBody = { enabled?: boolean | null, concurrency?: number | null, };
 
 export type ContentPreview = { object_id: ObjectId, path: string | null, generation: number, object_generation: number, stale: boolean, state: ContentState, coverage: Coverage, indexed_bytes: ApiInt, total_bytes: ApiInt, chunk_count: number, line_count: ApiInt, encoding: string | null, reason: string | null, requested_ordinal: number, chunks: Array<PreviewChunk>, has_more_before: boolean, has_more_after: boolean, truncated: boolean, limits: PreviewLimits, };
 
+export type ContentSearchState = "ready" | "rebuilding" | "failed" | "disabled";
+
 export type ContentState = "pending" | "indexed" | "partial" | "failed" | "excluded" | "unsupported" | "stale" | "not_applicable" | "not_replicated";
 
 export type ContentStats = { by_state: { [key in string]: [ApiInt, ApiInt, ApiInt] }, total_records: ApiInt, indexed_bytes: ApiInt, chunks: ApiInt, };
+
+export type ContentStatusView = { search: ContentSearchState, detail: string, enabled: boolean, paused: boolean, paused_since_unix_s?: ApiInt, flow: ContentFlow, flow_reason: string, in_flight: number, rebuild: RebuildStatus, };
 
 export type ContentSummary = { state: ContentState, coverage: Coverage, generation?: number, indexed_bytes?: ApiInt, content_id?: string, reason?: string, };
 
@@ -130,7 +136,7 @@ export type ForgetView = { retired_sources: ApiInt, };
 
 export type Freshness = "live" | "periodic" | "unknown";
 
-export type Health = { version: string, schema_version: number, host: string, uptime_s: ApiInt, catalog_path: string, sources: number, running_scans: number, export_max_rows: ApiInt, };
+export type Health = { version: string, schema_version: number, host: string, uptime_s: ApiInt, catalog_path: string, sources: number, running_scans: number, export_max_rows: ApiInt, content_status: ContentStatusView, };
 
 export type Hit = { object_id: ObjectId, entry_id?: EntryId, source_id: SourceId, host_id: HostId, kind: ObjectKind, name: string, path?: string, parent_id?: ObjectId, extension: string, size: ApiInt, allocated_size: ApiInt, modified?: UnixNanos, created?: UnixNanos, changed?: UnixNanos, attributes: FileAttributes, hard_link_count: number, content: ContentSummary, score?: number, snippets?: Array<Snippet>, directory?: DirectorySummary, archive?: ArchiveSummary, source_state: SourceState, };
 

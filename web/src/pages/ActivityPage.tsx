@@ -1,7 +1,13 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
-import { api, type ActivitySourceView, type ApiInt, type RetryReport } from '../api'
+import {
+  api,
+  type ActivitySourceView,
+  type ApiInt,
+  type ContentStatusView,
+  type RetryReport,
+} from '../api'
 import { ErrorBox, Spinner, StateBadge } from '../components'
 import { bytes, count, duration, integerNumber, when } from '../format'
 
@@ -17,6 +23,60 @@ function StateBar({ states }: { states: Record<string, ApiInt> }) {
         <span key={k} className={`seg ${k}`} style={{ width: `${(100 * value(k)) / total}%` }} />
       ))}
     </div>
+  )
+}
+
+const FLOW_BADGE: Record<ContentStatusView['flow'], string> = {
+  disabled: 'warn',
+  stopped: 'warn',
+  draining: 'warn',
+  waiting: 'info',
+  running: 'ok',
+}
+
+const SEARCH_BADGE: Record<ContentStatusView['search'], string> = {
+  ready: 'ok',
+  rebuilding: 'warn',
+  failed: 'bad',
+  disabled: 'warn',
+}
+
+// Pause/resume for the whole extraction pipeline. The server answers the
+// switch with the state it produced, so the badge next to the button is the
+// service's own answer rather than an optimistic guess — which matters
+// because pausing a busy service lands on "draining", not "stopped".
+//
+// `--no-content` is a process setting chosen at start-up: there is nothing
+// to resume into, so the button is not offered at all.
+function ContentControl({ content }: { content: ContentStatusView }) {
+  const qc = useQueryClient()
+  const toggle = useMutation({
+    mutationFn: () => api.setContentPaused(!content.paused),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['activity'] }),
+  })
+  return (
+    <>
+      {toggle.isError && <span className="badge bad">{(toggle.error as Error).message}</span>}
+      <span className={`badge ${SEARCH_BADGE[content.search]}`} title={content.detail}>
+        content search {content.search}
+      </span>
+      <span className={`badge ${FLOW_BADGE[content.flow]}`} title={content.flow_reason}>
+        extraction {content.flow}
+      </span>
+      {content.enabled && (
+        <button
+          onClick={() => toggle.mutate()}
+          disabled={toggle.isPending}
+          title={
+            content.paused
+              ? 'Claim content jobs again'
+              : 'Stop claiming new jobs; batches already claimed finish and publish. Survives a restart.'
+          }
+        >
+          {content.paused ? 'Resume extraction' : 'Pause extraction'}
+        </button>
+      )}
+    </>
   )
 }
 
@@ -194,10 +254,11 @@ export default function ActivityPage() {
       <div className="toolbar">
         <h1 style={{ margin: 0 }}>Activity</h1>
         <div style={{ flex: 1 }} />
-        <span className={`badge ${a.content_enabled ? 'ok' : 'warn'}`}>
-          content extraction {a.content_enabled ? 'running' : 'paused (--no-content)'}
-        </span>
+        <ContentControl content={a.content_status} />
       </div>
+      <p className="muted small" style={{ marginTop: 0 }}>
+        {a.content_status.detail}
+      </p>
 
       <div className="stats">
         <div className="stat">
@@ -231,6 +292,16 @@ export default function ActivityPage() {
           <div className="sub">
             chunk documents · {count(w.commits)} commits · {count(w.uncommitted_documents)} uncommitted ·{' '}
             {count(w.pending_publish)} awaiting publish
+          </div>
+        </div>
+        <div className="stat">
+          <div className="label">Index rebuild</div>
+          <div className="value">{a.content_status.rebuild.phase}</div>
+          <div className="sub">
+            {a.content_status.rebuild.phase === 'idle'
+              ? 'index complete with respect to stored chunks'
+              : `${count(a.content_status.rebuild.docs)} of ${count(a.content_status.rebuild.chunks)} documents · ${duration(a.content_status.rebuild.elapsed_ms)}`}
+            {a.content_status.rebuild.error ? ` · ${a.content_status.rebuild.error}` : ''}
           </div>
         </div>
         <div className="stat">

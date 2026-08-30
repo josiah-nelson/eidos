@@ -334,6 +334,46 @@ virtual paths, queued/running jobs, an unfinished content publication, and an
 open scan. It asserts a healthy catalog projection and content index reopen
 without rebuild, then checks the exact recovery counters and Activity JSON.
 
+### Pausing content extraction
+
+Extraction is the one background job that reads the source volumes
+continuously. `eidos content pause` stops it without stopping the service:
+
+```powershell
+eidos content pause      # stop claiming new content jobs
+eidos content status     # flow, content-search state, and why
+eidos content resume     # claim again
+```
+
+A pause stops **claiming**, nothing else. A batch a worker already holds runs
+to completion, commits, and publishes normally, so pausing never abandons
+work in flight or costs the extraction already paid for — which is why the
+state right after a pause on a busy service is `draining`, not `stopped`.
+Topping the queue up stops with claiming (that catalog load is part of what
+an operator is pausing); commits do not, because a draining worker's output
+must still reach search. The queue itself is durable and waits for the
+resume.
+
+**The pause survives a restart.** It is recorded in `content-pause.json` in
+the data directory and removed on resume; the file's presence is the flag.
+An operator who pauses because a volume is busy should not get the load back
+because the service was restarted or crashed. `eidos content resume` is the
+only way back — or deleting the marker with the service stopped.
+`--no-content` is the separate *process* switch: chosen at start-up, not
+persisted, and it outranks a pause in what the status reports, because
+resuming a `--no-content` process would change nothing. See
+[ADR-0025](adr/0025-durable-operator-content-pause.md).
+
+`content_status` on `GET /api/health` and `GET /api/activity`,
+`GET /api/content/status`, `eidos activity`, and the Activity page all render
+one derived value, so they cannot disagree about whether the pipeline is
+`disabled`, `stopped`, `draining`, `waiting`, or `running`, or about whether
+content search is `ready`, `rebuilding`, `failed`, or `disabled`. `waiting`
+distinguishes "nothing queued, or every source at its concurrency budget"
+from a pipeline that is actually stopped. `ActivityView.content_enabled` is
+retained unchanged for compatibility and is the same bit as
+`content_status.enabled`.
+
 Transient failures (share offline, sharing violation) retry on their own with
 exponential backoff. Deterministic, corrupt, unsupported, and resource-limit
 failures are terminal on purpose: they come back only through an explicit

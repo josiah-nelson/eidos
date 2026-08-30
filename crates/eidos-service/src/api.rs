@@ -56,6 +56,7 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
             get(crate::content_preview::object_content),
         )
         .route("/sources/{id}/archives", post(requeue_archives))
+        .merge(crate::content_control::routes())
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())
         .merge(crate::fleet_api::routes())
@@ -239,6 +240,12 @@ pub(crate) struct Health {
     running_scans: usize,
     /// Hard cap on rows a single `/api/search/export` may emit.
     export_max_rows: u64,
+    /// Whether content extraction is running, paused, or draining, and how
+    /// complete content search is. Derived by
+    /// [`crate::content_control::content_status`], the same function
+    /// `/api/activity` and the CLI use, so a health check and the Activity
+    /// page can never disagree about the pipeline.
+    content_status: crate::content_control::ContentStatusView,
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
@@ -258,6 +265,7 @@ async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
         sources: sources.len(),
         running_scans: running,
         export_max_rows: st.export.max_rows,
+        content_status: crate::content_control::content_status(&st),
     }))
 }
 
@@ -1050,7 +1058,13 @@ pub struct ActivitySourceView {
 
 #[derive(Serialize, TS)]
 pub struct ActivityView {
+    /// Process-level switch only. Kept for compatibility within this schema
+    /// version; `content_status.enabled` is the same bit, and
+    /// `content_status` carries the operator pause and drain state that this
+    /// boolean cannot express.
     pub content_enabled: bool,
+    /// Extraction flow, operator pause, and content-search completeness.
+    pub content_status: crate::content_control::ContentStatusView,
     /// Durable scan/job repairs performed synchronously at this process start.
     pub startup_recovery: crate::state::StartupRecovery,
     pub jobs: eidos_catalog::jobs::JobCounts,
@@ -1104,6 +1118,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
             content_enabled: st2
                 .content_enabled
                 .load(std::sync::atomic::Ordering::Relaxed),
+            content_status: crate::content_control::content_status(&st2),
             startup_recovery: st2.startup_recovery,
             jobs: st2.catalog.job_counts(None)?,
             content: st2.catalog.content_stats(None)?,

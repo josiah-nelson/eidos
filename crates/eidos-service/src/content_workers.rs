@@ -11,6 +11,11 @@
 //! reserved atomically inside the claiming transaction (see
 //! [`reserve_and_claim`] and [`crate::source_budget`]), and the RAII
 //! reservation is released when the batch ends, however it ends.
+//!
+//! Claiming is gated by three independent conditions — the process switch,
+//! the operator pause, and an index rebuild that owns the writer. All three
+//! stop *new claims* only; see [`crate::content_control`] for what the
+//! operator sees and why the pause is durable.
 
 use crate::source_budget::{SourceConcurrencyView, SourceReservation};
 use crate::state::AppState;
@@ -197,6 +202,28 @@ pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
 /// Jobs claimed per worker round trip (all from one source).
 pub const CLAIM_BATCH: u32 = 16;
 
+/// Whether a worker may claim a new batch right now.
+///
+/// Three independent conditions stop claiming, and every one of them stops
+/// *only* claiming:
+///
+/// - `--no-content`, the process switch chosen at start-up;
+/// - an operator pause, which is durable (see [`crate::content_control`]);
+/// - a content-index rebuild, which owns the index writer — a job claimed
+///   during one would sit on that gate holding its source budget.
+///
+/// A batch claimed a moment before any of them turned on is already past
+/// this check and runs to completion in [`run_batch`]: it commits and
+/// publishes normally, is never left stranded in `running` for startup
+/// recovery to repair, and the extraction already paid for is never
+/// discarded. This is the whole reason the gate is here, in front of the
+/// claim, rather than inside the batch loop.
+pub fn claiming_allowed(state: &AppState) -> bool {
+    state.content_enabled.load(Ordering::Relaxed)
+        && !state.content_pause.is_paused()
+        && !state.content_index.is_rebuilding()
+}
+
 /// Reserve one unit of a source's content budget and claim a batch from
 /// exactly that source.
 ///
@@ -227,10 +254,7 @@ fn worker_loop(state: &AppState, name: &str) {
         if state.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        if !state.content_enabled.load(Ordering::Relaxed) || state.content_index.is_rebuilding() {
-            // Nothing is claimed while the index is being rebuilt: the
-            // rebuild owns the writer, and a claimed job would only sit on
-            // the gate holding its source budget.
+        if !claiming_allowed(state) {
             std::thread::sleep(IDLE_SLEEP);
             continue;
         }
@@ -372,11 +396,28 @@ fn coordinator_loop(state: &AppState) {
             }
             last_commit = Instant::now();
         }
+        // Commits above run regardless: a paused pipeline must still publish
+        // what its draining workers extracted.
         if state.content_enabled.load(Ordering::Relaxed)
             && last_enqueue.elapsed() >= ENQUEUE_INTERVAL
         {
             last_enqueue = Instant::now();
-            if let Err(e) = top_up_queue(state) {
+            // Topping the queue up walks every source and writes new job
+            // rows — exactly the catalog load an operator pauses to stop.
+            // The backlog is durable, so it is still there at resume.
+            //
+            // Budgets are reconciled either way. A `content_concurrency`
+            // change made while paused has to be in force the moment
+            // claiming resumes, not up to ENQUEUE_INTERVAL afterwards, and
+            // a source added while paused must have a budget to admit work
+            // against. A pause stops claiming; it is not a reason for the
+            // rest of the pipeline's bookkeeping to go stale.
+            let outcome = if state.content_pause.is_paused() {
+                refresh_budgets(state).map(|_| 0)
+            } else {
+                top_up_queue(state)
+            };
+            if let Err(e) = outcome {
                 tracing::error!(error = %e, "content enqueue failed");
                 *status.last_error.lock() = Some(e.to_string());
             }

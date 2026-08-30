@@ -52,7 +52,7 @@ fn print_activity(v: &serde_json::Value) {
     let recovery = &v["startup_recovery"];
     println!(
         "content: {}  workers: {}  throughput: {}/s  indexed: {} files / {}  unsupported: {}  failed: {}  retried: {}",
-        if v["content_enabled"].as_bool().unwrap_or(false) { "on" } else { "off" },
+        g(v, "content_status.flow").as_str().unwrap_or("unknown"),
         n(w, "workers"),
         crate::profile::human_bytes(w["throughput_bytes_per_s"].as_f64().unwrap_or(0.0) as u64),
         n(w, "files_indexed"),
@@ -61,6 +61,11 @@ fn print_activity(v: &serde_json::Value) {
         n(w, "files_failed"),
         n(w, "files_retried"),
     );
+    // The one line that explains a stalled queue: paused, draining, waiting
+    // on a rebuild, or simply out of work.
+    if let Some(detail) = g(v, "content_status.detail").as_str() {
+        println!("  {detail}");
+    }
     println!(
         "jobs: queued {}  running {}  failed {}  oldest queued {} s   commits {}  pending publish {}  uncommitted docs {}  content index docs {}",
         n(v, "jobs.queued"),
