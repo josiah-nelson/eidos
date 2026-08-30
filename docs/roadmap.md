@@ -19,13 +19,20 @@ Each release has explicit non-goals. A release is not complete because the UI
 shows a plausible demo; its correctness, crash recovery, completeness reporting,
 and performance gates must pass.
 
-## 2. v0.5: trustworthy single-host Windows indexer
+## 2. v0.5: trustworthy Windows indexer and private dogfood fleet
 
 Product statement:
 
 > Prefer this over Everything on one Windows host because it retains comparable
 > metadata responsiveness while adding trustworthy literal-content search,
 > folder analytics, directory predicates, and a modern web UI.
+
+The standalone product remains the release floor. The targeted
+[v0.5 dogfood-fleet sprint](v0.5-dogfood-fleet-sprint.md) adds one manually
+configured central, explicit enrollment, bidirectional connection initiation,
+real metadata replication, and an optional profiling collector before the
+signed release. It is a measured private-fleet vertical slice, not the full v1
+control plane.
 
 ### 2.1 Milestone 0: repository and benchmark foundation
 
@@ -158,9 +165,26 @@ Exit gates:
   are provisioned externally (never stored in the repository);
 - all v0.5 performance and reliability gates pass.
 
-### 2.7 v0.5 non-goals
+### 2.7 Targeted dogfood-fleet release sprint
 
-- central fleet service and agents
+The final v0.5 sprint deliberately brings forward the smallest real fleet
+topology needed to test the synchronization architecture against several
+personal Windows machines. Its execution order, transport and enrollment
+boundary, chunking bakeoff, failure matrix, unified installer, and release
+gates are defined in
+[v0.5-dogfood-fleet-sprint.md](v0.5-dogfood-fleet-sprint.md).
+
+The scope brought forward from v1 is limited to a manual central, explicitly
+enrolled Windows nodes with complete local fallback, authenticated sessions
+that either peer may initiate, durable metadata replication, central search,
+and an experimental content-transfer bakeoff. The rest of the v1 fleet product
+remains below.
+
+### 2.8 v0.5 non-goals
+
+- automatic fleet discovery and polished enrollment or policy UI
+- multiple centrals, central HA, failover, and peer-to-peer search
+- remote file open/download routing
 - macOS/Linux
 - recursive archive content
 - PDF/Office/email extraction
@@ -180,8 +204,10 @@ Product statement:
 ### 3.1 Agent and central service
 
 - Split the v0.5 scanner contract into a Windows agent.
-- Add versioned, idempotent agent transport and durable local outbox.
-- Add central source leases, ingest, global search, and host health.
+- Promote the experimental v0.5 transport, enrollment, and central ingest path
+  into a supported versioned agent boundary.
+- Add central source leases and complete fleet/host health management around
+  the existing durable ingest and global metadata search slice.
 - Preserve offline sources until explicit age-out/retirement.
 - Add remote file-open/download routing.
 - Add fleet/source/backlog web screens.
