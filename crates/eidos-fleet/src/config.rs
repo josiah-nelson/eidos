@@ -97,11 +97,21 @@ impl FleetConfig {
     }
 
     pub fn max_frame(&self) -> usize {
-        (self.max_frame_bytes as usize).clamp(64 * 1024, 256 * 1024 * 1024)
+        usize::try_from(self.max_frame_bytes)
+            .unwrap_or(usize::MAX)
+            .clamp(64 * 1024, 256 * 1024 * 1024)
     }
 
     pub fn batch_bytes(&self) -> usize {
-        (self.batch_bytes as usize).clamp(64 * 1024, self.max_frame() / 2)
+        let max = self.max_frame() / 2;
+        let min = (64 * 1024).min(max);
+        usize::try_from(self.batch_bytes)
+            .unwrap_or(usize::MAX)
+            .clamp(min, max)
+    }
+
+    pub fn credit_bytes(&self) -> u64 {
+        self.credit_bytes.min(256 * 1024 * 1024)
     }
 }
 
@@ -125,5 +135,23 @@ mod tests {
         assert_eq!(FleetConfig::load(dir.path()).unwrap(), cfg);
         std::fs::write(FleetConfig::path(dir.path()), b"{ nope").unwrap();
         assert!(FleetConfig::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn minimum_frame_configuration_has_a_valid_batch_limit() {
+        let cfg = FleetConfig {
+            max_frame_bytes: 1,
+            batch_bytes: u64::MAX,
+            ..FleetConfig::default()
+        };
+        assert_eq!(cfg.max_frame(), 64 * 1024);
+        assert_eq!(cfg.batch_bytes(), 32 * 1024);
+        assert_eq!(cfg.credit_bytes(), DEFAULT_CREDIT_BYTES);
+
+        let cfg = FleetConfig {
+            credit_bytes: u64::MAX,
+            ..FleetConfig::default()
+        };
+        assert_eq!(cfg.credit_bytes(), 256 * 1024 * 1024);
     }
 }

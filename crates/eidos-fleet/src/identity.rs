@@ -246,11 +246,27 @@ fn restrict_dir(dir: &Path) {
 /// What a central hands an operator to enroll one node: its own
 /// fingerprint (so the node can pin it before trusting anything it says),
 /// where to reach it, and a single-use secret.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InviteCode {
     pub central_fingerprint: [u8; 32],
     pub secret: [u8; 32],
     pub endpoint: String,
+}
+
+impl std::fmt::Debug for InviteCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteCode")
+            .field("central_fingerprint", &hex(&self.central_fingerprint))
+            .field("secret", &"[REDACTED]")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+impl Drop for InviteCode {
+    fn drop(&mut self) {
+        self.secret.fill(0);
+    }
 }
 
 const INVITE_PREFIX: &str = "eidos-fleet-v1";
@@ -348,5 +364,7 @@ mod tests {
             InviteCode::token_hash(&code.secret),
             InviteCode::token_hash(&code.secret)
         );
+        assert!(!format!("{code:?}").contains(&hex(&code.secret)));
+        assert!(format!("{code:?}").contains("REDACTED"));
     }
 }

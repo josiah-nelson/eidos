@@ -193,37 +193,39 @@ pub(crate) fn peer_conn(conn: &Connection, node: NodeId) -> Result<Option<FleetP
     .transpose()
 }
 
+fn upsert_peer_conn(conn: &Connection, peer: &FleetPeer) -> Result<()> {
+    if let Some(existing) = peer_conn(conn, peer.node_id)? {
+        if existing.fingerprint != peer.fingerprint {
+            return Err(CatalogError::InvalidState(format!(
+                "peer {} is already enrolled with a different key",
+                peer.node_id
+            )));
+        }
+    }
+    conn.execute(
+        "INSERT INTO fleet_peers (node_id, name, role, fingerprint, endpoint, enabled, enrolled_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(node_id) DO UPDATE SET name = excluded.name, role = excluded.role,
+            endpoint = excluded.endpoint, enabled = excluded.enabled",
+        params![
+            peer.node_id.0.as_slice(),
+            peer.name,
+            peer.role.as_str(),
+            peer.fingerprint.as_slice(),
+            peer.endpoint,
+            peer.enabled as i64,
+            peer.enrolled_at.0
+        ],
+    )?;
+    Ok(())
+}
+
 impl Catalog {
     /// Admit (or update) a peer. The fingerprint is the trust anchor; a
     /// changed fingerprint for a known node id is refused, because node ids
     /// are derived from keys and a different key is a different node.
     pub fn fleet_upsert_peer(&self, peer: &FleetPeer) -> Result<()> {
-        self.with_writer(|conn| {
-            if let Some(existing) = peer_conn(conn, peer.node_id)? {
-                if existing.fingerprint != peer.fingerprint {
-                    return Err(CatalogError::InvalidState(format!(
-                        "peer {} is already enrolled with a different key",
-                        peer.node_id
-                    )));
-                }
-            }
-            conn.execute(
-                "INSERT INTO fleet_peers (node_id, name, role, fingerprint, endpoint, enabled, enrolled_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(node_id) DO UPDATE SET name = excluded.name, role = excluded.role,
-                    endpoint = excluded.endpoint, enabled = excluded.enabled",
-                params![
-                    peer.node_id.0.as_slice(),
-                    peer.name,
-                    peer.role.as_str(),
-                    peer.fingerprint.as_slice(),
-                    peer.endpoint,
-                    peer.enabled as i64,
-                    peer.enrolled_at.0
-                ],
-            )?;
-            Ok(())
-        })
+        self.with_writer(|conn| upsert_peer_conn(conn, peer))
     }
 
     pub fn fleet_peer(&self, node: NodeId) -> Result<Option<FleetPeer>> {
@@ -363,6 +365,63 @@ impl Catalog {
                     })
                 })
                 .transpose()?
+            };
+            tx.commit()?;
+            Ok(invite)
+        })
+    }
+
+    /// Consume an invitation and admit its peer in the same transaction.
+    /// A crash or roster write failure cannot burn a single-use invitation
+    /// without creating the corresponding roster entry.
+    pub fn fleet_redeem_invite_and_upsert_peer(
+        &self,
+        token_hash: [u8; 32],
+        peer: &FleetPeer,
+    ) -> Result<Option<FleetInvite>> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let now = UnixNanos::now().0;
+            let n = tx.execute(
+                "UPDATE fleet_invites SET used_at = ?2, used_by = ?3
+                 WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
+                params![token_hash.as_slice(), now, peer.node_id.0.as_slice()],
+            )?;
+            let invite = if n == 0 {
+                None
+            } else {
+                let invite = tx.query_row(
+                    "SELECT token_hash, name_hint, created_at, expires_at, used_at, used_by
+                     FROM fleet_invites WHERE token_hash = ?1",
+                    params![token_hash.as_slice()],
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                            r.get::<_, Option<Vec<u8>>>(5)?,
+                        ))
+                    },
+                )?;
+                let invite = FleetInvite {
+                    token_hash: blob32(invite.0, "invite hash")?,
+                    name_hint: invite.1,
+                    created_at: UnixNanos(invite.2),
+                    expires_at: UnixNanos(invite.3),
+                    used_at: invite.4.map(UnixNanos),
+                    used_by: invite
+                        .5
+                        .map(|b| blob16(b, "invite node id").map(NodeId))
+                        .transpose()?,
+                };
+                let mut enrolled = peer.clone();
+                if let Some(hint) = invite.name_hint.as_deref().filter(|hint| !hint.is_empty()) {
+                    enrolled.name = hint.to_string();
+                }
+                upsert_peer_conn(&tx, &enrolled)?;
+                Some(invite)
             };
             tx.commit()?;
             Ok(invite)

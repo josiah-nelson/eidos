@@ -78,6 +78,7 @@ lru = "0.16"
 bytes = "1.12"
 futures-core = "0.3"
 futures-util = "0.3"
+zeroize = "1.8"
 tempfile = "3.27"
 # Web UI embedded in the executable; `debug-embed` keeps dev and release
 # builds identical, `mime-guess` sets content types.

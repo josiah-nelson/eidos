@@ -850,6 +850,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts-rs",
+ "zeroize",
 ]
 
 [[package]]

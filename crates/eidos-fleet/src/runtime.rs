@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
 const CONFIG_POLL: Duration = Duration::from_secs(2);
@@ -37,6 +37,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKFILL_STEP: u32 = 2_000;
 const COLLECT_LIMIT: u32 = 10_000;
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
+/// Bound unauthenticated TLS work and established inbound sessions. Once
+/// full, the OS listener backlog provides the next layer of backpressure.
+const MAX_INBOUND_CONNECTIONS: usize = 64;
 
 struct Dial {
     next: Instant,
@@ -126,9 +129,9 @@ impl Fleet {
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
         self.ctx.registry.close_all();
-        for task in self.tasks.lock().drain(..) {
-            task.abort();
-        }
+        // Let listener_loop observe shutdown and abort its owned accept task.
+        // Aborting the parent here would drop (and detach) that JoinHandle,
+        // leaving the sync socket live after Fleet::shutdown returned.
     }
 
     /// Reload the configuration file now (after a CLI command changed it).
@@ -317,10 +320,16 @@ async fn accept_loop(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
             return;
         }
     };
+    let permits = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
     loop {
+        let permit = match permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         let (tcp, addr) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
+                drop(permit);
                 tracing::warn!(error = %e, "fleet accept failed");
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
@@ -329,6 +338,7 @@ async fn accept_loop(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
         let fleet = fleet.clone();
         let config = config.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             fleet
                 .ctx
                 .counters

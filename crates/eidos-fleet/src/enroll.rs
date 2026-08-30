@@ -2,7 +2,7 @@
 //! fingerprint; a node redeems it over a connection pinned to that
 //! fingerprint, and both sides end up with the other in their roster.
 
-use crate::identity::{hex, InviteCode, NodeIdentity};
+use crate::identity::{hex, node_id_of, InviteCode, NodeIdentity};
 use crate::tls;
 use crate::wire::{self, Message};
 use crate::FleetConfig;
@@ -11,6 +11,7 @@ use eidos_catalog::fleet::{FleetPeer, NodeId, PeerRole};
 use eidos_catalog::Catalog;
 use eidos_domain::UnixNanos;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// How long an invitation stays redeemable.
 pub const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -76,17 +77,25 @@ pub async fn enroll(
         .context("reaching the central")?;
     let (mut rd, mut wr) = tokio::io::split(stream);
     let max = wire::DEFAULT_MAX_FRAME_BYTES;
-    let request = wire::encode(&Message::Enroll {
-        secret: hex(&code.secret),
+    let request = Zeroizing::new(wire::encode(&Message::Enroll {
+        secret: hex(&code.secret).into(),
         name: identity.name.clone(),
         platform: std::env::consts::OS.to_string(),
-    })?;
-    wire::write_frame(&mut wr, &request, max).await?;
+    })?);
+    tokio::time::timeout(timeout, wire::write_frame(&mut wr, &request, max))
+        .await
+        .map_err(|_| anyhow!("sending the enrollment request timed out"))??;
     let (reply, _) = tokio::time::timeout(timeout, wire::read_frame(&mut rd, max))
         .await
         .map_err(|_| anyhow!("the central did not answer in time"))??;
     match reply {
         Message::Enrolled { node_id, name } => {
+            let pinned_node = node_id_of(&code.central_fingerprint);
+            if node_id != pinned_node {
+                return Err(anyhow!(
+                    "the central identity does not match its pinned certificate"
+                ));
+            }
             let peer = FleetPeer {
                 node_id,
                 name: name.clone(),

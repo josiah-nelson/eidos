@@ -16,7 +16,7 @@
 use crate::identity::NodeIdentity;
 use crate::metrics::FleetCounters;
 use crate::status::{Direction, SessionSourceView, SessionView, SyncRole};
-use crate::wire::{self, Family, Hello, Message, Role, PROTOCOL_VERSION};
+use crate::wire::{self, EnrollmentSecret, Family, Hello, Message, Role, PROTOCOL_VERSION};
 use crate::FleetConfig;
 use anyhow::{anyhow, Context};
 use eidos_catalog::fleet::{FleetPeer, NodeId, PeerRole};
@@ -35,7 +35,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Interval of the shipper/keepalive tick.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -44,6 +45,14 @@ pub const TICK: Duration = Duration::from_secs(1);
 pub const IDLE_PING: Duration = Duration::from_secs(30);
 /// Deadline for the hello exchange.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hello and enrollment are deliberately tiny; unknown certificates never
+/// get the full data-frame allocation budget before roster admission.
+const ADMISSION_MAX_FRAME_BYTES: usize = 64 * 1024;
+/// A peer that stops reading cannot hold a session (or shutdown) forever.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// A peer may stay otherwise active while ignoring a source response; bound
+/// those protocol phases independently from the connection keepalive.
+const PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// Backoff before re-offering a fenced source.
 const FENCE_RETRY: Duration = Duration::from_secs(60);
 /// A repair offer for a source with fewer objects than this uses a compact
@@ -82,6 +91,7 @@ impl SessionContext {
 struct Active {
     key: SessionKey,
     close: Arc<AtomicBool>,
+    close_notify: Arc<Notify>,
     view: Arc<Mutex<SessionView>>,
 }
 
@@ -103,6 +113,7 @@ impl Registry {
         peer: NodeId,
         key: SessionKey,
         close: Arc<AtomicBool>,
+        close_notify: Arc<Notify>,
         view: Arc<Mutex<SessionView>>,
     ) -> Result<(), Duplicate> {
         let mut active = self.active.lock();
@@ -111,8 +122,17 @@ impl Registry {
                 return Err(Duplicate);
             }
             existing.close.store(true, Ordering::Relaxed);
+            existing.close_notify.notify_one();
         }
-        active.insert(peer, Active { key, close, view });
+        active.insert(
+            peer,
+            Active {
+                key,
+                close,
+                close_notify,
+                view,
+            },
+        );
         Ok(())
     }
 
@@ -146,6 +166,7 @@ impl Registry {
     pub fn close_all(&self) {
         for a in self.active.lock().values() {
             a.close.store(true, Ordering::Relaxed);
+            a.close_notify.notify_one();
         }
     }
 }
@@ -171,11 +192,25 @@ pub enum SessionEnd {
 #[derive(Debug, Clone)]
 enum ShipPhase {
     Unoffered,
-    Offered,
+    Offered {
+        since: Instant,
+    },
     Idle,
-    InFlight { through_seq: u64, bytes: u64 },
-    Repairing,
-    Fenced { reason: String, since: Instant },
+    InFlight {
+        through_seq: u64,
+        bytes: u64,
+        since: Instant,
+    },
+    Repairing {
+        through_seq: u64,
+        through_chain: ChainHash,
+        leaf_bits: u8,
+        since: Instant,
+    },
+    Fenced {
+        reason: String,
+        since: Instant,
+    },
 }
 
 struct ShipState {
@@ -202,6 +237,20 @@ struct ConsumeState {
     rows: u64,
     phase: String,
     last_error: Option<String>,
+    pending_repair: Option<PendingRepair>,
+}
+
+struct PendingRepair {
+    epoch: SourceEpoch,
+    through_seq: u64,
+    through_chain: ChainHash,
+    leaf_bits: u8,
+    remaining: BTreeSet<u32>,
+    leaves: Vec<u32>,
+    rows: Vec<SyncRow>,
+    objects: BTreeSet<eidos_domain::ObjectId>,
+    bytes: u64,
+    since: Instant,
 }
 
 struct Session<W> {
@@ -214,12 +263,14 @@ struct Session<W> {
     max_frame: usize,
     /// Bytes we may still put in flight towards the peer.
     credit: i64,
+    credit_limit: i64,
     shipping: BTreeMap<SourceId, ShipState>,
     consuming: BTreeMap<SourceId, ConsumeState>,
     last_rx: Instant,
     last_ping: Option<(u64, Instant)>,
     view: Arc<Mutex<SessionView>>,
     close: Arc<AtomicBool>,
+    close_notify: Arc<Notify>,
     started: Instant,
 }
 
@@ -239,6 +290,7 @@ where
 {
     let (mut rd, mut wr) = tokio::io::split(stream);
     let max_frame = ctx.config.read().max_frame();
+    let admission_max = max_frame.min(ADMISSION_MAX_FRAME_BYTES);
     let my_nonce = random_nonce();
     let my_hello = Message::Hello(Hello {
         node_id: ctx.identity.node_id,
@@ -249,7 +301,7 @@ where
         versions: vec![PROTOCOL_VERSION],
         features: vec![],
         max_frame_bytes: max_frame as u64,
-        credit_bytes: ctx.config.read().credit_bytes,
+        credit_bytes: ctx.config.read().credit_bytes(),
     });
 
     // The dialing side speaks first so an accepting central can tell an
@@ -260,12 +312,23 @@ where
         }
     }
     let first =
-        match tokio::time::timeout(HELLO_TIMEOUT, wire::read_frame(&mut rd, max_frame)).await {
+        match tokio::time::timeout(HELLO_TIMEOUT, wire::read_frame(&mut rd, admission_max)).await {
             Ok(Ok((msg, n))) => {
                 ctx.counters.bytes_received(msg.family(), n as u64);
                 msg
             }
-            Ok(Err(e)) => return SessionEnd::Failed(format!("waiting for hello: {e}")),
+            Ok(Err(e)) => {
+                match &e {
+                    wire::FrameError::TooLarge { .. } => {
+                        ctx.counters.add(&ctx.counters.frames_refused_oversize, 1)
+                    }
+                    wire::FrameError::Malformed(_) => {
+                        ctx.counters.add(&ctx.counters.frames_malformed, 1)
+                    }
+                    _ => {}
+                }
+                return SessionEnd::Failed(format!("waiting for hello: {e}"));
+            }
             Err(_) => return SessionEnd::Failed("hello timed out".into()),
         };
 
@@ -308,6 +371,18 @@ where
             return SessionEnd::UnknownPeer;
         }
         (Message::Hello(hello), Some(peer)) => {
+            if peer.node_id != crate::identity::node_id_of(&peer_fingerprint) {
+                let _ = send(
+                    &mut wr,
+                    &Message::Goodbye {
+                        reason: "roster identity does not match the enrolled key".into(),
+                    },
+                    max_frame,
+                    &ctx.counters,
+                )
+                .await;
+                return SessionEnd::UnknownPeer;
+            }
             if hello.node_id != peer.node_id {
                 let _ = send(
                     &mut wr,
@@ -348,10 +423,23 @@ where
                 .await;
                 return SessionEnd::Version;
             }
+            if hello.max_frame_bytes < 64 * 1024 {
+                let _ = send(
+                    &mut wr,
+                    &Message::Goodbye {
+                        reason: "peer frame limit is below the protocol minimum".into(),
+                    },
+                    max_frame,
+                    &ctx.counters,
+                )
+                .await;
+                return SessionEnd::Version;
+            }
             (hello, peer)
         }
-        (Message::Goodbye { reason }, _) => {
-            return SessionEnd::Failed(format!("peer said goodbye: {reason}"))
+        (Message::Goodbye { .. }, None) => return SessionEnd::UnknownPeer,
+        (Message::Goodbye { .. }, Some(_)) => {
+            return SessionEnd::Failed("peer closed during hello".into())
         }
         (other, _) => {
             return SessionEnd::Failed(format!("expected hello, got {}", other.kind()));
@@ -374,6 +462,11 @@ where
         },
     };
     let close = Arc::new(AtomicBool::new(false));
+    let close_notify = Arc::new(Notify::new());
+    let credit = peer_hello
+        .credit_bytes
+        .min(ctx.config.read().credit_bytes())
+        .min(i64::MAX as u64) as i64;
     let view = Arc::new(Mutex::new(SessionView {
         peer: peer.node_id,
         peer_name: peer.name.clone(),
@@ -381,12 +474,18 @@ where
         since: UnixNanos::now(),
         remote_addr,
         last_activity_ms_ago: 0,
-        credit_remaining: peer_hello.credit_bytes.min(i64::MAX as u64) as i64,
+        credit_remaining: credit,
         sources: Vec::new(),
     }));
     if ctx
         .registry
-        .register(peer.node_id, key, close.clone(), view.clone())
+        .register(
+            peer.node_id,
+            key,
+            close.clone(),
+            close_notify.clone(),
+            view.clone(),
+        )
         .is_err()
     {
         ctx.counters.add(&ctx.counters.duplicate_sessions_closed, 1);
@@ -425,11 +524,12 @@ where
         }
     });
 
-    let peer_max = (peer_hello.max_frame_bytes as usize)
-        .min(max_frame)
-        .max(64 * 1024);
+    let peer_max = usize::try_from(peer_hello.max_frame_bytes)
+        .unwrap_or(usize::MAX)
+        .min(max_frame);
     let mut session = Session {
-        credit: peer_hello.credit_bytes.min(i64::MAX as u64) as i64,
+        credit,
+        credit_limit: credit,
         ctx: ctx.clone(),
         writer: wr,
         peer: peer.clone(),
@@ -443,6 +543,7 @@ where
         last_ping: None,
         view,
         close: close.clone(),
+        close_notify,
         started: Instant::now(),
     };
     let mut tick = tokio::time::interval(TICK);
@@ -453,7 +554,7 @@ where
                 Some(Ok((msg, n))) => {
                     session.ctx.counters.bytes_received(msg.family(), n as u64);
                     session.last_rx = Instant::now();
-                    match session.handle(msg).await {
+                    match session.handle(msg, n).await {
                         Ok(true) => {}
                         Ok(false) => break SessionEnd::Closed,
                         Err(e) => break SessionEnd::Failed(e.to_string()),
@@ -489,6 +590,15 @@ where
                 let _ = session.send(&Message::Goodbye { reason: "shutting down".into() }).await;
                 break SessionEnd::Closed;
             }
+            _ = session.close_notify.notified() => {
+                if *shutdown.borrow() {
+                    let _ = session.send(&Message::Goodbye { reason: "shutting down".into() }).await;
+                    break SessionEnd::Closed;
+                }
+                session.ctx.counters.add(&session.ctx.counters.duplicate_sessions_closed, 1);
+                let _ = session.send(&Message::Goodbye { reason: "duplicate session".into() }).await;
+                break SessionEnd::Duplicate;
+            }
         }
     };
     reader.abort();
@@ -506,14 +616,16 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
     wr: &mut W,
     max_frame: usize,
     fingerprint: [u8; 32],
-    secret: String,
+    secret: EnrollmentSecret,
     name: String,
-    platform: String,
+    _platform: String,
 ) -> SessionEnd {
     let reject = |reason: &str| Message::EnrollRejected {
         reason: reason.into(),
     };
     if !ctx.config.read().central {
+        ctx.counters
+            .add(&ctx.counters.connections_refused_unknown_peer, 1);
         let _ = send(
             wr,
             &reject("this installation is not a central"),
@@ -523,7 +635,9 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
         .await;
         return SessionEnd::UnknownPeer;
     }
-    let Some(secret) = crate::identity::unhex::<32>(&secret) else {
+    let Some(secret) = crate::identity::unhex::<32>(secret.as_str()) else {
+        ctx.counters
+            .add(&ctx.counters.connections_refused_unknown_peer, 1);
         let _ = send(
             wr,
             &reject("malformed invitation"),
@@ -533,38 +647,26 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
         .await;
         return SessionEnd::UnknownPeer;
     };
+    let secret = Zeroizing::new(secret);
     let node_id = crate::identity::node_id_of(&fingerprint);
     let hash = crate::InviteCode::token_hash(&secret);
-    let redeemed = ctx.catalog.fleet_redeem_invite(hash, node_id);
+    let fallback_name = sanitize_name(&name);
+    let peer = FleetPeer {
+        node_id,
+        name: fallback_name,
+        role: PeerRole::Node,
+        fingerprint,
+        endpoint: None,
+        enabled: true,
+        enrolled_at: UnixNanos::now(),
+        last_seen_at: Some(UnixNanos::now()),
+        last_error: None,
+    };
+    let redeemed = ctx.catalog.fleet_redeem_invite_and_upsert_peer(hash, &peer);
     match redeemed {
-        Ok(Some(invite)) => {
-            let name = invite
-                .name_hint
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| sanitize_name(&name));
-            let peer = FleetPeer {
-                node_id,
-                name: name.clone(),
-                role: PeerRole::Node,
-                fingerprint,
-                endpoint: None,
-                enabled: true,
-                enrolled_at: UnixNanos::now(),
-                last_seen_at: Some(UnixNanos::now()),
-                last_error: None,
-            };
-            if let Err(e) = ctx.catalog.fleet_upsert_peer(&peer) {
-                let _ = send(
-                    wr,
-                    &reject(&format!("roster: {e}")),
-                    max_frame,
-                    &ctx.counters,
-                )
-                .await;
-                return SessionEnd::Failed(format!("enrolling {node_id}: {e}"));
-            }
+        Ok(Some(_)) => {
             ctx.counters.add(&ctx.counters.enrollments, 1);
-            tracing::info!(node = %node_id, %name, %platform, "enrolled a fleet node");
+            tracing::info!(node = %node_id, "enrolled a fleet node");
             let _ = send(
                 wr,
                 &Message::Enrolled {
@@ -618,10 +720,28 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
+fn sanitize_peer_reason(reason: &str) -> String {
+    let cleaned: String = reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect();
+    if cleaned.is_empty() {
+        "peer rejected the source".into()
+    } else {
+        cleaned
+    }
+}
+
 fn random_nonce() -> u64 {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("entropy");
     u64::from_le_bytes(bytes)
+}
+
+fn replenish_credit(credit: &mut i64, limit: i64, bytes: u64) {
+    let bytes = bytes.min(i64::MAX as u64) as i64;
+    *credit = credit.saturating_add(bytes).min(limit);
 }
 
 async fn send<W: AsyncWrite + Unpin>(
@@ -630,9 +750,25 @@ async fn send<W: AsyncWrite + Unpin>(
     max_frame: usize,
     counters: &FleetCounters,
 ) -> anyhow::Result<usize> {
-    let bytes = wire::encode(msg)?;
-    let n = wire::write_frame(wr, &bytes, max_frame).await?;
+    let mut bytes = wire::encode(msg)?;
+    let result = write_encoded(wr, &bytes, max_frame, msg.kind()).await;
+    if matches!(msg, Message::Enroll { .. }) {
+        bytes.zeroize();
+    }
+    let n = result?;
     counters.bytes_sent(msg.family(), n as u64);
+    Ok(n)
+}
+
+async fn write_encoded<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    bytes: &[u8],
+    max_frame: usize,
+    kind: &str,
+) -> anyhow::Result<usize> {
+    let n = tokio::time::timeout(WRITE_TIMEOUT, wire::write_frame(wr, bytes, max_frame))
+        .await
+        .map_err(|_| anyhow!("writing {kind} frame timed out"))??;
     Ok(n)
 }
 
@@ -650,11 +786,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     /// Handle one inbound message. `Ok(false)` ends the session.
-    async fn handle(&mut self, msg: Message) -> anyhow::Result<bool> {
+    async fn handle(&mut self, msg: Message, frame_bytes: usize) -> anyhow::Result<bool> {
         match msg {
             Message::Hello(_) => Err(anyhow!("unexpected second hello")),
-            Message::Goodbye { reason } => {
-                tracing::debug!(peer = %self.peer.node_id, %reason, "peer closed the session");
+            Message::Goodbye { .. } => {
+                tracing::debug!(peer = %self.peer.node_id, "peer closed the session");
                 Ok(false)
             }
             Message::Ping { nonce } => {
@@ -732,6 +868,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     leaves,
                     rows,
                     final_part,
+                    frame_bytes,
                 )
                 .await?;
                 Ok(true)
@@ -847,8 +984,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 rows: 0,
                 phase: "offered".into(),
                 last_error: None,
+                pending_repair: None,
             });
         entry.head = head_seq;
+        entry.pending_repair = None;
         let reply = match outcome {
             HelloOutcome::Resume {
                 epoch,
@@ -894,6 +1033,28 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     async fn on_batch(&mut self, batch: eidos_catalog::sync::SyncBatch) -> anyhow::Result<()> {
         let remote = batch.source_id;
+        if !self.ctx.config.read().central {
+            self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+            self.send(&Message::Rejected {
+                source: remote,
+                reason: "this side is not a central".into(),
+            })
+            .await?;
+            return Ok(());
+        }
+        if self
+            .consuming
+            .get(&remote)
+            .is_some_and(|state| state.pending_repair.is_some())
+        {
+            self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+            self.send(&Message::Rejected {
+                source: remote,
+                reason: "repair is still in progress".into(),
+            })
+            .await?;
+            return Ok(());
+        }
         let Some(local) = self.consuming.get(&remote).map(|c| c.local) else {
             self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
             self.send(&Message::Rejected {
@@ -993,6 +1154,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         leaf_bits: u8,
         leaf_hashes: Vec<[u8; 32]>,
     ) -> anyhow::Result<()> {
+        if !self.ctx.config.read().central {
+            self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+            self.send(&Message::Rejected {
+                source,
+                reason: "this side is not a central".into(),
+            })
+            .await?;
+            return Ok(());
+        }
         let Some(local) = self.consuming.get(&source).map(|c| c.local) else {
             self.send(&Message::Rejected {
                 source,
@@ -1018,6 +1188,18 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             RepairOfferOutcome::Request { leaf_bits, leaves } => {
                 if let Some(state) = self.consuming.get_mut(&source) {
                     state.phase = format!("repairing {} leaves", leaves.len());
+                    state.pending_repair = Some(PendingRepair {
+                        epoch,
+                        through_seq,
+                        through_chain,
+                        leaf_bits,
+                        remaining: leaves.iter().copied().collect(),
+                        leaves: Vec::new(),
+                        rows: Vec::new(),
+                        objects: BTreeSet::new(),
+                        bytes: 0,
+                        since: Instant::now(),
+                    });
                 }
                 Message::RepairRequest {
                     source,
@@ -1030,6 +1212,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             }
             RepairOfferOutcome::Rejected { reason } => {
                 self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+                if let Some(state) = self.consuming.get_mut(&source) {
+                    state.phase = "fenced".into();
+                    state.last_error = Some(reason.clone());
+                    state.pending_repair = None;
+                }
                 Message::Rejected { source, reason }
             }
         };
@@ -1048,25 +1235,117 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         leaves: Vec<u32>,
         rows: Vec<SyncRow>,
         final_part: bool,
+        frame_bytes: usize,
     ) -> anyhow::Result<()> {
-        let Some(local) = self.consuming.get(&source).map(|c| c.local) else {
+        if !self.ctx.config.read().central {
+            self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+            self.send(&Message::Rejected {
+                source,
+                reason: "this side is not a central".into(),
+            })
+            .await?;
+            return Ok(());
+        }
+        if !self.consuming.contains_key(&source) {
             self.send(&Message::Rejected {
                 source,
                 reason: "hello required before repair".into(),
             })
             .await?;
             return Ok(());
+        }
+
+        // Repair parts are staged in bounded session memory and applied in
+        // one transaction only after the complete requested leaf set has
+        // arrived. A disconnect between parts therefore cannot advance the
+        // durable cursor past leaves that were never installed.
+        let memory_limit = self.ctx.config.read().credit_bytes();
+        let staged: Result<Option<(SourceId, PendingRepair)>, String> = {
+            let state = self.consuming.get_mut(&source).expect("mapped");
+            if let Some(mut pending) = state.pending_repair.take() {
+                let mut invalid = None;
+                if pending.epoch != epoch
+                    || pending.through_seq != through_seq
+                    || pending.through_chain != through_chain
+                    || pending.leaf_bits != leaf_bits
+                {
+                    invalid = Some("repair rows do not match the outstanding request".to_string());
+                }
+                let part_leaves: BTreeSet<u32> = leaves.iter().copied().collect();
+                if invalid.is_none()
+                    && (part_leaves.len() != leaves.len()
+                        || !part_leaves.is_subset(&pending.remaining)
+                        || (part_leaves.is_empty()
+                            && !(final_part && pending.remaining.is_empty())))
+                {
+                    invalid =
+                        Some("repair part has duplicate, unexpected, or empty leaves".to_string());
+                }
+                if invalid.is_none()
+                    && rows.iter().any(|row| {
+                        !part_leaves.contains(&leaf_index(leaf_bits, row.object))
+                            || !pending.objects.insert(row.object)
+                    })
+                {
+                    invalid = Some("repair part has an unexpected or duplicate row".to_string());
+                }
+                let bytes = pending.bytes.checked_add(frame_bytes as u64);
+                if invalid.is_none() && bytes.is_none_or(|bytes| bytes > memory_limit) {
+                    invalid = Some(format!(
+                        "repair response exceeds the {memory_limit}-byte staging limit"
+                    ));
+                }
+                if let Some(reason) = invalid {
+                    state.phase = "fenced".into();
+                    state.last_error = Some(reason.clone());
+                    Err(reason)
+                } else {
+                    pending.bytes = bytes.expect("validated");
+                    for leaf in &part_leaves {
+                        pending.remaining.remove(leaf);
+                    }
+                    pending.leaves.extend(leaves);
+                    pending.rows.extend(rows);
+                    if final_part != pending.remaining.is_empty() {
+                        let reason = "repair final marker does not complete the requested leaves";
+                        state.phase = "fenced".into();
+                        state.last_error = Some(reason.into());
+                        Err(reason.into())
+                    } else if final_part {
+                        Ok(Some((state.local, pending)))
+                    } else {
+                        state.phase = format!("repairing {} leaves", pending.remaining.len());
+                        state.pending_repair = Some(pending);
+                        Ok(None)
+                    }
+                }
+            } else {
+                let reason = "repair rows were not requested".to_string();
+                state.phase = "fenced".into();
+                state.last_error = Some(reason.clone());
+                Err(reason)
+            }
+        };
+        let Some((local, pending)) = (match staged {
+            Ok(staged) => staged,
+            Err(reason) => {
+                self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+                self.send(&Message::Rejected { source, reason }).await?;
+                return Ok(());
+            }
+        }) else {
+            return Ok(());
         };
         let catalog = self.ctx.catalog.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             catalog.replica_apply_repair(
                 local,
-                epoch,
-                through_seq,
-                through_chain,
-                leaf_bits,
-                &leaves,
-                &rows,
+                pending.epoch,
+                pending.through_seq,
+                pending.through_chain,
+                pending.leaf_bits,
+                &pending.leaves,
+                &pending.rows,
             )
         })
         .await
@@ -1083,25 +1362,21 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     .add(&self.ctx.counters.repair_rows_applied, replaced + removed);
                 if let Some(state) = self.consuming.get_mut(&source) {
                     state.applied = through_seq;
-                    state.phase = if final_part {
-                        "repaired".into()
-                    } else {
-                        "repairing".into()
-                    };
+                    state.phase = "repaired".into();
                 }
-                if final_part {
-                    self.ctx.counters.add(&self.ctx.counters.acks_sent, 1);
-                    Message::Ack {
-                        source,
-                        epoch,
-                        through_seq,
-                    }
-                } else {
-                    return Ok(());
+                self.ctx.counters.add(&self.ctx.counters.acks_sent, 1);
+                Message::Ack {
+                    source,
+                    epoch,
+                    through_seq,
                 }
             }
             RepairOutcome::Rejected { reason } => {
                 self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+                if let Some(state) = self.consuming.get_mut(&source) {
+                    state.phase = "fenced".into();
+                    state.last_error = Some(reason.clone());
+                }
                 Message::Rejected { source, reason }
             }
         };
@@ -1124,6 +1399,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if state.epoch != epoch {
             return Ok(());
         }
+        let in_flight = match state.phase {
+            ShipPhase::InFlight { bytes, .. } => bytes,
+            _ => 0,
+        };
         if after_seq > state.head {
             // The peer holds history we no longer have: a rewind. The next
             // offer reports our head and the peer fences it; do not send a
@@ -1132,9 +1411,24 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 reason: format!("peer cursor {after_seq} is beyond our head {}", state.head),
                 since: Instant::now(),
             };
+            replenish_credit(&mut self.credit, self.credit_limit, in_flight);
+            return Ok(());
+        }
+        if after_seq < state.cursor {
+            state.phase = ShipPhase::Fenced {
+                reason: format!("peer cursor regressed from {} to {after_seq}", state.cursor),
+                since: Instant::now(),
+            };
+            replenish_credit(&mut self.credit, self.credit_limit, in_flight);
+            return Ok(());
+        }
+        if after_seq == state.cursor && matches!(state.phase, ShipPhase::InFlight { .. }) {
+            // A delayed duplicate Resume must not release the credit owned
+            // by a newer batch.
             return Ok(());
         }
         state.cursor = after_seq;
+        replenish_credit(&mut self.credit, self.credit_limit, in_flight);
         self.acknowledge_durably(source, after_seq).await?;
         if requires_repair {
             self.ctx.counters.add(&self.ctx.counters.repairs_offered, 1);
@@ -1155,6 +1449,22 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if state.epoch != epoch {
             return Ok(());
         }
+        let in_flight = match state.phase {
+            ShipPhase::InFlight { bytes, .. } => bytes,
+            _ => 0,
+        };
+        if state.cursor != 0 {
+            state.phase = ShipPhase::Fenced {
+                reason: format!(
+                    "full resync would regress durable cursor {} in the same epoch",
+                    state.cursor
+                ),
+                since: Instant::now(),
+            };
+            replenish_credit(&mut self.credit, self.credit_limit, in_flight);
+            return Ok(());
+        }
+        replenish_credit(&mut self.credit, self.credit_limit, in_flight);
         state.cursor = 0;
         state.phase = ShipPhase::Idle;
         self.ship(source).await
@@ -1173,10 +1483,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if state.epoch != epoch {
             return Ok(());
         }
-        if let ShipPhase::InFlight { bytes, .. } = state.phase {
-            self.credit += bytes as i64;
-        }
         if through_seq > state.head {
+            let bytes = match state.phase {
+                ShipPhase::InFlight { bytes, .. } => bytes,
+                _ => 0,
+            };
             state.phase = ShipPhase::Fenced {
                 reason: format!(
                     "peer acknowledged {through_seq} beyond our head {}",
@@ -1184,9 +1495,41 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 ),
                 since: Instant::now(),
             };
+            replenish_credit(&mut self.credit, self.credit_limit, bytes);
             return Ok(());
         }
-        state.cursor = state.cursor.max(through_seq);
+        let bytes = match state.phase {
+            ShipPhase::InFlight {
+                through_seq: expected,
+                bytes,
+                ..
+            } if through_seq == expected => bytes,
+            ShipPhase::InFlight { .. } if through_seq <= state.cursor => return Ok(()),
+            ShipPhase::InFlight {
+                through_seq: expected,
+                bytes,
+                ..
+            } => {
+                state.phase = ShipPhase::Fenced {
+                    reason: format!(
+                        "peer acknowledged {through_seq}, but batch through {expected} is in flight"
+                    ),
+                    since: Instant::now(),
+                };
+                replenish_credit(&mut self.credit, self.credit_limit, bytes);
+                return Ok(());
+            }
+            _ if through_seq <= state.cursor => return Ok(()),
+            _ => {
+                state.phase = ShipPhase::Fenced {
+                    reason: format!("unexpected acknowledgement through {through_seq}"),
+                    since: Instant::now(),
+                };
+                return Ok(());
+            }
+        };
+        replenish_credit(&mut self.credit, self.credit_limit, bytes);
+        state.cursor = through_seq;
         state.phase = ShipPhase::Idle;
         self.acknowledge_durably(source, through_seq).await?;
         self.ship(source).await
@@ -1197,10 +1540,13 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             .counters
             .add(&self.ctx.counters.rejections_received, 1);
         if let Some(state) = self.shipping.get_mut(&source) {
-            if let ShipPhase::InFlight { bytes, .. } = state.phase {
-                self.credit += bytes as i64;
-            }
-            tracing::warn!(peer = %self.peer.node_id, source = source.0, %reason, "peer rejected a source");
+            let reason = sanitize_peer_reason(&reason);
+            let bytes = match state.phase {
+                ShipPhase::InFlight { bytes, .. } => bytes,
+                _ => 0,
+            };
+            replenish_credit(&mut self.credit, self.credit_limit, bytes);
+            tracing::warn!(peer = %self.peer.node_id, source = source.0, "peer rejected a source");
             state.last_error = Some(reason.clone());
             state.phase = ShipPhase::Fenced {
                 reason,
@@ -1219,20 +1565,43 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         leaves: Vec<u32>,
     ) -> anyhow::Result<()> {
         let Some(state) = self.shipping.get(&source) else {
-            return Ok(());
+            return Err(anyhow!("repair requested for an unavailable source"));
         };
-        if state.epoch != epoch || leaf_bits > MAX_FLEET_LEAF_BITS {
-            return Ok(());
+        let request_matches = matches!(
+            state.phase,
+            ShipPhase::Repairing {
+                through_seq: offered_seq,
+                through_chain: offered_chain,
+                leaf_bits: offered_bits,
+                ..
+            } if offered_seq == through_seq
+                && offered_chain == through_chain
+                && offered_bits == leaf_bits
+        );
+        let wanted: BTreeSet<u32> = leaves.iter().copied().collect();
+        if state.epoch != epoch
+            || leaf_bits > MAX_FLEET_LEAF_BITS
+            || !request_matches
+            || wanted.len() != leaves.len()
+            || wanted.iter().any(|leaf| *leaf >= (1u32 << leaf_bits))
+        {
+            return Err(anyhow!("invalid or unsolicited repair request"));
+        }
+        if self.credit <= 0 {
+            return Err(anyhow!("repair requested without remaining credit"));
         }
         let catalog = self.ctx.catalog.clone();
-        let wanted: BTreeSet<u32> = leaves.iter().copied().collect();
         let batch_bytes = self.ctx.config.read().batch_bytes();
+        let repair_budget = self.credit.max(0) as usize;
         // Rows of the requested leaves, grouped so each part stays under
         // the batch limit; a part's leaves are complete within it, since
         // absence from a requested leaf is authoritative.
         let parts = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<RepairParts>> {
             let (state, entries) = catalog.sync_ledger_entries(source)?;
-            if state.head_seq != through_seq || state.head_chain != through_chain {
+            if state.epoch.to_source_epoch() != epoch
+                || state.head_seq != through_seq
+                || state.head_chain != through_chain
+            {
                 // A request for a head we no longer have describes another
                 // history; the next offer restarts the exchange.
                 return Ok(None);
@@ -1249,12 +1618,27 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             }
             let mut parts: Vec<(Vec<u32>, Vec<SyncRow>)> = Vec::new();
             let mut current: (Vec<u32>, Vec<SyncRow>, usize) = (Vec::new(), Vec::new(), 0);
+            let mut total_size = 0usize;
             for (leaf, objects) in by_leaf {
-                let (_, rows) = catalog.sync_rows_for_objects(source, &objects)?;
+                let (row_state, rows) = catalog.sync_rows_for_objects(source, &objects)?;
+                if row_state.epoch.to_source_epoch() != epoch
+                    || row_state.head_seq != through_seq
+                    || row_state.head_chain != through_chain
+                {
+                    return Ok(None);
+                }
                 let size: usize = rows
                     .iter()
                     .map(|r| serde_json::to_vec(r).map(|v| v.len()).unwrap_or(0))
                     .sum();
+                total_size = total_size
+                    .checked_add(size)
+                    .ok_or_else(|| anyhow!("repair response byte count overflow"))?;
+                if total_size > repair_budget {
+                    return Err(anyhow!(
+                        "repair rows exceed the {repair_budget}-byte remaining credit"
+                    ));
+                }
                 if !current.0.is_empty() && current.2 + size > batch_bytes {
                     parts.push((
                         std::mem::take(&mut current.0),
@@ -1270,13 +1654,19 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             Ok(Some(parts))
         })
         .await
-        .context("repair rows task")??;
+        .context("repair rows task")?;
+        let parts = parts?;
         let Some(parts) = parts else {
+            if let Some(state) = self.shipping.get_mut(&source) {
+                state.phase = ShipPhase::Unoffered;
+            }
             return Ok(());
         };
         let count = parts.len();
+        let mut frames = Vec::with_capacity(count);
+        let mut total_bytes = 0u64;
         for (i, (leaves, rows)) in parts.into_iter().enumerate() {
-            self.send(&Message::RepairRows {
+            let message = Message::RepairRows {
                 source,
                 epoch,
                 through_seq,
@@ -1285,13 +1675,36 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 leaves,
                 rows,
                 final_part: i + 1 == count,
-            })
-            .await?;
+            };
+            let bytes = wire::encode(&message)?;
+            if bytes.len() > self.max_frame {
+                return Err(anyhow!(
+                    "repair part of {} bytes exceeds the {}-byte frame limit",
+                    bytes.len(),
+                    self.max_frame
+                ));
+            }
+            total_bytes = total_bytes
+                .checked_add(bytes.len() as u64 + 4)
+                .ok_or_else(|| anyhow!("repair response byte count overflow"))?;
+            frames.push(bytes);
         }
+        if total_bytes > self.credit.max(0) as u64 {
+            return Err(anyhow!(
+                "repair response needs {total_bytes} bytes but only {} bytes of credit remain",
+                self.credit.max(0)
+            ));
+        }
+        for bytes in frames {
+            let n = write_encoded(&mut self.writer, &bytes, self.max_frame, "repair_rows").await?;
+            self.ctx.counters.bytes_sent(Family::Repair, n as u64);
+        }
+        self.credit -= total_bytes as i64;
         if let Some(state) = self.shipping.get_mut(&source) {
             state.phase = ShipPhase::InFlight {
                 through_seq,
-                bytes: 0,
+                bytes: total_bytes,
+                since: Instant::now(),
             };
         }
         Ok(())
@@ -1313,6 +1726,14 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     async fn send_repair_offer(&mut self, source: SourceId) -> anyhow::Result<()> {
+        if self.credit <= 0 {
+            if let Some(ship) = self.shipping.get_mut(&source) {
+                ship.phase = ShipPhase::Offered {
+                    since: Instant::now(),
+                };
+            }
+            return Ok(());
+        }
         let catalog = self.ctx.catalog.clone();
         let configured = self.ctx.config.read().repair_leaf_bits;
         let (state, leaf_bits, hashes) =
@@ -1337,7 +1758,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             .context("merkle task")??;
         let epoch = state.epoch.to_source_epoch();
         if let Some(ship) = self.shipping.get_mut(&source) {
-            ship.phase = ShipPhase::Repairing;
+            ship.phase = ShipPhase::Repairing {
+                through_seq: state.head_seq,
+                through_chain: state.head_chain,
+                leaf_bits,
+                since: Instant::now(),
+            };
             ship.head = state.head_seq;
             ship.epoch = epoch;
         }
@@ -1399,6 +1825,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                         rows = (rows / 2).max(1);
                         continue;
                     }
+                    if bytes.len() > bytes_cap {
+                        return Err(anyhow!(
+                            "one-row batch of {} bytes exceeds the {bytes_cap}-byte batch limit",
+                            bytes.len()
+                        ));
+                    }
                     return Ok(Some((
                         bytes,
                         batch.through_seq,
@@ -1417,7 +1849,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         match encoded {
             Ok(Some((bytes, through_seq, row_count, head))) => {
                 state.head = head;
-                let n = wire::write_frame(&mut self.writer, &bytes, self.max_frame).await?;
+                let wire_bytes = bytes.len() as u64 + 4;
+                if wire_bytes > self.credit.max(0) as u64 {
+                    return Ok(());
+                }
+                let n = write_encoded(&mut self.writer, &bytes, self.max_frame, "batch").await?;
                 self.ctx.counters.bytes_sent(Family::Catalog, n as u64);
                 self.ctx.counters.add(&self.ctx.counters.batches_sent, 1);
                 self.ctx
@@ -1427,6 +1863,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 state.phase = ShipPhase::InFlight {
                     through_seq,
                     bytes: n as u64,
+                    since: Instant::now(),
                 };
                 state.batches += 1;
                 state.rows += row_count;
@@ -1449,6 +1886,47 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     /// Refresh the set of shippable sources, offer new ones, retry fenced
     /// ones after their backoff, keep the peer alive, and publish the view.
     async fn tick(&mut self) -> anyhow::Result<()> {
+        let catalog = self.ctx.catalog.clone();
+        let expected = self.peer.clone();
+        let admitted = tokio::task::spawn_blocking(move || {
+            catalog.fleet_peer(expected.node_id).map(|peer| {
+                peer.is_some_and(|peer| {
+                    peer.enabled
+                        && peer.fingerprint == expected.fingerprint
+                        && peer.role == expected.role
+                })
+            })
+        })
+        .await
+        .context("roster task")??;
+        if !admitted {
+            return Err(anyhow!("peer is no longer admitted by the roster"));
+        }
+        if let Some((source, phase)) = self.shipping.iter().find_map(|(source, state)| {
+            let (name, since) = match &state.phase {
+                ShipPhase::Offered { since } => ("offer", since),
+                ShipPhase::InFlight { since, .. } => ("acknowledgement", since),
+                ShipPhase::Repairing { since, .. } => ("repair request", since),
+                _ => return None,
+            };
+            (since.elapsed() > PROGRESS_TIMEOUT).then_some((*source, name))
+        }) {
+            return Err(anyhow!(
+                "timed out waiting for {phase} progress on source {source}"
+            ));
+        }
+        if let Some(source) = self.consuming.iter().find_map(|(source, state)| {
+            state
+                .pending_repair
+                .as_ref()
+                .filter(|repair| repair.since.elapsed() > PROGRESS_TIMEOUT)
+                .map(|_| *source)
+        }) {
+            return Err(anyhow!(
+                "timed out waiting for repair rows on source {source}"
+            ));
+        }
+
         // Keepalive with a bounded deadline.
         let idle = self.last_rx.elapsed();
         match self.last_ping {
@@ -1466,8 +1944,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // Shipper: what should be offered to this peer right now.
         let catalog = self.ctx.catalog.clone();
         let peer_role = self.peer.role;
+        let consumer = self.peer.node_id.0;
         let shippable = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Vec<(SourceId, eidos_catalog::sync::SyncSourceState)>> {
+            move || -> anyhow::Result<Vec<(SourceId, eidos_catalog::sync::SyncSourceState, u64)>> {
                 // Only a central consumes; offering sources to a node would
                 // only draw rejections.
                 if peer_role != PeerRole::Central {
@@ -1484,7 +1963,13 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     }
                     if let Some(state) = catalog.sync_source(s.id)? {
                         if state.ready {
-                            out.push((s.id, state));
+                            let cursor = catalog
+                                .sync_consumers(s.id)?
+                                .into_iter()
+                                .find(|c| c.consumer_id == consumer)
+                                .map(|c| c.watermark)
+                                .unwrap_or(0);
+                            out.push((s.id, state, cursor));
                         }
                     }
                 }
@@ -1493,11 +1978,21 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         )
         .await
         .context("source scan task")??;
-        let wanted: BTreeSet<SourceId> = shippable.iter().map(|(id, _)| *id).collect();
+        let wanted: BTreeSet<SourceId> = shippable.iter().map(|(id, _, _)| *id).collect();
+        let removed_credit: u64 = self
+            .shipping
+            .iter()
+            .filter(|(id, _)| !wanted.contains(id))
+            .filter_map(|(_, state)| match state.phase {
+                ShipPhase::InFlight { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .sum();
         self.shipping.retain(|id, _| wanted.contains(id));
+        replenish_credit(&mut self.credit, self.credit_limit, removed_credit);
         let mut to_offer: Vec<(SourceId, eidos_catalog::sync::SyncSourceState)> = Vec::new();
         let mut to_ship: Vec<SourceId> = Vec::new();
-        for (id, state) in shippable {
+        for (id, state, durable_cursor) in shippable {
             let epoch = state.epoch.to_source_epoch();
             match self.shipping.get_mut(&id) {
                 None => {
@@ -1505,7 +2000,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                         id,
                         ShipState {
                             epoch,
-                            cursor: 0,
+                            cursor: durable_cursor,
                             head: state.head_seq,
                             phase: ShipPhase::Unoffered,
                             batches: 0,
@@ -1518,6 +2013,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 Some(ship) => {
                     ship.head = state.head_seq;
                     if ship.epoch != epoch {
+                        let bytes = match ship.phase {
+                            ShipPhase::InFlight { bytes, .. } => bytes,
+                            _ => 0,
+                        };
+                        replenish_credit(&mut self.credit, self.credit_limit, bytes);
                         ship.epoch = epoch;
                         ship.cursor = 0;
                         ship.phase = ShipPhase::Unoffered;
@@ -1558,7 +2058,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             self.ctx.counters.add(&self.ctx.counters.offers_sent, 1);
             self.send(&msg).await?;
             if let Some(ship) = self.shipping.get_mut(&id) {
-                ship.phase = ShipPhase::Offered;
+                ship.phase = ShipPhase::Offered {
+                    since: Instant::now(),
+                };
             }
         }
         for id in to_ship {
@@ -1577,7 +2079,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 role: SyncRole::Shipping,
                 phase: match &s.phase {
                     ShipPhase::Unoffered => "unoffered".into(),
-                    ShipPhase::Offered => "offered".into(),
+                    ShipPhase::Offered { .. } => "offered".into(),
                     ShipPhase::Idle => {
                         if s.cursor >= s.head {
                             "in sync".into()
@@ -1588,7 +2090,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     ShipPhase::InFlight { through_seq, .. } => {
                         format!("batch through {through_seq} in flight")
                     }
-                    ShipPhase::Repairing => "repairing".into(),
+                    ShipPhase::Repairing { .. } => "repairing".into(),
                     ShipPhase::Fenced { reason, .. } => format!("fenced: {reason}"),
                 },
                 cursor: s.cursor,

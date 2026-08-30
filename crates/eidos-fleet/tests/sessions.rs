@@ -3,14 +3,18 @@
 //! either side that resume the same cursor, simultaneous dials that leave
 //! exactly one session, and peers that fail closed before any payload.
 
-use eidos_catalog::fleet::PeerRole;
+use eidos_catalog::fleet::{FleetPeer, NodeId, PeerRole};
+use eidos_catalog::replica::RemoteSourceDescriptor;
 use eidos_catalog::scan::{run_scan, RunScanOptions};
+use eidos_catalog::sync::{record_digest, SyncRow, SYNC_ROW_IMAGE_VERSION};
 use eidos_catalog::{Catalog, NewSource};
-use eidos_domain::{SourceId, SourceKind};
+use eidos_domain::{ObjectId, SourceId, SourceKind, UnixNanos};
 use eidos_fleet::enroll::{create_invite, enroll};
 use eidos_fleet::status::Direction;
 use eidos_fleet::wire::{self, Message};
 use eidos_fleet::{Fleet, FleetConfig, NodeIdentity};
+use eidos_sync::identity::SourceEpoch;
+use eidos_sync::merkle::{leaf_index, MerkleTree};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -179,6 +183,22 @@ async fn enroll_node(node: &Host, central: &Host) {
     assert_eq!(outcome.central, central.fleet().identity().node_id);
 }
 
+fn admit_peer(catalog: &Catalog, identity: &NodeIdentity, role: PeerRole) {
+    catalog
+        .fleet_upsert_peer(&FleetPeer {
+            node_id: identity.node_id,
+            name: identity.name.clone(),
+            role,
+            fingerprint: identity.fingerprint,
+            endpoint: None,
+            enabled: true,
+            enrolled_at: UnixNanos::now(),
+            last_seen_at: None,
+            last_error: None,
+        })
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enrollment_by_invitation_then_replication_converges_and_follows_changes() {
     let mut central = Host::new("central", true, true, false);
@@ -221,6 +241,18 @@ async fn enrollment_by_invitation_then_replication_converges_and_follows_changes
         .map(|s| s.name)
         .collect();
     assert!(names.contains("node-a/docs"), "{names:?}");
+    central
+        .catalog
+        .fleet_set_peer_enabled(node.fleet().identity().node_id, false)
+        .unwrap();
+    wait_for(SETTLE, || {
+        (!central
+            .fleet()
+            .is_connected(node.fleet().identity().node_id))
+        .then_some(())
+    })
+    .await
+    .expect("disabling a roster entry closes its active session");
     node.stop();
     central.stop();
 }
@@ -245,12 +277,16 @@ async fn either_side_may_initiate_and_the_cursor_survives_a_direction_change() {
         .catalog
         .fleet_set_peer_endpoint(node_id, Some(&node_endpoint))
         .unwrap();
-    node.catalog.fleet_set_peer_endpoint(central_id, None).unwrap();
+    node.catalog
+        .fleet_set_peer_endpoint(central_id, None)
+        .unwrap();
     // Drop the running session by restarting the node's fleet runtime.
     node.stop();
-    wait_for(SETTLE, || (!central.fleet().is_connected(node_id)).then_some(()))
-        .await
-        .expect("session dropped");
+    wait_for(SETTLE, || {
+        (!central.fleet().is_connected(node_id)).then_some(())
+    })
+    .await
+    .expect("session dropped");
     node.start();
     let listen = node.listening().await;
     central
@@ -271,7 +307,11 @@ async fn either_side_may_initiate_and_the_cursor_survives_a_direction_change() {
     let after = central.fleet().status();
     assert_eq!(after.counters.full_resyncs, full_resyncs_before);
     assert!(after.counters.batches_applied > batches_before);
-    assert_eq!(central.catalog.replica_sources().unwrap().len(), 1, "no duplicate source registration");
+    assert_eq!(
+        central.catalog.replica_sources().unwrap().len(),
+        1,
+        "no duplicate source registration"
+    );
     node.stop();
     central.stop();
 }
@@ -291,6 +331,17 @@ async fn simultaneous_initiation_leaves_exactly_one_session_on_both_sides() {
         .unwrap();
     // Both dial each other from now on; let several dial rounds pass.
     let replica = converged(&node, &central).await;
+    // Force one additional authenticated connection while the converged
+    // session is live. Whichever nonce wins, the registry must close one
+    // duplicate and settle back to one session.
+    let mut duplicate = raw_connect(node.fleet().identity(), &central).await;
+    send(
+        &mut duplicate,
+        &session_hello(node.fleet().identity(), wire::Role::Node, 30, 1 << 20),
+    )
+    .await;
+    let _ = recv(&mut duplicate).await;
+    drop(duplicate);
     tokio::time::sleep(Duration::from_secs(8)).await;
     let ns = node.fleet().status();
     let cs = central.fleet().status();
@@ -312,11 +363,23 @@ async fn simultaneous_initiation_leaves_exactly_one_session_on_both_sides() {
     central.stop();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_releases_the_sync_listener() {
+    let mut central = Host::new("central", true, true, false);
+    central.start();
+    let addr = central.listening().await;
+    central.stop();
+
+    let listener = wait_for(Duration::from_secs(10), || {
+        std::net::TcpListener::bind(&addr).ok()
+    })
+    .await
+    .expect("fleet shutdown releases its listener");
+    drop(listener);
+}
+
 /// Open a raw TLS connection to the central as `identity` and send frames.
-async fn raw_connect(
-    identity: &NodeIdentity,
-    central: &Host,
-) -> tokio_rustls_stream::Stream {
+async fn raw_connect(identity: &NodeIdentity, central: &Host) -> tokio_rustls_stream::Stream {
     let endpoint = central.listening().await;
     let (stream, _) = eidos_fleet::tls::connect(
         identity,
@@ -350,6 +413,285 @@ async fn recv(stream: &mut tokio_rustls_stream::Stream) -> Result<Message, wire:
     .map(|(m, _)| m)
 }
 
+fn session_hello(identity: &NodeIdentity, role: wire::Role, nonce: u64, credit: u64) -> Message {
+    Message::Hello(wire::Hello {
+        node_id: identity.node_id,
+        name: identity.name.clone(),
+        platform: "windows".into(),
+        role,
+        nonce,
+        versions: vec![wire::PROTOCOL_VERSION],
+        features: vec![],
+        max_frame_bytes: wire::DEFAULT_MAX_FRAME_BYTES as u64,
+        credit_bytes: credit,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_ack_does_not_refund_the_next_batch_credit() {
+    let mut node = Host::new("node-credit", false, true, true);
+    let central_dir = tempfile::tempdir().unwrap();
+    let central = NodeIdentity::load_or_create(central_dir.path(), "central-raw").unwrap();
+    admit_peer(&node.catalog, &central, PeerRole::Central);
+    let mut cfg = FleetConfig::load(node.dir.path()).unwrap();
+    cfg.batch_rows = 1;
+    cfg.store(node.dir.path()).unwrap();
+    node.start();
+    wait_for(SETTLE, || {
+        node.fleet()
+            .status()
+            .local_sources
+            .first()
+            .is_some_and(|source| source.ready)
+            .then_some(())
+    })
+    .await
+    .expect("source ledger ready");
+
+    let mut stream = raw_connect(&central, &node).await;
+    let credit = 1 << 20;
+    send(
+        &mut stream,
+        &session_hello(&central, wire::Role::Central, 10, credit),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut stream).await.unwrap(),
+        Message::Hello(_)
+    ));
+    let (source, epoch) = match recv(&mut stream).await.unwrap() {
+        Message::Offer {
+            descriptor, epoch, ..
+        } => (descriptor.remote_source_id, epoch),
+        other => panic!("expected offer, got {other:?}"),
+    };
+    send(
+        &mut stream,
+        &Message::Resume {
+            source,
+            epoch,
+            after_seq: 0,
+            requires_repair: false,
+        },
+    )
+    .await;
+    let first = match recv(&mut stream).await.unwrap() {
+        Message::Batch(batch) => batch.through_seq,
+        other => panic!("expected first batch, got {other:?}"),
+    };
+    send(
+        &mut stream,
+        &Message::Ack {
+            source,
+            epoch,
+            through_seq: first,
+        },
+    )
+    .await;
+    let second = match recv(&mut stream).await.unwrap() {
+        Message::Batch(batch) => batch.through_seq,
+        other => panic!("expected second batch, got {other:?}"),
+    };
+
+    // This delayed ACK belongs to the previous batch. It must neither
+    // release the second batch's credit nor move its InFlight phase.
+    send(
+        &mut stream,
+        &Message::Ack {
+            source,
+            epoch,
+            through_seq: first,
+        },
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(750),
+            wire::read_frame(&mut stream, wire::DEFAULT_MAX_FRAME_BYTES)
+        )
+        .await
+        .is_err(),
+        "a duplicate ACK released credit for a newer batch"
+    );
+
+    send(
+        &mut stream,
+        &Message::Ack {
+            source,
+            epoch,
+            through_seq: second,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut stream).await.unwrap(),
+        Message::Batch(_)
+    ));
+    assert!(node.fleet().status().sessions[0].credit_remaining <= credit as i64);
+    node.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multipart_repair_commits_once_before_its_ack() {
+    let mut central = Host::new("central-repair", true, true, false);
+    central.start();
+    let node_dir = tempfile::tempdir().unwrap();
+    let node = NodeIdentity::load_or_create(node_dir.path(), "node-repair").unwrap();
+    admit_peer(&central.catalog, &node, PeerRole::Node);
+
+    let mut stream = raw_connect(&node, &central).await;
+    send(
+        &mut stream,
+        &session_hello(&node, wire::Role::Node, 20, 1 << 20),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut stream).await.unwrap(),
+        Message::Hello(_)
+    ));
+
+    let source = SourceId(77);
+    let epoch = SourceEpoch::from_bytes([7; 16]);
+    let through_chain = [9; 32];
+    send(
+        &mut stream,
+        &Message::Offer {
+            descriptor: RemoteSourceDescriptor {
+                remote_source_id: source,
+                name: "docs".into(),
+                kind: SourceKind::WindowsLocal,
+                root_path: "C:\\docs".into(),
+                aliases: vec![],
+            },
+            epoch,
+            head_seq: 2,
+            head_chain: through_chain,
+            compacted_through: 1,
+            image_version: SYNC_ROW_IMAGE_VERSION,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut stream).await.unwrap(),
+        Message::Resume {
+            after_seq: 0,
+            requires_repair: true,
+            ..
+        }
+    ));
+
+    let first = ObjectId(1);
+    let first_leaf = leaf_index(1, first);
+    let second = (2..100)
+        .map(ObjectId)
+        .find(|object| leaf_index(1, *object) != first_leaf)
+        .expect("objects in both leaves");
+    let rows = [
+        SyncRow {
+            seq: 1,
+            object: first,
+            generation: 1,
+            image: None,
+        },
+        SyncRow {
+            seq: 2,
+            object: second,
+            generation: 1,
+            image: None,
+        },
+    ];
+    let hashes = MerkleTree::with_leaf_bits(
+        1,
+        rows.iter()
+            .map(|row| record_digest(row.object, row.generation, true)),
+    )
+    .leaf_hashes();
+    send(
+        &mut stream,
+        &Message::RepairOffer {
+            source,
+            epoch,
+            through_seq: 2,
+            through_chain,
+            leaf_bits: 1,
+            leaf_hashes: hashes,
+        },
+    )
+    .await;
+    let requested = match recv(&mut stream).await.unwrap() {
+        Message::RepairRequest { leaves, .. } => leaves,
+        other => panic!("expected repair request, got {other:?}"),
+    };
+    assert_eq!(requested.len(), 2);
+    let first_part_leaf = leaf_index(1, rows[0].object);
+    let (first_row, second_row) = if requested[0] == first_part_leaf {
+        (rows[0].clone(), rows[1].clone())
+    } else {
+        (rows[1].clone(), rows[0].clone())
+    };
+    send(
+        &mut stream,
+        &Message::RepairRows {
+            source,
+            epoch,
+            through_seq: 2,
+            through_chain,
+            leaf_bits: 1,
+            leaves: vec![requested[0]],
+            rows: vec![first_row],
+            final_part: false,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let replica = central.catalog.replica_sources().unwrap()[0].clone();
+    assert_eq!(replica.admission.applied_seq, 0);
+    assert!(central
+        .catalog
+        .replica_digests(replica.source_id)
+        .unwrap()
+        .is_empty());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            wire::read_frame(&mut stream, wire::DEFAULT_MAX_FRAME_BYTES)
+        )
+        .await
+        .is_err(),
+        "a non-final repair part was acknowledged"
+    );
+
+    send(
+        &mut stream,
+        &Message::RepairRows {
+            source,
+            epoch,
+            through_seq: 2,
+            through_chain,
+            leaf_bits: 1,
+            leaves: vec![requested[1]],
+            rows: vec![second_row],
+            final_part: true,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut stream).await.unwrap(),
+        Message::Ack { through_seq: 2, .. }
+    ));
+    let replica = central.catalog.replica_sources().unwrap()[0].clone();
+    assert_eq!(replica.admission.applied_seq, 2);
+    assert_eq!(
+        central
+            .catalog
+            .replica_digests(replica.source_id)
+            .unwrap()
+            .len(),
+        2
+    );
+    central.stop();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_any_payload() {
     let mut central = Host::new("central", true, true, false);
@@ -379,12 +721,42 @@ async fn unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_a
         other => panic!("{other:?}"),
     }
 
+    // A corrupt/manual roster row cannot bind a chosen node id to a
+    // certificate whose fingerprint derives a different stable identity.
+    let forged_id = NodeId([0x55; 16]);
+    central
+        .catalog
+        .fleet_upsert_peer(&FleetPeer {
+            node_id: forged_id,
+            name: "forged".into(),
+            role: PeerRole::Node,
+            fingerprint: stranger.fingerprint,
+            endpoint: None,
+            enabled: true,
+            enrolled_at: UnixNanos::now(),
+            last_seen_at: None,
+            last_error: None,
+        })
+        .unwrap();
+    let mut s = raw_connect(&stranger, &central).await;
+    let mut forged_hello = session_hello(&stranger, wire::Role::Node, 11, 1 << 20);
+    let Message::Hello(ref mut hello) = forged_hello else {
+        unreachable!()
+    };
+    hello.node_id = forged_id;
+    send(&mut s, &forged_hello).await;
+    match recv(&mut s).await.unwrap() {
+        Message::Goodbye { reason } => assert!(reason.contains("roster identity"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    central.catalog.fleet_remove_peer(forged_id).unwrap();
+
     // A bad invitation secret is refused and nothing is enrolled.
     let mut s = raw_connect(&stranger, &central).await;
     send(
         &mut s,
         &Message::Enroll {
-            secret: "00".repeat(32),
+            secret: "00".repeat(32).into(),
             name: "stranger".into(),
             platform: "windows".into(),
         },

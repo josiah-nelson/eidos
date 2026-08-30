@@ -24,6 +24,7 @@ rcgen = { workspace = true }
 ring = { workspace = true }
 getrandom = { workspace = true }
 ts-rs = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

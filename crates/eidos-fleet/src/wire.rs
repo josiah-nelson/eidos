@@ -14,8 +14,10 @@ use eidos_catalog::sync::{SyncBatch, SyncRow};
 use eidos_domain::SourceId;
 use eidos_sync::identity::{ChainHash, SourceEpoch};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zeroize::{Zeroize, Zeroizing};
 
 /// The one protocol version this build speaks. A peer that shares no
 /// version with us is refused before any payload is processed.
@@ -59,6 +61,36 @@ pub struct Hello {
     pub credit_bytes: u64,
 }
 
+/// An enrollment credential that clears its backing allocation on drop and
+/// never reveals its contents through `Debug` formatting.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnrollmentSecret(String);
+
+impl EnrollmentSecret {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EnrollmentSecret {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for EnrollmentSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl Drop for EnrollmentSecret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// Everything that crosses the wire after the TLS handshake.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -76,7 +108,7 @@ pub enum Message {
     /// Enrollment: sent by a node whose certificate is not yet in the
     /// central's roster, as the only message it may send.
     Enroll {
-        secret: String,
+        secret: EnrollmentSecret,
         name: String,
         platform: String,
     },
@@ -242,7 +274,7 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
     if len > max {
         return Err(FrameError::TooLarge { len, max });
     }
-    let mut payload = vec![0u8; len];
+    let mut payload = Zeroizing::new(vec![0u8; len]);
     r.read_exact(&mut payload).await.map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
             FrameError::Closed
@@ -291,5 +323,17 @@ mod tests {
             Err(FrameError::Malformed(_))
         ));
         assert!(matches!(decode(b"\xff\xfe"), Err(FrameError::Malformed(_))));
+    }
+
+    #[test]
+    fn enrollment_secrets_are_redacted_from_debug_output() {
+        let secret = "sensitive-enrollment-secret";
+        let message = Message::Enroll {
+            secret: secret.to_string().into(),
+            name: "node".into(),
+            platform: "windows".into(),
+        };
+        assert!(!format!("{message:?}").contains(secret));
+        assert!(format!("{message:?}").contains("REDACTED"));
     }
 }
