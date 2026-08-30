@@ -2045,11 +2045,21 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         for (id, state) in to_offer {
             let descriptor = {
                 let catalog = self.ctx.catalog.clone();
-                tokio::task::spawn_blocking(move || catalog.get_source(id))
-                    .await
-                    .context("source task")??
+                tokio::task::spawn_blocking(move || -> eidos_catalog::Result<_> {
+                    let Some(record) = catalog.get_source(id)? else {
+                        return Ok(None);
+                    };
+                    // The replica has no volume row of its own; it resolves
+                    // names the way the origin does only if told.
+                    let case_sensitive = catalog.is_source_case_sensitive(id)?;
+                    Ok(Some((record, case_sensitive)))
+                })
+                .await
+                .context("source task")??
             };
-            let Some(record) = descriptor else { continue };
+            let Some((record, case_sensitive)) = descriptor else {
+                continue;
+            };
             let msg = Message::Offer {
                 descriptor: RemoteSourceDescriptor {
                     remote_source_id: id,
@@ -2057,6 +2067,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     kind: record.kind,
                     root_path: record.root_path,
                     aliases: record.aliases,
+                    case_sensitive,
                 },
                 epoch: state.epoch.to_source_epoch(),
                 head_seq: state.head_seq,

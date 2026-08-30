@@ -492,17 +492,26 @@ fn getrandom_u64() -> u64 {
     u64::from_le_bytes(b)
 }
 
-/// Journal identity of a source's native feed checkpoint, when it has one.
-fn journal_id(catalog: &Catalog, source: eidos_domain::SourceId) -> Option<i64> {
-    let (checkpoint, _) = catalog.checkpoint(source).ok().flatten()?;
+/// Journal identity of a source's native feed checkpoint: `Ok(None)` when
+/// the source has no USN checkpoint, `Err` when it could not be read. The
+/// two stay distinct because the caller mints or re-mints an epoch on the
+/// answer; an unreadable checkpoint must not pass for a source without a
+/// journal.
+fn journal_id(
+    catalog: &Catalog,
+    source: eidos_domain::SourceId,
+) -> eidos_catalog::Result<Option<i64>> {
+    let Some((checkpoint, _)) = catalog.checkpoint(source)? else {
+        return Ok(None);
+    };
     if checkpoint.kind != "usn" {
-        return None;
+        return Ok(None);
     }
-    checkpoint
+    Ok(checkpoint
         .value
         .get("journal_id")
         .and_then(|v| v.as_u64())
-        .map(|v| v as i64)
+        .map(|v| v as i64))
 }
 
 /// Node side: keep every eligible source's ledger enabled and backfilled
@@ -544,7 +553,16 @@ fn maintain(
     let catalog = &fleet.ctx.catalog;
     let config = fleet.config();
     let counters = &fleet.ctx.counters;
-    let peers = catalog.fleet_peers().unwrap_or_default();
+    // Every transition below that is destructive (disabling a ledger,
+    // minting an epoch) is taken on a successful read that says so. A read
+    // error is not an empty roster or a missing ledger: skip the tick.
+    let peers = match catalog.fleet_peers() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "fleet maintenance could not read the roster");
+            return;
+        }
+    };
     let central = peers.iter().find(|p| p.role == PeerRole::Central);
     let sources = match catalog.list_sources() {
         Ok(s) => s,
@@ -561,26 +579,44 @@ fn maintain(
         let eligible = s.state != SourceState::Retired
             && s.published_generation.is_some()
             && s.sync_policy == SyncPolicy::Inherit;
-        let ledger = catalog.sync_source(s.id).ok().flatten();
+        let ledger = match catalog.sync_source(s.id) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(source = s.id.0, error = %e, "fleet maintenance could not read the sync ledger");
+                continue;
+            }
+        };
+        let journal = match journal_id(catalog, s.id) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(source = s.id.0, error = %e, "fleet maintenance could not read the native checkpoint");
+                continue;
+            }
+        };
         match (central, eligible, ledger) {
             // Enrolled (even if sync is paused) and eligible: keep the
             // ledger, mint it when missing, and re-mint on a journal change.
-            (Some(_), true, None) => {
-                let journal = journal_id(catalog, s.id);
-                match catalog.sync_enable(s.id, journal) {
-                    Ok(state) => {
-                        tracing::info!(source = s.id.0, epoch = %state.epoch, "sync enabled for source")
-                    }
-                    Err(e) => tracing::warn!(source = s.id.0, error = %e, "could not enable sync"),
+            (Some(_), true, None) => match catalog.sync_enable(s.id, journal) {
+                Ok(state) => {
+                    tracing::info!(source = s.id.0, epoch = %state.epoch, "sync enabled for source")
                 }
-            }
+                Err(e) => tracing::warn!(source = s.id.0, error = %e, "could not enable sync"),
+            },
             (Some(_), true, Some(ledger)) => {
-                let journal = journal_id(catalog, s.id);
-                if journal.is_some() && ledger.journal_id.is_some() && journal != ledger.journal_id
-                {
+                let replaced = match (ledger.journal_id, journal) {
+                    (Some(stored), Some(current)) => stored != current,
+                    // The journal id became known only after the ledger was
+                    // minted (the first checkpoint had not been written).
+                    // Nothing proves the journal was not replaced in
+                    // between, so re-mint once and record it; a later
+                    // replacement is then fenced instead of ignored forever.
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if replaced {
                     tracing::warn!(
                         source = s.id.0,
-                        "native journal replaced; minting a new sync epoch"
+                        "native journal replaced or first observed; minting a new sync epoch"
                     );
                     if let Err(e) = catalog.sync_enable(s.id, journal) {
                         tracing::warn!(source = s.id.0, error = %e, "could not re-enable sync");
@@ -665,6 +701,21 @@ fn maintain(
                     tracing::warn!(source = r.source_id.0, error = %e, "replica aggregates rebuild failed");
                 }
                 *entry = (Instant::now(), r.applied_at);
+            }
+            // An epoch change retires the previous epoch's rows in bounded
+            // steps; finish what the apply path left over.
+            if r.resync_target
+                .is_some_and(|target| r.admission.applied_seq >= target)
+            {
+                match catalog.replica_continue_retirement(r.source_id) {
+                    Ok(0) => {}
+                    Ok(rows) => {
+                        tracing::debug!(source = r.source_id.0, rows, "retired previous-epoch rows")
+                    }
+                    Err(e) => {
+                        tracing::warn!(source = r.source_id.0, error = %e, "epoch retirement step failed")
+                    }
+                }
             }
         }
         let _ = catalog.fleet_prune_invites();

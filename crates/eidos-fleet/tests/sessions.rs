@@ -562,6 +562,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
                 kind: SourceKind::WindowsLocal,
                 root_path: "C:\\docs".into(),
                 aliases: vec![],
+                case_sensitive: false,
             },
             epoch,
             head_seq: 2,
