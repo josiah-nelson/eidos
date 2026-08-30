@@ -4,6 +4,8 @@
 //! completeness reports freshness and content incompleteness truthfully, and
 //! `host:` narrows to one node.
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::NewSource;
 use eidos_domain::{CoverageKind, SearchRequest, SourceId, SourceKind};
@@ -15,6 +17,7 @@ use eidos_service::ServiceConfig;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tower::ServiceExt;
 
 struct Host {
     _dir: tempfile::TempDir,
@@ -190,6 +193,68 @@ async fn central_search_returns_the_replicated_union_with_truthful_origin_and_co
 
     // The ordinary follower projects the replicated rows.
     eidos_service::follower::follow_once(&central.state).unwrap();
+
+    // The source-list API carries the same remote freshness and explicit
+    // metadata-only content facts as search completeness.
+    let response = eidos_service::api::router(central.state.clone(), None)
+        .oneshot(
+            Request::builder()
+                .uri("/api/sources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let sources: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let replica_view = sources
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| {
+            source["source"]["id"]
+                .as_str()
+                .and_then(|id| id.parse::<i64>().ok())
+                == Some(replica.0)
+        })
+        .expect("replica source view");
+    assert_eq!(replica_view["completeness"]["content_complete"], false);
+    assert_eq!(replica_view["completeness"]["freshness"], "live");
+    assert_eq!(replica_view["completeness"]["remote"]["connected"], true);
+
+    // Catalog-level guards protect in-process CLI and benchmark callers too,
+    // before they touch the origin path or create local content work.
+    let scan = run_scan(
+        &central.state.catalog,
+        replica,
+        central.state.lister.as_ref(),
+        &RunScanOptions::default(),
+    );
+    assert!(scan.is_err());
+    assert_eq!(
+        central
+            .state
+            .catalog
+            .get_source(replica)
+            .unwrap()
+            .unwrap()
+            .kind,
+        SourceKind::Remote
+    );
+    assert!(central
+        .state
+        .catalog
+        .set_content_policy(replica, true, 1)
+        .is_err());
+    assert!(central
+        .state
+        .catalog
+        .requeue_archives(Some(replica))
+        .is_err());
+
     let r = central.search("figures");
     assert_eq!(r.hits.len(), 1, "{r:?}");
     let hit = &r.hits[0];
@@ -241,7 +306,25 @@ async fn central_search_returns_the_replicated_union_with_truthful_origin_and_co
     // `host:` narrows to one node's sources, by name.
     assert_eq!(central.search("host:laptop figures").hits.len(), 1);
     let own = central.state.host_name.clone();
-    assert_eq!(central.search(&format!("host:{own} figures")).hits.len(), 0);
+    let own_result = central.search(&format!("host:{own} figures"));
+    assert_eq!(own_result.hits.len(), 0);
+    assert!(
+        own_result.completeness.is_empty(),
+        "host scope must also narrow completeness: {own_result:?}"
+    );
+    assert!(own_result.coverage.full);
+    let union = central.search(&format!("host:{own} OR host:laptop"));
+    assert_eq!(
+        union.completeness.len(),
+        1,
+        "OR branches must not intersect their coverage scopes: {union:?}"
+    );
+    let excluded = central.search("-host:laptop");
+    assert_eq!(
+        excluded.completeness.len(),
+        1,
+        "a negated host does not remove it from coverage scope: {excluded:?}"
+    );
     assert_eq!(
         central
             .search(&format!("host:{} figures", hit.host_id.0))

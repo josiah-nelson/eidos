@@ -5,7 +5,7 @@
 //! adding a source. The fleet's own trust boundary is the dedicated TLS
 //! endpoint in `eidos-fleet`, never this API.
 
-use crate::api::{source_view, ApiError, ApiResult, SourceView};
+use crate::api::{blocking, source_view, ApiError, ApiResult, SourceView};
 use crate::api_json::ApiJson;
 use crate::state::AppState;
 use axum::extract::{Path, State};
@@ -46,10 +46,11 @@ fn parse_node(id: &str) -> Result<NodeId, ApiError> {
 
 async fn status(State(st): State<Arc<AppState>>) -> ApiResult<FleetStatus> {
     let fleet = fleet(&st)?;
-    let status = tokio::task::spawn_blocking(move || fleet.status())
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(ApiJson(status))
+    Ok(ApiJson(read_status(fleet).await?))
+}
+
+async fn read_status(fleet: Arc<Fleet>) -> Result<FleetStatus, ApiError> {
+    blocking(move || Ok(fleet.status())).await
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -67,27 +68,31 @@ async fn set_central(
     Json(body): Json<CentralBody>,
 ) -> ApiResult<FleetConfig> {
     let fleet = fleet(&st)?;
-    let mut config = fleet.config();
-    if let Some(central) = body.central {
-        config.central = central;
-    }
-    if let Some(listen) = body.listen {
-        let listen = listen.trim().to_string();
-        if listen.is_empty() {
-            config.listen = None;
-        } else {
-            listen
-                .parse::<std::net::SocketAddr>()
-                .map_err(|e| ApiError::bad_request(format!("listen address: {e}")))?;
-            config.listen = Some(listen);
+    let config = blocking(move || {
+        let mut config = fleet.config();
+        if let Some(central) = body.central {
+            config.central = central;
         }
-    }
-    config
-        .store(fleet.data_dir())
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    fleet
-        .reload_config()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        if let Some(listen) = body.listen {
+            let listen = listen.trim().to_string();
+            if listen.is_empty() {
+                config.listen = None;
+            } else {
+                listen
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|e| ApiError::bad_request(format!("listen address: {e}")))?;
+                config.listen = Some(listen);
+            }
+        }
+        config
+            .store(fleet.data_dir())
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        fleet
+            .reload_config()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        Ok(config)
+    })
+    .await?;
     Ok(ApiJson(config))
 }
 
@@ -139,14 +144,18 @@ async fn invite(
         Some(e) => e,
         None => default_endpoint(&st, &config)?,
     };
-    let code = create_invite(
-        &st.catalog,
-        fleet.identity(),
-        &config,
-        &endpoint,
-        body.name_hint.as_deref(),
-    )
-    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let invite_endpoint = endpoint.clone();
+    let code = blocking(move || {
+        create_invite(
+            &st.catalog,
+            fleet.identity(),
+            &config,
+            &invite_endpoint,
+            body.name_hint.as_deref(),
+        )
+        .map_err(|e| ApiError::bad_request(e.to_string()))
+    })
+    .await?;
     Ok(ApiJson(InviteView {
         code: code.encode(),
         endpoint,
@@ -208,28 +217,38 @@ async fn set_sync(
     State(st): State<Arc<AppState>>,
     Json(body): Json<SyncBody>,
 ) -> ApiResult<FleetStatus> {
-    let central = central_peer(&st)?;
-    st.catalog
-        .fleet_set_peer_enabled(central.node_id, body.enabled)?;
+    let runtime = fleet(&st)?;
+    let enabled = body.enabled;
+    let catalog_state = st.clone();
+    blocking(move || {
+        let central = central_peer(&catalog_state)?;
+        catalog_state
+            .catalog
+            .fleet_set_peer_enabled(central.node_id, enabled)?;
+        Ok(())
+    })
+    .await?;
     if !body.enabled {
         // Sessions re-check the roster only when they start; close the
         // running one so transfer stops now.
-        if let Some(fleet) = st.fleet.lock().clone() {
-            fleet.registry().close_all();
-        }
+        runtime.registry().close_all();
     }
-    status(State(st)).await
+    Ok(ApiJson(read_status(runtime).await?))
 }
 
 /// Leave the fleet: forget the central. The maintenance loop then removes
 /// the ledgers; local indexes are untouched. Rejoining is a new epoch.
 async fn leave(State(st): State<Arc<AppState>>) -> ApiResult<FleetStatus> {
-    let central = central_peer(&st)?;
-    st.catalog.fleet_remove_peer(central.node_id)?;
-    if let Some(fleet) = st.fleet.lock().clone() {
-        fleet.registry().close_all();
-    }
-    status(State(st)).await
+    let runtime = fleet(&st)?;
+    let catalog_state = st.clone();
+    blocking(move || {
+        let central = central_peer(&catalog_state)?;
+        catalog_state.catalog.fleet_remove_peer(central.node_id)?;
+        Ok(())
+    })
+    .await?;
+    runtime.registry().close_all();
+    Ok(ApiJson(read_status(runtime).await?))
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -247,18 +266,25 @@ async fn update_peer(
     Json(body): Json<PeerBody>,
 ) -> ApiResult<PeerView> {
     let node = parse_node(&id)?;
-    if let Some(endpoint) = body.endpoint {
-        let endpoint = endpoint.trim().to_string();
-        st.catalog
-            .fleet_set_peer_endpoint(node, (!endpoint.is_empty()).then_some(endpoint.as_str()))?;
-    }
-    if let Some(enabled) = body.enabled {
-        st.catalog.fleet_set_peer_enabled(node, enabled)?;
-    }
     let fleet = fleet(&st)?;
-    let status = tokio::task::spawn_blocking(move || fleet.status())
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let catalog_state = st.clone();
+    blocking(move || {
+        if let Some(endpoint) = body.endpoint {
+            let endpoint = endpoint.trim().to_string();
+            catalog_state.catalog.fleet_set_peer_endpoint(
+                node,
+                (!endpoint.is_empty()).then_some(endpoint.as_str()),
+            )?;
+        }
+        if let Some(enabled) = body.enabled {
+            catalog_state
+                .catalog
+                .fleet_set_peer_enabled(node, enabled)?;
+        }
+        Ok(())
+    })
+    .await?;
+    let status = read_status(fleet).await?;
     status
         .peers
         .into_iter()
@@ -279,15 +305,20 @@ async fn forget_peer(
     Path(id): Path<String>,
 ) -> ApiResult<ForgetView> {
     let node = parse_node(&id)?;
-    let mut retired = 0;
-    for r in st.catalog.replica_sources_of(node.0)? {
-        if st.catalog.replica_retire_source(r.source_id)? {
-            retired += 1;
+    let catalog_state = st.clone();
+    let retired = blocking(move || {
+        let mut retired = 0;
+        for r in catalog_state.catalog.replica_sources_of(node.0)? {
+            if catalog_state.catalog.replica_retire_source(r.source_id)? {
+                retired += 1;
+            }
         }
-    }
-    if !st.catalog.fleet_remove_peer(node)? && retired == 0 {
-        return Err(ApiError::not_found(format!("peer {node}")));
-    }
+        if !catalog_state.catalog.fleet_remove_peer(node)? && retired == 0 {
+            return Err(ApiError::not_found(format!("peer {node}")));
+        }
+        Ok(retired)
+    })
+    .await?;
     if let Some(fleet) = st.fleet.lock().clone() {
         fleet.registry().close_all();
     }
@@ -307,19 +338,23 @@ async fn set_sync_policy(
     Json(body): Json<SyncPolicyBody>,
 ) -> ApiResult<SourceView> {
     let sid = SourceId(id);
-    let s = st
-        .catalog
-        .get_source(sid)?
-        .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
-    if s.kind == SourceKind::Remote {
-        return Err(ApiError::bad_request(
-            "a replicated source has no sync policy of its own",
-        ));
-    }
-    st.catalog.set_sync_policy(sid, body.policy)?;
-    let s = st
-        .catalog
-        .get_source(sid)?
-        .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
-    Ok(ApiJson(source_view(&st, s)?))
+    let view = blocking(move || {
+        let s = st
+            .catalog
+            .get_source(sid)?
+            .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
+        if s.kind == SourceKind::Remote {
+            return Err(ApiError::bad_request(
+                "a replicated source has no sync policy of its own",
+            ));
+        }
+        st.catalog.set_sync_policy(sid, body.policy)?;
+        let s = st
+            .catalog
+            .get_source(sid)?
+            .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
+        source_view(&st, s)
+    })
+    .await?;
+    Ok(ApiJson(view))
 }

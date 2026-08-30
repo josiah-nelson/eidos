@@ -5,7 +5,7 @@
 
 use crate::content::{flip_state, upsert_content_record, ContentRecord};
 use crate::jobs::{enqueue_conn, outbox_append_conn, NewJob};
-use crate::{Catalog, Result};
+use crate::{Catalog, CatalogError, Result};
 use eidos_domain::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -934,6 +934,16 @@ impl Catalog {
     /// archive support existed and left `unsupported`. Returns the number
     /// queued.
     pub fn requeue_archives(&self, source: Option<SourceId>) -> Result<u64> {
+        if let Some(source) = source {
+            let row = self
+                .get_source(source)?
+                .ok_or_else(|| CatalogError::NotFound(format!("source {source}")))?;
+            if row.kind.is_remote() {
+                return Err(CatalogError::InvalidState(format!(
+                    "source {source} is a metadata-only fleet replica"
+                )));
+            }
+        }
         let mut total = 0u64;
         let mut after_object_id = i64::MIN;
         loop {
@@ -944,7 +954,9 @@ impl Catalog {
                 let rows: Vec<(i64, i64, i64, i64)> = {
                     let mut stmt = tx.prepare(&format!(
                         "SELECT o.object_id, o.source_id, o.generation, o.size FROM objects o
+                         JOIN sources s ON s.source_id = o.source_id
                          WHERE o.deleted_at IS NULL AND o.kind = 'file'
+                           AND s.kind != 'remote'
                            AND lower(COALESCE((
                                SELECT e.extension FROM entries e
                                WHERE e.object_id = o.object_id AND e.deleted_at IS NULL

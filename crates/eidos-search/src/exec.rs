@@ -560,6 +560,19 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
                 .filter(|s| wanted.contains(&s.host_id))
                 .map(|s| s.id)
                 .collect();
+            // Only a positive conjunct narrows the sources whose coverage is
+            // relevant. Under OR or NOT, retaining every source is the safe
+            // answer; intersecting branch scopes could falsely report full
+            // coverage for sources that contributed to another branch.
+            if ctx.neg_depth == 0 {
+                ctx.scope_sources = Some(match ctx.scope_sources.take() {
+                    Some(existing) => existing
+                        .into_iter()
+                        .filter(|s| sources.contains(s))
+                        .collect(),
+                    None => sources.clone(),
+                });
+            }
             ctx.readable.push(format!(
                 "host in [{}]",
                 wanted.iter().map(|h| h.0.to_string()).collect::<Vec<_>>().join(", ")
@@ -594,10 +607,12 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
                 "source in [{}]",
                 all.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
             ));
-            ctx.scope_sources = Some(match ctx.scope_sources.take() {
-                Some(existing) => existing.into_iter().filter(|s| all.contains(s)).collect(),
-                None => all.clone(),
-            });
+            if ctx.neg_depth == 0 {
+                ctx.scope_sources = Some(match ctx.scope_sources.take() {
+                    Some(existing) => existing.into_iter().filter(|s| all.contains(s)).collect(),
+                    None => all.clone(),
+                });
+            }
             any_of(all.iter().map(|s| term_u64(f.source_id, s.0 as u64)).collect())
         }
         Query::Object { ids } => any_of(ids.iter().map(|o| term_u64(f.object_id, o.0 as u64)).collect()),

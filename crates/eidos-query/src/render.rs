@@ -156,7 +156,13 @@ pub fn render(q: &Query) -> String {
             }
             Query::Host { ids, names } => {
                 let mut parts: Vec<String> = ids.iter().map(|i| i.0.to_string()).collect();
-                parts.extend(names.iter().cloned());
+                parts.extend(names.iter().map(|name| {
+                    if parser::bare_value_is_literal(name) {
+                        name.clone()
+                    } else {
+                        quoted(name)
+                    }
+                }));
                 out.push(format!("host:{}", parts.join(",")));
             }
             Query::Source { ids, names } => {

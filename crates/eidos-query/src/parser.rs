@@ -779,7 +779,7 @@ impl Parser {
                     {
                         ids.push(HostId(n));
                     } else if !v.is_empty() {
-                        names.push(v.to_string());
+                        names.push(unquote(v));
                     }
                 }
                 Query::Host { ids, names }
@@ -1096,6 +1096,19 @@ mod tests {
             assert_eq!(rendered, text, "{text} must render back to itself");
             assert_eq!(q(&rendered), expected, "{rendered} must parse again");
         }
+    }
+
+    #[test]
+    fn host_names_and_ids_survive_a_round_trip() {
+        let expected = Query::Host {
+            ids: vec![HostId(7)],
+            names: vec!["work laptop".into()],
+        };
+        let parsed = q("host:7,\"work laptop\"");
+        assert_eq!(parsed, expected);
+        let rendered = crate::render(&parsed);
+        assert_eq!(rendered, "host:7,\"work laptop\"");
+        assert_eq!(q(&rendered), expected);
     }
 
     #[test]

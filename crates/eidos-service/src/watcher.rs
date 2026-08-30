@@ -330,6 +330,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             stop(&status, "source retired".into());
             return;
         }
+        if source.kind.is_remote() {
+            stop(&status, "fleet replicas have no local change feed".into());
+            return;
+        }
         if state
             .scan_progress(source_id)
             .is_some_and(|p| !p.is_finished())
@@ -567,6 +571,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
         };
         if source.state == SourceState::Retired {
             stop(&status, "source retired".into());
+            return;
+        }
+        if source.kind.is_remote() {
+            stop(&status, "fleet replicas have no local change feed".into());
             return;
         }
         if state
@@ -1085,6 +1093,10 @@ pub fn native_scan_sequence(
             .catalog
             .get_source(source_id)?
             .ok_or_else(|| anyhow::anyhow!("source {source_id} not found"))?;
+        anyhow::ensure!(
+            !source.kind.is_remote(),
+            "source {source_id} is a fleet replica and cannot be scanned here"
+        );
         let vi = state
             .lister
             .volume_info(std::path::Path::new(&source.root_path))
@@ -1139,6 +1151,10 @@ pub fn native_scan_sequence(
             .catalog
             .get_source(source_id)?
             .ok_or_else(|| anyhow::anyhow!("source {source_id} not found"))?;
+        anyhow::ensure!(
+            !source.kind.is_remote(),
+            "source {source_id} is a fleet replica and cannot be scanned here"
+        );
         let volume = state
             .lister
             .volume_info(std::path::Path::new(&source.root_path))

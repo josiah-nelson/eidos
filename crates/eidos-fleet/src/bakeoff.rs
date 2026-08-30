@@ -18,12 +18,14 @@
 
 use eidos_content::cdc::{CdcParams, Chunker};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Bytes per protocol frame assumed for the framing measurement.
 pub const FRAME_BYTES: usize = crate::wire::DEFAULT_BATCH_BYTES;
+/// Rows per protocol frame assumed for the framing measurement.
+pub const FRAME_ROWS: u64 = crate::wire::DEFAULT_BATCH_ROWS as u64;
 /// Manifest entry per chunk: 32-byte hash + 8-byte length.
 const MANIFEST_ENTRY: u64 = 40;
 const ZSTD_LEVEL: i32 = 3;
@@ -65,6 +67,8 @@ impl Strategy {
 pub struct Measurement {
     pub scenario: String,
     pub strategy: Strategy,
+    /// The content extractor rejected this input before transfer.
+    pub rejected: bool,
     pub source_bytes: u64,
     pub compressed_bytes: u64,
     /// Bytes put on the wire, manifest included.
@@ -91,6 +95,7 @@ pub struct Measurement {
 pub struct Report {
     pub schema: &'static str,
     pub frame_bytes: u64,
+    pub frame_rows: u64,
     pub generated_at: String,
     pub measurements: Vec<Measurement>,
     pub summary: Vec<StrategySummary>,
@@ -100,6 +105,7 @@ pub struct Report {
 pub struct StrategySummary {
     pub strategy: Strategy,
     pub scenarios: u64,
+    pub rejected_scenarios: u64,
     pub source_bytes: u64,
     pub transferred_bytes: u64,
     /// `transferred / source` over every scenario.
@@ -236,7 +242,7 @@ fn versions() -> Vec<Version> {
     let mut random_b = random.clone();
     random_b[1 << 20..(1 << 20) + 4096].copy_from_slice(&pseudo_random(4096, "binary-edit"));
     v.push(Version {
-        name: "binary_incompressible_edit".into(),
+        name: "incompressible_payload_edit".into(),
         a: random,
         b: random_b,
     });
@@ -274,6 +280,13 @@ fn versions() -> Vec<Version> {
 
 /// Files from a read-only corpus paired as `(previous, current)` when a
 /// sibling `<name>.prev` exists, else measured as a first ship.
+fn previous_path(path: &Path) -> std::path::PathBuf {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => path.with_extension(format!("{extension}.prev")),
+        None => path.with_extension("prev"),
+    }
+}
+
 fn corpus_versions(dir: &Path, limit: usize) -> Vec<Version> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -292,10 +305,7 @@ fn corpus_versions(dir: &Path, limit: usize) -> Vec<Version> {
         if b.len() > 256 << 20 {
             continue;
         }
-        let prev = path.with_extension(format!(
-            "{}.prev",
-            path.extension().and_then(|e| e.to_str()).unwrap_or("")
-        ));
+        let prev = previous_path(&path);
         let a = std::fs::read(&prev).unwrap_or_default();
         out.push(Version {
             name: format!(
@@ -373,7 +383,8 @@ fn split(data: &[u8], strategy: Strategy) -> Chunked {
         .iter()
         .zip(hashes)
         .map(|((s, e), hash)| {
-            let compressed = zstd::encode_all(&data[*s..*e], ZSTD_LEVEL).unwrap_or_default();
+            let compressed = zstd::encode_all(&data[*s..*e], ZSTD_LEVEL)
+                .expect("compressing an in-memory chunk");
             peak = peak.max((e - s) as u64 + compressed.len() as u64);
             (hash, compressed, e - s)
         })
@@ -394,11 +405,13 @@ fn ms(d: Duration) -> f64 {
 
 /// Measure shipping `b` to a central that holds `a`.
 fn measure(name: &str, a: &[u8], b: &[u8], strategy: Strategy) -> Measurement {
-    // The central's holdings: chunk hashes of A under the same strategy.
-    let held: HashSet<[u8; 32]> = split(a, strategy)
+    // The central's holdings: compressed chunks of A under the same strategy.
+    // Keeping the bytes, not only their hashes, lets the apply measurement
+    // reconstruct and verify the exact logical content.
+    let held: HashMap<[u8; 32], Vec<u8>> = split(a, strategy)
         .chunks
         .into_iter()
-        .map(|(h, _, _)| h)
+        .map(|(hash, compressed, _)| (hash, compressed))
         .collect();
     let split_b = split(b, strategy);
     let chunks = split_b.chunks.len() as u64;
@@ -409,56 +422,68 @@ fn measure(name: &str, a: &[u8], b: &[u8], strategy: Strategy) -> Measurement {
     // Whole-content never reuses: identical bytes are still shipped.
     let reuse_allowed = strategy != Strategy::WholeCompressed;
     let started = Instant::now();
-    let mut staged: Vec<&Vec<u8>> = Vec::new();
+    let mut records = Vec::with_capacity(split_b.chunks.len());
     for (hash, compressed, raw) in &split_b.chunks {
-        wire += MANIFEST_ENTRY;
-        if reuse_allowed && held.contains(hash) {
+        let mut record_bytes = MANIFEST_ENTRY;
+        if reuse_allowed && held.contains_key(hash) {
             reused += *raw as u64;
         } else {
             novel += *raw as u64;
-            wire += compressed.len() as u64;
-            staged.push(compressed);
+            record_bytes += compressed.len() as u64;
         }
+        wire += record_bytes;
+        records.push(record_bytes);
     }
     let stage_ms = ms(started.elapsed());
-    let staging_bytes: u64 = staged.iter().map(|c| c.len() as u64).sum();
-    // Apply: decompress every novel chunk and reassemble the logical
-    // content the central indexes through its normal pipeline.
+    // The manifest is durable staging too: without it the receiver cannot
+    // order either reused or novel chunks after a restart.
+    let staging_bytes = wire;
+    // Apply: decompress the staged or previously-held chunk and reassemble
+    // the logical content the central indexes through its normal pipeline.
     let started = Instant::now();
     let mut assembled = Vec::with_capacity(b.len());
     for (hash, compressed, raw) in &split_b.chunks {
-        if reuse_allowed && held.contains(hash) {
-            assembled.resize(assembled.len() + raw, 0);
+        let encoded = if reuse_allowed {
+            held.get(hash).unwrap_or(compressed)
         } else {
-            let out = zstd::decode_all(&compressed[..]).unwrap_or_default();
-            assembled.extend_from_slice(&out);
-        }
+            compressed
+        };
+        let out = zstd::decode_all(&encoded[..]).expect("decoding a measured chunk");
+        assert_eq!(out.len(), *raw, "decoded chunk length changed");
+        assembled.extend_from_slice(&out);
     }
     let apply_ms = ms(started.elapsed());
-    debug_assert_eq!(assembled.len(), b.len());
-    // Interruption half way through the novel bytes, then resume: chunked
-    // strategies resend only what had not landed; whole content restarts.
+    assert_eq!(
+        assembled, b,
+        "strategy did not reconstruct the source bytes"
+    );
+    // Interruption half way through the wire stream, then resume. Only whole
+    // records are acknowledged; a record cut by the interruption is resent.
     let started = Instant::now();
     let recovery_bytes = if strategy == Strategy::WholeCompressed {
         wire
     } else {
-        let mut sent = 0u64;
-        let half = staging_bytes / 2;
-        let mut remaining = 0u64;
-        for c in &staged {
-            if sent < half {
-                sent += c.len() as u64;
-            } else {
-                remaining += c.len() as u64 + MANIFEST_ENTRY;
+        let interrupted_at = wire / 2;
+        let mut acknowledged = 0u64;
+        for record in &records {
+            if acknowledged + record > interrupted_at {
+                break;
             }
+            acknowledged += record;
         }
-        remaining
+        wire - acknowledged
     };
     let recovery_ms = ms(started.elapsed());
-    let frames = wire.div_ceil(FRAME_BYTES as u64).max(1);
+    let frames = if chunks == 0 {
+        0
+    } else {
+        wire.div_ceil(FRAME_BYTES as u64)
+            .max(chunks.div_ceil(FRAME_ROWS))
+    };
     Measurement {
         scenario: name.to_string(),
         strategy,
+        rejected: false,
         source_bytes: b.len() as u64,
         compressed_bytes,
         transferred_bytes: wire,
@@ -482,6 +507,40 @@ fn measure(name: &str, a: &[u8], b: &[u8], strategy: Strategy) -> Measurement {
     }
 }
 
+fn measure_binary_rejection(data: &[u8], strategy: Strategy) -> Measurement {
+    let head = &data[..data.len().min(8 << 10)];
+    let started = Instant::now();
+    assert!(
+        matches!(
+            eidos_content::sniff(head),
+            eidos_content::Sniff::Binary { .. }
+        ),
+        "binary fixture was accepted as text"
+    );
+    let sniff_ms = ms(started.elapsed());
+    Measurement {
+        scenario: "binary_rejection".into(),
+        strategy,
+        rejected: true,
+        source_bytes: data.len() as u64,
+        compressed_bytes: 0,
+        transferred_bytes: 0,
+        reused_bytes: 0,
+        novel_bytes: 0,
+        chunks: 0,
+        frames: 0,
+        hash_ms: 0.0,
+        chunk_ms: sniff_ms,
+        compress_ms: 0.0,
+        stage_ms: 0.0,
+        apply_ms: 0.0,
+        peak_working_set_bytes: head.len() as u64,
+        staging_bytes: 0,
+        recovery_bytes: 0,
+        recovery_ms: 0.0,
+    }
+}
+
 /// Run every scenario under every strategy.
 pub fn run(corpus: Option<&Path>, corpus_limit: usize) -> Report {
     let mut versions = versions();
@@ -494,6 +553,10 @@ pub fn run(corpus: Option<&Path>, corpus_limit: usize) -> Report {
             measurements.push(measure(&v.name, &v.a, &v.b, strategy));
         }
     }
+    let binary = pseudo_random(8 << 20, "binary-rejection");
+    for strategy in Strategy::ALL {
+        measurements.push(measure_binary_rejection(&binary, strategy));
+    }
     let summary = Strategy::ALL
         .iter()
         .map(|s| {
@@ -504,6 +567,7 @@ pub fn run(corpus: Option<&Path>, corpus_limit: usize) -> Report {
             StrategySummary {
                 strategy: *s,
                 scenarios: rows.len() as u64,
+                rejected_scenarios: rows.iter().filter(|row| row.rejected).count() as u64,
                 source_bytes: source,
                 transferred_bytes: transferred,
                 transfer_ratio: if source == 0 {
@@ -523,6 +587,7 @@ pub fn run(corpus: Option<&Path>, corpus_limit: usize) -> Report {
     Report {
         schema: "eidos-chunking-bakeoff/1",
         frame_bytes: FRAME_BYTES as u64,
+        frame_rows: FRAME_ROWS,
         generated_at: eidos_domain::UnixNanos::now().to_rfc3339(),
         measurements,
         summary,
@@ -532,13 +597,14 @@ pub fn run(corpus: Option<&Path>, corpus_limit: usize) -> Report {
 /// A compact table for the decision record.
 pub fn render_summary(report: &Report) -> String {
     let mut out = String::new();
-    out.push_str("| strategy | scenarios | source MiB | wire MiB | ratio | cpu ms | frames | recovery MiB |\n");
-    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| strategy | scenarios | rejected | source MiB | wire MiB | ratio | cpu ms | frames | recovery MiB |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for s in &report.summary {
         out.push_str(&format!(
-            "| {} | {} | {:.1} | {:.1} | {:.3} | {:.0} | {} | {:.1} |\n",
+            "| {} | {} | {} | {:.1} | {:.1} | {:.3} | {:.0} | {} | {:.1} |\n",
             s.strategy.name(),
             s.scenarios,
+            s.rejected_scenarios,
             s.source_bytes as f64 / (1u64 << 20) as f64,
             s.transferred_bytes as f64 / (1u64 << 20) as f64,
             s.transfer_ratio,
@@ -593,6 +659,50 @@ mod tests {
             assert_eq!(m.reused_bytes, 0);
             assert!(m.transferred_bytes >= m.compressed_bytes);
             assert!(m.transferred_bytes < m.source_bytes, "{s:?} {m:?}");
+        }
+    }
+
+    #[test]
+    fn framing_honors_both_byte_and_row_limits() {
+        let rows = FRAME_ROWS + 1;
+        let wire = rows * MANIFEST_ENTRY;
+        assert_eq!(
+            wire.div_ceil(FRAME_BYTES as u64)
+                .max(rows.div_ceil(FRAME_ROWS)),
+            2
+        );
+    }
+
+    #[test]
+    fn interrupted_record_is_resent_and_manifest_is_staged() {
+        let b = pseudo_random(256 << 10, "recovery");
+        let m = measure("first", &[], &b, Strategy::Fixed64K);
+        assert_eq!(m.staging_bytes, m.transferred_bytes);
+        assert!(m.recovery_bytes >= m.transferred_bytes / 2);
+        assert!(m.recovery_bytes <= m.transferred_bytes);
+    }
+
+    #[test]
+    fn extensionless_corpus_uses_one_dot_for_the_previous_version() {
+        assert_eq!(
+            previous_path(Path::new("sample")),
+            std::path::PathBuf::from("sample.prev")
+        );
+        assert_eq!(
+            previous_path(Path::new("sample.txt")),
+            std::path::PathBuf::from("sample.txt.prev")
+        );
+    }
+
+    #[test]
+    fn binary_input_is_rejected_before_chunking_or_transfer() {
+        let binary = pseudo_random(1 << 20, "binary-test");
+        for strategy in Strategy::ALL {
+            let measurement = measure_binary_rejection(&binary, strategy);
+            assert!(measurement.rejected);
+            assert_eq!(measurement.chunks, 0);
+            assert_eq!(measurement.transferred_bytes, 0);
+            assert_eq!(measurement.frames, 0);
         }
     }
 }

@@ -10,6 +10,7 @@ use anyhow::{anyhow, Context};
 use eidos_catalog::fleet::{FleetPeer, NodeId, PeerRole};
 use eidos_catalog::Catalog;
 use eidos_domain::UnixNanos;
+use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -54,13 +55,18 @@ pub struct Enrollment {
 /// fingerprint, present the secret, and record the central as this node's
 /// peer. Sync starts at the service's next tick.
 pub async fn enroll(
-    catalog: &Catalog,
+    catalog: &Arc<Catalog>,
     identity: &NodeIdentity,
     code: &InviteCode,
     timeout: Duration,
 ) -> anyhow::Result<Enrollment> {
-    if let Some(existing) = catalog
-        .fleet_peers()?
+    let existing_peers = {
+        let catalog = catalog.clone();
+        tokio::task::spawn_blocking(move || catalog.fleet_peers())
+            .await
+            .context("checking the local fleet roster")??
+    };
+    if let Some(existing) = existing_peers
         .into_iter()
         .find(|p| p.role == PeerRole::Central)
     {
@@ -108,7 +114,10 @@ pub async fn enroll(
                 last_error: None,
                 connected: false,
             };
-            catalog.fleet_upsert_peer(&peer)?;
+            let catalog = catalog.clone();
+            tokio::task::spawn_blocking(move || catalog.fleet_upsert_peer(&peer))
+                .await
+                .context("recording the central in the local fleet roster")??;
             Ok(Enrollment {
                 central: node_id,
                 central_name: name,

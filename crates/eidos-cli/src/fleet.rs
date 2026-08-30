@@ -13,6 +13,7 @@ use eidos_domain::SyncPolicy;
 use eidos_fleet::{FleetConfig, FleetStatus, InviteCode, NodeIdentity};
 use serde::de::DeserializeOwned;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Args, Debug)]
@@ -44,7 +45,7 @@ pub enum FleetCommand {
     /// Enable or disable the central role and set the sync listener.
     Central {
         /// Listen address for the dedicated sync endpoint, e.g. 0.0.0.0:7710.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_listen")]
         listen: Option<String>,
         /// Stop accepting enrollments and replicas (the listener stays).
         #[arg(long)]
@@ -82,7 +83,10 @@ pub enum FleetCommand {
         #[arg(long)]
         disable: bool,
         /// Forget the node and retire its replicated sources (central only).
-        #[arg(long)]
+        #[arg(
+            long,
+            conflicts_with_all = ["endpoint", "enable", "disable"]
+        )]
         forget: bool,
     },
     /// Keep a source on this host only, or let it follow enrollment again.
@@ -148,6 +152,19 @@ fn send<T: DeserializeOwned>(
 
 fn service_reachable(url: &str) -> bool {
     get::<serde_json::Value>(url, "/api/health").is_ok()
+}
+
+fn api_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn source_id_by_name(sources: &[serde_json::Value], name: &str) -> Option<i64> {
+    sources
+        .iter()
+        .find(|source| source["source"]["name"].as_str() == Some(name))
+        .and_then(|source| api_i64(&source["source"]["id"]))
 }
 
 pub fn run(args: FleetArgs) -> anyhow::Result<()> {
@@ -239,7 +256,7 @@ pub fn run(args: FleetArgs) -> anyhow::Result<()> {
                 let endpoint = endpoint.ok_or_else(|| {
                     anyhow!("the service is not running; pass --endpoint host:port explicitly")
                 })?;
-                let catalog = Catalog::open(args.data_dir.join("catalog.db"))?;
+                let catalog = Arc::new(Catalog::open(args.data_dir.join("catalog.db"))?);
                 let identity =
                     NodeIdentity::load_or_create(&args.data_dir, &eidos_domain::bench::hostname())?;
                 let config = FleetConfig::load(&args.data_dir)?;
@@ -270,7 +287,7 @@ pub fn run(args: FleetArgs) -> anyhow::Result<()> {
                     view["endpoint"].as_str().unwrap_or_default()
                 );
             } else {
-                let catalog = Catalog::open(args.data_dir.join("catalog.db"))?;
+                let catalog = Arc::new(Catalog::open(args.data_dir.join("catalog.db"))?);
                 let identity =
                     NodeIdentity::load_or_create(&args.data_dir, &eidos_domain::bench::hostname())?;
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -348,10 +365,7 @@ pub fn run(args: FleetArgs) -> anyhow::Result<()> {
                 return Err(anyhow!("choose --local-only or --inherit"));
             }
             let sources: Vec<serde_json::Value> = get(&url, "/api/sources")?;
-            let id = sources
-                .iter()
-                .find(|s| s["source"]["name"].as_str() == Some(source.as_str()))
-                .and_then(|s| s["source"]["id"].as_i64())
+            let id = source_id_by_name(&sources, &source)
                 .ok_or_else(|| anyhow!("no source named {source}"))?;
             let policy = if local_only {
                 SyncPolicy::LocalOnly
@@ -498,4 +512,44 @@ fn print_status(s: &FleetStatus) {
         c.bytes_catalog_sent,
         c.bytes_catalog_received
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrap {
+        #[command(flatten)]
+        fleet: FleetArgs,
+    }
+
+    #[test]
+    fn policy_reads_api_integer_strings() {
+        let sources = vec![serde_json::json!({
+            "source": { "id": "42", "name": "reports" }
+        })];
+        assert_eq!(source_id_by_name(&sources, "reports"), Some(42));
+    }
+
+    #[test]
+    fn contradictory_mutation_flags_are_rejected() {
+        assert!(Wrap::try_parse_from([
+            "eidos-fleet",
+            "central",
+            "--listen",
+            "0.0.0.0:7710",
+            "--no-listen",
+        ])
+        .is_err());
+        assert!(Wrap::try_parse_from([
+            "eidos-fleet",
+            "peer",
+            "00112233445566778899aabbccddeeff",
+            "--forget",
+            "--disable",
+        ])
+        .is_err());
+    }
 }
