@@ -196,6 +196,74 @@ fn source_without_sync_stamps_nothing() {
 }
 
 #[test]
+fn sync_enabled_before_the_initial_scan_stamps_the_root_and_its_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("one.txt"), b"one").unwrap();
+    let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+    let host = catalog.ensure_host("h", "windows").unwrap();
+    let source = catalog
+        .add_source(&NewSource {
+            host_id: host,
+            name: "pre-enabled".into(),
+            kind: SourceKind::WindowsLocal,
+            root_path: root.display().to_string(),
+            aliases: vec![],
+        })
+        .unwrap();
+    catalog.sync_enable(source, None).unwrap();
+    assert!(catalog.sync_backfill(source, 16).unwrap().done);
+    assert_eq!(catalog.sync_source(source).unwrap().unwrap().head_seq, 0);
+
+    let lister = eidos_scanner::default_lister();
+    run_scan(
+        &catalog,
+        source,
+        lister.as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    let root_object = catalog
+        .get_source(source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let batch = catalog.sync_rows_after(source, 0, u32::MAX).unwrap();
+    let root_row = row_for(&batch, root_object);
+    let native = root_row
+        .image
+        .as_ref()
+        .expect("root is live")
+        .object
+        .native
+        .expect("the root stat identity was shipped");
+
+    let before = catalog.sync_source(source).unwrap().unwrap().head_seq;
+    let mut replacement = native;
+    replacement.file_id_low ^= 1 << 48;
+    catalog.set_root_identity(source, replacement).unwrap();
+    let after = catalog.sync_source(source).unwrap().unwrap().head_seq;
+    assert_eq!(after, before + 1);
+    let changed = catalog.sync_rows_after(source, before, u32::MAX).unwrap();
+    assert_eq!(
+        row_for(&changed, root_object)
+            .image
+            .as_ref()
+            .unwrap()
+            .object
+            .native,
+        Some(replacement)
+    );
+    catalog.set_root_identity(source, replacement).unwrap();
+    assert_eq!(
+        catalog.sync_source(source).unwrap().unwrap().head_seq,
+        after
+    );
+}
+
+#[test]
 fn enable_backfills_live_objects_in_bounded_steps() {
     let fx = Fx::new();
     let live = fx.live_object_count();

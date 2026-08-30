@@ -260,6 +260,19 @@ impl Central {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
         catalog.ensure_host("central", "windows").unwrap();
+        catalog
+            .fleet_upsert_peer(&FleetPeer {
+                node_id: NodeId(NODE),
+                name: "node-a".into(),
+                role: PeerRole::Node,
+                fingerprint: [0xA5; 32],
+                endpoint: None,
+                enabled: true,
+                enrolled_at: UnixNanos(1),
+                last_seen_at: None,
+                last_error: None,
+            })
+            .unwrap();
         Central { dir, catalog }
     }
 
@@ -1877,24 +1890,25 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
         }
         other => panic!("{other:?}"),
     }
-    match central
-        .catalog
-        .replica_apply_repair(
-            source,
-            state.epoch.to_source_epoch(),
-            state.head_seq,
-            state.head_chain,
-            leaf_bits,
-            &leaves,
-            &rows,
-        )
-        .unwrap()
-    {
-        RepairOutcome::Rejected { reason } => {
-            assert!(reason.contains("outstanding request"), "{reason}")
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                leaf_bits,
+                &leaves,
+                &rows,
+            )
+            .unwrap(),
+        RepairOutcome::Applied {
+            replaced: 0,
+            removed: 0,
+            ..
         }
-        other => panic!("replayed repair was accepted: {other:?}"),
-    }
+    ));
     node.catalog
         .sync_acknowledge(node.source, state.epoch, CENTRAL, state.head_seq)
         .unwrap();
@@ -2275,9 +2289,10 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
     let split = leaves.len() / 2;
     let (first_leaves, final_leaves) = leaves.split_at(split);
     let first_scope: BTreeSet<_> = first_leaves.iter().copied().collect();
-    let (first_rows, final_rows): (Vec<_>, Vec<_>) = rows
+    let first_rows = rows
         .into_iter()
-        .partition(|row| first_scope.contains(&leaf_index(leaf_bits, row.object)));
+        .filter(|row| first_scope.contains(&leaf_index(leaf_bits, row.object)))
+        .collect::<Vec<_>>();
     assert!(matches!(
         central
             .catalog
@@ -2297,14 +2312,8 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
             ..
         } if remaining_leaves == final_leaves.len() as u64
     ));
-    assert!(
-        !central
-            .catalog
-            .source_completeness(source)
-            .unwrap()
-            .metadata_complete
-    );
-    central.reopen();
+    // Losing the response to a committed part must not make retransmission
+    // fail or apply the part twice.
     assert!(matches!(
         central
             .catalog
@@ -2314,12 +2323,107 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
                 state.head_seq,
                 state.head_chain,
                 leaf_bits,
-                final_leaves,
-                &final_rows,
+                first_leaves,
+                &first_rows,
+                false,
+            )
+            .unwrap(),
+        RepairOutcome::Staged {
+            replaced: 0,
+            removed: 0,
+            remaining_leaves,
+        } if remaining_leaves == final_leaves.len() as u64
+    ));
+    assert!(
+        !central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
+    central.reopen();
+    let resumed_hello = central
+        .catalog
+        .replica_admit_hello(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            state.compacted_through,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            resumed_hello,
+            HelloOutcome::Resume {
+                requires_repair: true,
+                ..
+            }
+        ),
+        "{resumed_hello:?}"
+    );
+    let resumed_leaves = match central
+        .catalog
+        .replica_repair_offer(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &source_tree.leaf_hashes(),
+        )
+        .unwrap()
+    {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("repair did not resume after reopen: {other:?}"),
+    };
+    assert_eq!(resumed_leaves, final_leaves);
+    let resumed_scope: BTreeSet<_> = resumed_leaves.iter().copied().collect();
+    let resumed_objects = entries
+        .iter()
+        .filter(|entry| resumed_scope.contains(&leaf_index(leaf_bits, entry.object)))
+        .map(|entry| entry.object)
+        .collect::<Vec<_>>();
+    let (_, resumed_rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &resumed_objects)
+        .unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair_part(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                leaf_bits,
+                &resumed_leaves,
+                &resumed_rows,
                 true,
             )
             .unwrap(),
         RepairOutcome::Applied { .. }
+    ));
+    // The final commit is idempotent too when its response is lost.
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair_part(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                leaf_bits,
+                &resumed_leaves,
+                &resumed_rows,
+                true,
+            )
+            .unwrap(),
+        RepairOutcome::Applied {
+            replaced: 0,
+            removed: 0,
+            ..
+        }
     ));
     assert_eq!(
         central
@@ -2587,6 +2691,143 @@ fn an_outstanding_repair_keeps_a_later_batch_reconciling() {
 }
 
 #[test]
+fn disabled_or_removed_peers_are_durably_fenced_from_replica_writes() {
+    let node = Node::new();
+    let mut central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let applied = central.applied_seq(source);
+    node.touch("a/one.txt", 123, 1_700_000_123);
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    let batch = node
+        .catalog
+        .sync_rows_after(node.source, applied, u32::MAX)
+        .unwrap();
+
+    assert!(central
+        .catalog
+        .fleet_set_peer_enabled(NodeId(NODE), false)
+        .unwrap());
+    central.reopen();
+    match central
+        .catalog
+        .replica_admit_hello(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            state.compacted_through,
+        )
+        .unwrap()
+    {
+        HelloOutcome::Rejected { reason } => assert!(reason.contains("disabled"), "{reason}"),
+        other => panic!("disabled peer's hello was accepted: {other:?}"),
+    }
+    match central.catalog.replica_apply_batch(source, &batch).unwrap() {
+        BatchOutcome::Rejected { reason } => assert!(reason.contains("disabled"), "{reason}"),
+        other => panic!("disabled peer's batch was accepted: {other:?}"),
+    }
+    assert!(central
+        .catalog
+        .replica_ensure_source(&Central::node(), &node.descriptor(), node.epoch())
+        .is_err());
+
+    assert!(central
+        .catalog
+        .fleet_set_peer_enabled(NodeId(NODE), true)
+        .unwrap());
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                state.compacted_through,
+            )
+            .unwrap(),
+        HelloOutcome::Resume { .. }
+    ));
+    let (_, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
+    let tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
+    );
+    let leaves = match central
+        .catalog
+        .replica_repair_offer(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &tree.leaf_hashes(),
+        )
+        .unwrap()
+    {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("repair was not requested: {other:?}"),
+    };
+    assert!(!leaves.is_empty());
+    let wanted: BTreeSet<_> = leaves.iter().copied().collect();
+    let objects = entries
+        .iter()
+        .filter(|entry| wanted.contains(&leaf_index(leaf_bits, entry.object)))
+        .map(|entry| entry.object)
+        .collect::<Vec<_>>();
+    let (_, rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &objects)
+        .unwrap();
+    assert!(central
+        .catalog
+        .fleet_set_peer_enabled(NodeId(NODE), false)
+        .unwrap());
+    central.reopen();
+    match central
+        .catalog
+        .replica_apply_repair(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &leaves,
+            &rows,
+        )
+        .unwrap()
+    {
+        RepairOutcome::Rejected { reason } => assert!(reason.contains("disabled"), "{reason}"),
+        other => panic!("disabled peer's repair was accepted: {other:?}"),
+    }
+
+    assert!(central.catalog.fleet_remove_peer(NodeId(NODE)).unwrap());
+    central.reopen();
+    match central.catalog.replica_apply_batch(source, &batch).unwrap() {
+        BatchOutcome::Rejected { reason } => assert!(reason.contains("no longer"), "{reason}"),
+        other => panic!("removed peer's batch was accepted: {other:?}"),
+    }
+    assert!(central
+        .catalog
+        .replica_ensure_source(&Central::node(), &node.descriptor(), node.epoch())
+        .is_err());
+    assert_ne!(
+        central.catalog.get_source(source).unwrap().unwrap().state,
+        SourceState::Retired,
+        "fencing preserves a disabled peer's searchable replica data"
+    );
+}
+
+#[test]
 fn snapshot_fallback_preserves_rows_already_staged_by_repair() {
     let node = Node::new();
     let mut central = Central::new();
@@ -2830,6 +3071,20 @@ fn two_nodes_with_the_same_source_name_and_path_stay_distinct() {
         name: "node-a".into(),
         platform: "windows".into(),
     };
+    central
+        .catalog
+        .fleet_upsert_peer(&FleetPeer {
+            node_id: NodeId(node_b.node_id),
+            name: node_b.name.clone(),
+            role: PeerRole::Node,
+            fingerprint: [0xB6; 32],
+            endpoint: None,
+            enabled: true,
+            enrolled_at: UnixNanos(1),
+            last_seen_at: None,
+            last_error: None,
+        })
+        .unwrap();
     let mut descriptor = b.descriptor();
     descriptor.root_path = a.root.display().to_string();
     let source_b = central

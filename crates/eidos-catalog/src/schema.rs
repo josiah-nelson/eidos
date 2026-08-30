@@ -571,6 +571,8 @@ CREATE TABLE sync_replica_repairs (
     leaf_bits     INTEGER NOT NULL,
     leaves        TEXT NOT NULL,
     hashes        BLOB NOT NULL,
+    remaining     TEXT NOT NULL,
+    last_part     TEXT NOT NULL,
     requested_at  INTEGER NOT NULL
 );
 "#,

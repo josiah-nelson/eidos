@@ -713,7 +713,9 @@ fn wire_leaf_hashes(rows: &[SyncRow], leaf_bits: u8) -> Result<BTreeMap<u32, [u8
 
 fn repair_pending_conn(tx: &Transaction<'_>, source: SourceId) -> Result<bool> {
     Ok(tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sync_replica_repairs WHERE source_id = ?1)",
+        "SELECT EXISTS(
+            SELECT 1 FROM sync_replica_repairs
+            WHERE source_id = ?1 AND json_array_length(remaining) > 0)",
         params![source.0],
         |r| r.get::<_, i64>(0),
     )? != 0)
@@ -724,6 +726,25 @@ fn source_is_retired_conn(conn: &Connection, source: SourceId) -> Result<bool> {
         "SELECT state = ?2 FROM sources WHERE source_id = ?1",
         params![source.0, SourceState::Retired.as_str()],
         |r| r.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn node_is_authorized_conn(conn: &Connection, node: &[u8; 16]) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM fleet_peers WHERE node_id = ?1 AND enabled = 1)",
+        params![node.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn source_peer_is_authorized_conn(conn: &Connection, source: SourceId) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sync_replica_sources r
+            JOIN fleet_peers p ON p.node_id = r.node_id
+            WHERE r.source_id = ?1 AND p.enabled = 1)",
+        params![source.0],
+        |row| row.get::<_, i64>(0),
     )? != 0)
 }
 
@@ -1084,6 +1105,11 @@ impl Catalog {
     ) -> Result<ReplicaSourceState> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !node_is_authorized_conn(&tx, &node.node_id)? {
+                return Err(CatalogError::InvalidState(
+                    "replica peer is disabled or no longer enrolled".into(),
+                ));
+            }
             let existing: Option<i64> = tx
                 .query_row(
                     "SELECT source_id FROM sync_replica_sources WHERE node_id = ?1 AND remote_source_id = ?2",
@@ -1224,6 +1250,11 @@ impl Catalog {
                     reason: "replica source is retired".into(),
                 });
             }
+            if !source_peer_is_authorized_conn(&tx, source)? {
+                return Ok(HelloOutcome::Rejected {
+                    reason: "replica peer is disabled or no longer enrolled".into(),
+                });
+            }
             let now = UnixNanos::now().0;
             let same_epoch_rewind = (state.admission.epoch == epoch
                 || state.admission.pending_epoch() == Some(epoch))
@@ -1270,7 +1301,8 @@ impl Catalog {
                 HelloDecision::Incremental { after_seq } => HelloOutcome::Resume {
                     epoch,
                     after_seq,
-                    requires_repair: after_seq < compacted_through,
+                    requires_repair: after_seq < compacted_through
+                        || repair_pending_conn(&tx, source)?,
                 },
                 HelloDecision::FullResync { new_epoch, .. } => {
                     // Every live object of the new incarnation is stamped at
@@ -1408,6 +1440,11 @@ impl Catalog {
             if source_is_retired_conn(&tx, source)? {
                 return Ok(BatchOutcome::Rejected {
                     reason: "replica source is retired".into(),
+                });
+            }
+            if !source_peer_is_authorized_conn(&tx, source)? {
+                return Ok(BatchOutcome::Rejected {
+                    reason: "replica peer is disabled or no longer enrolled".into(),
                 });
             }
             if batch.source_id != state.remote_source_id {
@@ -1590,6 +1627,11 @@ impl Catalog {
                     reason: "replica source is retired".into(),
                 });
             }
+            if !source_peer_is_authorized_conn(&tx, source)? {
+                return Ok(RepairOfferOutcome::Rejected {
+                    reason: "replica peer is disabled or no longer enrolled".into(),
+                });
+            }
             if through_seq != state.reported_head {
                 return Ok(RepairOfferOutcome::Rejected {
                     reason: format!(
@@ -1629,6 +1671,70 @@ impl Catalog {
                     reason: "invalid Merkle shape".into(),
                 });
             }
+            let existing = tx
+                .prepare_cached(
+                    "SELECT epoch, through_seq, through_chain, leaf_bits, leaves, hashes, remaining
+                     FROM sync_replica_repairs WHERE source_id = ?1",
+                )?
+                .query_row(params![source.0], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })
+                .optional()?;
+            if let Some((
+                requested_epoch,
+                requested_seq,
+                requested_chain,
+                requested_bits,
+                requested_leaves,
+                requested_hashes,
+                remaining,
+            )) = existing
+            {
+                let identical_request = requested_epoch.as_slice() == epoch.as_bytes().as_slice()
+                    && requested_seq as u64 == through_seq
+                    && repair_chain_from_blob(requested_chain)? == through_chain
+                    && requested_bits as u8 == leaf_bits;
+                if identical_request {
+                    let requested_leaves: Vec<u32> = serde_json::from_str(&requested_leaves)
+                        .map_err(|error| {
+                            CatalogError::InvalidState(format!(
+                                "repair leaf scope is unreadable: {error}"
+                            ))
+                        })?;
+                    let requested_hashes = decode_leaf_hashes(requested_hashes)?;
+                    if requested_hashes.len() != requested_leaves.len() {
+                        return Err(CatalogError::InvalidState(
+                            "repair leaf scope and expected hashes have different lengths".into(),
+                        ));
+                    }
+                    if requested_leaves.iter().zip(&requested_hashes).any(|(leaf, hash)| {
+                        leaf_hashes.get(*leaf as usize) != Some(hash)
+                    }) {
+                        return Ok(RepairOfferOutcome::Rejected {
+                            reason: "history fork: repeated repair offer changed its leaf manifest"
+                                .into(),
+                        });
+                    }
+                    let remaining: Vec<u32> = serde_json::from_str(&remaining).map_err(|error| {
+                        CatalogError::InvalidState(format!(
+                            "remaining repair scope is unreadable: {error}"
+                        ))
+                    })?;
+                    tx.commit()?;
+                    return Ok(RepairOfferOutcome::Request {
+                        leaf_bits,
+                        leaves: remaining,
+                    });
+                }
+            }
             let local = replica_leaf_hashes_conn(&tx, source, leaf_bits)?;
             let leaves = if state.resync_target.is_some() {
                 // Completing an epoch resync by repair must materialize every
@@ -1650,12 +1756,13 @@ impl Catalog {
             let requested_hashes = encode_leaf_hashes(&requested_hashes);
             tx.prepare_cached(
                 "INSERT INTO sync_replica_repairs
-                    (source_id, epoch, through_seq, through_chain, leaf_bits, leaves, hashes, requested_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    (source_id, epoch, through_seq, through_chain, leaf_bits, leaves, hashes, remaining, last_part, requested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', ?9)
                  ON CONFLICT(source_id) DO UPDATE SET
                     epoch = excluded.epoch, through_seq = excluded.through_seq,
                     through_chain = excluded.through_chain, leaf_bits = excluded.leaf_bits,
                     leaves = excluded.leaves, hashes = excluded.hashes,
+                    remaining = excluded.remaining, last_part = excluded.last_part,
                     requested_at = excluded.requested_at",
             )?
             .execute(params![
@@ -1666,6 +1773,7 @@ impl Catalog {
                 leaf_bits as i64,
                 serde_json::to_string(&leaves)?,
                 requested_hashes,
+                serde_json::to_string(&leaves)?,
                 UnixNanos::now().0,
             ])?;
             mark_completeness_conn(&tx, source, UnixNanos::now().0, false)?;
@@ -1754,6 +1862,11 @@ impl Catalog {
                     reason: "replica source is retired".into(),
                 });
             }
+            if !source_peer_is_authorized_conn(&tx, source)? {
+                return Ok(RepairOutcome::Rejected {
+                    reason: "replica peer is disabled or no longer enrolled".into(),
+                });
+            }
             if through_seq != state.reported_head {
                 return Ok(RepairOutcome::Rejected {
                     reason: format!(
@@ -1796,9 +1909,11 @@ impl Catalog {
                     ),
                 });
             }
+            let response_hashes = wire_leaf_hashes(rows, leaf_bits)?;
+            let empty_hash = MerkleLeafHasher::new().finalize();
             let request = tx
                 .prepare_cached(
-                    "SELECT epoch, through_seq, through_chain, leaf_bits, leaves, hashes
+                    "SELECT epoch, through_seq, through_chain, leaf_bits, leaves, hashes, remaining, last_part
                      FROM sync_replica_repairs WHERE source_id = ?1",
                 )?
                 .query_row(params![source.0], |r| {
@@ -1809,10 +1924,12 @@ impl Catalog {
                         r.get::<_, i64>(3)?,
                         r.get::<_, String>(4)?,
                         r.get::<_, Vec<u8>>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
                     ))
                 })
                 .optional()?;
-            let Some((requested_epoch, requested_seq, requested_chain, requested_bits, requested_leaves, requested_hashes)) = request else {
+            let Some((requested_epoch, requested_seq, requested_chain, requested_bits, requested_leaves, requested_hashes, remaining_leaves, last_part)) = request else {
                 return Ok(RepairOutcome::Rejected {
                     reason: "repair response has no outstanding request".into(),
                 });
@@ -1837,19 +1954,40 @@ impl Catalog {
                     "repair leaf scope contains duplicates".into(),
                 ));
             }
+            let remaining_leaves: Vec<u32> = serde_json::from_str(&remaining_leaves).map_err(|e| {
+                CatalogError::InvalidState(format!("remaining repair scope is unreadable: {e}"))
+            })?;
+            let remaining_scope: BTreeSet<u32> = remaining_leaves.iter().copied().collect();
+            if remaining_scope.len() != remaining_leaves.len()
+                || !remaining_scope.is_subset(&requested_scope)
+            {
+                return Err(CatalogError::InvalidState(
+                    "remaining repair scope is invalid".into(),
+                ));
+            }
+            let last_part: Vec<u32> = serde_json::from_str(&last_part).map_err(|e| {
+                CatalogError::InvalidState(format!("last repair part is unreadable: {e}"))
+            })?;
+            let last_scope: BTreeSet<u32> = last_part.iter().copied().collect();
+            if last_scope.len() != last_part.len() || !last_scope.is_subset(&requested_scope) {
+                return Err(CatalogError::InvalidState(
+                    "last repair part scope is invalid".into(),
+                ));
+            }
+            let applying_new_part = wanted.is_subset(&remaining_scope);
+            let replaying_applied_part = wanted == last_scope && !wanted.is_empty();
             if requested_epoch.as_slice() != epoch.as_bytes().as_slice()
                 || requested_seq as u64 != through_seq
                 || repair_chain_from_blob(requested_chain)? != through_chain
                 || requested_bits as u8 != leaf_bits
-                || !wanted.is_subset(&requested_scope)
-                || final_part != (wanted == requested_scope)
+                || (!applying_new_part && !replaying_applied_part)
+                || (applying_new_part && final_part != (wanted == remaining_scope))
+                || (replaying_applied_part && final_part != remaining_scope.is_empty())
             {
                 return Ok(RepairOutcome::Rejected {
                     reason: "repair response does not match the outstanding request".into(),
                 });
             }
-            let response_hashes = wire_leaf_hashes(rows, leaf_bits)?;
-            let empty_hash = MerkleLeafHasher::new().finalize();
             if leaves.iter().any(|leaf| {
                 response_hashes.get(leaf).unwrap_or(&empty_hash)
                     != expected_by_leaf
@@ -1859,6 +1997,22 @@ impl Catalog {
                 return Ok(RepairOutcome::Rejected {
                     reason: "repair response does not match the requested Merkle leaf hash".into(),
                 });
+            }
+            if replaying_applied_part {
+                tx.commit()?;
+                return if final_part {
+                    Ok(RepairOutcome::Applied {
+                        through_seq,
+                        replaced: 0,
+                        removed: 0,
+                    })
+                } else {
+                    Ok(RepairOutcome::Staged {
+                        replaced: 0,
+                        removed: 0,
+                        remaining_leaves: remaining_scope.len() as u64,
+                    })
+                };
             }
             let now = UnixNanos::now().0;
             let sync_epoch = SyncEpoch::from_source_epoch(epoch);
@@ -1946,22 +2100,18 @@ impl Catalog {
                     removed += 1;
                 }
             }
-            let remaining = requested_scope
+            let remaining = remaining_scope
                 .difference(&wanted)
                 .copied()
                 .collect::<Vec<_>>();
             if !final_part {
-                let remaining_hashes = remaining
-                    .iter()
-                    .map(|leaf| expected_by_leaf[leaf])
-                    .collect::<Vec<_>>();
                 tx.prepare_cached(
-                    "UPDATE sync_replica_repairs SET leaves = ?2, hashes = ?3 WHERE source_id = ?1",
+                    "UPDATE sync_replica_repairs SET remaining = ?2, last_part = ?3 WHERE source_id = ?1",
                 )?
                 .execute(params![
                     source.0,
                     serde_json::to_string(&remaining)?,
-                    encode_leaf_hashes(&remaining_hashes)
+                    serde_json::to_string(leaves)?
                 ])?;
                 mark_applied_conn(&tx, source, now, false)?;
                 tx.commit()?;
@@ -1993,8 +2143,11 @@ impl Catalog {
                 }
             }
             store_admission_conn(&tx, source, &state.admission, state.resync_target)?;
-            tx.prepare_cached("DELETE FROM sync_replica_repairs WHERE source_id = ?1")?
-                .execute(params![source.0])?;
+            tx.prepare_cached(
+                "UPDATE sync_replica_repairs SET remaining = '[]', last_part = ?2
+                 WHERE source_id = ?1",
+            )?
+            .execute(params![source.0, serde_json::to_string(leaves)?])?;
             let image_complete = state.resync_target.is_none()
                 && state.admission.applied_seq >= state.reported_head;
             mark_applied_conn(&tx, source, now, image_complete)?;

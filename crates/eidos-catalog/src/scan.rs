@@ -177,6 +177,11 @@ impl Catalog {
                         "UPDATE sources SET root_object_id = ?2 WHERE source_id = ?1",
                         params![source_id.0, root.0],
                     )?;
+                    // Enrollment may enable and finish an empty-source
+                    // backfill before the first scan. In that ordering the
+                    // newly created root must enter the ledger here; there is
+                    // no later backfill pass to discover it.
+                    crate::sync::touch_conn(&tx, source_id, root)?;
                     source.root_object_id = Some(root);
                     root
                 }

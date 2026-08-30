@@ -223,14 +223,17 @@ impl Catalog {
     /// root path) so change feeds can match events beneath it.
     pub fn set_root_identity(&self, source_id: SourceId, native: NativeIdentity) -> Result<()> {
         self.with_writer(|conn| {
-            let src = get_source_conn(conn, source_id)?
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let src = get_source_conn(&tx, source_id)?
                 .ok_or_else(|| CatalogError::NotFound(format!("source {source_id}")))?;
             let root = match src.root_object_id {
                 Some(r) => r,
                 None => return Ok(()),
             };
-            conn.execute(
-                "UPDATE objects SET native_volume_serial = ?2, native_id_high = ?3, native_id_low = ?4, identity_confidence = ?5 WHERE object_id = ?1",
+            let changed = tx.execute(
+                "UPDATE objects SET native_volume_serial = ?2, native_id_high = ?3, native_id_low = ?4, identity_confidence = ?5
+                 WHERE object_id = ?1 AND (native_volume_serial IS NOT ?2 OR native_id_high IS NOT ?3
+                    OR native_id_low IS NOT ?4 OR identity_confidence != ?5)",
                 params![
                     root.0,
                     native.volume_serial as i64,
@@ -239,6 +242,10 @@ impl Catalog {
                     native.confidence.as_str()
                 ],
             )?;
+            if changed > 0 {
+                crate::sync::touch_conn(&tx, source_id, root)?;
+            }
+            tx.commit()?;
             Ok(())
         })
     }
