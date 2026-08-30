@@ -13,7 +13,7 @@ One search across every system you control, with the context and certainty ordin
 >
 > Eidos is under active development, and several capabilities described below are planned rather than available today. For an exact breakdown of the current implementation, see [What works today](#what-works-today) and the [release roadmap](docs/roadmap.md).
 >
-> There is no packaged release yet. APIs, schemas, and query syntax may change.
+> The first packaged Windows release is [v0.5.0](https://github.com/josiah-nelson/eidos/releases/latest); see [installing.md](docs/installing.md). APIs, schemas, and query syntax may still change.
 
 ## The file is somewhere. That should be enough.
 
@@ -189,7 +189,7 @@ Optional semantic retrieval can eventually add another signal when the exact wor
 
 ## What works today
 
-The current v0.5 implementation is Windows-first and focused on proving the foundation before distributing a packaged release.
+The v0.5 release is Windows-first (a signed installer; macOS builds from source) and focused on proving the foundation.
 
 | Area | Current capability |
 |---|---|
@@ -202,6 +202,9 @@ The current v0.5 implementation is Windows-first and focused on proving the foun
 | Directories | First-class directory results, descendant predicates, subtree sizes, counts, tree browsing, and treemap data |
 | Reliability | Atomic scan publication, durable jobs, offline preservation, and per-source completeness |
 | Interfaces | Web UI, CLI, and HTTP API using the same typed query model |
+| Archives | ZIP member inventories searchable by name, path, and size |
+| Packaging | Signed Windows setup (per-user or service), in-place upgrades; macOS LaunchAgent from source |
+| Fleet (experimental) | Explicitly enrolled nodes replicate catalog metadata to one central over mutual TLS; central search over the union |
 
 Everything Eidos does to a source is read-only.
 
@@ -357,7 +360,7 @@ docs/             public documentation and architecture decisions
 
 ## Contributing
 
-Eidos is developed in the open, but the architecture and public interfaces are still evolving quickly. Expect churn until the first packaged release.
+Eidos is developed in the open, but the architecture and public interfaces are still evolving quickly. Expect churn while the v0.5.x line settles.
 
 Bug reports with reproducible synthetic fixtures are especially useful.
 

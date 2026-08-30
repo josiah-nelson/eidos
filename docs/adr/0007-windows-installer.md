@@ -1,4 +1,4 @@
-# ADR-0013: Windows installer — dual-scope MSI, guided bundle, service and background modes
+# ADR-0007: Windows installer — dual-scope MSI, guided bundle, service and background modes
 
 Status: Accepted (2026-08-24)
 

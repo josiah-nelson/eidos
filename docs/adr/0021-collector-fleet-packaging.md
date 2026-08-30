@@ -14,7 +14,7 @@ on several hosts for at least thirty days (a cohort that shares one study
 key, so content fingerprints compare across hosts), and the hosts have no
 build tree, no Rust, and no reason to acquire either.
 
-The indexer already ships a WiX v7 installer (ADR-0013): a dual-scope MSI
+The indexer already ships a WiX v7 installer ([ADR-0007](0007-windows-installer.md)): a dual-scope MSI
 driven by a WPF bootstrapper application. The collector is a different
 product with a different shape — always per-machine, no web UI, no port, no
 user-visible choices — and a fleet installs it unattended.
@@ -59,7 +59,7 @@ are deliberately *not* remembered in the registry. After the first install
 host's runtime `observe lanes` choices alone.
 
 **Service registration is MSI-native** (`ServiceInstall`, `ServiceControl`,
-`ServiceConfig`, `util:ServiceConfig`), matching ADR-0013 and mirroring what
+`ServiceConfig`, `util:ServiceConfig`), matching ADR-0007 and mirroring what
 `observe install` registers by hand, so rollback and removal are the
 installer's. The data directory's ACL is not: it is set by `observe init`,
 which is where the key is written, and where it belonged even before there

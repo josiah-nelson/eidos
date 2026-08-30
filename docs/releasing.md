@@ -45,29 +45,25 @@ core-plus-collector per-machine through the unified setup, same-version
 adoption and later upgrade from the separate collector package, repair,
 uninstall keeping data, and explicit purge of exactly one product's data.
 
-## Release checklist (v0.5)
+## Release checklist
 
-The [sprint gates](v0.5-dogfood-fleet-sprint.md#11-v05-release-gates) in
-order; nothing later compensates for an earlier failure:
+The tag is the release. Everything the workflow needs is in the tree it
+tags; there is no separate rehearsal to pass first.
 
-1. `Cargo.toml` carries the numeric version (`0.5.0`, no `-dev`).
-2. `scripts\check.ps1` passes on the release commit (format, lint, full
-   suite including the real-SQLite adapter tests, the loopback-TLS fleet
-   session tests and the central-search test, web tests and build).
-3. `sync-soak.yml` (the million-universe protocol soak) and `installer.yml`
-   pass on the release commit.
-4. `eidos bench chunking` has produced the report behind
-   [ADR-0024](adr/0024-content-transfer-bakeoff.md).
-5. The signing rehearsal (`gh workflow run release.yml --ref <commit>`)
-   succeeds and every artifact verifies.
-6. The private-fleet soak in [fleet.md](fleet.md) has been run with the
-   release candidate and its results are in
-   [releases/v0.5.0.md](releases/v0.5.0.md); a failed fleet gate ships the
-   same installer with sync disabled and the gate documented, never
-   weakened local correctness.
-7. Tag `v0.5.0` from the tested commit; the release publishes the unified
-   setup, the administrator artifacts, checksums, and the release notes with
-   the known limits and rollback steps.
+1. Bump the workspace `version` in `Cargo.toml` (and `Cargo.lock`, via
+   `cargo update -w --offline` or any build) and `web/package.json`
+   (`npm version <version> --no-git-tag-version`) to the version the tag
+   will carry, numeric, no `-dev`.
+2. Write `docs/releases/<tag>.md` - the announcement the GitHub release is
+   created with. Without it the release gets generated notes.
+3. `scripts\check.ps1` passes on the release commit.
+4. Push the tag from that commit. The workflow refuses a tag that does not
+   match `Cargo.toml`, then runs format, lint, the generated API contract
+   check, every Rust test on Windows and the web lint/tests/build, and only
+   then builds, signs, verifies and publishes.
+
+`installer.yml` (lifecycle rehearsal on an unsigned build) and
+`sync-soak.yml` stay on demand for changes that touch what they cover.
 
 ## macOS
 
@@ -119,42 +115,29 @@ gh variable set AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME --body "<profile
 The endpoint must match the region in which the Artifact Signing account and
 certificate profile were created.
 
-## Test and publish
+## Publish
 
-Run the workflow manually against a branch to rehearse signing without
-touching a release:
-
-```powershell
-gh workflow run release.yml --ref main
-gh run watch
-```
-
-A manual run names the assets `eidos-manual-<sha>-*`, uploads them as a
-seven-day workflow artifact, and publishes nothing. Inspect the downloaded
-files with:
+Bump the workspace `version` in `Cargo.toml` and `web/package.json`, commit,
+then tag and push:
 
 ```powershell
-Get-AuthenticodeSignature .\eidos-manual-abc1234-setup.exe | Format-List Status,StatusMessage,SignerCertificate
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
-To publish, bump the workspace `version` in `Cargo.toml`, then tag and push:
+The tag push tests, builds and signs that revision and publishes the
+release: it creates the release from `docs/releases/v0.5.0.md` (generated
+notes when there is no such file) when the tag has none yet, and uploads to
+an existing release (replacing same-named assets) when one is already there,
+so drafting the release on GitHub first works equally well. A tag with a
+pre-release suffix (`v0.5.1-rc.1`) is published as a pre-release. The
+`release` environment only admits `v*` tags, so the first signing run of a
+version is the release itself; a bad build fails before anything is
+published, and a fix is a new patch tag.
 
-```powershell
-git tag v0.4.0
-git push origin v0.4.0
-```
-
-The tag push builds that revision, signs it, and publishes the release: it
-creates the release with generated notes when the tag has none yet, and
-uploads to an existing release (replacing same-named assets) when one is
-already there — so drafting release notes first and then pushing the tag
-works equally well. A tag with a pre-release suffix (`v0.4.0-rc.1`) is
-published as a pre-release.
-
-The version inside the installer comes from the workspace `version` in
-`Cargo.toml` with any pre-release suffix removed (Windows Installer versions
-are numeric), so bump it before tagging; a same-version rebuild is not a
-major upgrade.
+The version inside the installer comes from the same workspace `version`
+with any pre-release suffix removed (Windows Installer versions are
+numeric); a same-version rebuild is not a major upgrade.
 
 Client-secret authentication is supported by the Artifact Signing action and
 matches the currently provisioned repository secrets. OpenID Connect is the

@@ -1,14 +1,17 @@
 name: release
 
+# A pushed `v*` tag is the release. The tag is the canonical version: it must
+# match the workspace version in Cargo.toml (so the executable reports it),
+# it is stamped into web/package.json, and it names the installers and the
+# GitHub release. The whole test suite runs here first; any failure stops the
+# build before anything is signed.
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: write
-  actions: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -70,44 +73,37 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate release version and installer rehearsal
+      - name: Take the version from the tag
         id: release_version
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          # v1.2.3 or v1.2.3-rc.1 -> 1.2.3 / 1.2.3-rc.1. Windows Installer
+          # versions are numeric; installer\build.ps1 drops any pre-release
+          # suffix for the MSI and bundle metadata.
+          if ($env:RELEASE_TAG -notmatch '^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$') {
+            throw "release tag $env:RELEASE_TAG is not v<major>.<minor>.<patch>[-pre]"
+          }
+          $version = $Matches[1]
+
           $manifest = Get-Content Cargo.toml -Raw
           $match = [regex]::Match($manifest, '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"')
           if (-not $match.Success) { throw 'workspace package version is missing from Cargo.toml' }
-          $version = $match.Groups[1].Value
-          if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne "v$version") {
-            throw "release tag $env:GITHUB_REF_NAME does not match workspace version $version"
+          if ($match.Groups[1].Value -ne $version) {
+            throw "release tag $env:RELEASE_TAG does not match workspace version $($match.Groups[1].Value) in Cargo.toml; bump Cargo.toml (and Cargo.lock) before tagging"
           }
-          "version=$version" >> $env:GITHUB_OUTPUT
 
-          $response = gh api -X GET "repos/$env:GITHUB_REPOSITORY/actions/workflows/installer.yml/runs?event=workflow_dispatch&status=completed&per_page=100" | ConvertFrom-Json
-          $matching = @($response.workflow_runs | Where-Object {
-            $_.conclusion -eq 'success' -and $_.head_sha -eq $env:GITHUB_SHA
-          })
-          if ($matching.Count -eq 0) {
-            throw 'release requires a successful manual installer.yml run for this exact source tree'
-          }
-          "Installer rehearsal: $($matching[0].html_url)"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "Releasing $version"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      # The per-commit gate lints Windows but does not test it, so this is the
-      # last chance to catch Windows runtime behaviour before a signed build
-      # goes out. It runs before anything is built or signed so a failure
-      # costs nothing but the test time.
-      - name: Run the Windows test suite
-        env:
-          CARGO_PROFILE_DEV_DEBUG: 0
-        run: cargo test --locked
 
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -115,6 +111,43 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
+
+      - name: Stamp the release version into the web UI
+        shell: pwsh
+        working-directory: web
+        env:
+          EIDOS_RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        run: npm version $env:EIDOS_RELEASE_VERSION --no-git-tag-version --allow-same-version
+
+      # The full gate, in the same order as scripts/check.ps1: format, lint,
+      # the generated API contract, every Rust test on Windows, and the web
+      # lint/tests/build. Nothing is built for release or signed until all of
+      # it has passed.
+      - name: Format and lint
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Generated API contract is current
+        shell: pwsh
+        run: |
+          cargo test --locked -p eidos-service export_api_contract --lib
+          if ($LASTEXITCODE -ne 0) { throw "contract export failed ($LASTEXITCODE)" }
+          git diff --exit-code -- web/src/generated/api.ts
+          if ($LASTEXITCODE -ne 0) { throw 'web/src/generated/api.ts is stale; regenerate and commit it' }
+
+      - name: Run the Windows test suite
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+        run: cargo test --locked
+
+      - name: Web lint, tests and build
+        working-directory: web
+        run: |
+          npm ci
+          npm run lint
+          npm test
+          npm run build
 
       - name: Install .NET SDK
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
@@ -127,12 +160,6 @@ jobs:
           dotnet tool install --global wix --version 7.0.0
           wix eula accept wix7
           wix --version
-
-      - name: Build web UI
-        working-directory: web
-        run: |
-          npm ci
-          npm run build
 
       - name: Build Windows executable
         # The web UI is embedded in the executable; refuse to build without it.
@@ -253,14 +280,9 @@ jobs:
         id: names
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          if ($env:RELEASE_TAG) {
-            $version = $env:RELEASE_TAG
-          } else {
-            $version = "manual-$($env:GITHUB_SHA.Substring(0, 7))"
-          }
-          $version = $version -replace '[^0-9A-Za-z._-]', '-'
+          $version = $env:RELEASE_TAG
           $setup = "installer\out\eidos-$version-setup.exe"
           $msi = "installer\out\eidos-$version.msi"
           $collectorSetup = "installer\out\eidos-collector-$version-setup.exe"
@@ -341,8 +363,7 @@ jobs:
             }
           }
 
-      - name: Publish the signed assets for the tag
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish the release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -365,11 +386,20 @@ jobs:
           $exists = $LASTEXITCODE -eq 0
           $ErrorActionPreference = 'Stop'
 
+          # The release notes are docs/releases/<tag>.md when it exists;
+          # otherwise GitHub generates them from the merged pull requests.
+          $notes = "docs/releases/$env:RELEASE_TAG.md"
+
           $arguments = @($env:RELEASE_TAG)
           if ($exists) {
             $arguments += '--clobber'
           } else {
-            $arguments += @('--title', $env:RELEASE_TAG, '--generate-notes')
+            $arguments += @('--title', $env:RELEASE_TAG)
+            if (Test-Path -LiteralPath $notes) {
+              $arguments += @('--notes-file', $notes)
+            } else {
+              $arguments += '--generate-notes'
+            }
             # A tag carrying a pre-release suffix (v1.2.0-rc.1) publishes as a
             # pre-release so it is not offered as the latest download.
             if ($env:RELEASE_TAG -match '-') { $arguments += '--prerelease' }
@@ -377,18 +407,3 @@ jobs:
           $arguments += $assets
 
           gh release $(if ($exists) { 'upload' } else { 'create' }) @arguments
-
-      - name: Upload manual test artifact
-        if: "!startsWith(github.ref, 'refs/tags/')"
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: eidos-signed-windows-x86_64
-          path: |
-            ${{ steps.names.outputs.setup }}
-            ${{ steps.names.outputs.setup }}.sha256
-            ${{ steps.names.outputs.msi }}
-            ${{ steps.names.outputs.msi }}.sha256
-            ${{ steps.names.outputs.collector_setup }}
-            ${{ steps.names.outputs.collector_setup }}.sha256
-            ${{ steps.names.outputs.collector_msi }}
-            ${{ steps.names.outputs.collector_msi }}.sha256
