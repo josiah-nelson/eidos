@@ -1296,6 +1296,113 @@ fn a_rebuilt_epoch_can_swap_reused_remote_ids_without_changing_local_identity() 
 }
 
 #[test]
+fn a_child_first_reference_follows_a_reused_real_parent_mapping() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let reused_remote = node.id("a/one.txt");
+    let mut original = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap()
+        .rows;
+    let root_position = original
+        .iter()
+        .position(|row| {
+            row.image
+                .as_ref()
+                .is_some_and(|image| image.entries.iter().any(|entry| entry.parent.is_none()))
+        })
+        .expect("source root row");
+    let mut root = original.swap_remove(root_position);
+    let old_root_remote = root.object;
+    root.object = reused_remote;
+    root.seq = 2;
+    root.image.as_mut().unwrap().object.id = reused_remote;
+
+    let child_position = original
+        .iter()
+        .position(|row| row.object == node.id("a"))
+        .expect("child directory row");
+    let mut child = original.swap_remove(child_position);
+    child.seq = 1;
+    for entry in &mut child.image.as_mut().unwrap().entries {
+        assert_eq!(entry.parent, Some(old_root_remote));
+        entry.parent = Some(reused_remote);
+    }
+
+    let epoch = SourceEpoch::random_v4(505, 606);
+    let first_chain = [0x51; 32];
+    let head_chain = [0x52; 32];
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(source, epoch, 2, head_chain, 0)
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    let child_first = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 1,
+        through_chain: first_chain,
+        head_seq: 2,
+        rows: vec![child],
+    };
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(source, &child_first)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    let parent = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 1,
+        after_chain: first_chain,
+        through_seq: 2,
+        through_chain: head_chain,
+        head_seq: 2,
+        rows: vec![root],
+    };
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(source, &parent)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    let root_local = central
+        .catalog
+        .get_source(source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .expect("replica root");
+    let child_local = central
+        .catalog
+        .resolve_relative(source, "a")
+        .unwrap()
+        .expect("child follows remapped parent");
+    let parent_local = central
+        .catalog
+        .with_reader(|conn| {
+            Ok(ObjectId(conn.query_row(
+                "SELECT parent_id FROM entries
+                 WHERE source_id = ?1 AND object_id = ?2 AND deleted_at IS NULL",
+                [source.0, child_local.0],
+                |row| row.get(0),
+            )?))
+        })
+        .unwrap();
+    assert_eq!(parent_local, root_local);
+}
+
+#[test]
 fn unused_child_first_placeholders_are_removed_when_an_epoch_is_retired() {
     let node = Node::new();
     let central = Central::new();
@@ -1563,6 +1670,26 @@ fn repair_replay_is_chain_bound_and_rejects_duplicate_objects() {
         } if requested_leaves.as_slice() == leaves
     ));
 
+    let mut oversized = rows[0].clone();
+    let entry = oversized.image.as_ref().unwrap().entries[0].clone();
+    oversized.image.as_mut().unwrap().entries = vec![entry; 100_001];
+    match central
+        .catalog
+        .replica_apply_repair(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &leaves,
+            &[oversized],
+        )
+        .unwrap()
+    {
+        RepairOutcome::Rejected { reason } => assert!(reason.contains("malformed"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+
     let mut wrong_chain = state.head_chain;
     wrong_chain[0] ^= 0xff;
     match central
@@ -1827,6 +1954,30 @@ fn an_outstanding_repair_keeps_a_later_batch_reconciling() {
     let completeness = central.catalog.source_completeness(source).unwrap();
     assert_eq!(completeness.state, SourceState::Reconciling);
     assert!(!completeness.metadata_complete);
+    assert!(central.catalog.replica_retire_source(source).unwrap());
+    assert!(central.catalog.replica_source(source).unwrap().is_none());
+    let (repairs, mappings): (i64, i64) = central
+        .catalog
+        .with_reader(|conn| {
+            Ok((
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sync_replica_repairs WHERE source_id = ?1",
+                    [source.0],
+                    |row| row.get(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sync_replica_rows WHERE source_id = ?1",
+                    [source.0],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .unwrap();
+    assert_eq!((repairs, mappings), (0, 0));
+    assert_eq!(
+        central.catalog.get_source(source).unwrap().unwrap().state,
+        SourceState::Retired
+    );
 }
 
 #[test]
@@ -1903,10 +2054,36 @@ fn snapshot_fallback_preserves_rows_already_staged_by_repair() {
     ));
 
     central.reopen();
+    let mut wrong_chain = state.head_chain;
+    wrong_chain[0] ^= 0xff;
+    match central
+        .catalog
+        .replica_admit_hello(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            wrong_chain,
+            0,
+        )
+        .unwrap()
+    {
+        HelloOutcome::Rejected { reason } => assert!(reason.contains("history fork"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
     let snapshot = node
         .catalog
         .sync_rows_after(node.source, 0, u32::MAX)
         .unwrap();
+    let mut forked_snapshot = snapshot.clone();
+    forked_snapshot.through_chain = wrong_chain;
+    match central
+        .catalog
+        .replica_apply_batch(source, &forked_snapshot)
+        .unwrap()
+    {
+        BatchOutcome::Rejected { reason } => assert!(reason.contains("history fork"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
     assert!(matches!(
         central
             .catalog

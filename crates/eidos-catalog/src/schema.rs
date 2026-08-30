@@ -527,6 +527,7 @@ CREATE TABLE sync_replica_sources (
     admission          TEXT NOT NULL,
     resync_target      INTEGER,
     reported_head      INTEGER NOT NULL DEFAULT 0,
+    reported_chain     BLOB,
     reported_compacted INTEGER NOT NULL DEFAULT 0,
     reported_at        INTEGER,
     applied_at         INTEGER,

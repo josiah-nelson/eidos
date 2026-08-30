@@ -76,6 +76,10 @@ pub struct ReplicaSourceState {
     /// reach before rows of the previous epoch are known to be absent.
     pub resync_target: Option<u64>,
     pub reported_head: u64,
+    /// Chain hash most recently authenticated for `reported_head`. A batch
+    /// can discover a newer numeric head before carrying its final chain, in
+    /// which case this is temporarily `None` and repair stays fenced.
+    pub reported_chain: Option<ChainHash>,
     pub reported_compacted: u64,
     pub reported_at: Option<UnixNanos>,
     pub applied_at: Option<UnixNanos>,
@@ -169,6 +173,7 @@ const REMOTE_GENERATION: i64 = 1;
 const MAX_SQLITE_SEQUENCE: u64 = i64::MAX as u64;
 const RETIRE_STEP_ROWS: usize = 10_000;
 const MAX_REPAIR_PART_ROWS: usize = 10_000;
+const MAX_REPAIR_PART_ENTRIES: usize = 100_000;
 
 fn admission_from_json(json: &str) -> Result<AdmissionState> {
     serde_json::from_str(json).map_err(|e| {
@@ -185,6 +190,10 @@ fn repair_chain_from_blob(blob: Vec<u8>) -> Result<ChainHash> {
         .map_err(|_| CatalogError::InvalidState("repair chain is not 32 bytes".into()))
 }
 
+fn optional_chain_from_blob(blob: Option<Vec<u8>>) -> Result<Option<ChainHash>> {
+    blob.map(repair_chain_from_blob).transpose()
+}
+
 fn node_id_from_blob(blob: Vec<u8>) -> Result<[u8; 16]> {
     blob.try_into()
         .map_err(|_| CatalogError::InvalidState("fleet node id is not 16 bytes".into()))
@@ -193,7 +202,7 @@ fn node_id_from_blob(blob: Vec<u8>) -> Result<[u8; 16]> {
 fn state_conn(conn: &Connection, source: SourceId) -> Result<Option<ReplicaSourceState>> {
     conn.prepare_cached(
         "SELECT node_id, remote_source_id, admission, resync_target, reported_head,
-                reported_compacted, reported_at, applied_at, image_version
+                reported_chain, reported_compacted, reported_at, applied_at, image_version
          FROM sync_replica_sources WHERE source_id = ?1",
     )?
     .query_row(params![source.0], |r| {
@@ -203,15 +212,16 @@ fn state_conn(conn: &Connection, source: SourceId) -> Result<Option<ReplicaSourc
             r.get::<_, String>(2)?,
             r.get::<_, Option<i64>>(3)?,
             r.get::<_, i64>(4)?,
-            r.get::<_, i64>(5)?,
-            r.get::<_, Option<i64>>(6)?,
+            r.get::<_, Option<Vec<u8>>>(5)?,
+            r.get::<_, i64>(6)?,
             r.get::<_, Option<i64>>(7)?,
-            r.get::<_, i64>(8)?,
+            r.get::<_, Option<i64>>(8)?,
+            r.get::<_, i64>(9)?,
         ))
     })
     .optional()?
     .map(
-        |(node, remote, admission, target, head, compacted, reported, applied, version)| {
+        |(node, remote, admission, target, head, chain, compacted, reported, applied, version)| {
             Ok(ReplicaSourceState {
                 source_id: source,
                 node_id: node_id_from_blob(node)?,
@@ -219,6 +229,7 @@ fn state_conn(conn: &Connection, source: SourceId) -> Result<Option<ReplicaSourc
                 admission: admission_from_json(&admission)?,
                 resync_target: target.map(|t| t as u64),
                 reported_head: head as u64,
+                reported_chain: optional_chain_from_blob(chain)?,
                 reported_compacted: compacted as u64,
                 reported_at: reported.map(UnixNanos),
                 applied_at: applied.map(UnixNanos),
@@ -373,6 +384,50 @@ fn native_matches_conn(
     )? != 0)
 }
 
+/// Move references already installed in `epoch` away from a local object
+/// whose remote numeric id has been reassigned. The referenced parent or
+/// archive container can arrive after its children, so those children must
+/// follow the replacement mapping instead of remaining attached to the old
+/// native object.
+fn reparent_current_epoch_refs_conn(
+    tx: &Transaction<'_>,
+    source: SourceId,
+    epoch: &SyncEpoch,
+    from: ObjectId,
+    to: ObjectId,
+) -> Result<()> {
+    // The new epoch is authoritative. Remove only names which collide with
+    // current-epoch references that are about to move to the replacement.
+    tx.prepare_cached(
+        "DELETE FROM entries
+         WHERE source_id = ?1 AND parent_id = ?2 AND deleted_at IS NULL
+           AND is_virtual = 0 AND name IN (
+               SELECT e.name FROM entries e
+               JOIN sync_replica_rows rr ON rr.local_object_id = e.object_id
+               WHERE e.source_id = ?1 AND e.parent_id = ?3
+                 AND e.deleted_at IS NULL AND e.is_virtual = 0
+                 AND rr.source_id = ?1 AND rr.epoch = ?4)",
+    )?
+    .execute(params![source.0, to.0, from.0, epoch.0.as_slice()])?;
+    tx.prepare_cached(
+        "UPDATE entries SET parent_id = ?3
+         WHERE source_id = ?1 AND parent_id = ?2
+           AND object_id IN (
+               SELECT local_object_id FROM sync_replica_rows
+               WHERE source_id = ?1 AND epoch = ?4)",
+    )?
+    .execute(params![source.0, from.0, to.0, epoch.0.as_slice()])?;
+    tx.prepare_cached(
+        "UPDATE objects SET archive_container_id = ?3
+         WHERE source_id = ?1 AND archive_container_id = ?2
+           AND object_id IN (
+               SELECT local_object_id FROM sync_replica_rows
+               WHERE source_id = ?1 AND epoch = ?4)",
+    )?
+    .execute(params![source.0, from.0, to.0, epoch.0.as_slice()])?;
+    Ok(())
+}
+
 fn row_state_conn(
     tx: &Transaction<'_>,
     source: SourceId,
@@ -441,13 +496,15 @@ fn reuse_native_object_conn(
         )
         .optional()?;
     let Some((old_remote, old_local)) = old else {
-        if existing.as_ref().is_some_and(|state| !state.placeholder) {
+        if let Some(displaced) = existing.as_ref().filter(|state| !state.placeholder) {
             let temporary = temporary_remote_id_conn(tx, source)?;
             tx.prepare_cached(
                 "UPDATE sync_replica_rows SET remote_object_id = ?3
                  WHERE source_id = ?1 AND remote_object_id = ?2",
             )?
             .execute(params![source.0, row.object.0, temporary.0])?;
+            let replacement = local_object_conn(tx, source, epoch, row.object)?;
+            reparent_current_epoch_refs_conn(tx, source, epoch, displaced.local, replacement)?;
         }
         return row_state_conn(tx, source, row.object);
     };
@@ -480,7 +537,7 @@ fn reuse_native_object_conn(
         .execute(params![source.0, row.object.0])?;
         tx.prepare_cached("DELETE FROM objects WHERE object_id = ?1")?
             .execute(params![placeholder.local.0])?;
-    } else if existing.is_some() {
+    } else if let Some(displaced) = existing {
         // The rebuilt source reused two remote numeric ids for different
         // native objects. Swap the mappings through a negative id which can
         // never arrive on the wire; later rows in the same batch can then
@@ -501,6 +558,14 @@ fn reuse_native_object_conn(
              WHERE source_id = ?1 AND remote_object_id = ?2",
         )?
         .execute(params![source.0, temporary.0, old_remote])?;
+        reparent_current_epoch_refs_conn(tx, source, epoch, displaced.local, ObjectId(old_local))?;
+        // Treat the replacement like a resolved child-first placeholder so
+        // applying its row emits a subtree projection for the moved children.
+        tx.prepare_cached(
+            "UPDATE sync_replica_rows SET placeholder = 1
+             WHERE source_id = ?1 AND remote_object_id = ?2",
+        )?
+        .execute(params![source.0, row.object.0])?;
         return row_state_conn(tx, source, row.object);
     }
     tx.prepare_cached(
@@ -593,6 +658,14 @@ fn repair_pending_conn(tx: &Transaction<'_>, source: SourceId) -> Result<bool> {
     Ok(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sync_replica_repairs WHERE source_id = ?1)",
         params![source.0],
+        |r| r.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn source_is_retired_conn(conn: &Connection, source: SourceId) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT state = ?2 FROM sources WHERE source_id = ?1",
+        params![source.0, SourceState::Retired.as_str()],
         |r| r.get::<_, i64>(0),
     )? != 0)
 }
@@ -1072,11 +1145,21 @@ impl Catalog {
             let mut state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
             })?;
+            if source_is_retired_conn(&tx, source)? {
+                return Ok(HelloOutcome::Rejected {
+                    reason: "replica source is retired".into(),
+                });
+            }
             let now = UnixNanos::now().0;
             let same_epoch_rewind = (state.admission.epoch == epoch
                 || state.admission.pending_epoch() == Some(epoch))
                 && state.reported_at.is_some()
                 && head_seq < state.reported_head;
+            let same_epoch_fork = (state.admission.epoch == epoch
+                || state.admission.pending_epoch() == Some(epoch))
+                && state.reported_at.is_some()
+                && head_seq == state.reported_head
+                && state.reported_chain.is_some_and(|chain| chain != head_chain);
             let malformed = head_seq > MAX_SQLITE_SEQUENCE
                 || compacted_through > MAX_SQLITE_SEQUENCE
                 || compacted_through > head_seq
@@ -1090,6 +1173,12 @@ impl Catalog {
                     reason: format!(
                         "same-epoch sequence rewind: reported={}, source={head_seq}",
                         state.reported_head
+                    ),
+                }
+            } else if same_epoch_fork {
+                HelloOutcome::Rejected {
+                    reason: format!(
+                        "history fork at sequence {head_seq}: offered head differs from the durable head"
                     ),
                 }
             } else {
@@ -1142,17 +1231,30 @@ impl Catalog {
                 HelloOutcome::Resume { .. } | HelloOutcome::FullResync { .. }
             ) {
                 tx.execute(
-                    "UPDATE sync_replica_sources SET reported_head = ?2, reported_compacted = ?3, reported_at = ?4
+                    "UPDATE sync_replica_sources SET reported_head = ?2, reported_chain = ?3,
+                         reported_compacted = ?4, reported_at = ?5
                      WHERE source_id = ?1",
-                    params![source.0, head_seq as i64, compacted_through as i64, now],
+                    params![
+                        source.0,
+                        head_seq as i64,
+                        head_chain.as_slice(),
+                        compacted_through as i64,
+                        now
+                    ],
                 )?;
                 // A different repair head or epoch no longer describes the
                 // accepted offer. Preserve an exact staged repair across a
                 // reconnect, but discard stale repair state before resuming.
                 tx.execute(
                     "DELETE FROM sync_replica_repairs
-                     WHERE source_id = ?1 AND (epoch != ?2 OR through_seq != ?3)",
-                    params![source.0, epoch.as_bytes().as_slice(), head_seq as i64],
+                     WHERE source_id = ?1
+                       AND (epoch != ?2 OR through_seq != ?3 OR through_chain != ?4)",
+                    params![
+                        source.0,
+                        epoch.as_bytes().as_slice(),
+                        head_seq as i64,
+                        head_chain.as_slice()
+                    ],
                 )?;
                 if head_seq > state.admission.applied_seq || state.resync_target.is_some() {
                     mark_completeness_conn(&tx, source, now, false)?;
@@ -1205,6 +1307,11 @@ impl Catalog {
             let mut state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
             })?;
+            if source_is_retired_conn(&tx, source)? {
+                return Ok(BatchOutcome::Rejected {
+                    reason: "replica source is retired".into(),
+                });
+            }
             if batch.source_id != state.remote_source_id {
                 return Ok(BatchOutcome::Rejected {
                     reason: format!(
@@ -1224,6 +1331,18 @@ impl Catalog {
                     reason: format!(
                         "batch head {} regresses the durable offered head {}",
                         batch.head_seq, state.reported_head
+                    ),
+                });
+            }
+            if batch.head_seq == state.reported_head
+                && through_seq == batch.head_seq
+                && state
+                    .reported_chain
+                    .is_some_and(|chain| chain != through_chain)
+            {
+                return Ok(BatchOutcome::Rejected {
+                    reason: format!(
+                        "history fork at sequence {through_seq}: batch head differs from the durable head"
                     ),
                 });
             }
@@ -1320,10 +1439,22 @@ impl Catalog {
             tx.prepare_cached(
                 "UPDATE sync_replica_sources
                  SET reported_at = CASE WHEN ?2 > reported_head THEN ?3 ELSE reported_at END,
+                     reported_chain = CASE
+                         WHEN ?2 > reported_head THEN
+                             CASE WHEN ?4 = ?2 THEN ?5 ELSE NULL END
+                         WHEN ?2 = reported_head AND ?4 = ?2 THEN ?5
+                         ELSE reported_chain
+                     END,
                      reported_head = MAX(reported_head, ?2)
                  WHERE source_id = ?1",
             )?
-            .execute(params![source.0, batch.head_seq as i64, now])?;
+            .execute(params![
+                source.0,
+                batch.head_seq as i64,
+                now,
+                through_seq as i64,
+                through_chain.as_slice()
+            ])?;
             let reported_head = state.reported_head.max(batch.head_seq);
             let image_complete = through_seq == batch.head_seq
                 && through_seq >= reported_head
@@ -1356,12 +1487,23 @@ impl Catalog {
             let state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
             })?;
+            if source_is_retired_conn(&tx, source)? {
+                return Ok(RepairOfferOutcome::Rejected {
+                    reason: "replica source is retired".into(),
+                });
+            }
             if through_seq != state.reported_head {
                 return Ok(RepairOfferOutcome::Rejected {
                     reason: format!(
                         "repair head {through_seq} does not match the durable offered head {}",
                         state.reported_head
                     ),
+                });
+            }
+            if state.reported_chain != Some(through_chain) {
+                return Ok(RepairOfferOutcome::Rejected {
+                    reason: "history fork: repair chain does not match the durable offered head"
+                        .into(),
                 });
             }
             let pending_epoch = state.admission.pending_epoch() == Some(epoch);
@@ -1470,9 +1612,13 @@ impl Catalog {
     ) -> Result<RepairOutcome> {
         let unique = rows.iter().map(|r| r.object).collect::<BTreeSet<_>>().len() == rows.len();
         let unique_leaves = leaves.iter().copied().collect::<BTreeSet<_>>().len() == leaves.len();
+        let entry_count = rows.iter().try_fold(0usize, |count, row| {
+            count.checked_add(row.image.as_ref().map_or(0, |image| image.entries.len()))
+        });
         if !(MIN_FLEET_LEAF_BITS..=MAX_FLEET_LEAF_BITS).contains(&leaf_bits)
             || through_seq > MAX_SQLITE_SEQUENCE
             || rows.len() > MAX_REPAIR_PART_ROWS
+            || entry_count.is_none_or(|count| count > MAX_REPAIR_PART_ENTRIES)
             || leaves.iter().any(|l| *l >= (1u32 << leaf_bits))
             || rows.iter().any(|r| {
                 r.seq > through_seq
@@ -1502,12 +1648,23 @@ impl Catalog {
             let mut state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
             })?;
+            if source_is_retired_conn(&tx, source)? {
+                return Ok(RepairOutcome::Rejected {
+                    reason: "replica source is retired".into(),
+                });
+            }
             if through_seq != state.reported_head {
                 return Ok(RepairOutcome::Rejected {
                     reason: format!(
                         "repair head {through_seq} does not match the durable offered head {}",
                         state.reported_head
                     ),
+                });
+            }
+            if state.reported_chain != Some(through_chain) {
+                return Ok(RepairOutcome::Rejected {
+                    reason: "history fork: repair chain does not match the durable offered head"
+                        .into(),
                 });
             }
             let pending_epoch = state.admission.pending_epoch() == Some(epoch);
@@ -1752,6 +1909,9 @@ impl Catalog {
             let mut state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
             })?;
+            if source_is_retired_conn(&tx, source)? {
+                return Ok(0);
+            }
             let Some(target) = state.resync_target else {
                 return Ok(0);
             };
@@ -1776,28 +1936,62 @@ impl Catalog {
     /// Retire a replicated source: its rows disappear from search and the
     /// replica mapping is dropped. A later offer starts from scratch.
     pub fn replica_retire_source(&self, source: SourceId) -> Result<bool> {
-        self.with_writer(|conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let now = UnixNanos::now().0;
-            let n = tx.execute(
-                "DELETE FROM sync_replica_sources WHERE source_id = ?1",
-                params![source.0],
-            )?;
-            if n == 0 {
-                return Ok(false);
+        let mut found = false;
+        loop {
+            let (exists, done) = self.with_writer(|conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let exists = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sync_replica_sources WHERE source_id = ?1)",
+                    params![source.0],
+                    |r| r.get::<_, i64>(0),
+                )? != 0;
+                if !exists {
+                    return Ok((false, true));
+                }
+                let now = UnixNanos::now().0;
+                tx.execute(
+                    "UPDATE sources SET state = ?2,
+                         state_reason = 'retired from the fleet', updated_at = ?3
+                     WHERE source_id = ?1",
+                    params![source.0, SourceState::Retired.as_str(), now],
+                )?;
+                // Fence and discard repair state before mapping cleanup. All
+                // protocol writers reject a retired source between chunks.
+                tx.execute(
+                    "DELETE FROM sync_replica_repairs WHERE source_id = ?1",
+                    params![source.0],
+                )?;
+                tx.execute(
+                    "DELETE FROM sync_replica_rows
+                     WHERE source_id = ?1 AND remote_object_id IN (
+                         SELECT remote_object_id FROM sync_replica_rows
+                         WHERE source_id = ?1 ORDER BY remote_object_id LIMIT ?2)",
+                    params![source.0, RETIRE_STEP_ROWS as i64],
+                )?;
+                let remaining = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sync_replica_rows WHERE source_id = ?1)",
+                    params![source.0],
+                    |r| r.get::<_, i64>(0),
+                )? != 0;
+                if !remaining {
+                    tx.execute(
+                        "DELETE FROM sync_replica_sources WHERE source_id = ?1",
+                        params![source.0],
+                    )?;
+                }
+                tx.commit()?;
+                Ok((true, !remaining))
+            })?;
+            if !exists {
+                return Ok(found);
             }
-            tx.execute(
-                "DELETE FROM sync_replica_rows WHERE source_id = ?1",
-                params![source.0],
-            )?;
-            tx.execute(
-                "UPDATE sources SET state = ?2, state_reason = 'retired from the fleet', updated_at = ?3
-                 WHERE source_id = ?1",
-                params![source.0, SourceState::Retired.as_str(), now],
-            )?;
-            tx.commit()?;
-            Ok(true)
-        })
+            found = true;
+            if done {
+                return Ok(true);
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// Every replicated source of a peer.
