@@ -177,12 +177,69 @@ impl Registry {
         views
     }
 
+    /// Ask the active session for one peer to close. The session's normal
+    /// cleanup removes it from the registry and clears durable presence.
+    pub fn close_peer(&self, peer: NodeId) -> bool {
+        let active = self.active.lock();
+        let Some(session) = active.get(&peer) else {
+            return false;
+        };
+        session.close.store(true, Ordering::Relaxed);
+        session.close_notify.notify_one();
+        true
+    }
+
     /// Ask every session to close (shutdown).
     pub fn close_all(&self) {
         for a in self.active.lock().values() {
             a.close.store(true, Ordering::Relaxed);
             a.close_notify.notify_one();
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn register(registry: &Registry, peer: NodeId) -> Arc<AtomicBool> {
+        let close = Arc::new(AtomicBool::new(false));
+        registry
+            .register(
+                peer,
+                SessionKey {
+                    initiator: peer,
+                    nonce: 1,
+                },
+                close.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(Mutex::new(SessionView {
+                    peer,
+                    peer_name: format!("peer-{peer}"),
+                    direction: Direction::Inbound,
+                    since: UnixNanos(1),
+                    remote_addr: None,
+                    last_activity_ms_ago: 0,
+                    credit_remaining: 0,
+                    sources: Vec::new(),
+                })),
+            )
+            .expect("unique peer");
+        close
+    }
+
+    #[test]
+    fn closing_one_peer_does_not_revoke_other_sessions() {
+        let registry = Registry::default();
+        let first = NodeId([1; 16]);
+        let second = NodeId([2; 16]);
+        let first_close = register(&registry, first);
+        let second_close = register(&registry, second);
+
+        assert!(registry.close_peer(first));
+        assert!(first_close.load(Ordering::Relaxed));
+        assert!(!second_close.load(Ordering::Relaxed));
+        assert!(!registry.close_peer(NodeId([3; 16])));
     }
 }
 

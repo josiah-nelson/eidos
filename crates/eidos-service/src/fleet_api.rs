@@ -267,6 +267,7 @@ async fn update_peer(
 ) -> ApiResult<PeerView> {
     let node = parse_node(&id)?;
     let fleet = fleet(&st)?;
+    let disabled = body.enabled == Some(false);
     let catalog_state = st.clone();
     blocking(move || {
         if let Some(endpoint) = body.endpoint {
@@ -284,6 +285,11 @@ async fn update_peer(
         Ok(())
     })
     .await?;
+    if disabled {
+        // Persist revocation first, then wake the exact authenticated
+        // session so it cannot process another periodic tick of frames.
+        fleet.registry().close_peer(node);
+    }
     let status = read_status(fleet).await?;
     status
         .peers
@@ -306,22 +312,27 @@ async fn forget_peer(
 ) -> ApiResult<ForgetView> {
     let node = parse_node(&id)?;
     let catalog_state = st.clone();
+    let replica_sources = blocking(move || {
+        let replica_sources = catalog_state.catalog.replica_sources_of(node.0)?;
+        if !catalog_state.catalog.fleet_remove_peer(node)? && replica_sources.is_empty() {
+            return Err(ApiError::not_found(format!("peer {node}")));
+        }
+        Ok(replica_sources)
+    })
+    .await?;
+    if let Some(fleet) = st.fleet.lock().clone() {
+        fleet.registry().close_peer(node);
+    }
     let retired = blocking(move || {
         let mut retired = 0;
-        for r in catalog_state.catalog.replica_sources_of(node.0)? {
-            if catalog_state.catalog.replica_retire_source(r.source_id)? {
+        for replica in replica_sources {
+            if st.catalog.replica_retire_source(replica.source_id)? {
                 retired += 1;
             }
-        }
-        if !catalog_state.catalog.fleet_remove_peer(node)? && retired == 0 {
-            return Err(ApiError::not_found(format!("peer {node}")));
         }
         Ok(retired)
     })
     .await?;
-    if let Some(fleet) = st.fleet.lock().clone() {
-        fleet.registry().close_all();
-    }
     Ok(ApiJson(ForgetView {
         retired_sources: retired,
     }))
