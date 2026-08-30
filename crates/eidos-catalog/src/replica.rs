@@ -168,7 +168,6 @@ pub struct ReplicaCoverage {
 const REMOTE_GENERATION: i64 = 1;
 const MAX_SQLITE_SEQUENCE: u64 = i64::MAX as u64;
 const RETIRE_STEP_ROWS: usize = 10_000;
-const REPAIR_SCAN_BATCH: usize = 10_000;
 const MAX_REPAIR_PART_ROWS: usize = 10_000;
 
 fn admission_from_json(json: &str) -> Result<AdmissionState> {
@@ -340,6 +339,40 @@ struct RowState {
     placeholder: bool,
 }
 
+fn temporary_remote_id_conn(tx: &Transaction<'_>, source: SourceId) -> Result<ObjectId> {
+    let minimum: Option<i64> = tx.query_row(
+        "SELECT MIN(remote_object_id) FROM sync_replica_rows WHERE source_id = ?1",
+        params![source.0],
+        |r| r.get(0),
+    )?;
+    let remote = match minimum.filter(|remote| *remote < 0) {
+        Some(minimum) => minimum.checked_sub(1).ok_or_else(|| {
+            CatalogError::InvalidState("temporary replica object ids exhausted".into())
+        })?,
+        None => -1,
+    };
+    Ok(ObjectId(remote))
+}
+
+fn native_matches_conn(
+    tx: &Transaction<'_>,
+    local: ObjectId,
+    native: eidos_domain::NativeIdentity,
+) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM objects WHERE object_id = ?1
+               AND native_volume_serial = ?2 AND native_id_high = ?3 AND native_id_low = ?4)",
+        params![
+            local.0,
+            native.volume_serial as i64,
+            native.file_id_high as i64,
+            native.file_id_low as i64,
+        ],
+        |r| r.get::<_, i64>(0),
+    )? != 0)
+}
+
 fn row_state_conn(
     tx: &Transaction<'_>,
     source: SourceId,
@@ -376,8 +409,12 @@ fn reuse_native_object_conn(
     let Some(native) = row.image.as_ref().and_then(|image| image.object.native) else {
         return Ok(existing);
     };
-    if existing.as_ref().is_some_and(|state| !state.placeholder) {
-        return Ok(existing);
+    if let Some(state) = existing.as_ref().filter(|state| !state.placeholder) {
+        if state.epoch.as_slice() == epoch.0.as_slice()
+            || native_matches_conn(tx, state.local, native)?
+        {
+            return Ok(existing);
+        }
     }
     let excluded_local = existing.as_ref().map(|state| state.local.0);
     let old = tx
@@ -404,10 +441,18 @@ fn reuse_native_object_conn(
         )
         .optional()?;
     let Some((old_remote, old_local)) = old else {
-        return Ok(existing);
+        if existing.as_ref().is_some_and(|state| !state.placeholder) {
+            let temporary = temporary_remote_id_conn(tx, source)?;
+            tx.prepare_cached(
+                "UPDATE sync_replica_rows SET remote_object_id = ?3
+                 WHERE source_id = ?1 AND remote_object_id = ?2",
+            )?
+            .execute(params![source.0, row.object.0, temporary.0])?;
+        }
+        return row_state_conn(tx, source, row.object);
     };
 
-    if let Some(placeholder) = existing {
+    if let Some(placeholder) = existing.as_ref().filter(|state| state.placeholder) {
         // Reparenting can meet stale old-epoch names. The incoming subtree is
         // authoritative, so remove only the colliding old names first.
         tx.prepare_cached(
@@ -435,6 +480,28 @@ fn reuse_native_object_conn(
         .execute(params![source.0, row.object.0])?;
         tx.prepare_cached("DELETE FROM objects WHERE object_id = ?1")?
             .execute(params![placeholder.local.0])?;
+    } else if existing.is_some() {
+        // The rebuilt source reused two remote numeric ids for different
+        // native objects. Swap the mappings through a negative id which can
+        // never arrive on the wire; later rows in the same batch can then
+        // resolve their native identities without a uniqueness collision.
+        let temporary = temporary_remote_id_conn(tx, source)?;
+        tx.prepare_cached(
+            "UPDATE sync_replica_rows SET remote_object_id = ?3
+             WHERE source_id = ?1 AND remote_object_id = ?2",
+        )?
+        .execute(params![source.0, row.object.0, temporary.0])?;
+        tx.prepare_cached(
+            "UPDATE sync_replica_rows SET remote_object_id = ?3
+             WHERE source_id = ?1 AND remote_object_id = ?2",
+        )?
+        .execute(params![source.0, old_remote, row.object.0])?;
+        tx.prepare_cached(
+            "UPDATE sync_replica_rows SET remote_object_id = ?3
+             WHERE source_id = ?1 AND remote_object_id = ?2",
+        )?
+        .execute(params![source.0, temporary.0, old_remote])?;
+        return row_state_conn(tx, source, row.object);
     }
     tx.prepare_cached(
         "UPDATE sync_replica_rows SET remote_object_id = ?3
@@ -452,6 +519,7 @@ fn prepare_rows_conn(
     source: SourceId,
     epoch: &SyncEpoch,
     rows: &[SyncRow],
+    authoritative: bool,
 ) -> Result<()> {
     for row in rows {
         reuse_native_object_conn(tx, source, epoch, row)?;
@@ -459,6 +527,13 @@ fn prepare_rows_conn(
     let mut remove = tx.prepare_cached("DELETE FROM entries WHERE object_id = ?1")?;
     for row in rows {
         if let Some(state) = row_state_conn(tx, source, row.object)? {
+            if !authoritative
+                && !state.placeholder
+                && state.epoch.as_slice() == epoch.0.as_slice()
+                && state.seq >= row.seq
+            {
+                continue;
+            }
             remove.execute(params![state.local.0])?;
         }
     }
@@ -480,6 +555,14 @@ fn prepare_rows_conn(
         let Some(local) = row_state_conn(tx, source, row.object)?.map(|state| state.local) else {
             continue;
         };
+        let state = row_state_conn(tx, source, row.object)?.expect("local was just resolved");
+        if !authoritative
+            && !state.placeholder
+            && state.epoch.as_slice() == epoch.0.as_slice()
+            && state.seq >= row.seq
+        {
+            continue;
+        }
         for entry in &image.entries {
             if entry.is_virtual {
                 continue;
@@ -492,6 +575,26 @@ fn prepare_rows_conn(
         }
     }
     Ok(())
+}
+
+fn wire_row_ids_are_valid(row: &SyncRow) -> bool {
+    row.object.0 > 0
+        && row.image.as_ref().is_none_or(|image| {
+            image.object.id.0 > 0
+                && image.archive_container.is_none_or(|object| object.0 > 0)
+                && image
+                    .entries
+                    .iter()
+                    .all(|entry| entry.parent.is_none_or(|object| object.0 > 0))
+        })
+}
+
+fn repair_pending_conn(tx: &Transaction<'_>, source: SourceId) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_replica_repairs WHERE source_id = ?1)",
+        params![source.0],
+        |r| r.get::<_, i64>(0),
+    )? != 0)
 }
 
 /// Content at a replica is never present: files say so explicitly, and
@@ -970,7 +1073,8 @@ impl Catalog {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
             })?;
             let now = UnixNanos::now().0;
-            let pending_rewind = state.admission.pending_epoch() == Some(epoch)
+            let same_epoch_rewind = (state.admission.epoch == epoch
+                || state.admission.pending_epoch() == Some(epoch))
                 && state.reported_at.is_some()
                 && head_seq < state.reported_head;
             let malformed = head_seq > MAX_SQLITE_SEQUENCE
@@ -981,10 +1085,10 @@ impl Catalog {
                 HelloOutcome::Rejected {
                     reason: "malformed source head".into(),
                 }
-            } else if pending_rewind {
+            } else if same_epoch_rewind {
                 HelloOutcome::Rejected {
                     reason: format!(
-                        "same-epoch sequence rewind during resync: central={}, source={head_seq}",
+                        "same-epoch sequence rewind: reported={}, source={head_seq}",
                         state.reported_head
                     ),
                 }
@@ -1042,6 +1146,14 @@ impl Catalog {
                      WHERE source_id = ?1",
                     params![source.0, head_seq as i64, compacted_through as i64, now],
                 )?;
+                // A different repair head or epoch no longer describes the
+                // accepted offer. Preserve an exact staged repair across a
+                // reconnect, but discard stale repair state before resuming.
+                tx.execute(
+                    "DELETE FROM sync_replica_repairs
+                     WHERE source_id = ?1 AND (epoch != ?2 OR through_seq != ?3)",
+                    params![source.0, epoch.as_bytes().as_slice(), head_seq as i64],
+                )?;
                 if head_seq > state.admission.applied_seq || state.resync_target.is_some() {
                     mark_completeness_conn(&tx, source, now, false)?;
                 }
@@ -1078,7 +1190,10 @@ impl Catalog {
             || batch.head_seq > MAX_SQLITE_SEQUENCE
             || through_seq > batch.head_seq
             || rows.iter().any(|r| {
-                r.seq <= after_seq || r.seq > through_seq || r.generation > MAX_SQLITE_SEQUENCE
+                r.seq <= after_seq
+                    || r.seq > through_seq
+                    || r.generation > MAX_SQLITE_SEQUENCE
+                    || !wire_row_ids_are_valid(r)
             })
         {
             return Ok(BatchOutcome::Rejected {
@@ -1138,6 +1253,12 @@ impl Catalog {
                         reason: "snapshot was not requested for this epoch".into(),
                     });
                 }
+                // Snapshot streaming is an explicit fallback from a staged
+                // repair. The equal-sequence row guard below preserves rows
+                // already installed by that repair while the snapshot fills
+                // the rest of the epoch.
+                tx.prepare_cached("DELETE FROM sync_replica_repairs WHERE source_id = ?1")?
+                    .execute(params![source.0])?;
             } else {
                 match state
                     .admission
@@ -1181,7 +1302,7 @@ impl Catalog {
                 state.admission.applied(through_seq, through_chain);
             }
             let mut counts = ApplyCounts::default();
-            prepare_rows_conn(&tx, source, &sync_epoch, rows)?;
+            prepare_rows_conn(&tx, source, &sync_epoch, rows, false)?;
             for row in rows {
                 apply_row_conn(&tx, source, &sync_epoch, row, false, now, &mut counts)?;
             }
@@ -1197,13 +1318,17 @@ impl Catalog {
             }
             store_admission_conn(&tx, source, &state.admission, state.resync_target)?;
             tx.prepare_cached(
-                "UPDATE sync_replica_sources SET reported_head = MAX(reported_head, ?2)
+                "UPDATE sync_replica_sources
+                 SET reported_at = CASE WHEN ?2 > reported_head THEN ?3 ELSE reported_at END,
+                     reported_head = MAX(reported_head, ?2)
                  WHERE source_id = ?1",
             )?
-            .execute(params![source.0, batch.head_seq as i64])?;
+            .execute(params![source.0, batch.head_seq as i64, now])?;
+            let reported_head = state.reported_head.max(batch.head_seq);
             let image_complete = through_seq == batch.head_seq
-                && through_seq >= state.reported_head
-                && state.resync_target.is_none();
+                && through_seq >= reported_head
+                && state.resync_target.is_none()
+                && !repair_pending_conn(&tx, source)?;
             mark_applied_conn(&tx, source, now, image_complete)?;
             tx.commit()?;
             Ok(BatchOutcome::Applied {
@@ -1349,9 +1474,11 @@ impl Catalog {
             || through_seq > MAX_SQLITE_SEQUENCE
             || rows.len() > MAX_REPAIR_PART_ROWS
             || leaves.iter().any(|l| *l >= (1u32 << leaf_bits))
-            || rows
-                .iter()
-                .any(|r| r.seq > through_seq || r.generation > MAX_SQLITE_SEQUENCE)
+            || rows.iter().any(|r| {
+                r.seq > through_seq
+                    || r.generation > MAX_SQLITE_SEQUENCE
+                    || !wire_row_ids_are_valid(r)
+            })
             || !unique
             || !unique_leaves
             || (!final_part && leaves.is_empty())
@@ -1450,26 +1577,30 @@ impl Catalog {
             let sync_epoch = SyncEpoch::from_source_epoch(epoch);
             let present: BTreeSet<ObjectId> = rows.iter().map(|r| r.object).collect();
             let mut removed = 0;
-            let leaves_json = serde_json::to_string(leaves)?;
-            let mut after_remote = i64::MIN;
-            loop {
+            // During an epoch rebuild, keep every old-epoch mapping until all
+            // repair parts have run native matching. Final bounded retirement
+            // then removes what was truly absent. Incremental repair has no
+            // old epoch to retire, so preflight its entire authoritative leaf
+            // scope and reject before mutation if it exceeds the write bound.
+            let known = if pending_epoch {
+                Vec::new()
+            } else {
+                let leaves_json = serde_json::to_string(leaves)?;
                 let known = tx
                     .prepare_cached(
                         "SELECT remote_object_id, local_object_id, deleted
                          FROM sync_replica_rows
                          WHERE source_id = ?1 AND placeholder = 0
-                           AND remote_object_id > ?4
                            AND eidos_merkle_leaf(?2, remote_object_id) IN
-                               (SELECT value FROM json_each(?3))
-                         ORDER BY remote_object_id LIMIT ?5",
+                                (SELECT value FROM json_each(?3))
+                         ORDER BY remote_object_id LIMIT ?4",
                     )?
                     .query_map(
                         params![
                             source.0,
                             leaf_bits as i64,
                             leaves_json,
-                            after_remote,
-                            REPAIR_SCAN_BATCH as i64
+                            (MAX_REPAIR_PART_ROWS + 1) as i64
                         ],
                         |r| {
                             Ok((
@@ -1480,38 +1611,53 @@ impl Catalog {
                         },
                     )?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                if known.is_empty() {
-                    break;
+                if known.len() > MAX_REPAIR_PART_ROWS {
+                    return Ok(RepairOutcome::Rejected {
+                        reason: format!(
+                            "repair leaf scope exceeds the {MAX_REPAIR_PART_ROWS}-mapping transaction limit"
+                        ),
+                    });
                 }
-                after_remote = known.last().expect("non-empty batch").0;
-                for (remote, local, deleted) in known {
-                    if present.contains(&ObjectId(remote)) {
-                        continue;
+                known
+            };
+            let mut counts = ApplyCounts::default();
+            prepare_rows_conn(&tx, source, &sync_epoch, rows, true)?;
+            for row in rows {
+                apply_row_conn(&tx, source, &sync_epoch, row, true, now, &mut counts)?;
+            }
+            for (remote, _, _) in known {
+                if present.contains(&ObjectId(remote)) {
+                    continue;
+                }
+                // Native remapping above may have moved a mapping away from
+                // this absent remote id. Delete whichever mapping, if any,
+                // still occupies the authoritative absent id.
+                if let Some(state) = row_state_conn(&tx, source, ObjectId(remote))? {
+                    if !state.placeholder {
+                        let deleted: bool = tx.query_row(
+                            "SELECT deleted != 0 FROM sync_replica_rows
+                             WHERE source_id = ?1 AND remote_object_id = ?2",
+                            params![source.0, remote],
+                            |r| r.get(0),
+                        )?;
+                        if !deleted {
+                            tx.prepare_cached(
+                                "UPDATE objects SET deleted_at = COALESCE(deleted_at, ?2) WHERE object_id = ?1",
+                            )?
+                            .execute(params![state.local.0, now])?;
+                            tx.prepare_cached(
+                                "UPDATE entries SET deleted_at = ?2 WHERE object_id = ?1 AND deleted_at IS NULL",
+                            )?
+                            .execute(params![state.local.0, now])?;
+                            outbox_append_conn(&tx, source, state.local, "delete", 0)?;
+                        }
                     }
-                    if deleted == 0 {
-                        tx.prepare_cached(
-                            "UPDATE objects SET deleted_at = COALESCE(deleted_at, ?2) WHERE object_id = ?1",
-                        )?
-                        .execute(params![local, now])?;
-                        tx.prepare_cached(
-                            "UPDATE entries SET deleted_at = ?2 WHERE object_id = ?1 AND deleted_at IS NULL",
-                        )?
-                        .execute(params![local, now])?;
-                        outbox_append_conn(&tx, source, ObjectId(local), "delete", 0)?;
-                    }
-                    // Authoritative absence: the source has no row at all,
-                    // so neither does the replica's Merkle image.
                     tx.prepare_cached(
                         "DELETE FROM sync_replica_rows WHERE source_id = ?1 AND remote_object_id = ?2",
                     )?
                     .execute(params![source.0, remote])?;
                     removed += 1;
                 }
-            }
-            let mut counts = ApplyCounts::default();
-            prepare_rows_conn(&tx, source, &sync_epoch, rows)?;
-            for row in rows {
-                apply_row_conn(&tx, source, &sync_epoch, row, true, now, &mut counts)?;
             }
             let remaining = requested_scope
                 .difference(&wanted)
@@ -1552,9 +1698,11 @@ impl Catalog {
                 }
             }
             store_admission_conn(&tx, source, &state.admission, state.resync_target)?;
-            mark_applied_conn(&tx, source, now, state.resync_target.is_none())?;
             tx.prepare_cached("DELETE FROM sync_replica_repairs WHERE source_id = ?1")?
                 .execute(params![source.0])?;
+            let image_complete = state.resync_target.is_none()
+                && state.admission.applied_seq >= state.reported_head;
+            mark_applied_conn(&tx, source, now, image_complete)?;
             tx.commit()?;
             Ok(RepairOutcome::Applied {
                 through_seq,
@@ -1616,7 +1764,9 @@ impl Catalog {
             if done {
                 state.resync_target = None;
                 store_admission_conn(&tx, source, &state.admission, None)?;
-                mark_applied_conn(&tx, source, now, true)?;
+                let image_complete = state.admission.applied_seq >= state.reported_head
+                    && !repair_pending_conn(&tx, source)?;
+                mark_applied_conn(&tx, source, now, image_complete)?;
             }
             tx.commit()?;
             Ok(retired)

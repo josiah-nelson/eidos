@@ -431,6 +431,43 @@ fn a_batch_cannot_publish_below_the_durable_reported_head() {
             .unwrap()
             .metadata_complete
     );
+
+    let legitimate = node
+        .catalog
+        .sync_rows_after(node.source, applied, 1)
+        .unwrap();
+    let partial_head = legitimate.through_seq;
+    let partial_chain = legitimate.through_chain;
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(source, &legitimate)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    match central
+        .catalog
+        .replica_admit_hello(
+            source,
+            state.epoch.to_source_epoch(),
+            partial_head,
+            partial_chain,
+            0,
+        )
+        .unwrap()
+    {
+        HelloOutcome::Rejected { reason } => assert!(reason.contains("rewind"), "{reason}"),
+        other => panic!("active-epoch head regression was accepted: {other:?}"),
+    }
+    assert_eq!(
+        central
+            .catalog
+            .replica_source(source)
+            .unwrap()
+            .unwrap()
+            .reported_head,
+        state.head_seq
+    );
 }
 
 #[test]
@@ -886,6 +923,133 @@ fn an_empty_new_epoch_is_a_complete_snapshot_that_retires_the_old_image() {
 }
 
 #[test]
+fn retirement_cannot_publish_complete_below_a_newer_reported_head() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let old_epoch = central
+        .catalog
+        .replica_source(source)
+        .unwrap()
+        .unwrap()
+        .admission
+        .epoch;
+    central
+        .catalog
+        .with_writer(|conn| {
+            let tx = conn.transaction()?;
+            for remote in 1_000_000..1_010_001 {
+                tx.execute(
+                    "INSERT INTO objects
+                        (source_id, kind, identity_confidence, first_seen_generation,
+                         last_seen_generation)
+                     VALUES (?1, 'file', 'path', 1, 1)",
+                    [source.0],
+                )?;
+                let local = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO sync_replica_rows
+                        (source_id, remote_object_id, local_object_id, epoch, seq,
+                         generation, deleted, placeholder)
+                     VALUES (?1, ?2, ?3, ?4, 1, 1, 0, 0)",
+                    rusqlite::params![source.0, remote, local, old_epoch.as_bytes().as_slice()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+
+    let before_rebuild = central.catalog.replica_source(source).unwrap().unwrap();
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
+    let mismatched_hashes = vec![[0xFF; 32]; 1usize << leaf_bits];
+    let request = central
+        .catalog
+        .replica_repair_offer(
+            source,
+            old_epoch,
+            before_rebuild.admission.applied_seq,
+            before_rebuild.admission.applied_chain,
+            leaf_bits,
+            &mismatched_hashes,
+        )
+        .unwrap();
+    let leaves = match request {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("{other:?}"),
+    };
+    match central
+        .catalog
+        .replica_apply_repair(
+            source,
+            old_epoch,
+            before_rebuild.admission.applied_seq,
+            before_rebuild.admission.applied_chain,
+            leaf_bits,
+            &leaves,
+            &[],
+        )
+        .unwrap()
+    {
+        RepairOutcome::Rejected { reason } => {
+            assert!(reason.contains("transaction limit"), "{reason}")
+        }
+        other => panic!("oversized repair transaction was accepted: {other:?}"),
+    }
+
+    let epoch = SourceEpoch::random_v4(303, 404);
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(source, epoch, 0, CHAIN_GENESIS, 0)
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    let empty = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 0,
+        through_chain: CHAIN_GENESIS,
+        head_seq: 0,
+        rows: vec![],
+    };
+    assert!(matches!(
+        central.catalog.replica_apply_batch(source, &empty).unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    assert!(central
+        .catalog
+        .replica_source(source)
+        .unwrap()
+        .unwrap()
+        .resync_target
+        .is_some());
+
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(source, epoch, 1, [0x44; 32], 0)
+            .unwrap(),
+        HelloOutcome::Resume { after_seq: 0, .. }
+    ));
+    assert!(central.catalog.replica_continue_retirement(source).unwrap() > 0);
+    let state = central.catalog.replica_source(source).unwrap().unwrap();
+    assert_eq!(state.resync_target, None);
+    assert_eq!(state.admission.applied_seq, 0);
+    assert_eq!(state.reported_head, 1);
+    assert!(
+        !central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
+}
+
+#[test]
 fn a_full_resync_replaces_the_root_mapping_when_remote_object_ids_change() {
     let node = Node::new();
     let central = Central::new();
@@ -1058,6 +1222,77 @@ fn a_full_resync_replaces_the_root_mapping_when_remote_object_ids_change() {
             .root_object_id,
         Some(newest_root)
     );
+}
+
+#[test]
+fn a_rebuilt_epoch_can_swap_reused_remote_ids_without_changing_local_identity() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let one_remote = node.id("a/one.txt");
+    let three_remote = node.id("c/three.txt");
+    let one_local = central
+        .catalog
+        .resolve_relative(source, "a/one.txt")
+        .unwrap()
+        .unwrap();
+    let three_local = central
+        .catalog
+        .resolve_relative(source, "c/three.txt")
+        .unwrap()
+        .unwrap();
+
+    let mut snapshot = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap();
+    let epoch = SourceEpoch::random_v4(101, 202);
+    snapshot.epoch = SyncEpoch::from_source_epoch(epoch);
+    for row in &mut snapshot.rows {
+        let replacement = if row.object == one_remote {
+            Some(three_remote)
+        } else if row.object == three_remote {
+            Some(one_remote)
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            row.object = replacement;
+            row.image.as_mut().unwrap().object.id = replacement;
+        }
+    }
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(source, epoch, snapshot.head_seq, snapshot.through_chain, 0,)
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(source, &snapshot)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+
+    let (mapped_one, mapped_three) = central
+        .catalog
+        .with_reader(|conn| {
+            let mut mapping = conn.prepare(
+                "SELECT local_object_id FROM sync_replica_rows
+                 WHERE source_id = ?1 AND remote_object_id = ?2",
+            )?;
+            Ok((
+                ObjectId(mapping.query_row([source.0, one_remote.0], |row| row.get(0))?),
+                ObjectId(mapping.query_row([source.0, three_remote.0], |row| row.get(0))?),
+            ))
+        })
+        .unwrap();
+    assert_eq!(mapped_one, three_local);
+    assert_eq!(mapped_three, one_local);
+    assert_eq!(central.image(source), node.image());
 }
 
 #[test]
@@ -1534,6 +1769,159 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
     let replica_tree =
         MerkleTree::with_leaf_bits(leaf_bits, central.catalog.replica_digests(source).unwrap());
     assert_eq!(replica_tree.leaf_hashes(), source_tree.leaf_hashes());
+}
+
+#[test]
+fn an_outstanding_repair_keeps_a_later_batch_reconciling() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let applied = central.applied_seq(source);
+    node.touch("a/one.txt", 123, 1_700_000_123);
+    let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                state.compacted_through,
+            )
+            .unwrap(),
+        HelloOutcome::Resume { .. }
+    ));
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
+    let tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries
+            .iter()
+            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+    );
+    let request = central
+        .catalog
+        .replica_repair_offer(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &tree.leaf_hashes(),
+        )
+        .unwrap();
+    assert!(matches!(
+        request,
+        eidos_catalog::replica::RepairOfferOutcome::Request { ref leaves, .. }
+            if !leaves.is_empty()
+    ));
+    let batch = node
+        .catalog
+        .sync_rows_after(node.source, applied, u32::MAX)
+        .unwrap();
+    assert!(matches!(
+        central.catalog.replica_apply_batch(source, &batch).unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    let completeness = central.catalog.source_completeness(source).unwrap();
+    assert_eq!(completeness.state, SourceState::Reconciling);
+    assert!(!completeness.metadata_complete);
+}
+
+#[test]
+fn snapshot_fallback_preserves_rows_already_staged_by_repair() {
+    let node = Node::new();
+    let mut central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    node.catalog.sync_enable(node.source, None).unwrap();
+    while !node.catalog.sync_backfill(node.source, 2).unwrap().done {}
+    let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                0,
+            )
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
+    let tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries
+            .iter()
+            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+    );
+    let request = central
+        .catalog
+        .replica_repair_offer(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &tree.leaf_hashes(),
+        )
+        .unwrap();
+    let requested = match request {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("{other:?}"),
+    };
+    let staged_leaf = leaf_index(leaf_bits, entries[0].object);
+    assert!(requested.contains(&staged_leaf));
+    let objects: Vec<_> = entries
+        .iter()
+        .filter(|entry| leaf_index(leaf_bits, entry.object) == staged_leaf)
+        .map(|entry| entry.object)
+        .collect();
+    let (_, staged_rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &objects)
+        .unwrap();
+    assert!(!staged_rows.is_empty());
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair_part(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                leaf_bits,
+                &[staged_leaf],
+                &staged_rows,
+                false,
+            )
+            .unwrap(),
+        RepairOutcome::Staged { .. }
+    ));
+
+    central.reopen();
+    let snapshot = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(source, &snapshot)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    assert_eq!(central.image(source), node.image());
+    assert!(
+        central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
 }
 
 #[test]
