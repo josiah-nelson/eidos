@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   api,
+  ApiError,
   type FleetStatus,
   type InviteView,
   type LocalSourceSync,
@@ -27,10 +28,12 @@ export default function FleetPage() {
           <h1 style={{ margin: 0 }}>Fleet</h1>
         </div>
         <ErrorBox error={q.error} />
-        <p className="muted">
-          The fleet runtime is not available. It starts with the service when the catalog opens cleanly; check the
-          service log if this persists.
-        </p>
+        {q.error instanceof ApiError && q.error.status === 503 && (
+          <p className="muted">
+            The fleet runtime is not available. It starts with the service when the catalog opens cleanly; check the
+            service log if this persists.
+          </p>
+        )}
       </>
     )
   const f = q.data
@@ -86,7 +89,10 @@ export default function FleetPage() {
         </div>
       </div>
 
-      <ThisNode f={f} />
+      {/* Remounts when the polled listener changes: the input's draft state
+          is re-seeded from the authoritative value instead of surviving a
+          concurrent administrative change and writing it back stale. */}
+      <ThisNode key={f.listen ?? ''} f={f} />
 
       {f.peers.length > 0 && (
         <>
