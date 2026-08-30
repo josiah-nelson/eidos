@@ -1119,6 +1119,16 @@ namespace Eidos.Setup
                     ? this.detectedPerMachine
                     : cmd.Scope == BundleScope.PerMachine
                         || string.Equals(scopeVar, "perMachine", StringComparison.OrdinalIgnoreCase);
+                if (!string.IsNullOrEmpty(accountKindVar))
+                {
+                    // Command-line choices are already stored in Burn for MSI
+                    // forwarding, but the BA must use the same effective value
+                    // for its pre-plan named-account password check.
+                    this.account = string.Equals(accountKindVar, "local-system", StringComparison.OrdinalIgnoreCase) ? AccountKind.LocalSystem
+                        : string.Equals(accountKindVar, "local-service", StringComparison.OrdinalIgnoreCase) ? AccountKind.LocalService
+                        : string.Equals(accountKindVar, "network-service", StringComparison.OrdinalIgnoreCase) ? AccountKind.NetworkService
+                        : AccountKind.User;
+                }
                 // The collector: 1 installs or keeps it, 0 leaves it out or
                 // removes it during install/modify, and empty keeps whatever
                 // is detected. Removal keeps the service only when asked
