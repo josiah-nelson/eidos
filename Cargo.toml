@@ -8,6 +8,7 @@ members = [
     "crates/eidos-archive",
     "crates/eidos-diskimg",
     "crates/eidos-sync",
+    "crates/eidos-fleet",
     "crates/eidos-search",
     "crates/eidos-query",
     "crates/eidos-service",
@@ -30,6 +31,7 @@ eidos-catalog = { path = "crates/eidos-catalog" }
 eidos-archive = { path = "crates/eidos-archive" }
 eidos-diskimg = { path = "crates/eidos-diskimg" }
 eidos-sync = { path = "crates/eidos-sync" }
+eidos-fleet = { path = "crates/eidos-fleet" }
 eidos-scanner = { path = "crates/eidos-scanner" }
 eidos-content = { path = "crates/eidos-content" }
 eidos-search = { path = "crates/eidos-search" }
@@ -56,6 +58,12 @@ blake3 = "1.8"
 getrandom = "0.4"
 crc32fast = "1.5"
 ntfs = "0.4"
+# Fleet transport: TLS with per-node self-signed certificates pinned by
+# fingerprint (no CA). The ring provider is what ureq already links.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+ring = "0.17"
 clap = { version = "4.6", features = ["derive", "env"] }
 regex = "1.13"
 regex-syntax = "0.8"

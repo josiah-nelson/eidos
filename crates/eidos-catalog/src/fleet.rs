@@ -11,11 +11,32 @@ use eidos_domain::{SourceId, SyncPolicy, UnixNanos};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use ts_rs::TS;
 
 /// Stable 16-byte fleet node identity, derived from the node's certificate
-/// public key.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// public key. Serializes as 32 hex characters.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, TS)]
+#[ts(type = "string")]
 pub struct NodeId(pub [u8; 16]);
+
+impl Serialize for NodeId {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::parse_hex(&s)
+            .ok_or_else(|| serde::de::Error::custom("node id is not 32 hex characters"))
+    }
+}
 
 impl NodeId {
     pub fn to_hex(self) -> String {
