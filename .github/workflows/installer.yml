@@ -189,9 +189,12 @@ jobs:
           if ((Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash -ne (Get-Content "$env:RUNNER_TEMP\study-key.hash")) { throw "adoption rotated the study key" }
           # The old collector bundle registration is gone; the visible MSI
           # registration remains so a collector kept without the core is
-          # independently maintainable from Apps & Features.
+          # independently maintainable from Apps & Features. Bundle entries
+          # carry BundleVersion; the MSI product entry does not. Matching on
+          # BundleUpgradeCode would catch the unified bundle itself, which
+          # lists the collector upgrade code as a RelatedBundle.
           $arp = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' | Get-ItemProperty
-          $bundle = $arp | Where-Object { $_.BundleUpgradeCode -contains '{5D2B93F8-29ED-4E6C-B101-1355B4A36F3A}' }
+          $bundle = $arp | Where-Object { $_.DisplayName -eq 'eidos observatory collector' -and $_.BundleVersion }
           if ($bundle) { throw "the separate collector bundle is still registered: $($bundle.DisplayName)" }
           $collectorProduct = $arp | Where-Object { $_.DisplayName -eq 'eidos observatory collector' -and $_.WindowsInstaller -eq 1 }
           if (-not $collectorProduct) { throw "the collector MSI has no maintenance registration" }
