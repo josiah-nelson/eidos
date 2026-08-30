@@ -543,14 +543,23 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
                 .map_err(|e| QueryError::Other { message: e.to_string() })?;
             let mut wanted: Vec<HostId> = ids.clone();
             for n in names {
-                match hosts.iter().find(|h| h.name.eq_ignore_ascii_case(n)) {
-                    Some(h) => wanted.push(h.id),
-                    None => {
-                        return Err(QueryError::Other {
-                            message: format!("unknown host name: {n}"),
-                        })
-                    }
+                // A replicated host is stored as `<name>#<node id>` so two
+                // nodes with one display name stay distinct; a query names
+                // the display name and selects every host carrying it.
+                let display = |name: &str| name.split('#').next().unwrap_or(name).to_string();
+                let matched: Vec<HostId> = hosts
+                    .iter()
+                    .filter(|h| {
+                        h.name.eq_ignore_ascii_case(n) || display(&h.name).eq_ignore_ascii_case(n)
+                    })
+                    .map(|h| h.id)
+                    .collect();
+                if matched.is_empty() {
+                    return Err(QueryError::Other {
+                        message: format!("unknown host name: {n}"),
+                    });
                 }
+                wanted.extend(matched);
             }
             let sources: Vec<SourceId> = ctx
                 .catalog

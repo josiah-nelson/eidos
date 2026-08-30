@@ -4854,6 +4854,7 @@ fn one_certificate_fingerprint_cannot_enroll_as_two_node_ids() {
         enrolled_at: UnixNanos(1),
         last_seen_at: None,
         last_error: None,
+        connected: false,
     };
     central.catalog.fleet_upsert_peer(&first).unwrap();
     let mut collision = first.clone();

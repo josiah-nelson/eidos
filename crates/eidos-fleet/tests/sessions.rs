@@ -195,6 +195,7 @@ fn admit_peer(catalog: &Catalog, identity: &NodeIdentity, role: PeerRole) {
             enrolled_at: UnixNanos::now(),
             last_seen_at: None,
             last_error: None,
+            connected: false,
         })
         .unwrap();
 }
@@ -802,6 +803,7 @@ async fn unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_a
             enrolled_at: UnixNanos::now(),
             last_seen_at: None,
             last_error: None,
+            connected: false,
         })
         .unwrap();
     let mut s = raw_connect(&stranger, &central).await;

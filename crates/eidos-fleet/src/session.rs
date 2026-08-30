@@ -699,6 +699,7 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
         enrolled_at: UnixNanos::now(),
         last_seen_at: Some(UnixNanos::now()),
         last_error: None,
+        connected: false,
     };
     let catalog = ctx.catalog.clone();
     let redeemed = match tokio::task::spawn_blocking(move || {
