@@ -3843,6 +3843,203 @@ fn node_id_text_rejects_non_ascii_without_panicking() {
 }
 
 #[test]
+fn self_parent_and_self_archive_references_are_rejected_before_apply() {
+    let node = Node::new();
+    let central = Central::new();
+    let source = central.source_for(&node);
+    let epoch = node.epoch();
+    let mut row = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|row| {
+            row.image
+                .as_ref()
+                .is_some_and(|image| !image.entries.is_empty())
+        })
+        .unwrap();
+    row.seq = 1;
+    row.image.as_mut().unwrap().entries[0].parent = Some(row.object);
+    let chain = [0x91; 32];
+    central
+        .catalog
+        .replica_admit_hello(NODE, source, epoch, 1, chain, 0, 0)
+        .unwrap();
+    let self_parent = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 1,
+        through_chain: chain,
+        head_seq: 1,
+        rows: vec![row.clone()],
+    };
+    let BatchOutcome::Rejected { reason } = central
+        .catalog
+        .replica_apply_batch(NODE, source, &self_parent)
+        .unwrap()
+    else {
+        panic!("self-parent row was accepted");
+    };
+    assert!(reason.contains("malformed"), "{reason}");
+
+    let image = row.image.as_mut().unwrap();
+    image.entries[0].parent = None;
+    image.archive_container = Some(row.object);
+    let self_archive = SyncBatch {
+        rows: vec![row],
+        ..self_parent
+    };
+    let BatchOutcome::Rejected { reason } = central
+        .catalog
+        .replica_apply_batch(NODE, source, &self_archive)
+        .unwrap()
+    else {
+        panic!("self-archive row was accepted");
+    };
+    assert!(reason.contains("malformed"), "{reason}");
+    assert_eq!(central.applied_seq(source), 0);
+}
+
+#[test]
+fn an_indirect_parent_cycle_rejects_the_whole_batch() {
+    let node = Node::new();
+    let central = Central::new();
+    let source = central.source_for(&node);
+    let epoch = node.epoch();
+    let source_rows = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap()
+        .rows;
+    let root_id = node.id("");
+    let child_id = node.id("a");
+    let mut root = source_rows
+        .iter()
+        .find(|row| row.object == root_id)
+        .unwrap()
+        .clone();
+    let mut child = source_rows
+        .iter()
+        .find(|row| row.object == child_id)
+        .unwrap()
+        .clone();
+    root.seq = 1;
+    child.seq = 2;
+    for entry in &mut root.image.as_mut().unwrap().entries {
+        entry.parent = Some(child_id);
+    }
+    for entry in &mut child.image.as_mut().unwrap().entries {
+        entry.parent = Some(root_id);
+    }
+    let head_chain = [0x92; 32];
+    central
+        .catalog
+        .replica_admit_hello(NODE, source, epoch, 2, head_chain, 0, 0)
+        .unwrap();
+    let cyclic = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 2,
+        through_chain: head_chain,
+        head_seq: 2,
+        rows: vec![root, child],
+    };
+    let BatchOutcome::Rejected { reason } = central
+        .catalog
+        .replica_apply_batch(NODE, source, &cyclic)
+        .unwrap()
+    else {
+        panic!("cyclic batch was accepted");
+    };
+    assert!(reason.contains("topology cycle"), "{reason}");
+    assert_eq!(central.applied_seq(source), 0);
+    let mappings = central
+        .catalog
+        .with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM sync_replica_rows WHERE source_id = ?1",
+                [source.0],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(mappings, 0, "rejected batch must roll back every mapping");
+}
+
+#[test]
+fn aggregate_rebuild_is_bounded_for_a_corrupt_legacy_cycle() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, u32::MAX);
+    let source = central.source_for(&node);
+    let root = central
+        .catalog
+        .get_source(source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    central
+        .catalog
+        .with_writer(|conn| {
+            conn.execute(
+                "INSERT INTO entries
+                    (source_id, parent_id, object_id, name, name_folded, extension,
+                     is_virtual, first_seen_generation, last_seen_generation)
+                 VALUES (?1, ?2, ?2, 'legacy-cycle', 'legacy-cycle', '', 0, 0, 0)",
+                [source.0, root.0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    central.catalog.replica_rebuild_aggregates(source).unwrap();
+    assert_eq!(
+        central
+            .catalog
+            .get_source(source)
+            .unwrap()
+            .unwrap()
+            .root_object_id,
+        Some(root)
+    );
+}
+
+#[test]
+fn every_complete_apply_advances_replica_freshness() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, u32::MAX);
+    let source = central.source_for(&node);
+    let first = central
+        .catalog
+        .get_source(source)
+        .unwrap()
+        .unwrap()
+        .last_scan_completed_at
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    node.touch("a/one.txt", 101, 1_800_000_000);
+    converge(&node, &central, u32::MAX);
+    let second = central
+        .catalog
+        .get_source(source)
+        .unwrap()
+        .unwrap()
+        .last_scan_completed_at
+        .unwrap();
+    assert!(
+        second.0 > first.0,
+        "{first:?} did not advance to {second:?}"
+    );
+}
+
+#[test]
 fn one_certificate_fingerprint_cannot_enroll_as_two_node_ids() {
     let central = Central::new();
     let first = FleetPeer {

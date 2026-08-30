@@ -124,6 +124,7 @@ pub fn rebuild_source(
 ) -> Result<AggStats> {
     let mut children: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     let mut own: HashMap<ObjectId, Acc> = HashMap::new();
+    let mut directories = HashSet::from([root]);
     {
         let mut stmt = conn.prepare_cached(
             "SELECT e.parent_id, e.object_id, e.extension, o.kind, o.size, o.allocated, o.modified, o.content_state
@@ -137,6 +138,7 @@ pub fn rebuild_source(
             let ext: String = r.get(2)?;
             let kind: String = r.get(3)?;
             if kind == ObjectKind::Directory.as_str() {
+                directories.insert(obj);
                 children.entry(parent).or_default().push(obj);
             } else {
                 let size = r.get::<_, i64>(4)? as u64;
@@ -152,18 +154,24 @@ pub fn rebuild_source(
 
     // BFS from the root to establish a parent-before-child order.
     let mut order: Vec<(ObjectId, Option<ObjectId>)> = vec![(root, None)];
+    let mut seen = HashSet::from([root]);
     let mut i = 0;
     while i < order.len() {
         let (dir, _) = order[i];
         if let Some(kids) = children.get(&dir) {
             for k in kids {
-                order.push((*k, Some(dir)));
+                // A catalog should be acyclic, but rebuild is also used to
+                // recover old/corrupt catalogs and must remain bounded when
+                // topology is malformed.
+                if seen.insert(*k) {
+                    order.push((*k, Some(dir)));
+                }
             }
         }
         i += 1;
     }
     let reachable = order.len() as u64;
-    let total_dirs = 1 + children.values().map(|v| v.len() as u64).sum::<u64>();
+    let total_dirs = directories.len() as u64;
 
     conn.execute(
         "DELETE FROM directory_extension_counts WHERE object_id IN (SELECT object_id FROM directory_aggregates WHERE source_id = ?1)",

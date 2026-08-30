@@ -502,7 +502,13 @@ impl ScanSession {
                 if content_changed {
                     self.record_policy(ex.id, decision)?;
                 }
-                if row_changed {
+                if content_changed {
+                    // Retiring an archive changes the final image of every
+                    // virtual member, not only the physical container. Stamp
+                    // the set after both the member tombstones and container
+                    // update are final so replicas cannot retain ghost rows.
+                    crate::sync::touch_subtree_conn(&self.conn, self.source.id, ex.id)?;
+                } else if row_changed {
                     crate::sync::touch_conn(&self.conn, self.source.id, ex.id)?;
                 }
                 self.stats.objects_updated += 1;

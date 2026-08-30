@@ -3,11 +3,15 @@
 //! tombstone collection. Platform neutral except the scan fixture, which
 //! uses the default lister on a temporary tree.
 
+use eidos_catalog::archive::{ArchiveMember, ArchiveRecord};
 use eidos_catalog::changes::{ChangeEvent, NativeKey, ObjectSnapshot};
+use eidos_catalog::content::ContentRecord;
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::sync::{SyncBatch, SyncRow};
 use eidos_catalog::{Catalog, NewSource};
-use eidos_domain::{ObjectId, ObjectKind, SourceId, SourceKind, SyncPolicy};
+use eidos_domain::{
+    ContentState, Coverage, ObjectId, ObjectKind, SourceId, SourceKind, SyncPolicy, UnixNanos,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -367,6 +371,104 @@ fn enable_backfills_live_objects_in_bounded_steps() {
     let again = fx.catalog.sync_backfill(fx.source, 2).unwrap();
     assert!(again.done);
     assert_eq!(again.stamped, 0);
+}
+
+#[test]
+fn scan_detected_archive_change_stamps_every_retired_virtual_member() {
+    let fx = Fx::new();
+    let archive_path = fx.root.join("pack.zip");
+    std::fs::write(&archive_path, b"PK\x05\x06").unwrap();
+    fx.scan();
+    fx.enable_and_backfill(100);
+
+    let container = fx.id("pack.zip");
+    let generation = fx
+        .catalog
+        .get_object(container)
+        .unwrap()
+        .unwrap()
+        .generation;
+    let members = ["one.txt", "two.txt"]
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, name)| ArchiveMember {
+            ordinal: ordinal as u32,
+            path: name.into(),
+            name: name.into(),
+            parent: String::new(),
+            raw_name: name.into(),
+            is_dir: false,
+            implicit: false,
+            size: 3,
+            compressed: 3,
+            method: 0,
+            crc32: 0,
+            modified: Some(UnixNanos(1)),
+            encrypted: false,
+            flags: 0,
+        })
+        .collect::<Vec<_>>();
+    let archive = ArchiveRecord {
+        object_id: container,
+        source_id: fx.source,
+        generation,
+        format: "zip".into(),
+        member_count: members.len() as u64,
+        dir_count: 0,
+        implicit_dir_count: 0,
+        suspicious_count: 0,
+        declared_size: 6,
+        compressed_size: 6,
+        claimed_entries: members.len() as u64,
+        zip64: false,
+        truncated: false,
+        comment: None,
+        state: ContentState::Indexed,
+        error: None,
+        reason: None,
+        processed_at: UnixNanos::now(),
+        elapsed_ms: 1.0,
+    };
+    let content = ContentRecord {
+        object_id: container,
+        source_id: fx.source,
+        generation,
+        extraction_version: 1,
+        encoding: None,
+        coverage: Coverage::Full,
+        indexed_bytes: 0,
+        total_bytes: 4,
+        chunk_count: 0,
+        line_count: 0,
+        chars: 0,
+        content_id: None,
+        hash_complete: false,
+        state: ContentState::Indexed,
+        failure_class: None,
+        error: None,
+        reason: None,
+        processed_at: UnixNanos::now(),
+        elapsed_ms: 1.0,
+    };
+    assert!(fx
+        .catalog
+        .store_archive(&archive, &members, &content, None)
+        .unwrap());
+    let virtuals = [fx.id("pack.zip/one.txt"), fx.id("pack.zip/two.txt")];
+    let before = fx.catalog.sync_source(fx.source).unwrap().unwrap().head_seq;
+
+    std::fs::write(&archive_path, b"changed archive bytes").unwrap();
+    fx.scan();
+    let changed = fx
+        .catalog
+        .sync_rows_after(fx.source, before, u32::MAX)
+        .unwrap();
+    for object in virtuals {
+        assert!(
+            row_for(&changed, object).image.is_none(),
+            "retired virtual member {object} must ship as a tombstone"
+        );
+    }
 }
 
 #[test]

@@ -692,12 +692,62 @@ fn wire_row_is_valid(row: &SyncRow) -> bool {
         && row.image.as_ref().is_none_or(|image| {
             image.object.id.0 > 0
                 && u64::from(image.object.generation) == row.generation
-                && image.archive_container.is_none_or(|object| object.0 > 0)
                 && image
-                    .entries
-                    .iter()
-                    .all(|entry| entry.parent.is_none_or(|object| object.0 > 0))
+                    .archive_container
+                    .is_none_or(|object| object.0 > 0 && object != row.object)
+                && image.entries.iter().all(|entry| {
+                    entry
+                        .parent
+                        .is_none_or(|object| object.0 > 0 && object != row.object)
+                })
         })
+}
+
+fn parent_would_cycle_conn(
+    tx: &Transaction<'_>,
+    source: SourceId,
+    epoch: &SyncEpoch,
+    object: ObjectId,
+    parent: ObjectId,
+) -> Result<bool> {
+    Ok(tx.query_row(
+        "WITH RECURSIVE ancestors(object_id) AS (
+             SELECT ?3
+             UNION
+             SELECT e.parent_id FROM entries e
+             JOIN ancestors a ON a.object_id = e.object_id
+             JOIN sync_replica_rows rr ON rr.source_id = ?1
+                  AND rr.local_object_id = e.object_id AND rr.epoch = ?4
+             WHERE e.source_id = ?1 AND e.deleted_at IS NULL AND e.parent_id IS NOT NULL
+         )
+         SELECT EXISTS(SELECT 1 FROM ancestors WHERE object_id = ?2)",
+        params![source.0, object.0, parent.0, epoch.0.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn archive_container_would_cycle_conn(
+    tx: &Transaction<'_>,
+    source: SourceId,
+    epoch: &SyncEpoch,
+    object: ObjectId,
+    container: ObjectId,
+) -> Result<bool> {
+    Ok(tx.query_row(
+        "WITH RECURSIVE containers(object_id) AS (
+             SELECT ?3
+             UNION
+             SELECT o.archive_container_id FROM objects o
+             JOIN containers c ON c.object_id = o.object_id
+             JOIN sync_replica_rows rr ON rr.source_id = ?1
+                  AND rr.local_object_id = o.object_id AND rr.epoch = ?4
+             WHERE o.source_id = ?1 AND o.deleted_at IS NULL
+               AND o.archive_container_id IS NOT NULL
+         )
+         SELECT EXISTS(SELECT 1 FROM containers WHERE object_id = ?2)",
+        params![source.0, object.0, container.0, epoch.0.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
 }
 
 fn wire_entry_count(rows: &[SyncRow]) -> Option<usize> {
@@ -806,7 +856,7 @@ fn apply_row_conn(
     authoritative: bool,
     now: i64,
     counts: &mut ApplyCounts,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let existing = reuse_native_object_conn(tx, source, epoch, row)?;
     if let Some(state) = &existing {
         // Sequences only order rows within one epoch; a row of another
@@ -816,7 +866,7 @@ fn apply_row_conn(
             && state.epoch.as_slice() == epoch.0.as_slice()
             && state.seq >= row.seq
         {
-            return Ok(());
+            return Ok(None);
         }
     }
     let was_placeholder = existing.as_ref().is_some_and(|s| s.placeholder);
@@ -861,6 +911,21 @@ fn apply_row_conn(
                 Some(remote) => Some(local_object_conn(tx, source, epoch, remote)?.0),
                 None => None,
             };
+            if let Some(container) = container {
+                if archive_container_would_cycle_conn(
+                    tx,
+                    source,
+                    epoch,
+                    local,
+                    ObjectId(container),
+                )? {
+                    return Ok(Some(format!(
+                        "replica topology cycle: object {} cannot use archive container {}",
+                        row.object,
+                        image.archive_container.expect("container was present")
+                    )));
+                }
+            }
             tx.prepare_cached(
                 "UPDATE objects SET kind = ?2, native_volume_serial = ?3, native_id_high = ?4,
                     native_id_low = ?5, identity_confidence = ?6, generation = ?7, size = ?8,
@@ -906,6 +971,15 @@ fn apply_row_conn(
                     }
                     None => None,
                 };
+                if let Some(parent) = parent {
+                    if parent_would_cycle_conn(tx, source, epoch, local, ObjectId(parent))? {
+                        return Ok(Some(format!(
+                            "replica topology cycle: object {} cannot use parent {}",
+                            row.object,
+                            entry.parent.expect("parent was present")
+                        )));
+                    }
+                }
                 let ext = if matches!(o.kind, ObjectKind::File | ObjectKind::VirtualFile) {
                     extension_of(&entry.name)
                 } else {
@@ -949,7 +1023,7 @@ fn apply_row_conn(
         image_hash.as_slice(),
     ])?;
     counts.applied += 1;
-    Ok(())
+    Ok(None)
 }
 
 /// Retire every mapping that does not belong to `epoch`: after an epoch
@@ -1048,7 +1122,7 @@ fn mark_completeness_conn(
     tx.prepare_cached(
         "UPDATE sources SET published_generation = CASE WHEN ?5 THEN ?2 ELSE NULL END,
             state = ?3, state_reason = ?4,
-            last_scan_completed_at = CASE WHEN ?5 THEN COALESCE(last_scan_completed_at, ?6)
+            last_scan_completed_at = CASE WHEN ?5 THEN ?6
                                           ELSE last_scan_completed_at END,
             updated_at = ?6
          WHERE source_id = ?1",
@@ -1634,7 +1708,11 @@ impl Catalog {
             let mut counts = ApplyCounts::default();
             prepare_rows_conn(&tx, source, &sync_epoch, rows, false)?;
             for row in rows {
-                apply_row_conn(&tx, source, &sync_epoch, row, false, now, &mut counts)?;
+                if let Some(reason) =
+                    apply_row_conn(&tx, source, &sync_epoch, row, false, now, &mut counts)?
+                {
+                    return Ok(BatchOutcome::Rejected { reason });
+                }
             }
             let mut retired = 0;
             if let Some(target) = state.resync_target {
@@ -2189,7 +2267,11 @@ impl Catalog {
             let mut counts = ApplyCounts::default();
             prepare_rows_conn(&tx, source, &sync_epoch, rows, true)?;
             for row in rows {
-                apply_row_conn(&tx, source, &sync_epoch, row, true, now, &mut counts)?;
+                if let Some(reason) =
+                    apply_row_conn(&tx, source, &sync_epoch, row, true, now, &mut counts)?
+                {
+                    return Ok(RepairOutcome::Rejected { reason });
+                }
             }
             for (remote, _, _) in known {
                 if present.contains(&ObjectId(remote)) {
