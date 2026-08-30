@@ -37,9 +37,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKFILL_STEP: u32 = 2_000;
 const COLLECT_LIMIT: u32 = 10_000;
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
-/// Bound unauthenticated TLS work and established inbound sessions. Once
-/// full, the OS listener backlog provides the next layer of backpressure.
-const MAX_INBOUND_CONNECTIONS: usize = 64;
+/// Bound all TLS work and established sessions across both directions. Each
+/// session can materialize ledgers and Merkle trees, so outbound roster size
+/// must not multiply blocking work or memory without a fleet-wide ceiling.
+/// Once full, inbound connections wait in the OS backlog and outbound peers
+/// remain due for a later dial tick.
+const MAX_FLEET_SESSIONS: usize = 64;
 
 struct Dial {
     next: Instant,
@@ -56,6 +59,7 @@ pub struct Fleet {
     listening: Arc<Mutex<Option<String>>>,
     listener_error: Arc<Mutex<Option<String>>>,
     dials: Arc<Mutex<HashMap<NodeId, Dial>>>,
+    session_permits: Arc<Semaphore>,
     /// Sources whose ledger looks over its ceiling, by name.
     degraded: Arc<Mutex<Vec<String>>>,
 }
@@ -88,6 +92,7 @@ impl Fleet {
             listening: Arc::new(Mutex::new(None)),
             listener_error: Arc::new(Mutex::new(None)),
             dials: Arc::new(Mutex::new(HashMap::new())),
+            session_permits: Arc::new(Semaphore::new(MAX_FLEET_SESSIONS)),
             degraded: Arc::new(Mutex::new(Vec::new())),
         });
         let mut tasks = fleet.tasks.lock();
@@ -320,9 +325,8 @@ async fn accept_loop(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
             return;
         }
     };
-    let permits = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
     loop {
-        let permit = match permits.clone().acquire_owned().await {
+        let permit = match fleet.session_permits.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return,
         };
@@ -411,10 +415,14 @@ async fn dial_loop(fleet: Arc<Fleet>) {
             if dial.in_progress || dial.next > now {
                 continue;
             }
+            let Ok(permit) = fleet.session_permits.clone().try_acquire_owned() else {
+                continue;
+            };
             dial.in_progress = true;
             drop(dials);
             let fleet = fleet.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 fleet
                     .ctx
                     .counters

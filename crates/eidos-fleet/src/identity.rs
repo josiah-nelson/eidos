@@ -108,7 +108,7 @@ impl NodeIdentity {
             return Self::load(&dir);
         }
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        restrict_dir(&dir);
+        restrict_dir(&dir)?;
         let certified = rcgen::generate_simple_self_signed(vec![TLS_SERVER_NAME.to_string()])
             .map_err(|e| anyhow!("generating the node certificate: {e}"))?;
         let cert_der = certified.cert.der().to_vec();
@@ -126,6 +126,11 @@ impl NodeIdentity {
     }
 
     fn load(dir: &Path) -> anyhow::Result<Self> {
+        // Re-assert the boundary on every load. An administrator may have
+        // copied/restored the directory with inherited permissions after it
+        // was created; the authentication key must never be read until the
+        // directory is private again.
+        restrict_dir(dir)?;
         let cert_der = std::fs::read(dir.join(CERT_FILE))
             .with_context(|| format!("reading {}", dir.join(CERT_FILE).display()))?;
         let key_der = std::fs::read(dir.join(KEY_FILE))
@@ -199,47 +204,55 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// Keep the key directory to SYSTEM, Administrators and the account that
 /// runs the service. The data directory's default ACL (ProgramData) lets
 /// every local user read it, which must not extend to a private key.
-/// Best effort: a failure is logged, not fatal, because the service must
-/// still start on a host whose ACL tooling is unavailable.
-fn restrict_dir(dir: &Path) {
+/// Failure is fatal: starting fleet sync with an inherited ProgramData ACL
+/// would expose the private credential used to impersonate this node.
+fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         let me = std::process::Command::new("whoami")
             .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let mut args: Vec<String> = vec![
+            .context("finding the account that owns the fleet identity")?;
+        if !me.status.success() {
+            return Err(anyhow!(
+                "whoami failed while restricting {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&me.stderr).trim()
+            ));
+        }
+        let me = String::from_utf8(me.stdout)
+            .context("whoami returned a non-UTF-8 account name")?
+            .trim()
+            .to_string();
+        if me.is_empty() {
+            return Err(anyhow!("whoami returned an empty account name"));
+        }
+        let args: Vec<String> = vec![
             dir.display().to_string(),
             "/inheritance:r".into(),
             "/grant:r".into(),
             "*S-1-5-18:(OI)(CI)F".into(),
             "/grant:r".into(),
             "*S-1-5-32-544:(OI)(CI)F".into(),
+            "/grant:r".into(),
+            format!("{me}:(OI)(CI)F"),
         ];
-        if let Some(me) = me {
-            args.push("/grant:r".into());
-            args.push(format!("{me}:(OI)(CI)F"));
-        }
         match std::process::Command::new("icacls").args(&args).output() {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => tracing::warn!(
-                dir = %dir.display(),
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                "could not restrict the fleet key directory"
-            ),
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(anyhow!(
+                "icacls could not restrict {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
             Err(e) => {
-                tracing::warn!(dir = %dir.display(), error = %e, "icacls unavailable; fleet key directory keeps the inherited ACL")
+                Err(e).with_context(|| format!("running icacls to restrict {}", dir.display()))
             }
         }
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-            tracing::warn!(dir = %dir.display(), error = %e, "could not restrict the fleet key directory");
-        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {} to mode 0700", dir.display()))
     }
 }
 
