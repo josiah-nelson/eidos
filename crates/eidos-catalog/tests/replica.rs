@@ -399,6 +399,38 @@ fn repair_anchor(
     }
 }
 
+fn merkle_tree_for_rows(rows: &[SyncRow], leaf_bits: u8) -> MerkleTree {
+    MerkleTree::with_leaf_bits(
+        leaf_bits,
+        rows.iter().map(|row| {
+            let image_hash = row
+                .image
+                .as_ref()
+                .map(|image| {
+                    let mut canonical = image.clone();
+                    canonical.object.accessed = None;
+                    canonical.object.first_seen_generation = 0;
+                    canonical.object.last_seen_generation = 0;
+                    canonical.object.deleted_at = None;
+                    canonical.entries.sort_by(|left, right| {
+                        (left.parent, &left.name, left.is_virtual).cmp(&(
+                            right.parent,
+                            &right.name,
+                            right.is_virtual,
+                        ))
+                    });
+                    let encoded = serde_json::to_vec(&canonical).unwrap();
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"eidos-sync-row-image/1\0");
+                    hasher.update(&encoded);
+                    *hasher.finalize().as_bytes()
+                })
+                .unwrap_or([0; 32]);
+            record_digest(row.object, row.generation, row.image.is_none(), &image_hash)
+        }),
+    )
+}
+
 #[test]
 fn a_bounded_stream_reproduces_the_source_image_with_children_before_parents() {
     let node = Node::new();
@@ -3970,6 +4002,441 @@ fn an_indirect_parent_cycle_rejects_the_whole_batch() {
         })
         .unwrap();
     assert_eq!(mappings, 0, "rejected batch must roll back every mapping");
+}
+
+fn row_with_missing_relation(node: &Node, archive: bool) -> SyncRow {
+    let mut row = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|row| {
+            row.image
+                .as_ref()
+                .is_some_and(|image| !image.entries.is_empty())
+        })
+        .unwrap();
+    row.seq = 1;
+    let missing = ObjectId(9_000_000);
+    if archive {
+        row.image.as_mut().unwrap().archive_container = Some(missing);
+    } else {
+        row.image.as_mut().unwrap().entries[0].parent = Some(missing);
+    }
+    row
+}
+
+#[test]
+fn unresolved_batch_and_repair_relations_never_report_complete() {
+    for archive in [false, true] {
+        let node = Node::new();
+        let epoch = node.epoch();
+        let chain = if archive { [0xA2; 32] } else { [0xA1; 32] };
+        let row = row_with_missing_relation(&node, archive);
+
+        let batch_central = Central::new();
+        let batch_source = batch_central.source_for(&node);
+        batch_central
+            .catalog
+            .replica_admit_hello(NODE, batch_source, epoch, 1, chain, 0, 0)
+            .unwrap();
+        let batch = SyncBatch {
+            source_id: node.source,
+            epoch: SyncEpoch::from_source_epoch(epoch),
+            after_seq: 0,
+            after_chain: CHAIN_GENESIS,
+            through_seq: 1,
+            through_chain: chain,
+            head_seq: 1,
+            rows: vec![row.clone()],
+        };
+        assert!(matches!(
+            batch_central
+                .catalog
+                .replica_apply_batch(NODE, batch_source, &batch)
+                .unwrap(),
+            BatchOutcome::Applied { .. }
+        ));
+        let completeness = batch_central
+            .catalog
+            .source_completeness(batch_source)
+            .unwrap();
+        assert_eq!(completeness.state, SourceState::Reconciling);
+        assert!(!completeness.metadata_complete);
+
+        let repair_central = Central::new();
+        let repair_source = repair_central.source_for(&node);
+        repair_central
+            .catalog
+            .replica_admit_hello(NODE, repair_source, epoch, 1, chain, 0, 1)
+            .unwrap();
+        let leaf_bits = MIN_FLEET_LEAF_BITS;
+        let tree = merkle_tree_for_rows(std::slice::from_ref(&row), leaf_bits);
+        let request = repair_central
+            .catalog
+            .replica_repair_offer(
+                NODE,
+                repair_source,
+                epoch,
+                1,
+                chain,
+                1,
+                Some(CHAIN_GENESIS),
+                leaf_bits,
+                &tree.leaf_hashes(),
+            )
+            .unwrap();
+        let leaves = match request {
+            eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            repair_central
+                .catalog
+                .replica_apply_repair(
+                    NODE,
+                    repair_source,
+                    epoch,
+                    1,
+                    chain,
+                    1,
+                    leaf_bits,
+                    &leaves,
+                    &[row],
+                )
+                .unwrap(),
+            RepairOutcome::Applied { .. }
+        ));
+        let completeness = repair_central
+            .catalog
+            .source_completeness(repair_source)
+            .unwrap();
+        assert_eq!(completeness.state, SourceState::Reconciling);
+        assert!(!completeness.metadata_complete);
+    }
+}
+
+fn cross_epoch_cycle_rows(node: &Node, archive: bool) -> Vec<SyncRow> {
+    let rows = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap()
+        .rows;
+    let root_id = node.id("");
+    let child_id = node.id("a");
+    let mut root = rows
+        .iter()
+        .find(|row| row.object == root_id)
+        .unwrap()
+        .clone();
+    let mut child = rows
+        .iter()
+        .find(|row| row.object == child_id)
+        .unwrap()
+        .clone();
+    root.seq = 1;
+    child.seq = 2;
+    if archive {
+        root.image.as_mut().unwrap().archive_container = Some(child_id);
+        child.image.as_mut().unwrap().archive_container = Some(root_id);
+    } else {
+        for entry in &mut root.image.as_mut().unwrap().entries {
+            entry.parent = Some(child_id);
+        }
+        for entry in &mut child.image.as_mut().unwrap().entries {
+            entry.parent = Some(root_id);
+        }
+    }
+    vec![root, child]
+}
+
+#[test]
+fn cross_epoch_parent_and_archive_cycles_are_rejected_in_batches() {
+    for archive in [false, true] {
+        let node = Node::new();
+        let central = Central::new();
+        converge(&node, &central, 8);
+        let source = central.source_for(&node);
+        let before = central.image(source);
+        let epoch = SourceEpoch::random_v4(501, u64::from(archive));
+        let chain = if archive { [0xB2; 32] } else { [0xB1; 32] };
+        assert!(matches!(
+            central
+                .catalog
+                .replica_admit_hello(NODE, source, epoch, 2, chain, 0, 0)
+                .unwrap(),
+            HelloOutcome::FullResync { .. }
+        ));
+        let batch = SyncBatch {
+            source_id: node.source,
+            epoch: SyncEpoch::from_source_epoch(epoch),
+            after_seq: 0,
+            after_chain: CHAIN_GENESIS,
+            through_seq: 2,
+            through_chain: chain,
+            head_seq: 2,
+            rows: cross_epoch_cycle_rows(&node, archive),
+        };
+        let BatchOutcome::Rejected { reason } = central
+            .catalog
+            .replica_apply_batch(NODE, source, &batch)
+            .unwrap()
+        else {
+            panic!("cross-epoch cycle was accepted");
+        };
+        assert!(reason.contains("topology cycle"), "{reason}");
+        assert_eq!(central.image(source), before, "rejection must roll back");
+    }
+}
+
+#[test]
+fn multipart_repair_detaches_old_topology_and_rejects_a_later_cycle() {
+    for archive in [false, true] {
+        let node = Node::new();
+        let central = Central::new();
+        converge(&node, &central, 8);
+        let source = central.source_for(&node);
+        let epoch = SourceEpoch::random_v4(601, u64::from(archive));
+        let chain = if archive { [0xC2; 32] } else { [0xC1; 32] };
+        assert!(matches!(
+            central
+                .catalog
+                .replica_admit_hello(NODE, source, epoch, 2, chain, 0, 1)
+                .unwrap(),
+            HelloOutcome::FullResync { .. }
+        ));
+        let rows = cross_epoch_cycle_rows(&node, archive);
+        let leaf_bits = MIN_FLEET_LEAF_BITS;
+        let first_leaf = leaf_index(leaf_bits, rows[0].object);
+        let second_leaf = leaf_index(leaf_bits, rows[1].object);
+        assert_ne!(
+            first_leaf, second_leaf,
+            "fixture rows must occupy distinct leaves"
+        );
+        let tree = merkle_tree_for_rows(&rows, leaf_bits);
+        let request = central
+            .catalog
+            .replica_repair_offer(
+                NODE,
+                source,
+                epoch,
+                2,
+                chain,
+                1,
+                None,
+                leaf_bits,
+                &tree.leaf_hashes(),
+            )
+            .unwrap();
+        let requested = match request {
+            eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+            other => panic!("{other:?}"),
+        };
+        assert!(requested.contains(&first_leaf));
+        assert!(requested.contains(&second_leaf));
+        assert!(matches!(
+            central
+                .catalog
+                .replica_apply_repair_part(
+                    NODE,
+                    source,
+                    epoch,
+                    2,
+                    chain,
+                    1,
+                    leaf_bits,
+                    &[first_leaf],
+                    std::slice::from_ref(&rows[0]),
+                    false,
+                )
+                .unwrap(),
+            RepairOutcome::Staged { .. }
+        ));
+        let RepairOutcome::Rejected { reason } = central
+            .catalog
+            .replica_apply_repair_part(
+                NODE,
+                source,
+                epoch,
+                2,
+                chain,
+                1,
+                leaf_bits,
+                &[second_leaf],
+                std::slice::from_ref(&rows[1]),
+                false,
+            )
+            .unwrap()
+        else {
+            panic!("later cyclic repair part was accepted");
+        };
+        assert!(reason.contains("topology cycle"), "{reason}");
+        assert!(
+            !central
+                .catalog
+                .source_completeness(source)
+                .unwrap()
+                .metadata_complete
+        );
+    }
+}
+
+#[test]
+fn batch_and_repair_sizes_are_bounded_by_sqlite_storage() {
+    let node = Node::new();
+    let mut row = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|row| {
+            row.image
+                .as_ref()
+                .is_some_and(|image| image.object.kind == eidos_domain::ObjectKind::File)
+        })
+        .unwrap();
+    row.seq = 1;
+    let image = row.image.as_mut().unwrap();
+    image.object.size = i64::MAX as u64 + 1;
+    image.object.allocated = i64::MAX as u64 + 1;
+    let epoch = node.epoch();
+    let chain = [0xD1; 32];
+
+    let batch_central = Central::new();
+    let batch_source = batch_central.source_for(&node);
+    batch_central
+        .catalog
+        .replica_admit_hello(NODE, batch_source, epoch, 1, chain, 0, 0)
+        .unwrap();
+    let batch = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 1,
+        through_chain: chain,
+        head_seq: 1,
+        rows: vec![row.clone()],
+    };
+    assert!(matches!(
+        batch_central
+            .catalog
+            .replica_apply_batch(NODE, batch_source, &batch)
+            .unwrap(),
+        BatchOutcome::Rejected { .. }
+    ));
+
+    let repair_central = Central::new();
+    let repair_source = repair_central.source_for(&node);
+    repair_central
+        .catalog
+        .replica_admit_hello(NODE, repair_source, epoch, 1, chain, 0, 1)
+        .unwrap();
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
+    let tree = merkle_tree_for_rows(std::slice::from_ref(&row), leaf_bits);
+    let request = repair_central
+        .catalog
+        .replica_repair_offer(
+            NODE,
+            repair_source,
+            epoch,
+            1,
+            chain,
+            1,
+            Some(CHAIN_GENESIS),
+            leaf_bits,
+            &tree.leaf_hashes(),
+        )
+        .unwrap();
+    let leaves = match request {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(
+        repair_central
+            .catalog
+            .replica_apply_repair(
+                NODE,
+                repair_source,
+                epoch,
+                1,
+                chain,
+                1,
+                leaf_bits,
+                &leaves,
+                &[row.clone()],
+            )
+            .unwrap(),
+        RepairOutcome::Rejected { .. }
+    ));
+
+    let image = row.image.as_mut().unwrap();
+    image.object.size = i64::MAX as u64;
+    image.object.allocated = i64::MAX as u64;
+    let boundary_chain = [0xD2; 32];
+    let boundary_batch_central = Central::new();
+    let boundary_batch_source = boundary_batch_central.source_for(&node);
+    boundary_batch_central
+        .catalog
+        .replica_admit_hello(NODE, boundary_batch_source, epoch, 1, boundary_chain, 0, 0)
+        .unwrap();
+    let boundary_batch = SyncBatch {
+        through_chain: boundary_chain,
+        rows: vec![row.clone()],
+        ..batch
+    };
+    assert!(matches!(
+        boundary_batch_central
+            .catalog
+            .replica_apply_batch(NODE, boundary_batch_source, &boundary_batch)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+
+    let boundary_repair_central = Central::new();
+    let boundary_repair_source = boundary_repair_central.source_for(&node);
+    boundary_repair_central
+        .catalog
+        .replica_admit_hello(NODE, boundary_repair_source, epoch, 1, boundary_chain, 0, 1)
+        .unwrap();
+    let boundary_tree = merkle_tree_for_rows(std::slice::from_ref(&row), leaf_bits);
+    let request = boundary_repair_central
+        .catalog
+        .replica_repair_offer(
+            NODE,
+            boundary_repair_source,
+            epoch,
+            1,
+            boundary_chain,
+            1,
+            Some(CHAIN_GENESIS),
+            leaf_bits,
+            &boundary_tree.leaf_hashes(),
+        )
+        .unwrap();
+    let leaves = match request {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(
+        boundary_repair_central
+            .catalog
+            .replica_apply_repair(
+                NODE,
+                boundary_repair_source,
+                epoch,
+                1,
+                boundary_chain,
+                1,
+                leaf_bits,
+                &leaves,
+                &[row],
+            )
+            .unwrap(),
+        RepairOutcome::Applied { .. }
+    ));
 }
 
 #[test]

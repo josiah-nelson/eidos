@@ -363,12 +363,35 @@ fn local_object_conn(
         })
         .optional()?
     {
-        if placeholder && stored_epoch.as_slice() != epoch.0.as_slice() {
-            tx.prepare_cached(
-                "UPDATE sync_replica_rows SET epoch = ?3
-                 WHERE source_id = ?1 AND remote_object_id = ?2",
-            )?
-            .execute(params![source.0, remote.0, epoch.0.as_slice()])?;
+        if stored_epoch.as_slice() != epoch.0.as_slice() {
+            if placeholder {
+                tx.prepare_cached(
+                    "UPDATE sync_replica_rows SET epoch = ?3
+                     WHERE source_id = ?1 AND remote_object_id = ?2",
+                )?
+                .execute(params![source.0, remote.0, epoch.0.as_slice()])?;
+            } else {
+                // A new-epoch row may refer to a parent/container before that
+                // target's own row arrives. Do not retain the target's stale
+                // old-epoch outgoing topology: it can form a transient cycle
+                // with the authoritative new relation. Turn the mapping into
+                // a current-epoch placeholder so Merkle repair requests the
+                // missing row and completeness remains withheld.
+                tx.prepare_cached("DELETE FROM entries WHERE object_id = ?1")?
+                    .execute(params![id])?;
+                tx.prepare_cached(
+                    "UPDATE objects SET archive_container_id = NULL, deleted_at = NULL
+                     WHERE object_id = ?1",
+                )?
+                .execute(params![id])?;
+                tx.prepare_cached(
+                    "UPDATE sync_replica_rows SET epoch = ?3, seq = 0, generation = 0,
+                         deleted = 0, image_hash = zeroblob(32), placeholder = 1
+                     WHERE source_id = ?1 AND remote_object_id = ?2",
+                )?
+                .execute(params![source.0, remote.0, epoch.0.as_slice()])?;
+                outbox_append_conn(tx, source, ObjectId(id), "subtree", 0)?;
+            }
         }
         return Ok(ObjectId(id));
     }
@@ -692,6 +715,8 @@ fn wire_row_is_valid(row: &SyncRow) -> bool {
         && row.image.as_ref().is_none_or(|image| {
             image.object.id.0 > 0
                 && u64::from(image.object.generation) == row.generation
+                && image.object.size <= i64::MAX as u64
+                && image.object.allocated <= i64::MAX as u64
                 && image
                     .archive_container
                     .is_none_or(|object| object.0 > 0 && object != row.object)
@@ -706,7 +731,6 @@ fn wire_row_is_valid(row: &SyncRow) -> bool {
 fn parent_would_cycle_conn(
     tx: &Transaction<'_>,
     source: SourceId,
-    epoch: &SyncEpoch,
     object: ObjectId,
     parent: ObjectId,
 ) -> Result<bool> {
@@ -716,12 +740,10 @@ fn parent_would_cycle_conn(
              UNION
              SELECT e.parent_id FROM entries e
              JOIN ancestors a ON a.object_id = e.object_id
-             JOIN sync_replica_rows rr ON rr.source_id = ?1
-                  AND rr.local_object_id = e.object_id AND rr.epoch = ?4
              WHERE e.source_id = ?1 AND e.deleted_at IS NULL AND e.parent_id IS NOT NULL
          )
          SELECT EXISTS(SELECT 1 FROM ancestors WHERE object_id = ?2)",
-        params![source.0, object.0, parent.0, epoch.0.as_slice()],
+        params![source.0, object.0, parent.0],
         |row| row.get::<_, i64>(0),
     )? != 0)
 }
@@ -729,7 +751,6 @@ fn parent_would_cycle_conn(
 fn archive_container_would_cycle_conn(
     tx: &Transaction<'_>,
     source: SourceId,
-    epoch: &SyncEpoch,
     object: ObjectId,
     container: ObjectId,
 ) -> Result<bool> {
@@ -739,13 +760,11 @@ fn archive_container_would_cycle_conn(
              UNION
              SELECT o.archive_container_id FROM objects o
              JOIN containers c ON c.object_id = o.object_id
-             JOIN sync_replica_rows rr ON rr.source_id = ?1
-                  AND rr.local_object_id = o.object_id AND rr.epoch = ?4
              WHERE o.source_id = ?1 AND o.deleted_at IS NULL
                AND o.archive_container_id IS NOT NULL
          )
          SELECT EXISTS(SELECT 1 FROM containers WHERE object_id = ?2)",
-        params![source.0, object.0, container.0, epoch.0.as_slice()],
+        params![source.0, object.0, container.0],
         |row| row.get::<_, i64>(0),
     )? != 0)
 }
@@ -912,13 +931,7 @@ fn apply_row_conn(
                 None => None,
             };
             if let Some(container) = container {
-                if archive_container_would_cycle_conn(
-                    tx,
-                    source,
-                    epoch,
-                    local,
-                    ObjectId(container),
-                )? {
+                if archive_container_would_cycle_conn(tx, source, local, ObjectId(container))? {
                     return Ok(Some(format!(
                         "replica topology cycle: object {} cannot use archive container {}",
                         row.object,
@@ -972,7 +985,7 @@ fn apply_row_conn(
                     None => None,
                 };
                 if let Some(parent) = parent {
-                    if parent_would_cycle_conn(tx, source, epoch, local, ObjectId(parent))? {
+                    if parent_would_cycle_conn(tx, source, local, ObjectId(parent))? {
                         return Ok(Some(format!(
                             "replica topology cycle: object {} cannot use parent {}",
                             row.object,
@@ -1103,6 +1116,48 @@ fn mark_applied_conn(
     )?
     .execute(params![source.0, now])?;
     mark_completeness_conn(tx, source, now, complete)
+}
+
+/// Whether every live relationship in the current image resolves to a live,
+/// non-placeholder row from the same epoch. Child-first delivery is valid,
+/// but it must never make an incomplete image look complete.
+fn replica_topology_is_closed_conn(
+    tx: &Transaction<'_>,
+    source: SourceId,
+    epoch: &SyncEpoch,
+) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT NOT EXISTS (
+             SELECT 1 FROM entries e
+             JOIN sync_replica_rows child ON child.source_id = ?1
+                  AND child.local_object_id = e.object_id
+                  AND child.epoch = ?2 AND child.deleted = 0 AND child.placeholder = 0
+             WHERE e.source_id = ?1 AND e.deleted_at IS NULL AND e.parent_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM sync_replica_rows parent
+                   JOIN objects po ON po.object_id = parent.local_object_id
+                   WHERE parent.source_id = ?1 AND parent.local_object_id = e.parent_id
+                     AND parent.epoch = ?2 AND parent.deleted = 0 AND parent.placeholder = 0
+                     AND po.deleted_at IS NULL)
+             UNION ALL
+             SELECT 1 FROM objects o
+             JOIN sync_replica_rows child ON child.source_id = ?1
+                  AND child.local_object_id = o.object_id
+                  AND child.epoch = ?2 AND child.deleted = 0 AND child.placeholder = 0
+             WHERE o.source_id = ?1 AND o.deleted_at IS NULL
+               AND o.archive_container_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM sync_replica_rows container
+                   JOIN objects co ON co.object_id = container.local_object_id
+                   WHERE container.source_id = ?1
+                     AND container.local_object_id = o.archive_container_id
+                     AND container.epoch = ?2 AND container.deleted = 0
+                     AND container.placeholder = 0 AND co.deleted_at IS NULL)
+             LIMIT 1
+         )",
+        params![source.0, epoch.0.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
 }
 
 fn mark_completeness_conn(
@@ -1749,7 +1804,8 @@ impl Catalog {
                 && through_seq >= reported_head
                 && state.resync_target.is_none()
                 && state.applied_image_revision >= state.reported_image_revision
-                && !repair_pending_conn(&tx, source)?;
+                && !repair_pending_conn(&tx, source)?
+                && replica_topology_is_closed_conn(&tx, source, &sync_epoch)?;
             mark_applied_conn(&tx, source, now, image_complete)?;
             tx.commit()?;
             Ok(BatchOutcome::Applied {
@@ -2362,7 +2418,8 @@ impl Catalog {
             .execute(params![source.0, serde_json::to_string(leaves)?])?;
             let image_complete = state.resync_target.is_none()
                 && state.admission.applied_seq >= state.reported_head
-                && image_revision >= state.reported_image_revision;
+                && image_revision >= state.reported_image_revision
+                && replica_topology_is_closed_conn(&tx, source, &sync_epoch)?;
             mark_applied_conn(&tx, source, now, image_complete)?;
             tx.commit()?;
             Ok(RepairOutcome::Applied {
