@@ -10,7 +10,7 @@ use eidos_observe::{
 };
 use fsevent_stream::ffi::{
     kFSEventStreamCreateFlagFileEvents, kFSEventStreamCreateFlagNoDefer,
-    kFSEventStreamCreateFlagWatchRoot, kFSEventStreamEventIdSinceNow, FSEventsGetCurrentEventId,
+    kFSEventStreamCreateFlagWatchRoot, kFSEventStreamEventIdSinceNow,
 };
 use fsevent_stream::flags::StreamFlags;
 use fsevent_stream::stream::create_event_stream;
@@ -361,6 +361,15 @@ async fn run_fsevents(
         create_event_stream([Path::new("/")], since, Duration::from_secs(1), flags)?;
     let mut state = LogicalState::new(MAX_TRACKED_IDENTITIES);
     let mut pending_rename = None;
+    // The persisted cursor is the highest event id this stream has actually
+    // processed, never the store's current id. The store's counter includes
+    // events the stream has not been handed yet — coalescing holds them for
+    // the latency window — so persisting it resumes *past* those events and
+    // loses exactly the batch a restart was meant to replay. Resuming from
+    // the highest processed id can instead replay a change already seen,
+    // which is idempotent: the safe direction ADR-0018 chose for the cursor
+    // it publishes with a generation.
+    let mut highest_id = cursor_id(since);
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -369,8 +378,10 @@ async fn run_fsevents(
             batch = stream.next() => {
                 let Some(batch) = batch else { break };
                 let batch_received = Instant::now();
+                let mut batch_highest = None;
                 for event in batch {
                     let backlog_age = bucket_age(batch_received.elapsed().as_secs());
+                    batch_highest = max_cursor(batch_highest, cursor_id(event.id));
                     process_event(
                         &shared,
                         event,
@@ -379,8 +390,13 @@ async fn run_fsevents(
                         backlog_age,
                     )?;
                 }
-                let id = unsafe { FSEventsGetCurrentEventId() };
-                if id != kFSEventStreamEventIdSinceNow {
+                // Events are not guaranteed to arrive in id order, and a
+                // batch carrying only flag-bearing events (history replayed,
+                // stream-level notifications) has no usable id at all. Both
+                // leave the cursor where it is rather than moving it back.
+                let next_id = max_cursor(highest_id, batch_highest);
+                if next_id != highest_id {
+                    let id = next_id.expect("a cursor that advanced has an event id");
                     let cursor = FeedCursor {
                         feed: FeedKind::Fsevents,
                         version: 1,
@@ -388,6 +404,7 @@ async fn run_fsevents(
                     };
                     save_cursor(&cursor_file, id)?;
                     *shared.cursor.lock().expect("cursor lock") = Some(cursor);
+                    highest_id = Some(id);
                 }
             }
         }
@@ -796,6 +813,23 @@ fn load_cursor(file: &Path) -> Option<FeedCursor> {
     })
 }
 
+/// An event id worth remembering as a cursor position. Real ids start at 1;
+/// `0` is the "no id" placeholder, and `kFSEventStreamEventIdSinceNow` is the
+/// sentinel a stream with no stored position is created with. It is
+/// `u64::MAX`, so admitting it would pin the cursor at the maximum and the
+/// stream would never resume from anywhere again.
+fn cursor_id(id: u64) -> Option<u64> {
+    (id != 0 && id != kFSEventStreamEventIdSinceNow).then_some(id)
+}
+
+/// The later of two cursor positions, treating "no position" as the earliest.
+fn max_cursor(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+        (current, candidate) => current.or(candidate),
+    }
+}
+
 fn save_cursor(file: &Path, value: u64) -> anyhow::Result<()> {
     let temporary = file.with_extension("cursor.tmp");
     fs::write(&temporary, format!("{value}\n"))?;
@@ -805,11 +839,69 @@ fn save_cursor(file: &Path, value: u64) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{increment, native_metadata, LogicalState};
+    use super::{
+        cursor_id, increment, load_cursor, max_cursor, native_metadata, save_cursor, LogicalState,
+    };
     use eidos_observe::StudyKey;
+    use fsevent_stream::ffi::kFSEventStreamEventIdSinceNow;
 
     fn token(value: u64) -> eidos_observe::ObjectToken {
         StudyKey::from_bytes([9; 32]).token("test", &value.to_le_bytes())
+    }
+
+    /// The cursor update the FSEvents loop performs for one delivered batch.
+    fn advance(current: Option<u64>, batch: &[u64]) -> Option<u64> {
+        let mut batch_highest = None;
+        for id in batch {
+            batch_highest = max_cursor(batch_highest, cursor_id(*id));
+        }
+        max_cursor(current, batch_highest)
+    }
+
+    #[test]
+    fn the_feed_cursor_never_moves_backwards() {
+        // Events within a batch, and batches themselves, are not guaranteed
+        // to arrive in id order; the stored position is the highest id
+        // processed either way.
+        let mut cursor = None;
+        cursor = advance(cursor, &[7, 4, 9, 2]);
+        assert_eq!(cursor, Some(9));
+        cursor = advance(cursor, &[5, 8]);
+        assert_eq!(cursor, Some(9), "an older batch leaves the cursor alone");
+        cursor = advance(cursor, &[11]);
+        assert_eq!(cursor, Some(11));
+        // A batch of flag-only events carries nothing to store.
+        cursor = advance(cursor, &[]);
+        assert_eq!(cursor, Some(11));
+    }
+
+    #[test]
+    fn the_since_now_sentinel_never_becomes_a_cursor() {
+        // kFSEventStreamEventIdSinceNow is u64::MAX. Admitting it once would
+        // pin the cursor at the maximum and the stream could never resume.
+        assert_eq!(cursor_id(kFSEventStreamEventIdSinceNow), None);
+        assert_eq!(cursor_id(0), None, "0 is the absent-id placeholder");
+        assert_eq!(cursor_id(1), Some(1));
+
+        let fresh = advance(cursor_id(kFSEventStreamEventIdSinceNow), &[3]);
+        assert_eq!(fresh, Some(3), "a fresh stream starts from its first event");
+        assert_eq!(
+            advance(Some(3), &[kFSEventStreamEventIdSinceNow, 4]),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn a_saved_cursor_reloads_as_the_same_position() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("fsevents.cursor");
+        save_cursor(&file, 0x0000_0000_dead_beef).unwrap();
+        let reloaded = load_cursor(&file).expect("a saved cursor reloads");
+        assert_eq!(
+            u64::from_str_radix(&reloaded.opaque, 16).unwrap(),
+            0x0000_0000_dead_beef,
+            "run_fsevents resumes by parsing `opaque` back out as hex"
+        );
     }
 
     #[test]
