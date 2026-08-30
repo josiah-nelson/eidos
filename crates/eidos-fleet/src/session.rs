@@ -489,7 +489,9 @@ where
                     &ctx.counters,
                 )
                 .await;
-                return SessionEnd::Closed;
+                // Reported as a failure so a dialer backs off instead of
+                // redialing a paused peer every couple of seconds.
+                return SessionEnd::Failed("peer is disabled".into());
             }
             if !hello.versions.contains(&PROTOCOL_VERSION) {
                 ctx.counters
