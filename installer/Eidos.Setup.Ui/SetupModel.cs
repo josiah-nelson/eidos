@@ -1092,14 +1092,20 @@ namespace Eidos.Setup
                 // Silent/passive: EIDOS_SCOPE=perMachine|perUser selects the scope.
                 var scopeVar = this.Variable("EIDOS_SCOPE");
                 var wantCollector = this.Variable("EIDOS_INSTALL_COLLECTOR");
+                var accountKindVar = this.Variable("EIDOS_SERVICE_ACCOUNT_KIND");
                 var startServiceVar = this.Variable("EIDOS_START_SERVICE");
                 var startMenuVar = this.Variable("EIDOS_START_MENU");
+                var removeDataVar = this.Variable("EIDOS_REMOVE_DATA");
+                var collectorStartVar = this.Variable("EIDOS_COLLECTOR_START");
                 var removeCollectorVar = this.Variable("EIDOS_REMOVE_COLLECTOR");
                 var removeCollectorDataVar = this.Variable("EIDOS_COLLECTOR_REMOVE_DATA");
                 if (!this.ValidateNonInteractiveChoice("EIDOS_SCOPE", scopeVar, "perUser", "perMachine")
                     || !this.ValidateNonInteractiveChoice("EIDOS_INSTALL_COLLECTOR", wantCollector, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_SERVICE_ACCOUNT_KIND", accountKindVar, "local-system", "local-service", "network-service", "user")
                     || !this.ValidateNonInteractiveChoice("EIDOS_START_SERVICE", startServiceVar, "0", "1")
                     || !this.ValidateNonInteractiveChoice("EIDOS_START_MENU", startMenuVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_REMOVE_DATA", removeDataVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_COLLECTOR_START", collectorStartVar, "0", "1")
                     || !this.ValidateNonInteractiveChoice("EIDOS_REMOVE_COLLECTOR", removeCollectorVar, "0", "1")
                     || !this.ValidateNonInteractiveChoice("EIDOS_COLLECTOR_REMOVE_DATA", removeCollectorDataVar, "0", "1"))
                 {

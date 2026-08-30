@@ -249,7 +249,10 @@ jobs:
           . "$env:RUNNER_TEMP\helpers.ps1"
           $setup = "installer\out\upgrade\eidos-setup.exe"
           Run-SetupExpectFailure $setup "/quiet EIDOS_SCOPE=machine" "$env:RUNNER_TEMP\invalid-scope.log"
+          Run-SetupExpectFailure $setup "/quiet EIDOS_SERVICE_ACCOUNT_KIND=admin" "$env:RUNNER_TEMP\invalid-account-kind.log"
           Run-SetupExpectFailure $setup "/quiet EIDOS_START_SERVICE=true" "$env:RUNNER_TEMP\invalid-start.log"
+          Run-SetupExpectFailure $setup "/quiet EIDOS_COLLECTOR_START=true" "$env:RUNNER_TEMP\invalid-collector-start.log"
+          Run-SetupExpectFailure $setup "/quiet /uninstall EIDOS_REMOVE_DATA=true" "$env:RUNNER_TEMP\invalid-core-remove.log"
           Run-SetupExpectFailure $setup "/quiet /uninstall EIDOS_REMOVE_COLLECTOR=true" "$env:RUNNER_TEMP\invalid-remove.log"
           Wait-Health 7720
           Assert-Service eidos Running
