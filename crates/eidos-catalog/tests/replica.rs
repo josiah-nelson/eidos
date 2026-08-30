@@ -17,7 +17,7 @@ use eidos_domain::{
     ContentState, FileAttributes, ObjectId, SourceId, SourceKind, SourceState, UnixNanos,
 };
 use eidos_sync::identity::SourceEpoch;
-use eidos_sync::merkle::{leaf_index, MerkleTree, MIN_FLEET_LEAF_BITS};
+use eidos_sync::merkle::{leaf_index, MerkleLeafHasher, MerkleTree, MIN_FLEET_LEAF_BITS};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -402,6 +402,78 @@ fn a_bounded_stream_reproduces_the_source_image_with_children_before_parents() {
         .unwrap();
     let agg = central.catalog.directory_aggregate(root).unwrap().unwrap();
     assert_eq!(agg.file_count, 3);
+}
+
+#[test]
+fn scan_hard_link_addition_and_removal_ship_the_final_row_image() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let original = node.id("a/one.txt");
+    let generation = node
+        .catalog
+        .get_object(original)
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    std::fs::hard_link(
+        node.root.join("a/one.txt"),
+        node.root.join("c/one-link.txt"),
+    )
+    .unwrap();
+    node.scan();
+    converge(&node, &central, 8);
+    assert_eq!(node.id("c/one-link.txt"), original);
+    let remote = central
+        .catalog
+        .resolve_relative(source, "c/one-link.txt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        central
+            .catalog
+            .get_object(remote)
+            .unwrap()
+            .unwrap()
+            .link_count,
+        2
+    );
+
+    std::fs::remove_file(node.root.join("c/one-link.txt")).unwrap();
+    node.scan();
+    converge(&node, &central, 8);
+    assert!(central
+        .catalog
+        .resolve_relative(source, "c/one-link.txt")
+        .unwrap()
+        .is_none());
+    let remote = central
+        .catalog
+        .resolve_relative(source, "a/one.txt")
+        .unwrap()
+        .unwrap();
+    let remote = central.catalog.get_object(remote).unwrap().unwrap();
+    assert_eq!(remote.link_count, 1);
+    assert_eq!(remote.generation, generation);
+
+    let (_, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
+    let source_tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
+    );
+    let replica_tree =
+        MerkleTree::with_leaf_bits(leaf_bits, central.catalog.replica_digests(source).unwrap());
+    assert_eq!(source_tree.leaf_hashes(), replica_tree.leaf_hashes());
 }
 
 #[test]
@@ -1138,7 +1210,7 @@ fn retirement_targets_are_epoch_local_and_completeness_tracks_newer_heads() {
 
     let before_rebuild = central.catalog.replica_source(source).unwrap().unwrap();
     let leaf_bits = MIN_FLEET_LEAF_BITS;
-    let mismatched_hashes = vec![[0xFF; 32]; 1usize << leaf_bits];
+    let mismatched_hashes = vec![MerkleLeafHasher::new().finalize(); 1usize << leaf_bits];
     let request = central
         .catalog
         .replica_repair_offer(
@@ -1196,6 +1268,27 @@ fn retirement_targets_are_epoch_local_and_completeness_tracks_newer_heads() {
         central.catalog.replica_apply_batch(source, &empty).unwrap(),
         BatchOutcome::Applied { .. }
     ));
+    assert_eq!(
+        central
+            .catalog
+            .replica_source(source)
+            .unwrap()
+            .unwrap()
+            .resync_target,
+        Some(100)
+    );
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(source, epoch, 101, [0x44; 32], 0)
+            .unwrap(),
+        HelloOutcome::Resume { after_seq: 100, .. }
+    ));
+    assert_eq!(
+        central.catalog.replica_continue_retirement(source).unwrap(),
+        0,
+        "retirement must wait until the replica reaches the newly reported head"
+    );
     assert_eq!(
         central
             .catalog
@@ -1897,6 +1990,30 @@ fn compacted_metadata_only_changes_are_visible_to_merkle_repair() {
         .catalog
         .sync_rows_for_objects(node.source, &objects)
         .unwrap();
+    let mut truncated = rows.clone();
+    let omitted = truncated
+        .iter()
+        .position(|row| leaves.contains(&leaf_index(leaf_bits, row.object)))
+        .expect("a requested non-empty leaf");
+    truncated.remove(omitted);
+    match central
+        .catalog
+        .replica_apply_repair(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &leaves,
+            &truncated,
+        )
+        .unwrap()
+    {
+        RepairOutcome::Rejected { reason } => {
+            assert!(reason.contains("Merkle leaf hash"), "{reason}")
+        }
+        other => panic!("truncated repair response was accepted: {other:?}"),
+    }
     assert!(matches!(
         central
             .catalog
@@ -2224,6 +2341,162 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
     let replica_tree =
         MerkleTree::with_leaf_bits(leaf_bits, central.catalog.replica_digests(source).unwrap());
     assert_eq!(replica_tree.leaf_hashes(), source_tree.leaf_hashes());
+}
+
+#[test]
+fn newer_pending_epoch_repair_retires_rows_staged_for_the_older_head() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    node.catalog.sync_enable(node.source, None).unwrap();
+    while !node.catalog.sync_backfill(node.source, 2).unwrap().done {}
+    let (first_state, first_entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                first_state.epoch.to_source_epoch(),
+                first_state.head_seq,
+                first_state.head_chain,
+                first_state.compacted_through,
+            )
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
+    let first_tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        first_entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
+    );
+    let requested = match central
+        .catalog
+        .replica_repair_offer(
+            source,
+            first_state.epoch.to_source_epoch(),
+            first_state.head_seq,
+            first_state.head_chain,
+            leaf_bits,
+            &first_tree.leaf_hashes(),
+        )
+        .unwrap()
+    {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("{other:?}"),
+    };
+    let deleted_object = node.id("a/b/two.txt");
+    let staged_leaf = leaf_index(leaf_bits, deleted_object);
+    assert!(requested.contains(&staged_leaf));
+    let staged_objects = first_entries
+        .iter()
+        .filter(|entry| leaf_index(leaf_bits, entry.object) == staged_leaf)
+        .map(|entry| entry.object)
+        .collect::<Vec<_>>();
+    let (_, staged_rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &staged_objects)
+        .unwrap();
+    assert!(staged_rows.iter().any(|row| row.object == deleted_object));
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair_part(
+                source,
+                first_state.epoch.to_source_epoch(),
+                first_state.head_seq,
+                first_state.head_chain,
+                leaf_bits,
+                &[staged_leaf],
+                &staged_rows,
+                false,
+            )
+            .unwrap(),
+        RepairOutcome::Staged { .. }
+    ));
+
+    node.delete("a/b/two.txt");
+    let collected = node.catalog.sync_collect(node.source, 100).unwrap();
+    assert_eq!(collected.removed_tombstones, 1);
+    let (new_state, new_entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    assert!(new_state.head_seq > first_state.head_seq);
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                new_state.epoch.to_source_epoch(),
+                new_state.head_seq,
+                new_state.head_chain,
+                new_state.compacted_through,
+            )
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    let new_tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        new_entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
+    );
+    let leaves = match central
+        .catalog
+        .replica_repair_offer(
+            source,
+            new_state.epoch.to_source_epoch(),
+            new_state.head_seq,
+            new_state.head_chain,
+            leaf_bits,
+            &new_tree.leaf_hashes(),
+        )
+        .unwrap()
+    {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("{other:?}"),
+    };
+    let objects = new_entries
+        .iter()
+        .map(|entry| entry.object)
+        .collect::<Vec<_>>();
+    let (_, rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &objects)
+        .unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair(
+                source,
+                new_state.epoch.to_source_epoch(),
+                new_state.head_seq,
+                new_state.head_chain,
+                leaf_bits,
+                &leaves,
+                &rows,
+            )
+            .unwrap(),
+        RepairOutcome::Applied { .. }
+    ));
+    assert!(central
+        .catalog
+        .resolve_relative(source, "a/b/two.txt")
+        .unwrap()
+        .is_none());
+    let replica_tree =
+        MerkleTree::with_leaf_bits(leaf_bits, central.catalog.replica_digests(source).unwrap());
+    assert_eq!(new_tree.leaf_hashes(), replica_tree.leaf_hashes());
 }
 
 #[test]

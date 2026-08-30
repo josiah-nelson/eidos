@@ -704,14 +704,34 @@ impl ScanSession {
                 break;
             }
         }
-        // 2b. Sync ledger: every object this publish tombstoned (ADR-0015).
-        crate::sync::stamp_publish_tombstones_conn(&self.conn, self.source.id, now)?;
         // 3. Hard-link counts.
-        self.conn.execute(
+        let mut link_count_changed = self
+            .conn
+            .prepare_cached(
             "UPDATE objects SET link_count = (SELECT COUNT(*) FROM entries e WHERE e.object_id = objects.object_id AND e.deleted_at IS NULL)
-             WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file' AND last_seen_generation = ?2",
-            params![sid, gen],
-        )?;
+             WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file' AND last_seen_generation = ?2
+               AND link_count != (SELECT COUNT(*) FROM entries e WHERE e.object_id = objects.object_id AND e.deleted_at IS NULL)
+             RETURNING object_id",
+        )?
+            .query_map(params![sid, gen], |row| row.get::<_, i64>(0))?
+            .map(|row| row.map(ObjectId))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        link_count_changed.sort_unstable();
+        // 3b. Stamp final publish images after both entry cleanup and the
+        // hard-link count refresh. Objects with removed entries are covered
+        // by the set stamp; a count changed only by a new link needs an
+        // explicit final touch.
+        crate::sync::stamp_publish_changes_conn(&self.conn, self.source.id, now)?;
+        for object in link_count_changed {
+            let removed_entry = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE object_id = ?1 AND deleted_at = ?2)",
+                params![object.0, now],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !removed_entry {
+                crate::sync::touch_conn(&self.conn, self.source.id, object)?;
+            }
+        }
         let hard_links: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM objects WHERE source_id = ?1 AND deleted_at IS NULL AND link_count > 1",
             params![sid],

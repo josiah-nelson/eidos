@@ -570,6 +570,7 @@ CREATE TABLE sync_replica_repairs (
     through_chain BLOB NOT NULL,
     leaf_bits     INTEGER NOT NULL,
     leaves        TEXT NOT NULL,
+    hashes        BLOB NOT NULL,
     requested_at  INTEGER NOT NULL
 );
 "#,

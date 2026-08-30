@@ -506,14 +506,22 @@ fn touch_set_conn(
     Ok(n as u64)
 }
 
-/// Stamp every object the scan publish step tombstoned at `now`. Called
-/// inside the publish transaction after the cascade has settled.
-pub(crate) fn stamp_publish_tombstones_conn(
+/// Stamp every object whose final image the scan publish step changed at
+/// `now`: fully tombstoned objects and surviving hard-linked objects whose
+/// live entry set shrank. Called after the cascade and link-count refresh.
+pub(crate) fn stamp_publish_changes_conn(
     conn: &Connection,
     source: SourceId,
     now: i64,
 ) -> Result<u64> {
-    touch_set_conn(conn, source, "deleted_at = ?2", &[now])
+    touch_set_conn(
+        conn,
+        source,
+        "(deleted_at = ?2 OR EXISTS (
+            SELECT 1 FROM entries e
+            WHERE e.object_id = objects.object_id AND e.deleted_at = ?2))",
+        &[now],
+    )
 }
 
 fn entries_conn(conn: &Connection, object: ObjectId) -> Result<Vec<SyncEntryImage>> {

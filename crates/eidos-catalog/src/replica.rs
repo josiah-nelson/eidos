@@ -40,7 +40,7 @@ use eidos_sync::merkle::{
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What a peer says about one of its sources when it offers it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +174,26 @@ const MAX_SQLITE_SEQUENCE: u64 = i64::MAX as u64;
 const RETIRE_STEP_ROWS: usize = 10_000;
 const MAX_APPLY_ROWS: usize = 10_000;
 const MAX_APPLY_ENTRIES: usize = 100_000;
+
+fn encode_leaf_hashes(hashes: &[[u8; 32]]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(hashes.len() * 32);
+    for hash in hashes {
+        encoded.extend_from_slice(hash);
+    }
+    encoded
+}
+
+fn decode_leaf_hashes(encoded: Vec<u8>) -> Result<Vec<[u8; 32]>> {
+    if encoded.len() % 32 != 0 {
+        return Err(CatalogError::InvalidState(
+            "repair leaf hashes are not a sequence of 32-byte digests".into(),
+        ));
+    }
+    Ok(encoded
+        .chunks_exact(32)
+        .map(|chunk| chunk.try_into().expect("chunk size was checked"))
+        .collect())
+}
 
 fn admission_from_json(json: &str) -> Result<AdmissionState> {
     serde_json::from_str(json).map_err(|e| {
@@ -659,6 +679,36 @@ fn wire_entry_count(rows: &[SyncRow]) -> Option<usize> {
     rows.iter().try_fold(0usize, |count, row| {
         count.checked_add(row.image.as_ref().map_or(0, |image| image.entries.len()))
     })
+}
+
+fn wire_leaf_hashes(rows: &[SyncRow], leaf_bits: u8) -> Result<BTreeMap<u32, [u8; 32]>> {
+    let mut grouped = BTreeMap::<u32, Vec<&SyncRow>>::new();
+    for row in rows {
+        grouped
+            .entry(leaf_index(leaf_bits, row.object))
+            .or_default()
+            .push(row);
+    }
+    grouped
+        .into_iter()
+        .map(|(leaf, mut rows)| {
+            rows.sort_unstable_by_key(|row| row.object);
+            let mut hasher = MerkleLeafHasher::new();
+            for row in rows {
+                let image_hash = match &row.image {
+                    Some(image) => sync_row_image_hash(image)?,
+                    None => [0; 32],
+                };
+                hasher.update(&record_digest(
+                    row.object,
+                    row.generation,
+                    row.image.is_none(),
+                    &image_hash,
+                ));
+            }
+            Ok((leaf, hasher.finalize()))
+        })
+        .collect()
 }
 
 fn repair_pending_conn(tx: &Transaction<'_>, source: SourceId) -> Result<bool> {
@@ -1257,6 +1307,24 @@ impl Catalog {
                 outcome,
                 HelloOutcome::Resume { .. } | HelloOutcome::FullResync { .. }
             ) {
+                let restarting_pending_epoch = reconnecting_pending_epoch
+                    && (head_seq != state.reported_head
+                        || state.reported_chain != Some(head_chain));
+                if restarting_pending_epoch {
+                    // Rows staged for an older snapshot of the pending epoch
+                    // must become retirement candidates again. Otherwise an
+                    // object deleted and compacted before the replacement
+                    // repair remains tagged as current and survives forever.
+                    tx.execute(
+                        "UPDATE sync_replica_rows SET epoch = ?3
+                         WHERE source_id = ?1 AND epoch = ?2",
+                        params![
+                            source.0,
+                            epoch.as_bytes().as_slice(),
+                            state.admission.epoch.as_bytes().as_slice()
+                        ],
+                    )?;
+                }
                 tx.execute(
                     "UPDATE sync_replica_sources SET reported_head = ?2, reported_chain = ?3,
                          reported_compacted = ?4, reported_at = ?5
@@ -1575,14 +1643,20 @@ impl Catalog {
                     .filter_map(|(leaf, (mine, theirs))| (mine != theirs).then_some(leaf as u32))
                     .collect::<Vec<_>>()
             };
+            let requested_hashes = leaves
+                .iter()
+                .map(|leaf| leaf_hashes[*leaf as usize])
+                .collect::<Vec<_>>();
+            let requested_hashes = encode_leaf_hashes(&requested_hashes);
             tx.prepare_cached(
                 "INSERT INTO sync_replica_repairs
-                    (source_id, epoch, through_seq, through_chain, leaf_bits, leaves, requested_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    (source_id, epoch, through_seq, through_chain, leaf_bits, leaves, hashes, requested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(source_id) DO UPDATE SET
                     epoch = excluded.epoch, through_seq = excluded.through_seq,
                     through_chain = excluded.through_chain, leaf_bits = excluded.leaf_bits,
-                    leaves = excluded.leaves, requested_at = excluded.requested_at",
+                    leaves = excluded.leaves, hashes = excluded.hashes,
+                    requested_at = excluded.requested_at",
             )?
             .execute(params![
                 source.0,
@@ -1591,6 +1665,7 @@ impl Catalog {
                 through_chain.as_slice(),
                 leaf_bits as i64,
                 serde_json::to_string(&leaves)?,
+                requested_hashes,
                 UnixNanos::now().0,
             ])?;
             mark_completeness_conn(&tx, source, UnixNanos::now().0, false)?;
@@ -1723,7 +1798,7 @@ impl Catalog {
             }
             let request = tx
                 .prepare_cached(
-                    "SELECT epoch, through_seq, through_chain, leaf_bits, leaves
+                    "SELECT epoch, through_seq, through_chain, leaf_bits, leaves, hashes
                      FROM sync_replica_repairs WHERE source_id = ?1",
                 )?
                 .query_row(params![source.0], |r| {
@@ -1733,10 +1808,11 @@ impl Catalog {
                         r.get::<_, Vec<u8>>(2)?,
                         r.get::<_, i64>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, Vec<u8>>(5)?,
                     ))
                 })
                 .optional()?;
-            let Some((requested_epoch, requested_seq, requested_chain, requested_bits, requested_leaves)) = request else {
+            let Some((requested_epoch, requested_seq, requested_chain, requested_bits, requested_leaves, requested_hashes)) = request else {
                 return Ok(RepairOutcome::Rejected {
                     reason: "repair response has no outstanding request".into(),
                 });
@@ -1744,7 +1820,23 @@ impl Catalog {
             let requested_leaves: Vec<u32> = serde_json::from_str(&requested_leaves).map_err(|e| {
                 CatalogError::InvalidState(format!("repair leaf scope is unreadable: {e}"))
             })?;
+            let requested_hashes = decode_leaf_hashes(requested_hashes)?;
+            if requested_hashes.len() != requested_leaves.len() {
+                return Err(CatalogError::InvalidState(
+                    "repair leaf scope and expected hashes have different lengths".into(),
+                ));
+            }
+            let expected_by_leaf = requested_leaves
+                .iter()
+                .copied()
+                .zip(requested_hashes)
+                .collect::<BTreeMap<_, _>>();
             let requested_scope: BTreeSet<u32> = requested_leaves.into_iter().collect();
+            if expected_by_leaf.len() != requested_scope.len() {
+                return Err(CatalogError::InvalidState(
+                    "repair leaf scope contains duplicates".into(),
+                ));
+            }
             if requested_epoch.as_slice() != epoch.as_bytes().as_slice()
                 || requested_seq as u64 != through_seq
                 || repair_chain_from_blob(requested_chain)? != through_chain
@@ -1754,6 +1846,18 @@ impl Catalog {
             {
                 return Ok(RepairOutcome::Rejected {
                     reason: "repair response does not match the outstanding request".into(),
+                });
+            }
+            let response_hashes = wire_leaf_hashes(rows, leaf_bits)?;
+            let empty_hash = MerkleLeafHasher::new().finalize();
+            if leaves.iter().any(|leaf| {
+                response_hashes.get(leaf).unwrap_or(&empty_hash)
+                    != expected_by_leaf
+                        .get(leaf)
+                        .expect("wanted leaves were checked against the requested scope")
+            }) {
+                return Ok(RepairOutcome::Rejected {
+                    reason: "repair response does not match the requested Merkle leaf hash".into(),
                 });
             }
             let now = UnixNanos::now().0;
@@ -1847,10 +1951,18 @@ impl Catalog {
                 .copied()
                 .collect::<Vec<_>>();
             if !final_part {
+                let remaining_hashes = remaining
+                    .iter()
+                    .map(|leaf| expected_by_leaf[leaf])
+                    .collect::<Vec<_>>();
                 tx.prepare_cached(
-                    "UPDATE sync_replica_repairs SET leaves = ?2 WHERE source_id = ?1",
+                    "UPDATE sync_replica_repairs SET leaves = ?2, hashes = ?3 WHERE source_id = ?1",
                 )?
-                .execute(params![source.0, serde_json::to_string(&remaining)?])?;
+                .execute(params![
+                    source.0,
+                    serde_json::to_string(&remaining)?,
+                    encode_leaf_hashes(&remaining_hashes)
+                ])?;
                 mark_applied_conn(&tx, source, now, false)?;
                 tx.commit()?;
                 return Ok(RepairOutcome::Staged {
@@ -1941,7 +2053,10 @@ impl Catalog {
             let Some(target) = state.resync_target else {
                 return Ok(0);
             };
-            if state.admission.applied_seq < target {
+            if state.admission.applied_seq < target
+                || state.admission.applied_seq < state.reported_head
+                || state.reported_chain.is_none()
+            {
                 return Ok(0);
             }
             let epoch = SyncEpoch::from_source_epoch(state.admission.epoch);
