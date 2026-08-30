@@ -24,7 +24,7 @@ use eidos_content::Limits;
 use eidos_domain::{JobStage, ObjectId, SourceId, SourceState};
 use eidos_search::pipeline::{process_object, ProcessResult};
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -234,14 +234,34 @@ pub fn claiming_allowed(state: &AppState) -> bool {
 /// one reader) does not hold up the rest of the pool.
 ///
 /// `Ok(None)` means no source has due work with capacity to spare; nothing
-/// is reserved in that case. Dropping the returned guard releases the unit.
+/// is reserved in that case. The global gates and active source scans are
+/// checked under the same admission lock that serialises pause transitions
+/// and scan registration, so neither can race this claim. Dropping the
+/// returned guard releases the unit.
 pub fn reserve_and_claim(
     state: &AppState,
     worker: &str,
     limit: u32,
 ) -> eidos_catalog::Result<Option<(SourceReservation, Vec<JobRecord>)>> {
+    let _admission = state.content_pause.admission_guard();
+    if !claiming_allowed(state) {
+        return Ok(None);
+    }
+    // Scan starts also hold the admission gate while inserting their
+    // progress entry. A finished entry is harmless and does not keep its
+    // source idle during the 30-second diagnostics retention window.
+    let active_scans: HashSet<SourceId> = state
+        .scans
+        .lock()
+        .iter()
+        .filter_map(|(source, progress)| (!progress.is_finished()).then_some(*source))
+        .collect();
     let budgets = state.content_workers.budgets.clone();
-    let mut admit = |source: SourceId| budgets.try_reserve(source);
+    let mut admit = |source: SourceId| {
+        (!active_scans.contains(&source))
+            .then(|| budgets.try_reserve(source))
+            .flatten()
+    };
     state
         .catalog
         .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)
@@ -253,10 +273,6 @@ fn worker_loop(state: &AppState, name: &str) {
     loop {
         if state.shutdown.load(Ordering::Relaxed) {
             return;
-        }
-        if !claiming_allowed(state) {
-            std::thread::sleep(IDLE_SLEEP);
-            continue;
         }
         let (reservation, jobs) = match reserve_and_claim(state, name, CLAIM_BATCH) {
             Ok(Some(claimed)) => claimed,
@@ -412,6 +428,10 @@ fn coordinator_loop(state: &AppState) {
             // a source added while paused must have a budget to admit work
             // against. A pause stops claiming; it is not a reason for the
             // rest of the pipeline's bookkeeping to go stale.
+            // The check and the catalog work share the control/claim gate.
+            // Once a pause response completes, a coordinator that observed
+            // the old state cannot still top the queue up behind it.
+            let _admission = state.content_pause.admission_guard();
             let outcome = if state.content_pause.is_paused() {
                 refresh_budgets(state).map(|_| 0)
             } else {

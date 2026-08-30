@@ -187,6 +187,15 @@ fn the_reported_state_names_the_condition_an_operator_can_act_on() {
     );
     assert!(paused.detail.contains(&paused.flow_reason));
 
+    // A rebuild outranks the pause because resume cannot restore claiming
+    // while the rebuild owns the content-index writer.
+    e.state.content_index.begin_rebuild(0).unwrap();
+    let rebuilding = content_status(&e.state);
+    assert_eq!(rebuilding.flow, ContentFlow::Waiting);
+    assert_eq!(rebuilding.search, ContentSearchState::Rebuilding);
+    assert!(rebuilding.flow_reason.contains("being rebuilt"));
+    assert!(rebuilding.paused, "the durable pause remains recorded");
+
     // `--no-content` outranks a pause: resuming would change nothing, so
     // reporting "paused" would send the operator after the wrong switch.
     e.state.content_enabled.store(false, Ordering::Relaxed);

@@ -35,6 +35,7 @@ use axum::extract::State;
 use axum::routing::{get, post};
 use axum::Router;
 use eidos_search::content::{RebuildPhase, RebuildStatus};
+use parking_lot::{Mutex, MutexGuard};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,6 +68,13 @@ fn now_unix_s() -> u64 {
 #[derive(Debug)]
 pub struct ContentPause {
     path: PathBuf,
+    /// Serialises durable control transitions with worker claims, queue
+    /// top-up, and scan registration. Holding this gate is the admission
+    /// linearization point:
+    /// once a pause response is produced, no worker can still be between its
+    /// gate check and the catalog claim; once a scan is registered, no worker
+    /// can claim that source from a stale scan snapshot.
+    admission: Mutex<()>,
     paused: AtomicBool,
     /// Wall-clock second the pause was requested; meaningless when running.
     since_unix_s: AtomicU64,
@@ -92,17 +100,30 @@ impl ContentPause {
                 );
                 (true, since)
             }
-            Err(_) => (false, 0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && data_dir.is_dir() => (false, 0),
+            Err(e) => {
+                // An unreadable data directory must not silently re-enable
+                // source I/O. Fail closed until an operator can inspect the
+                // marker or explicitly resume successfully.
+                let since = now_unix_s();
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not inspect the content-pause marker; keeping extraction paused"
+                );
+                (true, since)
+            }
         };
         Self {
             path,
+            admission: Mutex::new(()),
             paused: AtomicBool::new(paused),
             since_unix_s: AtomicU64::new(since),
         }
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+        self.paused.load(Ordering::Acquire)
     }
 
     pub fn paused_since_unix_s(&self) -> Option<u64> {
@@ -117,6 +138,19 @@ impl ContentPause {
     /// is told and what a restart will do never diverge. Both directions are
     /// idempotent.
     pub fn set_paused(&self, paused: bool) -> std::io::Result<bool> {
+        let _admission = self.admission.lock();
+        self.set_paused_admitted(paused)
+    }
+
+    /// Enter the shared content-work/control/scan admission gate.
+    pub(crate) fn admission_guard(&self) -> MutexGuard<'_, ()> {
+        self.admission.lock()
+    }
+
+    /// Change the durable state while the caller holds [`Self::admission`].
+    /// Keeping this separate lets an API response derive its status before a
+    /// concurrent opposite control can take effect.
+    pub(crate) fn set_paused_admitted(&self, paused: bool) -> std::io::Result<bool> {
         if paused == self.is_paused() {
             return Ok(false);
         }
@@ -137,7 +171,7 @@ impl ContentPause {
                 Err(e) => return Err(e),
             }
         }
-        self.paused.store(paused, Ordering::Relaxed);
+        self.paused.store(paused, Ordering::Release);
         tracing::info!(paused, "content claiming switched");
         Ok(true)
     }
@@ -196,8 +230,9 @@ pub struct ContentStatusView {
 }
 
 /// Derive the current content state. Cheap: atomics, one budget-table lock,
-/// and the rebuild mutex — no catalog or index reads, so health and the
-/// control endpoints stay outside the admission gate.
+/// and the rebuild mutex — no catalog or index reads. The function does not
+/// acquire the admission gate itself; control endpoints deliberately call it
+/// while holding that gate so their response describes their own transition.
 pub fn content_status(state: &AppState) -> ContentStatusView {
     let enabled = state.content_enabled.load(Ordering::Relaxed);
     let paused = state.content_pause.is_paused();
@@ -207,14 +242,27 @@ pub fn content_status(state: &AppState) -> ContentStatusView {
     let busy = in_flight > 0;
 
     // Order matters: the reason an operator is shown is the one they can act
-    // on. `--no-content` outranks a pause, and a pause outranks a rebuild,
-    // because resuming a paused service while a rebuild owns the writer
-    // still claims nothing and saying "paused" would then be a lie.
+    // on. `--no-content` outranks everything, and a rebuild outranks a pause:
+    // resuming while the rebuild owns the writer still claims nothing, so
+    // saying "paused" would send the operator after the wrong switch.
     let (flow, flow_reason) = if !enabled {
         (
             ContentFlow::Disabled,
             "content extraction is disabled for this process (--no-content)".to_string(),
         )
+    } else if rebuilding {
+        if busy {
+            (
+                ContentFlow::Draining,
+                "the content index is being rebuilt: no new jobs are claimed until it finishes"
+                    .to_string(),
+            )
+        } else {
+            (
+                ContentFlow::Waiting,
+                "the content index is being rebuilt: claiming resumes when it finishes".to_string(),
+            )
+        }
     } else if paused {
         if busy {
             (
@@ -228,19 +276,6 @@ pub fn content_status(state: &AppState) -> ContentStatusView {
             (
                 ContentFlow::Stopped,
                 "paused: no jobs are claimed and nothing is in flight".to_string(),
-            )
-        }
-    } else if rebuilding {
-        if busy {
-            (
-                ContentFlow::Draining,
-                "the content index is being rebuilt: no new jobs are claimed until it finishes"
-                    .to_string(),
-            )
-        } else {
-            (
-                ContentFlow::Waiting,
-                "the content index is being rebuilt: claiming resumes when it finishes".to_string(),
             )
         }
     } else if busy {
@@ -302,18 +337,25 @@ async fn status(State(st): State<Arc<AppState>>) -> ApiResult<ContentStatusView>
 }
 
 async fn pause(State(st): State<Arc<AppState>>) -> ApiResult<ContentStatusView> {
-    set(&st, true)
+    // The durable filesystem mutation and admission wait are synchronous.
+    // Keep both off an async runtime worker, like the other operator
+    // mutations in the service.
+    crate::api::blocking(move || set(&st, true)).await
 }
 
 async fn resume(State(st): State<Arc<AppState>>) -> ApiResult<ContentStatusView> {
-    set(&st, false)
+    crate::api::blocking(move || set(&st, false)).await
 }
 
 /// Switch the pause and answer with the resulting state, so a caller that
 /// pauses learns *in the same response* whether workers are already stopped
 /// or still draining a claimed batch.
 fn set(st: &AppState, paused: bool) -> ApiResult<ContentStatusView> {
-    st.content_pause.set_paused(paused).map_err(|e| {
+    // Keep the gate through status derivation. The response therefore names
+    // the state this request produced, and a worker cannot pass its gate and
+    // claim after a completed pause reports `stopped`.
+    let _admission = st.content_pause.admission_guard();
+    st.content_pause.set_paused_admitted(paused).map_err(|e| {
         ApiError::internal(format!(
             "the pause marker could not be {}: {e}",
             if paused { "written" } else { "removed" }
@@ -325,6 +367,13 @@ fn set(st: &AppState, paused: bool) -> ApiResult<ContentStatusView> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_workers::reserve_and_claim;
+    use crate::scanner::ScanProgress;
+    use crate::ServiceConfig;
+    use eidos_catalog::jobs::NewJob;
+    use eidos_catalog::NewSource;
+    use eidos_domain::{JobStage, Priority, SourceKind};
+    use std::sync::Barrier;
 
     #[test]
     fn the_marker_round_trips_and_both_directions_are_idempotent() {
@@ -375,5 +424,135 @@ mod tests {
 
         assert!(p.set_paused(true).is_err());
         assert!(!p.is_paused(), "a failed write leaves claiming enabled");
+    }
+
+    #[test]
+    fn concurrent_controls_are_idempotent_and_match_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let pause = Arc::new(ContentPause::load(dir.path()));
+        let ready = Arc::new(Barrier::new(17));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let pause = pause.clone();
+            let ready = ready.clone();
+            threads.push(std::thread::spawn(move || {
+                ready.wait();
+                pause.set_paused(true)
+            }));
+        }
+        ready.wait();
+        let changed = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap().unwrap())
+            .filter(|changed| *changed)
+            .count();
+        assert_eq!(changed, 1, "exactly one overlapping pause changes state");
+        assert!(pause.is_paused());
+
+        // Opposite controls may finish in either order, but the in-memory
+        // result and the durable state must always describe that same order.
+        let ready = Arc::new(Barrier::new(3));
+        let resume = {
+            let pause = pause.clone();
+            let ready = ready.clone();
+            std::thread::spawn(move || {
+                ready.wait();
+                pause.set_paused(false).unwrap();
+            })
+        };
+        let repause = {
+            let pause = pause.clone();
+            let ready = ready.clone();
+            std::thread::spawn(move || {
+                ready.wait();
+                pause.set_paused(true).unwrap();
+            })
+        };
+        ready.wait();
+        resume.join().unwrap();
+        repause.join().unwrap();
+
+        let marker_exists = dir.path().join(PAUSE_MARKER).exists();
+        assert_eq!(pause.is_paused(), marker_exists);
+        assert_eq!(ContentPause::load(dir.path()).is_paused(), marker_exists);
+        assert!(!dir.path().join("content-pause.json.tmp").exists());
+    }
+
+    fn state_with_queued_job() -> (tempfile::TempDir, Arc<AppState>, eidos_domain::SourceId) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            AppState::open(&ServiceConfig {
+                data_dir: dir.path().join("data"),
+                auto_reconcile: false,
+                content_workers: 1,
+                fleet: false,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let source = state
+            .catalog
+            .add_source(&NewSource {
+                host_id: state.host_id,
+                name: "admission-test".into(),
+                kind: SourceKind::WindowsGeneric,
+                root_path: r"\\server\share".into(),
+                aliases: vec![],
+            })
+            .unwrap();
+        state.content_budgets().set(source, 1);
+        state
+            .catalog
+            .enqueue_many(&[NewJob {
+                source_id: source,
+                object_id: None,
+                object_generation: 1,
+                stage: JobStage::ContentText,
+                priority: Priority::NormalText,
+                idempotency_key: "admission-test".into(),
+                payload: None,
+                estimated_cost: 0,
+            }])
+            .unwrap();
+        (dir, state, source)
+    }
+
+    #[test]
+    fn a_completed_pause_cannot_be_followed_by_a_stale_claim() {
+        let (_dir, state, _source) = state_with_queued_job();
+
+        // Hold the admission gate exactly as the pause endpoint does and let
+        // a worker wait behind it. The stopped response is derived before the
+        // worker proceeds, and its authoritative recheck then rejects work.
+        let admission = state.content_pause.admission_guard();
+        let worker = {
+            let state = state.clone();
+            std::thread::spawn(move || reserve_and_claim(&state, "content-test", 1).unwrap())
+        };
+        state.content_pause.set_paused_admitted(true).unwrap();
+        assert_eq!(content_status(&state).flow, ContentFlow::Stopped);
+        drop(admission);
+
+        assert!(worker.join().unwrap().is_none());
+        assert_eq!(state.content_budgets().reserved_total(), 0);
+    }
+
+    #[test]
+    fn a_resumed_backlog_waits_for_scan_ownership_to_end() {
+        let (_dir, state, source) = state_with_queued_job();
+        state.content_pause.set_paused(true).unwrap();
+        state
+            .scans
+            .lock()
+            .insert(source, Arc::new(ScanProgress::new(source)));
+
+        state.content_pause.set_paused(false).unwrap();
+        assert!(
+            reserve_and_claim(&state, "content-test", 1)
+                .unwrap()
+                .is_none(),
+            "resuming does not bypass an active scan's source ownership"
+        );
+        assert_eq!(state.content_budgets().reserved_total(), 0);
     }
 }

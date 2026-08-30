@@ -32,19 +32,25 @@ tell apart before concluding something is stuck.
 
 ## Decisions
 
-- **The pause gates claiming, and nothing else.** It is checked in
-  `worker_loop` beside the process switch and the rebuild check, before
-  `reserve_and_claim`. A batch already claimed runs to completion in
-  `run_batch`, is committed by the coordinator, and is published normally.
-  No job is abandoned, none is left `running` for `requeue_running_jobs` to
-  repair, and no extraction that was already paid for is thrown away.
-  Interrupting workers mid-batch was rejected: it buys a faster stop and
-  costs re-extraction of every file in flight.
+- **The pause gates claiming, and nothing else.** The process switch, pause,
+  and rebuild state are checked inside `reserve_and_claim`, while a shared
+  admission mutex is held through the catalog claim transaction. Pause and
+  resume transitions hold that same mutex through their durable mutation and
+  response status. A completed `stopped` response therefore cannot be
+  followed by a worker that passed an earlier check. A batch admitted before
+  the pause runs to completion in `run_batch`, is committed by the
+  coordinator, and is published normally. No job is abandoned, none is left
+  `running` for `requeue_running_jobs` to repair, and no extraction that was
+  already paid for is thrown away. Interrupting workers mid-batch was
+  rejected: it buys a faster stop and costs re-extraction of every file in
+  flight.
 - **Queue top-up stops with claiming; commits do not.** `top_up_queue` walks
   every source and writes new job rows — the catalog load an operator paused
-  to stop. The backlog is durable, so it is still there at resume. The
-  coordinator keeps committing and publishing, because a draining worker's
-  output must reach search rather than sit uncommitted until the pause ends.
+  to stop. Its pause check and catalog work use the shared admission mutex, so
+  top-up cannot act on a stale pre-pause check after the response. The backlog
+  is durable, so it is still there at resume. The coordinator keeps committing
+  and publishing, because a draining worker's output must reach search rather
+  than sit uncommitted until the pause ends.
 - **The pause is durable.** It is recorded in `content-pause.json` in the
   data directory, written to a temporary file and renamed into place, and
   removed on resume; the file's presence is the flag. The catalog has no
@@ -58,13 +64,22 @@ tell apart before concluding something is stuck.
   written the call fails and the in-memory flag is untouched, so what the
   operator is told and what a restart will do never diverge. A marker that
   exists but cannot be parsed still means paused; the timestamp inside it is
-  advisory and falls back to the load time.
+  advisory and falls back to the load time. Concurrent controls are
+  serialised with the same admission mutex, including their temporary-file
+  mutation, so identical controls stay idempotent and opposite controls leave
+  the marker and in-memory flag in the same order. Startup distinguishes a
+  missing marker from any other metadata error: an unreadable marker or data
+  directory fails closed as paused instead of silently restoring source I/O.
 - **A paused backlog does not defer reconciliation.** Automatic rescans are
   deferred while a content crawl is active (`content crawl active (n queued,
   m running)`). A queue nothing is going to claim must not hold rescans off
   indefinitely, so the deferral now requires the pause to be off as well as
   `--no-content` and the per-source policy to be on. Jobs already `running`
   still defer: those are draining and touching the volume a scan would walk.
+  The automatic-scan decision and scan registration use the shared admission
+  mutex too, and worker admission rejects a source with an active registered
+  scan. If resume wins the mutex, its queued backlog defers the scan; if the
+  scan wins, the resumed backlog waits until that scan finishes.
 - **One function derives the reported state.**
   `content_control::content_status` returns a `flow`
   (`disabled | stopped | draining | waiting | running`), a
@@ -73,13 +88,15 @@ tell apart before concluding something is stuck.
   `/api/health`, `/api/activity`, `eidos content status`, `eidos activity`,
   and the Activity page all render that one value, so they cannot disagree.
   It reads atomics, the budget table, and the rebuild mutex only — no
-  catalog or index reads — so the control and health endpoints stay outside
-  the admission gate.
+  catalog or index reads. Health/status reads need no admission gate; a
+  control deliberately keeps the gate until this value has been derived so
+  its response describes the state that control produced.
 - **The reasons are ordered by what the operator can act on.**
-  `--no-content` outranks a pause, and a pause outranks a rebuild. Resuming
-  a `--no-content` process changes nothing, and resuming while a rebuild
-  owns the writer still claims nothing, so naming the pause in either case
-  would send the operator after the wrong switch.
+  `--no-content` outranks everything, and a rebuild outranks a pause. Resuming
+  a `--no-content` process changes nothing, and resuming while a rebuild owns
+  the writer still claims nothing, so naming the pause in either case would
+  send the operator after the wrong switch. The pause remains recorded in the
+  status and becomes the operative reason after the rebuild finishes.
 
 ## Consequences
 
