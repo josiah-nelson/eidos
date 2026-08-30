@@ -172,6 +172,10 @@ pub struct SyncSourceState {
     /// A complete metadata generation is durably published and no scan is
     /// currently exposing an intermediate ledger image.
     pub metadata_complete: bool,
+    /// The source's current policy permits its ledger/image to leave this
+    /// host. This is checked again by every materialization entry point so a
+    /// policy change fences an already-enabled ledger immediately.
+    pub replication_allowed: bool,
     pub backfill_after: ObjectId,
 }
 
@@ -294,7 +298,8 @@ fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncS
                     AND s.state IN ('metadata_complete', 'content_pending', 'complete')
                     AND NOT EXISTS (
                         SELECT 1 FROM scan_generations g
-                        WHERE g.source_id = ss.source_id AND g.state = 'open')
+                        WHERE g.source_id = ss.source_id AND g.state = 'open'),
+                s.sync_policy != 'local_only'
          FROM sync_sources ss
          JOIN sources s ON s.source_id = ss.source_id
          WHERE ss.source_id = ?1",
@@ -310,12 +315,24 @@ fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncS
                 r.get::<_, Vec<u8>>(6)?,
                 r.get::<_, i64>(7)?,
                 r.get::<_, i64>(8)?,
+                r.get::<_, i64>(9)?,
             ))
         },
     )
     .optional()?
     .map(
-        |(epoch, head, compacted, journal, ready, after, chain, image_revision, complete)| {
+        |(
+            epoch,
+            head,
+            compacted,
+            journal,
+            ready,
+            after,
+            chain,
+            image_revision,
+            complete,
+            replication_allowed,
+        )| {
             Ok(SyncSourceState {
                 source_id: source,
                 epoch: epoch_from_blob(epoch)?,
@@ -326,6 +343,7 @@ fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncS
                 journal_id: journal,
                 ready: ready != 0,
                 metadata_complete: complete != 0,
+                replication_allowed: replication_allowed != 0,
                 backfill_after: ObjectId(after),
             })
         },
@@ -334,6 +352,12 @@ fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncS
 }
 
 fn ensure_ship_ready(state: &SyncSourceState) -> Result<()> {
+    if !state.replication_allowed {
+        return Err(CatalogError::InvalidState(format!(
+            "source {} is local-only and cannot be replicated",
+            state.source_id
+        )));
+    }
     if !state.ready {
         return Err(CatalogError::InvalidState(format!(
             "source {} sync backfill has not finished",
@@ -652,14 +676,14 @@ impl Catalog {
         let epoch = SyncEpoch::mint()?;
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let kind: Option<String> = tx
+            let source_config: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT kind FROM sources WHERE source_id = ?1",
+                    "SELECT kind, sync_policy FROM sources WHERE source_id = ?1",
                     params![source.0],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            match kind.as_deref() {
+            match source_config.as_ref().map(|(kind, _)| kind.as_str()) {
                 None => return Err(CatalogError::NotFound(format!("source {source}"))),
                 Some("remote") => {
                     return Err(CatalogError::InvalidState(
@@ -667,6 +691,14 @@ impl Catalog {
                     ))
                 }
                 Some(_) => {}
+            }
+            if source_config
+                .as_ref()
+                .is_some_and(|(_, policy)| policy == "local_only")
+            {
+                return Err(CatalogError::InvalidState(format!(
+                    "source {source} is local-only and cannot be sync-enabled"
+                )));
             }
             let now = UnixNanos::now().0;
             tx.execute(

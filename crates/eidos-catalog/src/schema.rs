@@ -584,6 +584,15 @@ CREATE TABLE sync_replica_repairs (
 );
 "#,
     ),
+    (
+        "fleet: invalidate repair requests created without a cursor proof",
+        r#"
+-- Repair offers ahead of an active epoch's durable cursor now authenticate
+-- the chain at that cursor. An in-flight request created by older code has
+-- no evidence that this check occurred, so require the peer to re-offer it.
+DELETE FROM sync_replica_repairs;
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.

@@ -16,7 +16,7 @@ use eidos_catalog::{Catalog, NewSource};
 use eidos_domain::{
     ContentState, FileAttributes, ObjectId, SourceId, SourceKind, SourceState, UnixNanos,
 };
-use eidos_sync::identity::SourceEpoch;
+use eidos_sync::identity::{ChainHash, SourceEpoch};
 use eidos_sync::merkle::{leaf_index, MerkleLeafHasher, MerkleTree, MIN_FLEET_LEAF_BITS};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -378,6 +378,25 @@ fn ship_batch(
         .catalog
         .replica_apply_batch(NODE, source, &batch)
         .unwrap()
+}
+
+/// Chain proof at the central's durable cursor for an active epoch. A fresh
+/// pending epoch has no ancestry relationship to prove.
+fn repair_anchor(
+    node: &Node,
+    central: &Central,
+    source: SourceId,
+    epoch: SourceEpoch,
+) -> Option<ChainHash> {
+    let replica = central.catalog.replica_source(source).unwrap().unwrap();
+    if replica.admission.pending_epoch() == Some(epoch) {
+        None
+    } else {
+        assert_eq!(replica.admission.epoch, epoch);
+        node.catalog
+            .sync_chain_at(node.source, replica.admission.applied_seq)
+            .unwrap()
+    }
 }
 
 #[test]
@@ -962,7 +981,8 @@ fn a_same_epoch_rewind_is_fenced_and_a_rewritten_history_is_a_fork() {
         "a rejected rewind cannot replace the last accepted coverage report"
     );
     // The restored node keeps working and overtakes the cursor with a
-    // different history: same cursor, different chain, fenced as a fork.
+    // different history. If it still retains the cursor, the next batch is
+    // chain-fenced there.
     node.touch("c/three.txt", 333, 1_700_000_002);
     node.touch("c/three.txt", 334, 1_700_000_003);
     node.touch("c/three.txt", 335, 1_700_000_004);
@@ -1004,6 +1024,89 @@ fn a_same_epoch_rewind_is_fenced_and_a_rewritten_history_is_a_fork() {
         central.catalog.get_object(three).unwrap().unwrap().size,
         300
     );
+
+    // Merkle repair is not an alternate way around that batch fence. The
+    // source must authenticate its chain at the durable cursor, and the
+    // restored branch's chain proof differs there.
+    let (repair_state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
+    let tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
+    );
+    let divergent_anchor = node
+        .catalog
+        .sync_chain_at(node.source, applied)
+        .unwrap()
+        .expect("the un-compacted fork still retains the cursor");
+    assert_ne!(
+        divergent_anchor,
+        central
+            .catalog
+            .replica_source(source)
+            .unwrap()
+            .unwrap()
+            .admission
+            .applied_chain
+    );
+    match central
+        .catalog
+        .replica_repair_offer(
+            NODE,
+            source,
+            repair_state.epoch.to_source_epoch(),
+            repair_state.head_seq,
+            repair_state.head_chain,
+            repair_state.image_revision,
+            Some(divergent_anchor),
+            leaf_bits,
+            &tree.leaf_hashes(),
+        )
+        .unwrap()
+    {
+        eidos_catalog::replica::RepairOfferOutcome::Rejected { reason } => {
+            assert!(reason.contains("history proof"), "{reason}")
+        }
+        other => panic!("divergent repair proof was admitted: {other:?}"),
+    }
+
+    // Once that divergent source also discards the central's durable chain
+    // anchor, a Merkle snapshot cannot prove ancestry. It must not be able
+    // to bypass the batch fence by overtaking the numeric cursor.
+    node.catalog
+        .with_writer(|conn| {
+            conn.execute("DELETE FROM sync_consumers", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let collected = node.catalog.sync_collect(node.source, 100).unwrap();
+    assert!(collected.compacted_through > applied);
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    match central
+        .catalog
+        .replica_admit_hello(
+            NODE,
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            state.compacted_through,
+            state.image_revision,
+        )
+        .unwrap()
+    {
+        HelloOutcome::NewEpochRequired { reason } => {
+            assert!(reason.contains("mint a new epoch"), "{reason}")
+        }
+        other => panic!("overtaken fork without an anchor was admitted: {other:?}"),
+    }
 }
 
 #[test]
@@ -1289,6 +1392,7 @@ fn retirement_targets_are_epoch_local_and_completeness_tracks_newer_heads() {
             before_rebuild.admission.applied_seq,
             before_rebuild.admission.applied_chain,
             0,
+            None,
             leaf_bits,
             &mismatched_hashes,
         )
@@ -1866,7 +1970,7 @@ fn unused_child_first_placeholders_are_removed_when_an_epoch_is_retired() {
 }
 
 #[test]
-fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
+fn a_cursor_below_the_compaction_floor_requires_a_fresh_epoch_for_repair() {
     let node = Node::new();
     let central = Central::new();
     converge(&node, &central, 8);
@@ -1899,19 +2003,40 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
             state.image_revision,
         )
         .unwrap();
-    assert!(matches!(
-        outcome,
-        HelloOutcome::Resume {
-            requires_repair: true,
-            ..
+    match outcome {
+        HelloOutcome::NewEpochRequired { reason } => {
+            assert!(reason.contains("mint a new epoch"), "{reason}")
         }
-    ));
+        other => panic!("unanchored active-epoch repair was admitted: {other:?}"),
+    }
     assert!(node
         .catalog
         .sync_rows_after(node.source, central.applied_seq(source), 8)
         .is_err());
+
+    // Re-minting makes the replacement image an explicitly new incarnation.
+    // That pending epoch may be installed by Merkle repair without claiming
+    // continuity from history the shipper no longer retains.
+    node.catalog.sync_enable(node.source, None).unwrap();
+    while !node.catalog.sync_backfill(node.source, 2).unwrap().done {}
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                NODE,
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                state.compacted_through,
+                state.image_revision,
+            )
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
     // Repair: the node offers its leaf manifest, the central asks for the
-    // leaves that differ, the node answers with those rows.
+    // leaves that differ, and the node answers with those rows.
     let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
     let leaf_bits = MIN_FLEET_LEAF_BITS;
     let tree = MerkleTree::with_leaf_bits(
@@ -1929,6 +2054,7 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
             state.head_seq,
             state.head_chain,
             state.image_revision,
+            repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
             leaf_bits,
             &tree.leaf_hashes(),
         )
@@ -1964,12 +2090,7 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
         )
         .unwrap();
     match outcome {
-        eidos_catalog::replica::RepairOutcome::Applied { removed, .. } => {
-            assert_eq!(
-                removed, 1,
-                "the collected tombstone is an authoritative absence"
-            );
-        }
+        eidos_catalog::replica::RepairOutcome::Applied { .. } => {}
         other => panic!("{other:?}"),
     }
     assert!(matches!(
@@ -2010,7 +2131,7 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
 }
 
 #[test]
-fn compacted_metadata_only_changes_are_visible_to_merkle_repair() {
+fn compacted_metadata_only_changes_are_visible_after_fresh_epoch_repair() {
     let node = Node::new();
     let central = Central::new();
     converge(&node, &central, 8);
@@ -2031,9 +2152,30 @@ fn compacted_metadata_only_changes_are_visible_to_merkle_repair() {
     assert_eq!(changed.generation, before.generation);
     assert_eq!(changed.attributes, changed_attributes);
     node.catalog.sync_collect(node.source, 100).unwrap();
-    let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
     assert!(state.compacted_through > before_cursor);
 
+    match central
+        .catalog
+        .replica_admit_hello(
+            NODE,
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            state.compacted_through,
+            state.image_revision,
+        )
+        .unwrap()
+    {
+        HelloOutcome::NewEpochRequired { reason } => {
+            assert!(reason.contains("mint a new epoch"), "{reason}")
+        }
+        other => panic!("unanchored metadata repair was admitted: {other:?}"),
+    }
+    node.catalog.sync_enable(node.source, None).unwrap();
+    while !node.catalog.sync_backfill(node.source, 2).unwrap().done {}
+    let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
     assert!(matches!(
         central
             .catalog
@@ -2047,10 +2189,7 @@ fn compacted_metadata_only_changes_are_visible_to_merkle_repair() {
                 state.image_revision,
             )
             .unwrap(),
-        HelloOutcome::Resume {
-            requires_repair: true,
-            ..
-        }
+        HelloOutcome::FullResync { .. }
     ));
     let leaf_bits = MIN_FLEET_LEAF_BITS;
     let tree = MerkleTree::with_leaf_bits(
@@ -2073,6 +2212,7 @@ fn compacted_metadata_only_changes_are_visible_to_merkle_repair() {
             state.head_seq,
             state.head_chain,
             state.image_revision,
+            repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
             leaf_bits,
             &tree.leaf_hashes(),
         )
@@ -2216,6 +2356,12 @@ fn repair_restarts_when_collection_changes_its_snapshot(tombstone_part_first: bo
             manifest_state.head_seq,
             manifest_state.head_chain,
             manifest_state.image_revision,
+            repair_anchor(
+                &node,
+                &central,
+                source,
+                manifest_state.epoch.to_source_epoch(),
+            ),
             leaf_bits,
             &tree.leaf_hashes(),
         )
@@ -2340,6 +2486,12 @@ fn repair_restarts_when_collection_changes_its_snapshot(tombstone_part_first: bo
             replay_state.head_seq,
             replay_state.head_chain,
             replay_state.image_revision,
+            repair_anchor(
+                &node,
+                &central,
+                source,
+                replay_state.epoch.to_source_epoch(),
+            ),
             leaf_bits,
             &replay_tree.leaf_hashes(),
         )
@@ -2475,6 +2627,7 @@ fn repair_replay_is_chain_bound_and_rejects_duplicate_objects() {
             state.head_seq,
             state.head_chain,
             state.image_revision,
+            repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
             leaf_bits,
             &hashes,
         )
@@ -2646,6 +2799,7 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
             state.head_seq,
             state.head_chain,
             state.image_revision,
+            repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
             leaf_bits,
             &source_tree.leaf_hashes(),
         )
@@ -2751,6 +2905,7 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
             state.head_seq,
             state.head_chain,
             state.image_revision,
+            repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
             leaf_bits,
             &source_tree.leaf_hashes(),
         )
@@ -2834,13 +2989,15 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
 }
 
 #[test]
-fn newer_pending_epoch_repair_retires_rows_staged_for_the_older_head() {
+fn collection_only_revision_restarts_a_pending_epoch_repair() {
     let node = Node::new();
     let central = Central::new();
     converge(&node, &central, 8);
     let source = central.source_for(&node);
     node.catalog.sync_enable(node.source, None).unwrap();
     while !node.catalog.sync_backfill(node.source, 2).unwrap().done {}
+    let deleted_object = node.id("a/b/two.txt");
+    node.delete("a/b/two.txt");
     let (first_state, first_entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
     assert!(matches!(
         central
@@ -2878,6 +3035,7 @@ fn newer_pending_epoch_repair_retires_rows_staged_for_the_older_head() {
             first_state.head_seq,
             first_state.head_chain,
             first_state.image_revision,
+            repair_anchor(&node, &central, source, first_state.epoch.to_source_epoch()),
             leaf_bits,
             &first_tree.leaf_hashes(),
         )
@@ -2886,7 +3044,6 @@ fn newer_pending_epoch_repair_retires_rows_staged_for_the_older_head() {
         eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
         other => panic!("{other:?}"),
     };
-    let deleted_object = node.id("a/b/two.txt");
     let staged_leaf = leaf_index(leaf_bits, deleted_object);
     assert!(requested.contains(&staged_leaf));
     let staged_objects = first_entries
@@ -2898,7 +3055,9 @@ fn newer_pending_epoch_repair_retires_rows_staged_for_the_older_head() {
         .catalog
         .sync_rows_for_objects(node.source, &staged_objects)
         .unwrap();
-    assert!(staged_rows.iter().any(|row| row.object == deleted_object));
+    assert!(staged_rows
+        .iter()
+        .any(|row| row.object == deleted_object && row.image.is_none()));
     assert!(matches!(
         central
             .catalog
@@ -2918,11 +3077,12 @@ fn newer_pending_epoch_repair_retires_rows_staged_for_the_older_head() {
         RepairOutcome::Staged { .. }
     ));
 
-    node.delete("a/b/two.txt");
     let collected = node.catalog.sync_collect(node.source, 100).unwrap();
     assert_eq!(collected.removed_tombstones, 1);
     let (new_state, new_entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
-    assert!(new_state.head_seq > first_state.head_seq);
+    assert_eq!(new_state.head_seq, first_state.head_seq);
+    assert_eq!(new_state.head_chain, first_state.head_chain);
+    assert!(new_state.image_revision > first_state.image_revision);
     assert!(matches!(
         central
             .catalog
@@ -2958,6 +3118,7 @@ fn newer_pending_epoch_repair_retires_rows_staged_for_the_older_head() {
             new_state.head_seq,
             new_state.head_chain,
             new_state.image_revision,
+            repair_anchor(&node, &central, source, new_state.epoch.to_source_epoch()),
             leaf_bits,
             &new_tree.leaf_hashes(),
         )
@@ -3046,6 +3207,7 @@ fn an_outstanding_repair_keeps_a_later_batch_reconciling() {
             state.head_seq,
             state.head_chain,
             state.image_revision,
+            repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
             leaf_bits,
             &tree.leaf_hashes(),
         )
@@ -3184,6 +3346,7 @@ fn disabled_or_removed_peers_are_durably_fenced_from_replica_writes() {
             state.head_seq,
             state.head_chain,
             state.image_revision,
+            repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
             leaf_bits,
             &tree.leaf_hashes(),
         )
@@ -3331,6 +3494,7 @@ fn authenticated_replica_writes_are_bound_to_the_source_owner_and_node_role() {
                 state.head_seq,
                 state.head_chain,
                 state.image_revision,
+                repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
                 leaf_bits,
                 &tree.leaf_hashes(),
             )
@@ -3413,6 +3577,7 @@ fn snapshot_fallback_preserves_rows_already_staged_by_repair() {
             state.head_seq,
             state.head_chain,
             state.image_revision,
+            repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
             leaf_bits,
             &tree.leaf_hashes(),
         )
@@ -3556,6 +3721,7 @@ fn a_compacted_new_epoch_can_install_its_first_snapshot_by_repair() {
             state.head_seq,
             state.head_chain,
             state.image_revision,
+            repair_anchor(&node, &central, source, state.epoch.to_source_epoch()),
             leaf_bits,
             &tree.leaf_hashes(),
         )
@@ -3711,7 +3877,10 @@ fn the_history_chain_migration_reincarnates_existing_sync_ledgers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("catalog.db");
     let mut conn = rusqlite::Connection::open(&path).unwrap();
-    let predecessor = eidos_catalog::schema::MIGRATIONS.len() - 1;
+    let predecessor = eidos_catalog::schema::MIGRATIONS
+        .iter()
+        .position(|(description, _)| description.starts_with("fleet: history chain"))
+        .unwrap();
     for (index, (description, sql)) in eidos_catalog::schema::MIGRATIONS
         .iter()
         .take(predecessor)

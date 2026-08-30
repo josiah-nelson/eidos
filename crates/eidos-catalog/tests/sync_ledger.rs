@@ -7,7 +7,7 @@ use eidos_catalog::changes::{ChangeEvent, NativeKey, ObjectSnapshot};
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::sync::{SyncBatch, SyncRow};
 use eidos_catalog::{Catalog, NewSource};
-use eidos_domain::{ObjectId, ObjectKind, SourceId, SourceKind};
+use eidos_domain::{ObjectId, ObjectKind, SourceId, SourceKind, SyncPolicy};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -193,6 +193,46 @@ fn source_without_sync_stamps_nothing() {
     assert!(fx.catalog.sync_source(fx.source).unwrap().is_none());
     assert!(fx.catalog.sync_sources().unwrap().is_empty());
     assert!(fx.catalog.sync_rows_after(fx.source, 0, 10).is_err());
+}
+
+#[test]
+fn local_only_fences_enable_and_an_already_enabled_export() {
+    let fx = Fx::new();
+    fx.catalog
+        .set_sync_policy(fx.source, SyncPolicy::LocalOnly)
+        .unwrap();
+    let error = fx.catalog.sync_enable(fx.source, None).unwrap_err();
+    assert!(error.to_string().contains("local-only"), "{error}");
+
+    fx.catalog
+        .set_sync_policy(fx.source, SyncPolicy::Inherit)
+        .unwrap();
+    fx.enable_and_backfill(2);
+    let enabled = fx.catalog.sync_source(fx.source).unwrap().unwrap();
+    assert!(enabled.replication_allowed);
+    assert!(fx.catalog.sync_rows_after(fx.source, 0, u32::MAX).is_ok());
+
+    fx.catalog
+        .set_sync_policy(fx.source, SyncPolicy::LocalOnly)
+        .unwrap();
+    let fenced = fx.catalog.sync_source(fx.source).unwrap().unwrap();
+    assert!(!fenced.replication_allowed);
+    for error in [
+        fx.catalog
+            .sync_rows_after(fx.source, 0, u32::MAX)
+            .unwrap_err(),
+        fx.catalog.sync_ledger_entries(fx.source).unwrap_err(),
+        fx.catalog
+            .sync_merkle_leaf_hashes(fx.source, eidos_sync::merkle::MIN_FLEET_LEAF_BITS)
+            .unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("local-only"), "{error}");
+    }
+
+    fx.catalog
+        .set_sync_policy(fx.source, SyncPolicy::Inherit)
+        .unwrap();
+    assert!(fx.catalog.sync_rows_after(fx.source, 0, u32::MAX).is_ok());
 }
 
 #[test]

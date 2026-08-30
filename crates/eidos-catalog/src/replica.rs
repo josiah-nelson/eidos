@@ -103,6 +103,9 @@ pub enum HelloOutcome {
     /// The epoch changed (or the cursor is new): stream the source from
     /// sequence zero of `epoch`.
     FullResync { epoch: SourceEpoch },
+    /// The current epoch can no longer prove continuity from the replica's
+    /// durable cursor. The shipper must mint a fresh epoch before retrying.
+    NewEpochRequired { reason: String },
     /// Fenced; the reason is safe to send to the peer.
     Rejected { reason: String },
 }
@@ -1302,6 +1305,10 @@ impl Catalog {
                 && state.reported_at.is_some()
                 && image_revision < state.reported_image_revision;
             let reconnecting_pending_epoch = state.admission.pending_epoch() == Some(epoch);
+            let active_epoch_lost_anchor = state.admission.epoch == epoch
+                && !reconnecting_pending_epoch
+                && head_seq > state.admission.applied_seq
+                && compacted_through > state.admission.applied_seq;
             let malformed = head_seq > MAX_SQLITE_SEQUENCE
                 || compacted_through > MAX_SQLITE_SEQUENCE
                 || compacted_through > head_seq
@@ -1329,6 +1336,13 @@ impl Catalog {
                     reason: format!(
                         "same-epoch retained-image rewind: reported={}, source={image_revision}",
                         state.reported_image_revision
+                    ),
+                }
+            } else if active_epoch_lost_anchor {
+                HelloOutcome::NewEpochRequired {
+                    reason: format!(
+                        "history continuity from durable cursor {} is no longer retained; mint a new epoch",
+                        state.admission.applied_seq
                     ),
                 }
             } else {
@@ -1386,7 +1400,8 @@ impl Catalog {
             ) {
                 let restarting_pending_epoch = reconnecting_pending_epoch
                     && (head_seq != state.reported_head
-                        || state.reported_chain != Some(head_chain));
+                        || state.reported_chain != Some(head_chain)
+                        || image_revision != state.reported_image_revision);
                 if restarting_pending_epoch {
                     // Rows staged for an older snapshot of the pending epoch
                     // must become retirement candidates again. Otherwise an
@@ -1678,6 +1693,7 @@ impl Catalog {
         through_seq: u64,
         through_chain: ChainHash,
         image_revision: u64,
+        anchor_chain: Option<ChainHash>,
         leaf_bits: u8,
         leaf_hashes: &[[u8; 32]],
     ) -> Result<RepairOfferOutcome> {
@@ -1725,6 +1741,17 @@ impl Catalog {
             {
                 return Ok(RepairOfferOutcome::Rejected {
                     reason: "stale repair offer".into(),
+                });
+            }
+            if !pending_epoch
+                && through_seq > state.admission.applied_seq
+                && anchor_chain != Some(state.admission.applied_chain)
+            {
+                return Ok(RepairOfferOutcome::Rejected {
+                    reason: format!(
+                        "repair has no valid history proof at durable cursor {}; mint a new epoch",
+                        state.admission.applied_seq
+                    ),
                 });
             }
             if !pending_epoch
@@ -2323,6 +2350,7 @@ impl Catalog {
                 state.resync_target = None;
                 store_admission_conn(&tx, source, &state.admission, None)?;
                 let image_complete = state.admission.applied_seq >= state.reported_head
+                    && state.applied_image_revision >= state.reported_image_revision
                     && !repair_pending_conn(&tx, source)?;
                 mark_applied_conn(&tx, source, now, image_complete)?;
             }
