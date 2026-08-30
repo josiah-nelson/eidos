@@ -128,7 +128,10 @@
         not roll back a healthy core. The bootstrapper still reports that
         partial result as a failure and plans the package per action.
       -->
-      <MsiPackage Id="EidosCollectorMsi" SourceFile="$(var.CollectorMsiPath)" Vital="no" Compressed="yes" Visible="no">
+      <!-- Keep the collector MSI visible in Apps & Features. If the unified
+           bundle removes only the core, the retained independent service
+           must still have a registered maintenance/uninstall entry. -->
+      <MsiPackage Id="EidosCollectorMsi" SourceFile="$(var.CollectorMsiPath)" Vital="no" Compressed="yes" Visible="yes">
         <MsiProperty Name="EIDOS_STUDY_KEY" Value="[EIDOS_STUDY_KEY]" Condition="EIDOS_STUDY_KEY &lt;&gt; &quot;&quot;" />
         <MsiProperty Name="EIDOS_LANES" Value="[EIDOS_LANES]" Condition="EIDOS_LANES &lt;&gt; &quot;&quot;" />
         <MsiProperty Name="EIDOS_UPLOAD" Value="[EIDOS_UPLOAD]" Condition="EIDOS_UPLOAD &lt;&gt; &quot;&quot;" />

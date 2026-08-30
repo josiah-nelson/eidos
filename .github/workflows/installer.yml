@@ -87,6 +87,12 @@ jobs:
             if (-not $p.WaitForExit(600000)) { $p.Kill(); throw "setup did not finish: $exe $safeArguments" }
             if ($p.ExitCode -ne 0) { Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 60; throw "$exe $safeArguments exited $($p.ExitCode)" }
           }
+          function Run-SetupExpectFailure([string]$exe, [string]$arguments, [string]$log) {
+            $safeArguments = $arguments -replace '(?i)(EIDOS_(?:STUDY_KEY|SERVICE_PASSWORD)=)(?:"[^"]*"|\S+)', '$1<redacted>'
+            $p = [Diagnostics.Process]::Start($exe, "$arguments /log `"$log`"")
+            if (-not $p.WaitForExit(600000)) { $p.Kill(); throw "setup did not finish: $exe $safeArguments" }
+            if ($p.ExitCode -eq 0) { throw "$exe $safeArguments accepted an invalid unattended value" }
+          }
           function Wait-Health([int]$port) {
             $deadline = (Get-Date).AddSeconds(90)
             while ((Get-Date) -lt $deadline) {
@@ -227,6 +233,19 @@ jobs:
           if ((Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash -ne (Get-Content "$env:RUNNER_TEMP\study-key.hash")) { throw "repair rotated the study key" }
           $fleet = Invoke-RestMethod http://127.0.0.1:7720/api/fleet -TimeoutSec 30
           if ($fleet.node_id -ne (Get-Content "$env:RUNNER_TEMP\node-id")) { throw "repair changed the fleet node identity" }
+
+      - name: Invalid unattended choices fail before planning
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          $setup = "installer\out\upgrade\eidos-setup.exe"
+          Run-SetupExpectFailure $setup "/quiet EIDOS_SCOPE=machine" "$env:RUNNER_TEMP\invalid-scope.log"
+          Run-SetupExpectFailure $setup "/quiet EIDOS_START_SERVICE=true" "$env:RUNNER_TEMP\invalid-start.log"
+          Run-SetupExpectFailure $setup "/quiet /uninstall EIDOS_REMOVE_COLLECTOR=true" "$env:RUNNER_TEMP\invalid-remove.log"
+          Wait-Health 7720
+          Assert-Service eidos Running
+          Assert-Service eidos-collector Running
 
       - name: Uninstall keeps data by default, for both products
         shell: pwsh

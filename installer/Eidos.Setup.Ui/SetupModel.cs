@@ -55,6 +55,7 @@ namespace Eidos.Setup
         private const int ErrorProductVersion = unchecked((int)0x80070666);
         private const int ErrorServiceNotActive = unchecked((int)0x80070426);
         private const int ErrorLogonFailure = unchecked((int)0x8007052E);
+        private const int ErrorInvalidArgument = unchecked((int)0x80070057);
         private const string RegistryKey = @"Software\eidos";
         private const string CollectorRegistryKey = @"Software\eidos-collector";
         private const string CollectorBundleUpgradeCode = "5D2B93F8-29ED-4E6C-B101-1355B4A36F3A";
@@ -1089,7 +1090,21 @@ namespace Eidos.Setup
             if (cmd.Display != Display.Full)
             {
                 // Silent/passive: EIDOS_SCOPE=perMachine|perUser selects the scope.
-                var scopeVar = this.Engine.ContainsVariable("EIDOS_SCOPE") ? this.Engine.GetVariableString("EIDOS_SCOPE") : "";
+                var scopeVar = this.Variable("EIDOS_SCOPE");
+                var wantCollector = this.Variable("EIDOS_INSTALL_COLLECTOR");
+                var startServiceVar = this.Variable("EIDOS_START_SERVICE");
+                var startMenuVar = this.Variable("EIDOS_START_MENU");
+                var removeCollectorVar = this.Variable("EIDOS_REMOVE_COLLECTOR");
+                var removeCollectorDataVar = this.Variable("EIDOS_COLLECTOR_REMOVE_DATA");
+                if (!this.ValidateNonInteractiveChoice("EIDOS_SCOPE", scopeVar, "perUser", "perMachine")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_INSTALL_COLLECTOR", wantCollector, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_START_SERVICE", startServiceVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_START_MENU", startMenuVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_REMOVE_COLLECTOR", removeCollectorVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_COLLECTOR_REMOVE_DATA", removeCollectorDataVar, "0", "1"))
+                {
+                    return;
+                }
                 // Maintenance cannot change the installed core's scope. For a
                 // fresh install, scope controls only the dual-scope core; the
                 // optional collector remains a per-machine package and can
@@ -1103,10 +1118,7 @@ namespace Eidos.Setup
                 // is detected. Removal keeps the service only when asked
                 // (EIDOS_REMOVE_COLLECTOR=0) and its data unless
                 // EIDOS_COLLECTOR_REMOVE_DATA=1.
-                var wantCollector = this.Variable("EIDOS_INSTALL_COLLECTOR");
                 this.installCollector = wantCollector == "1" || (this.collectorInstalled && wantCollector != "0");
-                var startServiceVar = this.Variable("EIDOS_START_SERVICE");
-                var startMenuVar = this.Variable("EIDOS_START_MENU");
                 if (!string.IsNullOrEmpty(startServiceVar))
                 {
                     this.startService = startServiceVar == "1";
@@ -1132,8 +1144,8 @@ namespace Eidos.Setup
                     this.Requery();
                     return;
                 }
-                this.removeCollector = this.Variable("EIDOS_REMOVE_COLLECTOR") != "0";
-                this.removeCollectorData = this.Variable("EIDOS_COLLECTOR_REMOVE_DATA") == "1";
+                this.removeCollector = string.IsNullOrEmpty(removeCollectorVar) || removeCollectorVar == "1";
+                this.removeCollectorData = removeCollectorDataVar == "1";
                 this.installDirEdited = this.dataDirEdited = true; // overridable variables win
                 this.plannedAction = cmd.Action;
                 this.State = SetupState.Planning;
@@ -1169,6 +1181,25 @@ namespace Eidos.Setup
         private string Variable(string name)
         {
             return this.Engine.ContainsVariable(name) ? (this.Engine.GetVariableString(name) ?? "") : "";
+        }
+
+        private bool ValidateNonInteractiveChoice(string name, string value, params string[] allowed)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return true;
+            }
+            foreach (var choice in allowed)
+            {
+                if (string.Equals(value, choice, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            this.Fail(ErrorInvalidArgument, $"{name} must be empty or one of: {string.Join(", ", allowed)}.");
+            this.EndNonInteractive();
+            this.Requery();
+            return false;
         }
 
         private void OnDetectPackageComplete(object sender, DetectPackageCompleteEventArgs e)
