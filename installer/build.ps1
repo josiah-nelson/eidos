@@ -5,6 +5,7 @@
 #   .\installer\build.ps1 -SkipWeb -SkipRust -SkipBundle -SkipCollectorBundle # stop before the bundles (CI signs first)
 #   .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipCollectorMsi -SkipUi # bundles only, from signed parts
 #   .\installer\build.ps1 -SkipWeb -SkipRust -BinDir target\debug
+#   .\installer\build.ps1 -Version 0.5.0        # explicit release metadata (must match Cargo.toml)
 #
 # eidos-setup.exe is the unified setup: it carries eidos.msi and, as an
 # optional package, eidos-collector.msi. eidos-collector-setup.exe is the
@@ -22,7 +23,8 @@ param(
     [switch]$SkipCollectorMsi,
     [switch]$SkipCollectorBundle,
     [string]$BinDir = "",
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,9 +40,18 @@ function Step($name, $cmd) {
 # Windows Installer versions are numeric (major.minor.build); drop any
 # pre-release suffix from the workspace version.
 $cargo = Get-Content (Join-Path $root "Cargo.toml") -Raw
-$version = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
-$msiVersion = ($version -split '-')[0]
-Write-Host "eidos $version -> installer version $msiVersion"
+$versionMatch = [regex]::Match($cargo, '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"')
+if (-not $versionMatch.Success) { throw "workspace package version is missing from Cargo.toml" }
+$workspaceVersion = $versionMatch.Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($Version)) { $Version = $workspaceVersion }
+if ($Version -ne $workspaceVersion) {
+    throw "installer version $Version does not match workspace version $workspaceVersion"
+}
+$msiVersion = ($Version -split '-')[0]
+if ($msiVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "workspace version $Version does not yield a numeric Windows Installer version"
+}
+Write-Host "eidos $Version -> installer version $msiVersion"
 
 if (-not $SkipWeb) {
     Push-Location (Join-Path $root "web")

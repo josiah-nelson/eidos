@@ -71,6 +71,7 @@ jobs:
           fetch-depth: 0
 
       - name: Validate release version and installer rehearsal
+        id: release_version
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -82,6 +83,7 @@ jobs:
           if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne "v$version") {
             throw "release tag $env:GITHUB_REF_NAME does not match workspace version $version"
           }
+          "version=$version" >> $env:GITHUB_OUTPUT
 
           $response = gh api -X GET "repos/$env:GITHUB_REPOSITORY/actions/workflows/installer.yml/runs?event=workflow_dispatch&status=completed&per_page=100" | ConvertFrom-Json
           $matching = @()
@@ -145,7 +147,9 @@ jobs:
 
       - name: Build setup UI
         shell: pwsh
-        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipBundle -SkipCollectorMsi -SkipCollectorBundle
+        env:
+          EIDOS_RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        run: .\installer\build.ps1 -Version $env:EIDOS_RELEASE_VERSION -SkipWeb -SkipRust -SkipMsi -SkipBundle -SkipCollectorMsi -SkipCollectorBundle
 
       - name: Sign eidos.exe and the setup UI
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
@@ -177,7 +181,9 @@ jobs:
 
       - name: Build both MSIs (binding the signed executable)
         shell: pwsh
-        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipUi -SkipBundle -SkipCollectorBundle
+        env:
+          EIDOS_RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        run: .\installer\build.ps1 -Version $env:EIDOS_RELEASE_VERSION -SkipWeb -SkipRust -SkipUi -SkipBundle -SkipCollectorBundle
 
       - name: Sign both MSIs
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
@@ -209,7 +215,9 @@ jobs:
 
       - name: Build both bundles (from the signed MSIs and UI)
         shell: pwsh
-        run: .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipUi -SkipCollectorMsi
+        env:
+          EIDOS_RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        run: .\installer\build.ps1 -Version $env:EIDOS_RELEASE_VERSION -SkipWeb -SkipRust -SkipMsi -SkipUi -SkipCollectorMsi
 
       - name: Detach the Burn engines
         shell: pwsh
