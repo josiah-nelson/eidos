@@ -329,6 +329,7 @@ The name also deliberately evokes eidetic memory: not just recalling that someth
 | [Architecture](docs/architecture.md) | Invariants, identity model, catalog, search architecture, scheduler, and fleet evolution |
 | [Roadmap](docs/roadmap.md) | Releases, milestones, acceptance gates, and sequencing |
 | [v0.5 dogfood-fleet sprint](docs/v0.5-dogfood-fleet-sprint.md) | Unified installer, measured multi-node slice, chunking bakeoff, and release gates |
+| [Private fleet](docs/fleet.md) | Enrolling nodes with a central, what replicates, status, bounds, and the failure matrix (experimental) |
 | [Query syntax](docs/query-syntax.md) | Query language used by the UI, CLI, and API |
 | [Development](docs/development.md) | Toolchain, project layout, tests, linting, and benchmarks |
 | [Benchmarks](docs/benchmarks.md) | Reference corpus, methodology, measurements, and known limitations |

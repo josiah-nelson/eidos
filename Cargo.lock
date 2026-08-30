@@ -725,7 +725,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 
 [[package]]
 name = "eidos-archive"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "crc32fast",
  "eidos-domain",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-catalog"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "crossbeam-channel",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-cli"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-content"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "eidos-domain",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-diskimg"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "crc32fast",
  "eidos-domain",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-domain"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "libc",
  "serde",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-fleet"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-macos-collector"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-observe"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "rusqlite",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-query"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "eidos-domain",
  "proptest",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-scanner"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "core-foundation 0.9.4",
  "crossbeam-channel",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-search"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "eidos-archive",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-service"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-sync"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "eidos-domain",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-windows-collector"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blake3",

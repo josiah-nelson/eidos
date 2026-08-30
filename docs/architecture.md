@@ -427,8 +427,14 @@ members cannot exceed the parent job's global limits.
 
 ## 13. Standalone to fleet evolution
 
-v0.5 uses an in-process agent contract. v1 moves it behind an authenticated,
-versioned transport:
+v0.5 uses an in-process agent contract for everything local, and an
+experimental fleet slice beside it: an enrolled node's catalog ledger ships
+materialized metadata over a dedicated, mutually authenticated TLS endpoint
+into a central's replica, which is applied into ordinary catalog tables and
+projected by the same follower as local sources
+([ADR-0023](adr/0023-experimental-fleet-boundary.md)). Content stays where
+it is ([ADR-0024](adr/0024-content-transfer-bakeoff.md)). v1 promotes that
+slice into the supported agent boundary:
 
 ```text
 host agent

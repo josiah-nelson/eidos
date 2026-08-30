@@ -5,10 +5,12 @@ installer in `.github/workflows/release.yml` and publishes it on the GitHub
 release for that tag:
 
 - `eidos-<tag>-setup.exe` — the guided installer (Burn bundle with the setup
-  UI and the MSI); this is what people download.
-- `eidos-<tag>.msi` — the bare package for administrators and unattended
-  installs (`msiexec /i ... ALLUSERS=1 EIDOS_PORT=7700`).
-- `.sha256` checksums for both.
+  UI, the core MSI and the optional collector MSI); this is what people
+  download.
+- `eidos-<tag>.msi`, `eidos-collector-<tag>.msi`,
+  `eidos-collector-<tag>-setup.exe` — the bare packages and the
+  collector-only setup for administrators and fleet installs.
+- `.sha256` checksums for every asset.
 
 The workflow builds the web UI, the Rust executable (with the UI embedded),
 the setup UI, the MSI and the bundle, and signs every executable piece with
@@ -38,7 +40,34 @@ gh workflow run installer.yml --ref <branch>
 ```
 
 Run it before tagging whenever a change touches `installer/`, `build.ps1`, or
-the way the web UI is embedded — ordinary CI does not cover any of that.
+the way the web UI is embedded — ordinary CI does not cover any of that. It
+covers core-only per-user, core-plus-collector per-machine through the
+unified setup, upgrade from the separate collector package, repair,
+uninstall keeping data, and explicit purge of exactly one product's data.
+
+## Release checklist (v0.5)
+
+The [sprint gates](v0.5-dogfood-fleet-sprint.md#11-v05-release-gates) in
+order; nothing later compensates for an earlier failure:
+
+1. `Cargo.toml` carries the numeric version (`0.5.0`, no `-dev`).
+2. `scripts\check.ps1` passes on the release commit (format, lint, full
+   suite including the real-SQLite adapter tests, the loopback-TLS fleet
+   session tests and the central-search test, web tests and build).
+3. `sync-soak.yml` (the million-universe protocol soak) and `installer.yml`
+   pass on the release commit.
+4. `eidos bench chunking` has produced the report behind
+   [ADR-0024](adr/0024-content-transfer-bakeoff.md).
+5. The signing rehearsal (`gh workflow run release.yml --ref <commit>`)
+   succeeds and every artifact verifies.
+6. The private-fleet soak in [fleet.md](fleet.md) has been run with the
+   release candidate and its results are in
+   [releases/v0.5.0.md](releases/v0.5.0.md); a failed fleet gate ships the
+   same installer with sync disabled and the gate documented, never
+   weakened local correctness.
+7. Tag `v0.5.0` from the tested commit; the release publishes the unified
+   setup, the administrator artifacts, checksums, and the release notes with
+   the known limits and rollback steps.
 
 ## macOS
 

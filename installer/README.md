@@ -6,7 +6,7 @@ WiX v7 authoring for the eidos setup:
 |---|---|---|
 | `Eidos.Msi` | `eidos.msi` | The Windows Installer package (dual-scope) |
 | `Eidos.Setup.Ui` | `eidos-setup-ui.exe` | The guided UI: a .NET Framework 4.7.2 WPF bootstrapper application |
-| `Eidos.Bundle` | `eidos-setup.exe` | The product: Burn engine + UI + MSI (+ .NET prerequisite) |
+| `Eidos.Bundle` | `eidos-setup.exe` | The product: Burn engine + UI + core MSI + optional collector MSI (+ .NET prerequisite) |
 | `Eidos.Collector.Msi` | `eidos-collector.msi` | The observatory collector package (per-machine) |
 | `Eidos.Collector.Bundle` | `eidos-collector-setup.exe` | The collector setup: Burn engine + standard BA + MSI |
 
@@ -15,10 +15,13 @@ WiX v7 authoring for the eidos setup:
 .\installer\build.ps1 -SkipWeb -SkipRust
 ```
 
-The two products are independent and share only `eidos.exe`: the indexer
-setup installs the `eidos` service and the web UI, the collector setup
-installs the `eidos-collector` service. A host can have either, both, or
-neither. Each `-Skip` switch turns off exactly one artifact.
+The two packages are independent and share only `eidos.exe`: `eidos.msi`
+installs the `eidos` service and the web UI, `eidos-collector.msi` the
+`eidos-collector` service. `eidos-setup.exe` carries both and offers the
+collector as an advanced option; `eidos-collector-setup.exe` remains for
+fleet installs that want only the collector. A host can have either, both,
+or neither. Each `-Skip` switch turns off exactly one artifact; the unified
+bundle needs both MSIs built first.
 
 ## The setup (`eidos-setup.exe`)
 
@@ -29,14 +32,35 @@ Settings › Apps) for repair or removal; removal offers to delete the data
 folder and shows its size. A newer installed version is reported, an older
 one is upgraded in place with settings and data kept.
 
+*Advanced: profiling collector* on the options page adds the collector
+package (all-users scope: it is a LocalSystem service). The setup UI plans
+that package per action: `Present` when chosen on install or upgrade,
+`Repair` when installed on repair, `Absent` on removal unless the operator
+keeps it, and `None` otherwise - an empty choice never removes an existing
+collector, and the checkbox reflects the installed state on maintenance
+(`DetectPackageComplete`). The package is not vital, so a host that
+refuses it still gets a healthy core. A `RelatedBundle` upgrade of the
+separate collector setup's bundle code lets a host set up with
+`eidos-collector-setup.exe` upgrade into this setup; the collector MSI is
+major-upgraded in place, so the study key, spool and configuration stay.
+
 Unattended:
 
 ```powershell
 eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_PORT=7700 EIDOS_SERVICE_ACCOUNT_KIND=local-service
 eidos-setup.exe /passive                           # progress only, per-user defaults
+eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_INSTALL_COLLECTOR=1 EIDOS_STUDY_KEY=<64 hex> EIDOS_LANES=usn
 eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_DATA=1
+eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_COLLECTOR=1 EIDOS_COLLECTOR_REMOVE_DATA=1
 eidos-setup.exe /log setup.log ...                 # explicit log path
 ```
+
+`EIDOS_INSTALL_COLLECTOR` (`1`/`0`/empty = keep as installed),
+`EIDOS_REMOVE_COLLECTOR` (`0` keeps the collector service on removal) and
+`EIDOS_COLLECTOR_REMOVE_DATA` drive the collector package; the collector's
+own properties (`EIDOS_STUDY_KEY`, `EIDOS_LANES`, `EIDOS_UPLOAD`,
+`EIDOS_UPLOAD_HOUR`, `EIDOS_COLLECTOR_INSTALLDIR`, `EIDOS_COLLECTOR_DATADIR`,
+`EIDOS_COLLECTOR_START`) pass through unchanged.
 
 Every `EIDOS_*` MSI property listed below is also a bundle variable that a
 `NAME=value` argument overrides; `EIDOS_SCOPE` (`perUser` | `perMachine`)
