@@ -29,12 +29,12 @@ machine-readable report is `bench-results/chunking-bakeoff.json` (private
 measurements directory); the summary below is the run of 2026-08-29 on the
 development host, release build.
 
-| strategy | scenarios | source MiB | wire MiB | ratio | cpu ms | frames | recovery MiB |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| whole_compressed | 13 | 151.4 | 37.2 | 0.246 | 950 | 18 | 37.2 |
-| fixed_64k | 13 | 151.4 | 19.7 | 0.130 | 1747 | 16 | 9.7 |
-| cdc_16k | 13 | 151.4 | 17.9 | 0.118 | 2576 | 16 | 8.9 |
-| cdc_64k | 13 | 151.4 | 17.6 | 0.116 | 1412 | 16 | 8.6 |
+| strategy | scenarios | rejected (binary) | source MiB | wire MiB | ratio | cpu ms | frames | recovery MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| whole_compressed | 14 | 1 | 159.4 | 37.2 | 0.234 | 1004 | 18 | 37.2 |
+| fixed_64k | 14 | 1 | 159.4 | 19.7 | 0.124 | 2013 | 16 | 10.0 |
+| cdc_16k | 14 | 1 | 159.4 | 17.9 | 0.113 | 2858 | 16 | 9.0 |
+| cdc_64k | 14 | 1 | 159.4 | 17.6 | 0.110 | 1626 | 16 | 9.2 |
 
 Per scenario, the shapes that decide it:
 
@@ -74,8 +74,8 @@ The approved read-only corpora were not sampled: the harness accepts a
 2. **The single strategy to implement after v0.5 is FastCDC with a 64 KiB
    target (16-256 KiB), zstd per chunk, BLAKE3 chunk identity.** On every
    edit shape it is within a few percent of the best and it is the cheapest
-   chunked strategy in CPU (1.4 s versus 2.6 s for 16 KiB over the same
-   151 MiB) with the fewest chunks and manifest entries. Fixed 64 KiB
+   chunked strategy in CPU (1.6 s versus 2.9 s for 16 KiB over the same
+   159 MiB) with the fewest chunks and manifest entries. Fixed 64 KiB
    chunks lose the localized insertion/deletion cases (1.01 MiB versus
    0.01-0.07 MiB) because a shift invalidates every later boundary. Whole
    content is only competitive on complete rewrites, first ships, and
