@@ -229,6 +229,18 @@ where
 
 // ----- health --------------------------------------------------------------
 
+/// On-disk footprint of the durable stores, computed lazily and cached
+/// briefly by [`AppState::storage`].
+#[derive(Debug, Clone, Copy, Default, Serialize, TS)]
+pub struct StorageView {
+    /// `catalog.db` plus its WAL and shared-memory files.
+    pub catalog_db_bytes: u64,
+    /// The name/metadata (catalog) index directory.
+    pub catalog_index_bytes: u64,
+    /// The content (chunk) index directory.
+    pub content_index_bytes: u64,
+}
+
 #[derive(Serialize, TS)]
 pub(crate) struct Health {
     version: &'static str,
@@ -246,6 +258,8 @@ pub(crate) struct Health {
     /// `/api/activity` and the CLI use, so a health check and the Activity
     /// page can never disagree about the pipeline.
     content_status: crate::content_control::ContentStatusView,
+    /// On-disk footprint of the catalog and indexes.
+    storage: StorageView,
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
@@ -266,6 +280,7 @@ async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
         running_scans: running,
         export_max_rows: st.export.max_rows,
         content_status: crate::content_control::content_status(&st),
+        storage: st.storage(),
     }))
 }
 
@@ -1079,6 +1094,8 @@ pub struct ActivityView {
     pub admission: crate::admission::AdmissionView,
     /// Process-wide catalog writer wait time, including scan batch handoffs.
     pub catalog_writer: eidos_catalog::CatalogWriterStats,
+    /// On-disk footprint of the catalog and indexes.
+    pub storage: StorageView,
     pub sources: Vec<ActivitySourceView>,
     pub recent_failures: Vec<eidos_catalog::jobs::JobRecord>,
 }
@@ -1129,6 +1146,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
             content_rebuild: st2.content_index.rebuild_status(),
             admission: st2.admission.view(),
             catalog_writer: st2.catalog.writer_stats(),
+            storage: st2.storage(),
             sources,
             recent_failures: st2.catalog.recent_failed_jobs(20)?,
         })

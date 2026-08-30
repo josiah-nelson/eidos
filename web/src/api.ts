@@ -28,6 +28,7 @@ import type {
   SortField,
   SourceDetail,
   SourceView,
+  WorkersView,
 } from './generated/api'
 import type { PreviewWindow } from './preview-window'
 
@@ -148,6 +149,10 @@ export const api = {
   /** Stop or start claiming content jobs; answers with the resulting state. */
   setContentPaused: (paused: boolean) =>
     request<ContentStatusView>(`/api/content/${paused ? 'pause' : 'resume'}`, { method: 'POST' }),
+  contentWorkers: () => request<WorkersView>('/api/content/workers'),
+  /** Resize the global extraction pool; durable across restarts. */
+  setContentWorkers: (workers: number) =>
+    request<WorkersView>('/api/content/workers', { method: 'POST', body: JSON.stringify({ workers }) }),
   setContentPolicy: (id: ApiRouteId, body: ContentPolicyBody) =>
     request<SourceView>(`/api/sources/${id}/content`, {
       method: 'POST',

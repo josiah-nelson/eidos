@@ -38,6 +38,19 @@ enum ContentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set the global extraction worker pool.
+    ///
+    /// The pool is shared across every source; per-volume concurrency caps
+    /// apply on top. A new size takes effect at once and survives a
+    /// restart (it is persisted next to the catalog and overrides
+    /// `--content-workers`).
+    Workers {
+        /// New pool size (clamped to 1..=64); omit to show the current one.
+        count: Option<u32>,
+        /// Print the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
     /// Requeue failed content work: one job by id, or a whole source.
     ///
     /// Transient failures already retry on their own; this is for the
@@ -83,6 +96,30 @@ pub fn run(args: ContentArgs) -> anyhow::Result<()> {
         }
         ContentCommand::Pause { json } => switch(&args.url, "pause", json)?,
         ContentCommand::Resume { json } => switch(&args.url, "resume", json)?,
+        ContentCommand::Workers { count, json } => {
+            let url = format!("{}/api/content/workers", args.url);
+            let value: serde_json::Value = match count {
+                Some(n) => ureq::post(&url)
+                    .send_json(serde_json::json!({ "workers": n }))
+                    .context("resize the worker pool")?
+                    .body_mut()
+                    .read_json()?,
+                None => ureq::get(&url)
+                    .call()
+                    .context("read the worker pool size")?
+                    .body_mut()
+                    .read_json()?,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!(
+                    "workers: {}  (max {})",
+                    plain(&value["workers"]),
+                    plain(&value["max"])
+                );
+            }
+        }
         ContentCommand::Retry {
             job,
             source,
@@ -123,6 +160,14 @@ pub fn run(args: ContentArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Integers arrive as JSON numbers or, for large-int fields, as decimal
+/// strings; print either without quotes.
+fn plain(v: &serde_json::Value) -> String {
+    v.as_str()
+        .map(String::from)
+        .unwrap_or_else(|| v.to_string())
 }
 
 /// Flip the pause and report the state that came back, so the operator sees

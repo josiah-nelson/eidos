@@ -334,6 +334,17 @@ virtual paths, queued/running jobs, an unfinished content publication, and an
 open scan. It asserts a healthy catalog projection and content index reopen
 without rebuild, then checks the exact recovery counters and Activity JSON.
 
+### Extraction worker pool
+
+`eidos content workers` shows the global extraction pool;
+`eidos content workers N` (or `POST /api/content/workers`, or the pool
+input on the Activity page) resizes it at runtime, clamped to 1..=64. The
+choice is durable: it is written to `content-workers.json` in the data
+directory before it takes effect, and overrides `--content-workers` on
+restart. Per-volume `content_concurrency` caps apply on top of the pool,
+so one slow disk cannot absorb every worker — raising a volume's cap past
+the pool size has no effect until the pool grows too.
+
 ### Pausing content extraction
 
 Extraction is the one background job that reads the source volumes

@@ -41,6 +41,37 @@ const SEARCH_BADGE: Record<ContentStatusView['search'], string> = {
   disabled: 'warn',
 }
 
+// The global extraction pool. Per-volume caps (the Volume cap column
+// below) bound how much of this pool one disk can absorb, so raising a
+// volume's cap past the pool size has no effect until the pool grows too.
+// The server clamps and persists the choice across restarts.
+function WorkerPoolControl({ workers }: { workers: number }) {
+  const qc = useQueryClient()
+  const resize = useMutation({
+    mutationFn: (n: number) => api.setContentWorkers(n),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['activity'] }),
+  })
+  return (
+    <span title="global extraction worker pool, shared across all volumes; per-volume caps apply on top">
+      pool{' '}
+      <input
+        type="number"
+        min={1}
+        max={64}
+        className="small"
+        defaultValue={workers}
+        key={workers}
+        disabled={resize.isPending}
+        onBlur={(e) => {
+          const v = Number(e.target.value)
+          if (Number.isFinite(v) && v >= 1 && v !== workers) resize.mutate(v)
+        }}
+      />
+      {resize.isError ? <span className="muted small"> {resize.error.message}</span> : null}
+    </span>
+  )
+}
+
 // Pause/resume for the whole extraction pipeline. The server answers the
 // switch with the state it produced, so the badge next to the button is the
 // service's own answer rather than an optimistic guess — which matters
@@ -218,8 +249,11 @@ function SourceRow({ s }: { s: ActivitySourceView }) {
             if (Number.isFinite(v) && v >= 1 && v !== s.content_concurrency) policy.mutate({ concurrency: v })
           }}
         />
-        <div className="muted small" title="workers holding a slot of this source's budget (peak this session)">
-          {s.content_reserved} in flight · peak {s.content_peak_reserved}
+        <div
+          className="muted small"
+          title="workers reading this volume right now; the input above is this volume's cap on the global pool"
+        >
+          {s.content_reserved} reading now (peak {s.content_peak_reserved})
         </div>
       </td>
       <td className="num">{count(s.jobs_queued)}</td>
@@ -264,7 +298,9 @@ export default function ActivityPage() {
         <div className="stat">
           <div className="label">Throughput (60 s)</div>
           <div className="value">{bytes(Math.round(w.throughput_bytes_per_s))}/s</div>
-          <div className="sub">{w.workers} workers · {w.current.length} busy</div>
+          <div className="sub">
+            <WorkerPoolControl workers={integerNumber(w.workers)} /> · {w.current.length} busy
+          </div>
         </div>
         <div className="stat">
           <div className="label">Content queue</div>
@@ -278,7 +314,8 @@ export default function ActivityPage() {
           <div className="value">{count(settled)}</div>
           <div className="sub">
             {count(w.files_indexed)} indexed · {count(w.files_unsupported)} binary · {count(w.files_failed)} failed ·{' '}
-            {count(w.files_retried)} retried
+            {count(w.files_retried)} retried · ≈
+            {(integerNumber(w.uptime_s) > 0 ? settled / integerNumber(w.uptime_s) : 0).toFixed(1)} files/s
           </div>
         </div>
         <div className="stat">
@@ -309,6 +346,20 @@ export default function ActivityPage() {
           <div className="value">{bytes(a.content.indexed_bytes)}</div>
           <div className="sub">
             {count(a.content.total_records)} records · {count(a.content.chunks)} chunks
+          </div>
+        </div>
+        <div className="stat">
+          <div className="label">On-disk footprint</div>
+          <div className="value">
+            {bytes(
+              integerNumber(a.storage.catalog_db_bytes) +
+                integerNumber(a.storage.catalog_index_bytes) +
+                integerNumber(a.storage.content_index_bytes),
+            )}
+          </div>
+          <div className="sub">
+            catalog {bytes(a.storage.catalog_db_bytes)} · name index {bytes(a.storage.catalog_index_bytes)} · content
+            index {bytes(a.storage.content_index_bytes)}
           </div>
         </div>
         <div className="stat">
@@ -359,7 +410,9 @@ export default function ActivityPage() {
           <tr>
             <th>Source</th>
             <th>Content</th>
-            <th className="num">Concurrency</th>
+            <th className="num" title="per-volume cap on the global worker pool">
+              Volume cap
+            </th>
             <th className="num">Queued</th>
             <th className="num">Running</th>
             <th>Content states</th>

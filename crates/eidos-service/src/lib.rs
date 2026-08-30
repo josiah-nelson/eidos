@@ -50,7 +50,10 @@ pub struct ServiceConfig {
     pub auto_reconcile: bool,
     /// Run literal-text content extraction.
     pub content: bool,
-    /// Extraction threads (global; per-source budgets apply on top).
+    /// Extraction threads (global; per-source budgets apply on top). A
+    /// durable operator override written by the workers control
+    /// (`content-workers.json` in the data directory) wins over this value
+    /// at startup.
     pub content_workers: usize,
     /// Bounds and deadlines for expensive HTTP operations.
     pub admission: admission::AdmissionConfig,

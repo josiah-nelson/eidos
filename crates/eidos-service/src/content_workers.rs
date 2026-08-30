@@ -50,7 +50,12 @@ pub struct WorkerCurrent {
 
 #[derive(Debug, Default)]
 pub struct ContentWorkersStatus {
+    /// Desired pool size. A worker whose index is at or past this parks
+    /// instead of claiming; resized at runtime by [`resize_workers`].
     pub workers: AtomicUsize,
+    /// Threads actually spawned this process. Never shrinks: surplus
+    /// threads park until the pool grows over them again.
+    pub spawned: AtomicUsize,
     pub current: Mutex<HashMap<String, (Instant, WorkerCurrent)>>,
     /// Per-source concurrency budgets and the reservations held against
     /// them. Workers take capacity from here before claiming.
@@ -168,10 +173,14 @@ impl ContentWorkersStatus {
 
 /// Start `workers` extraction threads plus the coordinator.
 pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
-    let workers = workers.max(1);
+    let workers = workers.clamp(1, MAX_WORKERS);
     state
         .content_workers
         .workers
+        .store(workers, Ordering::Relaxed);
+    state
+        .content_workers
+        .spawned
         .store(workers, Ordering::Relaxed);
     *state.content_workers.started.lock() = Some(Instant::now());
     // Install persisted budgets *before* the first worker can claim, or a
@@ -189,7 +198,7 @@ pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
         let st = state.clone();
         std::thread::Builder::new()
             .name(format!("content-{i}"))
-            .spawn(move || worker_loop(&st, &format!("content-{i}")))
+            .spawn(move || worker_loop(&st, i, &format!("content-{i}")))
             .expect("spawn content worker");
     }
     let st = state.clone();
@@ -201,6 +210,58 @@ pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
 
 /// Jobs claimed per worker round trip (all from one source).
 pub const CLAIM_BATCH: u32 = 16;
+
+/// Durable operator override for the pool size, next to the pause marker.
+pub const WORKERS_MARKER: &str = "content-workers.json";
+
+/// Upper bound accepted by [`resize_workers`] (and the UI input).
+pub const MAX_WORKERS: usize = 64;
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct WorkersMarker {
+    workers: usize,
+}
+
+/// The operator-chosen pool size persisted in `data_dir`, if any. An
+/// unreadable or unparsable marker is ignored: unlike the pause marker
+/// there is nothing unsafe about falling back to the configured size.
+pub fn load_workers_override(data_dir: &std::path::Path) -> Option<usize> {
+    let raw = std::fs::read(data_dir.join(WORKERS_MARKER)).ok()?;
+    let marker: WorkersMarker = serde_json::from_slice(&raw).ok()?;
+    Some(marker.workers.clamp(1, MAX_WORKERS))
+}
+
+/// Resize the global pool at runtime and return the effective size.
+///
+/// Durable-first, like the pause marker: the new size is written to
+/// [`WORKERS_MARKER`] before it takes effect, so what the operator is told
+/// and what a restart does never diverge (the marker overrides
+/// `--content-workers` at startup). Growing spawns the missing threads;
+/// shrinking parks the surplus after their current batch — nothing in
+/// flight is interrupted, and per-source budgets still apply on top.
+pub fn resize_workers(state: &Arc<AppState>, workers: usize) -> std::io::Result<usize> {
+    let workers = workers.clamp(1, MAX_WORKERS);
+    let path = state.data_dir.join(WORKERS_MARKER);
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_vec(&WorkersMarker { workers }).expect("workers marker");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    let status = &state.content_workers;
+    status.workers.store(workers, Ordering::Relaxed);
+    let spawned = status.spawned.load(Ordering::Relaxed);
+    for i in spawned..workers {
+        let st = state.clone();
+        std::thread::Builder::new()
+            .name(format!("content-{i}"))
+            .spawn(move || worker_loop(&st, i, &format!("content-{i}")))
+            .expect("spawn content worker");
+    }
+    if workers > spawned {
+        status.spawned.store(workers, Ordering::Relaxed);
+    }
+    tracing::info!(workers, "content worker pool resized");
+    Ok(workers)
+}
 
 /// Whether a worker may claim a new batch right now.
 ///
@@ -267,12 +328,18 @@ pub fn reserve_and_claim(
         .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)
 }
 
-fn worker_loop(state: &AppState, name: &str) {
+fn worker_loop(state: &AppState, index: usize, name: &str) {
     let status = &state.content_workers;
     let limits = Limits::default();
     loop {
         if state.shutdown.load(Ordering::Relaxed) {
             return;
+        }
+        // A worker at or past the desired pool size parks: shrinking never
+        // interrupts a claimed batch, and growth reuses the parked thread.
+        if index >= status.workers.load(Ordering::Relaxed) {
+            std::thread::sleep(IDLE_SLEEP);
+            continue;
         }
         let (reservation, jobs) = match reserve_and_claim(state, name, CLAIM_BATCH) {
             Ok(Some(claimed)) => claimed,

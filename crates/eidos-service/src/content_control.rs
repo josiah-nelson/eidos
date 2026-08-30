@@ -50,6 +50,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/content/status", get(status))
         .route("/content/pause", post(pause))
         .route("/content/resume", post(resume))
+        .route("/content/workers", get(workers).post(set_workers))
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -362,6 +363,49 @@ fn set(st: &AppState, paused: bool) -> ApiResult<ContentStatusView> {
         ))
     })?;
     Ok(ApiJson(content_status(st)))
+}
+
+/// Request body for `POST /api/content/workers`.
+#[derive(Debug, Clone, Copy, serde::Deserialize, ts_rs::TS)]
+pub struct WorkersBody {
+    /// Desired global pool size; clamped to
+    /// `1..=`[`crate::content_workers::MAX_WORKERS`].
+    pub workers: u32,
+}
+
+/// The extraction worker pool as a control answer.
+#[derive(Debug, Clone, Copy, serde::Serialize, ts_rs::TS)]
+pub struct WorkersView {
+    /// Threads that may claim and extract at once, across every source.
+    /// Per-volume `content_concurrency` caps apply on top.
+    pub workers: usize,
+    /// Largest size the control accepts.
+    pub max: usize,
+}
+
+fn pool_view(st: &AppState) -> WorkersView {
+    WorkersView {
+        workers: st.content_workers.workers.load(Ordering::Relaxed),
+        max: crate::content_workers::MAX_WORKERS,
+    }
+}
+
+async fn workers(State(st): State<Arc<AppState>>) -> ApiResult<WorkersView> {
+    Ok(ApiJson(pool_view(&st)))
+}
+
+async fn set_workers(
+    State(st): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<WorkersBody>,
+) -> ApiResult<WorkersView> {
+    // Durable filesystem mutation, off the async runtime like the pause.
+    crate::api::blocking(move || {
+        crate::content_workers::resize_workers(&st, body.workers as usize).map_err(|e| {
+            ApiError::internal(format!("the worker-pool marker could not be written: {e}"))
+        })?;
+        Ok(ApiJson(pool_view(&st)))
+    })
+    .await
 }
 
 #[cfg(test)]

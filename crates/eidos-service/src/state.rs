@@ -44,6 +44,34 @@ struct StoredReconciliationDeferral {
     cause: ReconciliationDeferralCause,
 }
 
+/// `path` with `suffix` appended to the file name (`catalog.db` ->
+/// `catalog.db-wal`), which `Path::with_extension` cannot express.
+fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
+}
+
+/// Total size of the files under `dir`; unreadable entries count zero.
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
 pub struct AppState {
     /// Bounded gate in front of expensive HTTP operations.
     pub admission: Arc<crate::admission::Admission>,
@@ -59,6 +87,11 @@ pub struct AppState {
     /// [`crate::content_control`].
     pub content_pause: crate::content_control::ContentPause,
     pub content_worker_count: usize,
+    /// Resolved data directory: `catalog.db`, the index directories, and
+    /// the durable operator markers live here.
+    pub data_dir: std::path::PathBuf,
+    /// Cached on-disk footprint; recomputed lazily by [`AppState::storage`].
+    pub storage_cache: Mutex<Option<(Instant, crate::api::StorageView)>>,
     pub exec_opts: eidos_search::exec::ExecOptions,
     /// Bounds and counters for `/api/search/export`.
     pub export: crate::export::ExportLimits,
@@ -181,7 +214,10 @@ impl AppState {
             content_workers: Arc::new(crate::content_workers::ContentWorkersStatus::default()),
             content_enabled: AtomicBool::new(config.content),
             content_pause: crate::content_control::ContentPause::load(&config.data_dir),
-            content_worker_count: config.content_workers,
+            content_worker_count: crate::content_workers::load_workers_override(&config.data_dir)
+                .unwrap_or(config.content_workers),
+            data_dir: config.data_dir.clone(),
+            storage_cache: Mutex::new(None),
             exec_opts: eidos_search::exec::ExecOptions::default(),
             export: export_limits,
             export_stats: Arc::new(crate::export::ExportStats::default()),
@@ -204,6 +240,38 @@ impl AppState {
             fleet: Mutex::new(None),
         };
         Ok(state)
+    }
+
+    /// On-disk footprint of the catalog and both indexes, cached briefly so
+    /// the UI's 2-second activity poll does not walk index directories on
+    /// every call.
+    pub fn storage(&self) -> crate::api::StorageView {
+        const REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+        {
+            let cache = self.storage_cache.lock();
+            if let Some((at, view)) = *cache {
+                if at.elapsed() < REFRESH {
+                    return view;
+                }
+            }
+        }
+        let db = self.catalog.path();
+        let catalog_db_bytes = [
+            db.to_path_buf(),
+            with_suffix(db, "-wal"),
+            with_suffix(db, "-shm"),
+        ]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+        let view = crate::api::StorageView {
+            catalog_db_bytes,
+            catalog_index_bytes: dir_bytes(&self.data_dir.join("index").join("catalog")),
+            content_index_bytes: dir_bytes(&self.data_dir.join("index").join("content")),
+        };
+        *self.storage_cache.lock() = Some((Instant::now(), view));
+        view
     }
 
     /// Progress of a running (or just-finished, not yet reaped) scan.
