@@ -17,6 +17,7 @@ pub const CONFIG_FILE: &str = "config.json";
 
 /// Default port of the dedicated sync endpoint.
 pub const DEFAULT_SYNC_PORT: u16 = 7710;
+pub const MAX_BATCH_ROWS: u32 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
@@ -41,6 +42,8 @@ pub struct FleetConfig {
     /// degraded backlog.
     pub backlog_ceiling_tombstones: u64,
     /// Merkle leaf bits used for repair offers; `null` picks by source size.
+    /// The transport clamps this to 10..=17 so the complete compact manifest
+    /// fits inside the protocol's 16 MiB frame ceiling.
     pub repair_leaf_bits: Option<u8>,
 }
 
@@ -99,7 +102,7 @@ impl FleetConfig {
     pub fn max_frame(&self) -> usize {
         usize::try_from(self.max_frame_bytes)
             .unwrap_or(usize::MAX)
-            .clamp(64 * 1024, 256 * 1024 * 1024)
+            .clamp(64 * 1024, DEFAULT_MAX_FRAME_BYTES)
     }
 
     pub fn batch_bytes(&self) -> usize {
@@ -112,6 +115,10 @@ impl FleetConfig {
 
     pub fn credit_bytes(&self) -> u64 {
         self.credit_bytes.min(256 * 1024 * 1024)
+    }
+
+    pub fn batch_rows(&self) -> u32 {
+        self.batch_rows.clamp(1, MAX_BATCH_ROWS)
     }
 }
 
@@ -153,5 +160,13 @@ mod tests {
             ..FleetConfig::default()
         };
         assert_eq!(cfg.credit_bytes(), 256 * 1024 * 1024);
+
+        let cfg = FleetConfig {
+            max_frame_bytes: u64::MAX,
+            batch_rows: u32::MAX,
+            ..FleetConfig::default()
+        };
+        assert_eq!(cfg.max_frame(), DEFAULT_MAX_FRAME_BYTES);
+        assert_eq!(cfg.batch_rows(), MAX_BATCH_ROWS);
     }
 }

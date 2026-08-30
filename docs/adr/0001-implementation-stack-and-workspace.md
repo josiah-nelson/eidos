@@ -17,7 +17,7 @@ crate layout but warns against creating crates merely to mirror the diagram.
 
 | Component | Choice | Version | Notes |
 |---|---|---|---|
-| Toolchain | Rust stable, MSVC target | 1.98.0 | `rust-version = 1.85` floor |
+| Toolchain | Rust stable, MSVC target | 1.98.0 | `rust-version = 1.88` floor |
 | Async runtime | tokio | 1.53 | service coordination only; filesystem and parsing use dedicated blocking pools |
 | HTTP | axum + tower-http | 0.8 / 0.6 | tower-http 0.6 line is the one paired with axum 0.8 |
 | Catalog | rusqlite (bundled SQLite) | 0.40 | WAL, single writer, read pool |

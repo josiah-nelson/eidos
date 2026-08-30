@@ -581,11 +581,12 @@ async fn multipart_repair_commits_once_before_its_ack() {
         }
     ));
 
+    let leaf_bits = 10;
     let first = ObjectId(1);
-    let first_leaf = leaf_index(1, first);
+    let first_leaf = leaf_index(leaf_bits, first);
     let second = (2..100)
         .map(ObjectId)
-        .find(|object| leaf_index(1, *object) != first_leaf)
+        .find(|object| leaf_index(leaf_bits, *object) != first_leaf)
         .expect("objects in both leaves");
     let rows = [
         SyncRow {
@@ -602,7 +603,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
         },
     ];
     let hashes = MerkleTree::with_leaf_bits(
-        1,
+        leaf_bits,
         rows.iter()
             .map(|row| record_digest(row.object, row.generation, true)),
     )
@@ -614,7 +615,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
             epoch,
             through_seq: 2,
             through_chain,
-            leaf_bits: 1,
+            leaf_bits,
             leaf_hashes: hashes,
         },
     )
@@ -624,7 +625,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
         other => panic!("expected repair request, got {other:?}"),
     };
     assert_eq!(requested.len(), 2);
-    let first_part_leaf = leaf_index(1, rows[0].object);
+    let first_part_leaf = leaf_index(leaf_bits, rows[0].object);
     let (first_row, second_row) = if requested[0] == first_part_leaf {
         (rows[0].clone(), rows[1].clone())
     } else {
@@ -637,7 +638,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
             epoch,
             through_seq: 2,
             through_chain,
-            leaf_bits: 1,
+            leaf_bits,
             leaves: vec![requested[0]],
             rows: vec![first_row],
             final_part: false,
@@ -669,7 +670,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
             epoch,
             through_seq: 2,
             through_chain,
-            leaf_bits: 1,
+            leaf_bits,
             leaves: vec![requested[1]],
             rows: vec![second_row],
             final_part: true,
@@ -794,6 +795,19 @@ async fn unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_a
         other => panic!("{other:?}"),
     }
 
+    // Credit below one protocol-sized unit would otherwise livelock a
+    // healthy session forever without ever admitting a batch.
+    let mut s = raw_connect(node.fleet().identity(), &central).await;
+    send(
+        &mut s,
+        &session_hello(node.fleet().identity(), wire::Role::Node, 3, 1),
+    )
+    .await;
+    match recv(&mut s).await.unwrap() {
+        Message::Goodbye { reason } => assert!(reason.contains("credit"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+
     // A malformed frame from an enrolled node ends that connection only.
     let mut s = raw_connect(node.fleet().identity(), &central).await;
     send(
@@ -803,7 +817,7 @@ async fn unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_a
             name: "node-d".into(),
             platform: "windows".into(),
             role: wire::Role::Node,
-            nonce: 3,
+            nonce: 4,
             versions: vec![wire::PROTOCOL_VERSION],
             features: vec![],
             max_frame_bytes: 1 << 20,
@@ -832,7 +846,7 @@ async fn unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_a
             name: "node-d".into(),
             platform: "windows".into(),
             role: wire::Role::Node,
-            nonce: 4,
+            nonce: 5,
             versions: vec![wire::PROTOCOL_VERSION],
             features: vec![],
             max_frame_bytes: 1 << 20,

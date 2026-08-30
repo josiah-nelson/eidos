@@ -159,7 +159,7 @@ fn text_or_binary(head: &[u8], enc: Encoding) -> Sniff {
 fn looks_textual_utf16(head: &[u8], le: bool) -> bool {
     let mut ctrl = 0usize;
     let mut units = 0usize;
-    for pair in head.chunks_exact(2) {
+    for pair in head.as_chunks::<2>().0 {
         let u = if le {
             u16::from_le_bytes([pair[0], pair[1]])
         } else {

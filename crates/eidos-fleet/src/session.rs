@@ -16,7 +16,9 @@
 use crate::identity::NodeIdentity;
 use crate::metrics::FleetCounters;
 use crate::status::{Direction, SessionSourceView, SessionView, SyncRole};
-use crate::wire::{self, EnrollmentSecret, Family, Hello, Message, Role, PROTOCOL_VERSION};
+use crate::wire::{
+    self, EnrollmentSecret, Family, Hello, Message, Role, MAX_REPAIR_LEAF_BITS, PROTOCOL_VERSION,
+};
 use crate::FleetConfig;
 use anyhow::{anyhow, Context};
 use eidos_catalog::fleet::{FleetPeer, NodeId, PeerRole};
@@ -24,11 +26,11 @@ use eidos_catalog::replica::{
     BatchOutcome, HelloOutcome, RemoteNode, RemoteSourceDescriptor, RepairOfferOutcome,
     RepairOutcome,
 };
-use eidos_catalog::sync::{record_digest, SyncRow, SYNC_ROW_IMAGE_VERSION};
+use eidos_catalog::sync::{SyncRow, SYNC_ROW_IMAGE_VERSION};
 use eidos_catalog::Catalog;
 use eidos_domain::{SourceId, SourceKind, SourceState, SyncPolicy, UnixNanos};
 use eidos_sync::identity::{ChainHash, SourceEpoch};
-use eidos_sync::merkle::{leaf_index, MerkleTree, MAX_FLEET_LEAF_BITS};
+use eidos_sync::merkle::leaf_index;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +61,8 @@ const FENCE_RETRY: Duration = Duration::from_secs(60);
 /// tree; larger sources use the fleet minimum.
 const SMALL_SOURCE_ROWS: u64 = 1 << 16;
 const MIN_LEAF_BITS: u8 = 10;
+const MIN_REPAIR_ROW_ESTIMATE: usize = 256;
+const MAX_REPAIR_OBJECTS: usize = 100_000;
 
 /// The connection is identified for tie-breaking by who dialed and the
 /// random nonce that side chose; both peers know both.
@@ -332,9 +336,15 @@ where
             Err(_) => return SessionEnd::Failed("hello timed out".into()),
         };
 
-    let peer = match ctx.catalog.fleet_peer_by_fingerprint(&peer_fingerprint) {
-        Ok(peer) => peer,
-        Err(e) => return SessionEnd::Failed(format!("roster lookup: {e}")),
+    let catalog = ctx.catalog.clone();
+    let peer = match tokio::task::spawn_blocking(move || {
+        catalog.fleet_peer_by_fingerprint(&peer_fingerprint)
+    })
+    .await
+    {
+        Ok(Ok(peer)) => peer,
+        Ok(Err(e)) => return SessionEnd::Failed(format!("roster lookup: {e}")),
+        Err(e) => return SessionEnd::Failed(format!("roster lookup task: {e}")),
     };
     let peer_hello = match (first, peer) {
         (
@@ -428,6 +438,18 @@ where
                     &mut wr,
                     &Message::Goodbye {
                         reason: "peer frame limit is below the protocol minimum".into(),
+                    },
+                    max_frame,
+                    &ctx.counters,
+                )
+                .await;
+                return SessionEnd::Version;
+            }
+            if hello.credit_bytes < 64 * 1024 {
+                let _ = send(
+                    &mut wr,
+                    &Message::Goodbye {
+                        reason: "peer credit is below the protocol minimum".into(),
                     },
                     max_frame,
                     &ctx.counters,
@@ -662,7 +684,24 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
         last_seen_at: Some(UnixNanos::now()),
         last_error: None,
     };
-    let redeemed = ctx.catalog.fleet_redeem_invite_and_upsert_peer(hash, &peer);
+    let catalog = ctx.catalog.clone();
+    let redeemed = match tokio::task::spawn_blocking(move || {
+        catalog.fleet_redeem_invite_and_upsert_peer(hash, &peer)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let _ = send(
+                wr,
+                &reject("enrollment unavailable"),
+                max_frame,
+                &ctx.counters,
+            )
+            .await;
+            return SessionEnd::Failed(format!("enrollment task: {e}"));
+        }
+    };
     match redeemed {
         Ok(Some(_)) => {
             ctx.counters.add(&ctx.counters.enrollments, 1);
@@ -1171,6 +1210,17 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             .await?;
             return Ok(());
         };
+        if !(MIN_LEAF_BITS..=MAX_REPAIR_LEAF_BITS).contains(&leaf_bits)
+            || leaf_hashes.len() != 1usize << leaf_bits
+        {
+            self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+            self.send(&Message::Rejected {
+                source,
+                reason: "invalid Merkle repair shape".into(),
+            })
+            .await?;
+            return Ok(());
+        }
         let catalog = self.ctx.catalog.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             catalog.replica_repair_offer(
@@ -1580,7 +1630,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         );
         let wanted: BTreeSet<u32> = leaves.iter().copied().collect();
         if state.epoch != epoch
-            || leaf_bits > MAX_FLEET_LEAF_BITS
+            || leaf_bits > MAX_REPAIR_LEAF_BITS
             || !request_matches
             || wanted.len() != leaves.len()
             || wanted.iter().any(|leaf| *leaf >= (1u32 << leaf_bits))
@@ -1597,7 +1647,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // the batch limit; a part's leaves are complete within it, since
         // absence from a requested leaf is authoritative.
         let parts = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<RepairParts>> {
-            let (state, entries) = catalog.sync_ledger_entries(source)?;
+            let max_objects =
+                (repair_budget / MIN_REPAIR_ROW_ESTIMATE).clamp(1, MAX_REPAIR_OBJECTS);
+            let (state, objects) =
+                catalog.sync_objects_in_merkle_leaves(source, leaf_bits, &wanted, max_objects)?;
             if state.epoch.to_source_epoch() != epoch
                 || state.head_seq != through_seq
                 || state.head_chain != through_chain
@@ -1610,11 +1663,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             for leaf in &wanted {
                 by_leaf.entry(*leaf).or_default();
             }
-            for entry in entries {
-                let leaf = leaf_index(leaf_bits, entry.object);
-                if wanted.contains(&leaf) {
-                    by_leaf.entry(leaf).or_default().push(entry.object);
-                }
+            for object in objects {
+                let leaf = leaf_index(leaf_bits, object);
+                by_leaf.entry(leaf).or_default().push(object);
             }
             let mut parts: Vec<(Vec<u32>, Vec<SyncRow>)> = Vec::new();
             let mut current: (Vec<u32>, Vec<SyncRow>, usize) = (Vec::new(), Vec::new(), 0);
@@ -1747,21 +1798,16 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         let configured = self.ctx.config.read().repair_leaf_bits;
         let (state, leaf_bits, hashes) =
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                let (state, entries) = catalog.sync_ledger_entries(source)?;
+                let (_, count) = catalog.sync_ledger_state_and_count(source)?;
                 let leaf_bits = configured
-                    .unwrap_or(if (entries.len() as u64) < SMALL_SOURCE_ROWS {
+                    .unwrap_or(if count < SMALL_SOURCE_ROWS {
                         MIN_LEAF_BITS
                     } else {
                         eidos_sync::merkle::MIN_FLEET_LEAF_BITS
                     })
-                    .clamp(MIN_LEAF_BITS, MAX_FLEET_LEAF_BITS);
-                let tree = MerkleTree::with_leaf_bits(
-                    leaf_bits,
-                    entries
-                        .iter()
-                        .map(|e| record_digest(e.object, e.generation, e.deleted)),
-                );
-                Ok((state, leaf_bits, tree.leaf_hashes()))
+                    .clamp(MIN_LEAF_BITS, MAX_REPAIR_LEAF_BITS);
+                let (state, _, hashes) = catalog.sync_merkle_leaf_hashes(source, leaf_bits)?;
+                Ok((state, leaf_bits, hashes))
             })
             .await
             .context("merkle task")??;
@@ -1800,7 +1846,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         let (mut rows, bytes_cap) = {
             let cfg = self.ctx.config.read();
-            (cfg.batch_rows.max(1), cfg.batch_bytes())
+            (cfg.batch_rows(), cfg.batch_bytes())
         };
         if self.credit <= 0 {
             return Ok(());

@@ -832,10 +832,12 @@ name = "eidos-fleet"
 version = "0.5.0-dev"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "eidos-catalog",
  "eidos-domain",
  "eidos-scanner",
  "eidos-sync",
+ "fs4",
  "getrandom 0.4.3",
  "parking_lot",
  "rcgen",

@@ -33,6 +33,9 @@ pub const DEFAULT_BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// Bytes a consumer lets a shipper have in flight before it must wait for
 /// acknowledgements.
 pub const DEFAULT_CREDIT_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest leaf manifest that fits in the default frame after compact
+/// base64 serialization (2^17 hashes is about 5.4 MiB).
+pub const MAX_REPAIR_LEAF_BITS: u8 = 17;
 
 /// Which side of the fleet a peer claims to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +158,7 @@ pub enum Message {
         through_seq: u64,
         through_chain: ChainHash,
         leaf_bits: u8,
+        #[serde(with = "compact_hashes")]
         leaf_hashes: Vec<[u8; 32]>,
     },
     RepairRequest {
@@ -177,6 +181,46 @@ pub enum Message {
         rows: Vec<SyncRow>,
         final_part: bool,
     },
+}
+
+mod compact_hashes {
+    use super::MAX_REPAIR_LEAF_BITS;
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(hashes: &[[u8; 32]], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut bytes = Vec::with_capacity(hashes.len().saturating_mul(32));
+        for hash in hashes {
+            bytes.extend_from_slice(hash);
+        }
+        serializer.serialize_str(&STANDARD_NO_PAD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let bytes = STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)?;
+        let max_bytes = (1usize << MAX_REPAIR_LEAF_BITS) * 32;
+        if bytes.len() % 32 != 0 || bytes.len() > max_bytes {
+            return Err(serde::de::Error::custom(
+                "repair leaf hash block has an invalid length",
+            ));
+        }
+        bytes
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|chunk| Ok::<[u8; 32], D::Error>(*chunk))
+            .collect()
+    }
 }
 
 /// Message families, for byte accounting.
@@ -335,5 +379,21 @@ mod tests {
         };
         assert!(!format!("{message:?}").contains(secret));
         assert!(format!("{message:?}").contains("REDACTED"));
+    }
+
+    #[test]
+    fn the_largest_repair_manifest_fits_the_default_frame() {
+        let hashes = vec![[0xA5; 32]; 1usize << MAX_REPAIR_LEAF_BITS];
+        let message = Message::RepairOffer {
+            source: SourceId(1),
+            epoch: SourceEpoch::from_bytes([1; 16]),
+            through_seq: 1,
+            through_chain: [2; 32],
+            leaf_bits: MAX_REPAIR_LEAF_BITS,
+            leaf_hashes: hashes,
+        };
+        let encoded = encode(&message).unwrap();
+        assert!(encoded.len() < DEFAULT_MAX_FRAME_BYTES, "{}", encoded.len());
+        assert_eq!(decode(&encoded).unwrap(), message);
     }
 }

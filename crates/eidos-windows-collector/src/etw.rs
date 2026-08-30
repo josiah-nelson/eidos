@@ -699,14 +699,16 @@ fn decode_value(in_type: u16, length: usize, data: &[u8], pointer_size: usize) -
             if length > 0 {
                 let bytes = (length * 2).min(data.len());
                 let units: Vec<u16> = data[..bytes]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 (Field::Text(String::from_utf16_lossy(&units)), bytes)
             } else {
                 let mut units = Vec::new();
                 let mut consumed = 0;
-                for chunk in data.chunks_exact(2) {
+                for chunk in data.as_chunks::<2>().0 {
                     consumed += 2;
                     let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
                     if unit == 0 {
@@ -763,7 +765,9 @@ fn wide_string_at(buffer: &[u8], offset: usize) -> String {
         return String::new();
     }
     let units: Vec<u16> = buffer[offset..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|unit| *unit != 0)
         .collect();

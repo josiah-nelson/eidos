@@ -21,6 +21,7 @@ use eidos_catalog::Catalog;
 use eidos_domain::{SourceKind, SourceState, SyncPolicy, UnixNanos};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,11 +39,12 @@ const BACKFILL_STEP: u32 = 2_000;
 const COLLECT_LIMIT: u32 = 10_000;
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
 /// Bound all TLS work and established sessions across both directions. Each
-/// session can materialize ledgers and Merkle trees, so outbound roster size
+/// session can materialize batches and Merkle manifests, so outbound roster size
 /// must not multiply blocking work or memory without a fleet-wide ceiling.
 /// Once full, inbound connections wait in the OS backlog and outbound peers
 /// remain due for a later dial tick.
 const MAX_FLEET_SESSIONS: usize = 64;
+const INBOUND_ATTEMPTS_PER_MINUTE: usize = 20;
 
 struct Dial {
     next: Instant,
@@ -325,6 +327,7 @@ async fn accept_loop(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
             return;
         }
     };
+    let mut attempts: HashMap<std::net::IpAddr, VecDeque<Instant>> = HashMap::new();
     loop {
         let permit = match fleet.session_permits.clone().acquire_owned().await {
             Ok(permit) => permit,
@@ -339,6 +342,26 @@ async fn accept_loop(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
                 continue;
             }
         };
+        let now = Instant::now();
+        let recent = attempts.entry(addr.ip()).or_default();
+        while recent
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= Duration::from_secs(60))
+        {
+            recent.pop_front();
+        }
+        if recent.len() >= INBOUND_ATTEMPTS_PER_MINUTE {
+            drop(tcp);
+            drop(permit);
+            tracing::debug!(ip = %addr.ip(), "fleet inbound rate limit refused a connection");
+            continue;
+        }
+        recent.push_back(now);
+        attempts.retain(|_, entries| {
+            entries
+                .back()
+                .is_some_and(|attempt| now.duration_since(*attempt) < Duration::from_secs(60))
+        });
         let fleet = fleet.clone();
         let config = config.clone();
         tokio::spawn(async move {
@@ -384,10 +407,15 @@ async fn dial_loop(fleet: Arc<Fleet>) {
                 Duration::from_secs(cfg.reconnect_max_secs.max(2)),
             )
         };
-        let peers = match fleet.ctx.catalog.fleet_peers() {
-            Ok(p) => p,
-            Err(e) => {
+        let catalog = fleet.ctx.catalog.clone();
+        let peers = match tokio::task::spawn_blocking(move || catalog.fleet_peers()).await {
+            Ok(Ok(peers)) => peers,
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "fleet roster unreadable");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "fleet roster task failed");
                 continue;
             }
         };

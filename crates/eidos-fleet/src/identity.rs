@@ -13,8 +13,10 @@
 use anyhow::{anyhow, Context};
 use eidos_catalog::fleet::NodeId;
 use eidos_domain::UnixNanos;
+use fs4::fs_std::FileExt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// DNS name placed in every certificate's subject alternative names. Pinning
@@ -25,6 +27,7 @@ const FLEET_DIR: &str = "fleet";
 const CERT_FILE: &str = "node.crt";
 const KEY_FILE: &str = "node.key";
 const IDENTITY_FILE: &str = "identity.json";
+const LOCK_FILE: &str = "identity.lock";
 
 /// Certificate fingerprint: SHA-256 over the DER encoding.
 pub fn fingerprint_of(cert_der: &[u8]) -> [u8; 32] {
@@ -96,7 +99,9 @@ impl NodeIdentity {
     /// Whether an identity has been generated under `data_dir`.
     pub fn exists(data_dir: &Path) -> bool {
         let dir = Self::fleet_dir(data_dir);
-        dir.join(CERT_FILE).is_file() && dir.join(KEY_FILE).is_file()
+        dir.join(CERT_FILE).is_file()
+            && dir.join(KEY_FILE).is_file()
+            && dir.join(IDENTITY_FILE).is_file()
     }
 
     /// Load the identity, generating one on first use. `name` is used only
@@ -104,11 +109,12 @@ impl NodeIdentity {
     /// with until [`NodeIdentity::rename`].
     pub fn load_or_create(data_dir: &Path, name: &str) -> anyhow::Result<Self> {
         let dir = Self::fleet_dir(data_dir);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        restrict_dir(&dir)?;
+        let _lock = lock_identity_dir(&dir)?;
         if Self::exists(data_dir) {
             return Self::load(&dir);
         }
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        restrict_dir(&dir)?;
         let certified = rcgen::generate_simple_self_signed(vec![TLS_SERVER_NAME.to_string()])
             .map_err(|e| anyhow!("generating the node certificate: {e}"))?;
         let cert_der = certified.cert.der().to_vec();
@@ -117,11 +123,20 @@ impl NodeIdentity {
             name: name.to_string(),
             created_at: UnixNanos::now(),
         };
-        // Key first, then certificate, then the record: a crash between them
-        // leaves a directory `exists` says is incomplete and regenerates.
-        write_private(&dir.join(KEY_FILE), &key_der)?;
-        std::fs::write(dir.join(CERT_FILE), &cert_der)?;
-        std::fs::write(dir.join(IDENTITY_FILE), serde_json::to_vec_pretty(&record)?)?;
+        // Publish the record last. A crash before then leaves an incomplete
+        // identity that the next lock holder replaces as one unit.
+        let key_tmp = dir.join(format!("{KEY_FILE}.tmp"));
+        let cert_tmp = dir.join(format!("{CERT_FILE}.tmp"));
+        let record_tmp = dir.join(format!("{IDENTITY_FILE}.tmp"));
+        remove_if_present(&key_tmp)?;
+        remove_if_present(&cert_tmp)?;
+        remove_if_present(&record_tmp)?;
+        write_private(&key_tmp, &key_der)?;
+        write_synced(&cert_tmp, &cert_der)?;
+        write_synced(&record_tmp, &serde_json::to_vec_pretty(&record)?)?;
+        replace_file(&key_tmp, &dir.join(KEY_FILE))?;
+        replace_file(&cert_tmp, &dir.join(CERT_FILE))?;
+        replace_file(&record_tmp, &dir.join(IDENTITY_FILE))?;
         Self::load(&dir)
     }
 
@@ -135,13 +150,17 @@ impl NodeIdentity {
             .with_context(|| format!("reading {}", dir.join(CERT_FILE).display()))?;
         let key_der = std::fs::read(dir.join(KEY_FILE))
             .with_context(|| format!("reading {}", dir.join(KEY_FILE).display()))?;
-        let record: IdentityRecord = std::fs::read(dir.join(IDENTITY_FILE))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_else(|| IdentityRecord {
-                name: eidos_domain::bench::hostname(),
-                created_at: UnixNanos::now(),
-            });
+        let record_bytes = std::fs::read(dir.join(IDENTITY_FILE))
+            .with_context(|| format!("reading {}", dir.join(IDENTITY_FILE).display()))?;
+        let record: IdentityRecord = serde_json::from_slice(&record_bytes)
+            .with_context(|| format!("parsing {}", dir.join(IDENTITY_FILE).display()))?;
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert_der.clone())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.clone())),
+            )
+            .context("fleet identity certificate and private key do not match")?;
         let fingerprint = fingerprint_of(&cert_der);
         Ok(Self {
             node_id: node_id_of(&fingerprint),
@@ -154,14 +173,16 @@ impl NodeIdentity {
     }
 
     pub fn rename(&mut self, data_dir: &Path, name: &str) -> anyhow::Result<()> {
+        let dir = Self::fleet_dir(data_dir);
+        let _lock = lock_identity_dir(&dir)?;
         let record = IdentityRecord {
             name: name.to_string(),
             created_at: self.created_at,
         };
-        std::fs::write(
-            Self::fleet_dir(data_dir).join(IDENTITY_FILE),
-            serde_json::to_vec_pretty(&record)?,
-        )?;
+        let tmp = dir.join(format!("{IDENTITY_FILE}.tmp"));
+        remove_if_present(&tmp)?;
+        write_synced(&tmp, &serde_json::to_vec_pretty(&record)?)?;
+        replace_file(&tmp, &dir.join(IDENTITY_FILE))?;
         self.name = name.to_string();
         Ok(())
     }
@@ -182,7 +203,6 @@ impl NodeIdentity {
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -196,9 +216,48 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, bytes)?;
+        write_synced(path, bytes)?;
         Ok(())
     }
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+fn replace_file(from: &Path, to: &Path) -> anyhow::Result<()> {
+    remove_if_present(to)?;
+    std::fs::rename(from, to)
+        .with_context(|| format!("publishing {} as {}", from.display(), to.display()))
+}
+
+fn lock_identity_dir(dir: &Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = dir.join(LOCK_FILE);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    Ok(lock)
 }
 
 /// Keep the key directory to SYSTEM, Administrators and the account that
@@ -359,6 +418,49 @@ mod tests {
             NodeIdentity::load_or_create(tempfile::tempdir().unwrap().path(), "beta").unwrap();
         assert_ne!(a.node_id, other.node_id);
         assert!(!format!("{a:?}").contains("key"));
+    }
+
+    #[test]
+    fn concurrent_creation_publishes_one_key_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    NodeIdentity::load_or_create(&path, &format!("node-{i}"))
+                        .unwrap()
+                        .fingerprint
+                })
+            })
+            .collect();
+        let fingerprints: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(fingerprints
+            .iter()
+            .all(|fingerprint| *fingerprint == fingerprints[0]));
+    }
+
+    #[test]
+    fn a_mismatched_certificate_and_key_are_refused() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        NodeIdentity::load_or_create(first.path(), "first").unwrap();
+        NodeIdentity::load_or_create(second.path(), "second").unwrap();
+        std::fs::copy(
+            NodeIdentity::fleet_dir(second.path()).join(KEY_FILE),
+            NodeIdentity::fleet_dir(first.path()).join(KEY_FILE),
+        )
+        .unwrap();
+        let error = NodeIdentity::load_or_create(first.path(), "ignored")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("do not match"), "{error}");
     }
 
     #[test]

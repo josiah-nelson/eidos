@@ -3916,6 +3916,13 @@ fn a_compacted_new_epoch_can_install_its_first_snapshot_by_repair() {
             )
         }),
     );
+    let (hashed_state, hashed_count, streamed_hashes) = node
+        .catalog
+        .sync_merkle_leaf_hashes(node.source, leaf_bits)
+        .unwrap();
+    assert_eq!(hashed_state, state);
+    assert_eq!(hashed_count, entries.len() as u64);
+    assert_eq!(streamed_hashes, tree.leaf_hashes());
     let request = central
         .catalog
         .replica_repair_offer(
@@ -4862,6 +4869,57 @@ fn one_certificate_fingerprint_cannot_enroll_as_two_node_ids() {
             .node_id,
         first.node_id
     );
+}
+
+#[test]
+fn a_lost_enrollment_response_can_retry_only_the_committed_roster_entry() {
+    let central = Central::new();
+    let token_hash = [0x42; 32];
+    central
+        .catalog
+        .fleet_add_invite(
+            token_hash,
+            Some("enrolled-name"),
+            UnixNanos(UnixNanos::now().0 + 60_000_000_000),
+        )
+        .unwrap();
+    let peer = FleetPeer {
+        node_id: NodeId(NODE),
+        name: "fallback".into(),
+        role: PeerRole::Node,
+        fingerprint: [0x24; 32],
+        endpoint: None,
+        enabled: true,
+        enrolled_at: UnixNanos::now(),
+        last_seen_at: None,
+        last_error: None,
+    };
+    assert!(central
+        .catalog
+        .fleet_redeem_invite_and_upsert_peer(token_hash, &peer)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        central
+            .catalog
+            .fleet_peer(peer.node_id)
+            .unwrap()
+            .unwrap()
+            .name,
+        "enrolled-name"
+    );
+    assert!(central
+        .catalog
+        .fleet_redeem_invite_and_upsert_peer(token_hash, &peer)
+        .unwrap()
+        .is_some());
+
+    central.catalog.fleet_remove_peer(peer.node_id).unwrap();
+    assert!(central
+        .catalog
+        .fleet_redeem_invite_and_upsert_peer(token_hash, &peer)
+        .unwrap()
+        .is_none());
 }
 
 #[test]

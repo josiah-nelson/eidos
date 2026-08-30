@@ -387,10 +387,8 @@ impl Catalog {
                  WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
                 params![token_hash.as_slice(), now, peer.node_id.0.as_slice()],
             )?;
-            let invite = if n == 0 {
-                None
-            } else {
-                let invite = tx.query_row(
+            let invite = tx
+                .query_row(
                     "SELECT token_hash, name_hint, created_at, expires_at, used_at, used_by
                      FROM fleet_invites WHERE token_hash = ?1",
                     params![token_hash.as_slice()],
@@ -404,24 +402,49 @@ impl Catalog {
                             r.get::<_, Option<Vec<u8>>>(5)?,
                         ))
                     },
-                )?;
-                let invite = FleetInvite {
-                    token_hash: blob32(invite.0, "invite hash")?,
-                    name_hint: invite.1,
-                    created_at: UnixNanos(invite.2),
-                    expires_at: UnixNanos(invite.3),
-                    used_at: invite.4.map(UnixNanos),
-                    used_by: invite
-                        .5
-                        .map(|b| blob16(b, "invite node id").map(NodeId))
-                        .transpose()?,
-                };
+                )
+                .optional()?
+                .map(|invite| {
+                    Ok::<_, CatalogError>(FleetInvite {
+                        token_hash: blob32(invite.0, "invite hash")?,
+                        name_hint: invite.1,
+                        created_at: UnixNanos(invite.2),
+                        expires_at: UnixNanos(invite.3),
+                        used_at: invite.4.map(UnixNanos),
+                        used_by: invite
+                            .5
+                            .map(|b| blob16(b, "invite node id").map(NodeId))
+                            .transpose()?,
+                    })
+                })
+                .transpose()?;
+            let retry_of_committed_enrollment = if n == 0 {
+                invite
+                    .as_ref()
+                    .is_some_and(|invite| invite.used_by == Some(peer.node_id))
+                    && peer_conn(&tx, peer.node_id)?.is_some_and(|enrolled| {
+                        enrolled.enabled
+                            && enrolled.role == PeerRole::Node
+                            && enrolled.fingerprint == peer.fingerprint
+                    })
+            } else {
+                false
+            };
+            let invite = if n > 0 {
+                let invite = invite.expect("an updated invitation row still exists");
                 let mut enrolled = peer.clone();
                 if let Some(hint) = invite.name_hint.as_deref().filter(|hint| !hint.is_empty()) {
                     enrolled.name = hint.to_string();
                 }
                 upsert_peer_conn(&tx, &enrolled)?;
                 Some(invite)
+            } else if retry_of_committed_enrollment {
+                // The response to the first redemption may have been lost.
+                // Replaying the same secret is safe only while the exact,
+                // enabled roster entry created by that transaction remains.
+                invite
+            } else {
+                None
             };
             tx.commit()?;
             Ok(invite)
