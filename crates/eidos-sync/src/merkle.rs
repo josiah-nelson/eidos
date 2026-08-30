@@ -13,6 +13,14 @@ use thiserror::Error;
 pub const MIN_FLEET_LEAF_BITS: u8 = 17;
 pub const MAX_FLEET_LEAF_BITS: u8 = 20;
 
+/// Leaf an object hashes into in a tree of `1 << leaf_bits` leaves. A pure
+/// function of the object id, so peers agree without exchanging a tree.
+pub fn leaf_index(leaf_bits: u8, object: ObjectId) -> u32 {
+    let hash = blake3::hash(&object.raw().to_le_bytes());
+    let first = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("eight bytes"));
+    (first & ((1u64 << leaf_bits) - 1)) as u32
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordDigest {
     pub object: ObjectId,
@@ -193,9 +201,7 @@ impl MerkleTree {
     }
 
     fn leaf_for(&self, object: ObjectId) -> u32 {
-        let hash = blake3::hash(&object.raw().to_le_bytes());
-        let first = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("eight bytes"));
-        (first & (self.leaf_count as u64 - 1)) as u32
+        leaf_index(self.leaf_bits, object)
     }
 
     fn hash_leaf<'a>(records: impl IntoIterator<Item = &'a RecordDigest>) -> [u8; 32] {

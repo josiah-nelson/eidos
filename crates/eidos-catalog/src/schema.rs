@@ -447,6 +447,99 @@ ALTER TABLE volumes ADD COLUMN case_sensitive TEXT NOT NULL DEFAULT 'unknown';
 ALTER TABLE volumes ADD COLUMN native_feed TEXT NOT NULL DEFAULT 'none';
 "#,
     ),
+    (
+        "fleet: history chain, node roster, central replica (ADR-0023)",
+        r#"
+-- History chain over each source epoch's sequence (eidos-sync identity):
+-- chain(0) is all zeros and chain(n) = blake3(chain(n-1) || object ||
+-- generation || live-or-tombstone). A batch carries the chain at both ends
+-- of its interval so a consumer can fence a source restored to an older
+-- state that has since overtaken the cursor. Retained from
+-- `compacted_through` to the head; pruned by the collection pass.
+ALTER TABLE sync_sources ADD COLUMN head_chain BLOB NOT NULL
+    DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000';
+CREATE TABLE sync_chain (
+    source_id INTEGER NOT NULL,
+    seq       INTEGER NOT NULL,
+    chain     BLOB NOT NULL,
+    PRIMARY KEY (source_id, seq)
+) WITHOUT ROWID;
+INSERT INTO sync_chain (source_id, seq, chain)
+    SELECT source_id, 0, X'0000000000000000000000000000000000000000000000000000000000000000'
+    FROM sync_sources;
+-- When the touch happened, so backlog age can be reported per consumer.
+ALTER TABLE sync_rows ADD COLUMN touched_at INTEGER NOT NULL DEFAULT 0;
+
+-- Enrollment makes every eligible source replicate by default; a source may
+-- opt out. `inherit` follows the node's enrollment, `local_only` never ships.
+ALTER TABLE sources ADD COLUMN sync_policy TEXT NOT NULL DEFAULT 'inherit';
+
+-- Peers this installation trusts: the roster of enrolled nodes on a
+-- central, or the single central on an enrolled node. `fingerprint` is the
+-- SHA-256 of the peer's certificate public key; `node_id` is derived from it.
+CREATE TABLE fleet_peers (
+    node_id      BLOB PRIMARY KEY,
+    name         TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    fingerprint  BLOB NOT NULL,
+    endpoint     TEXT,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    enrolled_at  INTEGER NOT NULL,
+    last_seen_at INTEGER,
+    last_error   TEXT
+) WITHOUT ROWID;
+-- Single-use enrollment invitations minted by a central. Only the hash of
+-- the secret is stored.
+CREATE TABLE fleet_invites (
+    token_hash BLOB PRIMARY KEY,
+    name_hint  TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at    INTEGER,
+    used_by    BLOB
+) WITHOUT ROWID;
+
+-- A replicated source is an ordinary `sources` row (kind `remote`) whose
+-- objects and entries are applied from a peer's materialized batches, so
+-- projection, search and browse treat it like any other source. This table
+-- binds it to its origin and holds the durable admission cursor (epoch,
+-- applied sequence, chain) that commits in the same transaction as the
+-- effects it certifies.
+CREATE TABLE sync_replica_sources (
+    source_id          INTEGER PRIMARY KEY,
+    node_id            BLOB NOT NULL,
+    remote_source_id   INTEGER NOT NULL,
+    admission          TEXT NOT NULL,
+    resync_target      INTEGER,
+    reported_head      INTEGER NOT NULL DEFAULT 0,
+    reported_compacted INTEGER NOT NULL DEFAULT 0,
+    reported_at        INTEGER,
+    applied_at         INTEGER,
+    image_version      INTEGER NOT NULL DEFAULT 1,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    UNIQUE (node_id, remote_source_id)
+);
+-- One row per remote object the replica knows: its local object id, the
+-- epoch and sequence it was last applied at, and whether that application
+-- was a tombstone. `placeholder` marks a local object allocated because a
+-- child arrived before its parent; it is cleared when the parent's own row
+-- is applied.
+CREATE TABLE sync_replica_rows (
+    source_id        INTEGER NOT NULL,
+    remote_object_id INTEGER NOT NULL,
+    local_object_id  INTEGER NOT NULL,
+    epoch            BLOB NOT NULL,
+    seq              INTEGER NOT NULL,
+    generation       INTEGER NOT NULL,
+    deleted          INTEGER NOT NULL DEFAULT 0,
+    placeholder      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (source_id, remote_object_id)
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX sync_replica_rows_local ON sync_replica_rows (local_object_id);
+CREATE INDEX sync_replica_rows_epoch ON sync_replica_rows (source_id, epoch);
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.

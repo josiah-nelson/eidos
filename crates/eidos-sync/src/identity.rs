@@ -291,6 +291,11 @@ impl AdmissionState {
         }
     }
 
+    /// The epoch a full resync was requested for and not yet delivered.
+    pub fn pending_epoch(&self) -> Option<SourceEpoch> {
+        self.pending_epoch
+    }
+
     pub fn admit_hello(&mut self, epoch: SourceEpoch, source_head: u64) -> HelloDecision {
         if self.retired_epochs.contains(&epoch) {
             return HelloDecision::RejectEpochAndAlarm {

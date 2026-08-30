@@ -23,6 +23,9 @@
 use crate::model::{ObjectRecord, OBJECT_COLUMNS};
 use crate::{Catalog, CatalogError, Result};
 use eidos_domain::{ObjectId, SourceId, UnixNanos};
+use eidos_sync::identity::{chain_next, SourceEpoch};
+pub use eidos_sync::identity::{ChainHash, CHAIN_GENESIS};
+use eidos_sync::merkle::RecordDigest;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -30,12 +33,65 @@ use std::fmt;
 /// Version of the row image produced by [`Catalog::sync_rows_after`].
 pub const SYNC_ROW_IMAGE_VERSION: u32 = 1;
 
+/// The history chain hashes touches, not images: the sequence of
+/// `(object, generation, live-or-tombstone)` a source minted. Two
+/// incarnations that stamped the same touches in the same order share a
+/// chain, which is exactly when their histories are interchangeable; a
+/// source restored to an older state and edited again diverges at the first
+/// differing touch. The image itself is materialized at ship time and is
+/// not part of the chain (ADR-0023).
+fn chain_after(
+    previous: &ChainHash,
+    object: ObjectId,
+    generation: u64,
+    deleted: bool,
+) -> ChainHash {
+    chain_next(
+        previous,
+        object.0,
+        generation,
+        if deleted { None } else { Some(&[]) },
+    )
+}
+
+/// The Merkle record of one ledger row, computed identically on the source
+/// and on a replica so divergent leaves can be found without images.
+pub fn record_digest(object: ObjectId, generation: u64, deleted: bool) -> RecordDigest {
+    RecordDigest::from_value(object, generation, if deleted { None } else { Some(&[]) })
+}
+
+/// One `(object, generation, deleted)` triple of a source's retained rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncLedgerEntry {
+    pub object: ObjectId,
+    pub seq: u64,
+    pub generation: u64,
+    pub deleted: bool,
+}
+
+/// Rows and age a consumer has not acknowledged yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SyncBacklog {
+    pub rows: u64,
+    pub tombstones: u64,
+    /// Oldest unacknowledged touch, when there is one.
+    pub oldest_touched_at: Option<UnixNanos>,
+}
+
 /// Sixteen-byte source incarnation token. Consumers key their cursor to it;
 /// a different epoch means "full snapshot, not resume".
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SyncEpoch(pub [u8; 16]);
 
 impl SyncEpoch {
+    pub fn to_source_epoch(self) -> SourceEpoch {
+        SourceEpoch::from_bytes(self.0)
+    }
+
+    pub fn from_source_epoch(epoch: SourceEpoch) -> Self {
+        Self(epoch.as_bytes())
+    }
+
     fn mint() -> Result<Self> {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes)
@@ -72,6 +128,8 @@ pub struct SyncSourceState {
     pub epoch: SyncEpoch,
     /// Highest sequence minted for this epoch.
     pub head_seq: u64,
+    /// History chain hash at `head_seq`.
+    pub head_chain: ChainHash,
     /// Deletion rows at or below this sequence may have been collected; a
     /// consumer whose cursor is below it must take the repair path.
     pub compacted_through: u64,
@@ -125,7 +183,11 @@ pub struct SyncBatch {
     pub source_id: SourceId,
     pub epoch: SyncEpoch,
     pub after_seq: u64,
+    /// History chain at `after_seq`; the consumer applies the batch only if
+    /// this equals the chain it certified for its own cursor.
+    pub after_chain: ChainHash,
     pub through_seq: u64,
+    pub through_chain: ChainHash,
     /// Head at the time of the read; `through_seq < head_seq` means the
     /// batch was cut by `limit` and more rows follow.
     pub head_seq: u64,
@@ -157,9 +219,14 @@ fn epoch_from_blob(blob: Vec<u8>) -> Result<SyncEpoch> {
     Ok(SyncEpoch(bytes))
 }
 
+fn chain_from_blob(blob: Vec<u8>) -> Result<ChainHash> {
+    blob.try_into()
+        .map_err(|_| CatalogError::InvalidState("sync chain hash is not 32 bytes".into()))
+}
+
 fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncSourceState>> {
     conn.query_row(
-        "SELECT epoch, head_seq, compacted_through, journal_id, ready, backfill_after
+        "SELECT epoch, head_seq, compacted_through, journal_id, ready, backfill_after, head_chain
          FROM sync_sources WHERE source_id = ?1",
         params![source.0],
         |r| {
@@ -170,15 +237,17 @@ fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncS
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
+                r.get::<_, Vec<u8>>(6)?,
             ))
         },
     )
     .optional()?
-    .map(|(epoch, head, compacted, journal, ready, after)| {
+    .map(|(epoch, head, compacted, journal, ready, after, chain)| {
         Ok(SyncSourceState {
             source_id: source,
             epoch: epoch_from_blob(epoch)?,
             head_seq: head as u64,
+            head_chain: chain_from_blob(chain)?,
             compacted_through: compacted as u64,
             journal_id: journal,
             ready: ready != 0,
@@ -188,36 +257,78 @@ fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncS
     .transpose()
 }
 
-/// Mint the next sequence for a source. `None` when the source is not
-/// sync-enabled, which makes every stamping site a cheap no-op there.
-fn next_seq_conn(conn: &Connection, source: SourceId) -> Result<Option<i64>> {
-    Ok(conn
-        .prepare_cached(
-            "UPDATE sync_sources SET head_seq = head_seq + 1, updated_at = ?2
-             WHERE source_id = ?1 RETURNING head_seq",
-        )?
-        .query_row(params![source.0, UnixNanos::now().0], |r| {
-            r.get::<_, i64>(0)
+/// Head sequence and chain of a sync-enabled source, or `None` when the
+/// source is not sync-enabled (which makes every stamping site a cheap
+/// no-op there).
+fn head_conn(conn: &Connection, source: SourceId) -> Result<Option<(i64, ChainHash)>> {
+    conn.prepare_cached("SELECT head_seq, head_chain FROM sync_sources WHERE source_id = ?1")?
+        .query_row(params![source.0], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
         })
-        .optional()?)
+        .optional()?
+        .map(|(seq, chain)| Ok((seq, chain_from_blob(chain)?)))
+        .transpose()
+}
+
+fn set_head_conn(conn: &Connection, source: SourceId, seq: i64, chain: &ChainHash) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE sync_sources SET head_seq = ?2, head_chain = ?3, updated_at = ?4 WHERE source_id = ?1",
+    )?
+    .execute(params![source.0, seq, chain.as_slice(), UnixNanos::now().0])?;
+    Ok(())
+}
+
+fn insert_chain_conn(
+    conn: &Connection,
+    source: SourceId,
+    seq: i64,
+    chain: &ChainHash,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO sync_chain (source_id, seq, chain) VALUES (?1, ?2, ?3)
+         ON CONFLICT(source_id, seq) DO UPDATE SET chain = excluded.chain",
+    )?
+    .execute(params![source.0, seq, chain.as_slice()])?;
+    Ok(())
 }
 
 /// Stamp one object with the next sequence. Generation and deletion state
 /// are read from the object row, so callers stamp after their own update.
 pub(crate) fn touch_conn(conn: &Connection, source: SourceId, object: ObjectId) -> Result<bool> {
-    let Some(seq) = next_seq_conn(conn, source)? else {
+    let Some((head, head_chain)) = head_conn(conn, source)? else {
         return Ok(false);
     };
-    let n = conn
+    let Some((generation, deleted)) = conn
         .prepare_cached(
-            "INSERT INTO sync_rows (source_id, object_id, seq, generation, deleted)
-             SELECT ?1, object_id, ?3, generation, deleted_at IS NOT NULL
-             FROM objects WHERE object_id = ?2 AND source_id = ?1
-             ON CONFLICT(source_id, object_id) DO UPDATE SET
-                seq = excluded.seq, generation = excluded.generation, deleted = excluded.deleted",
+            "SELECT generation, deleted_at IS NOT NULL FROM objects WHERE object_id = ?2 AND source_id = ?1",
         )?
-        .execute(params![source.0, object.0, seq])?;
-    Ok(n > 0)
+        .query_row(params![source.0, object.0], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0))
+        })
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let seq = head + 1;
+    let chain = chain_after(&head_chain, object, generation as u64, deleted);
+    conn.prepare_cached(
+        "INSERT INTO sync_rows (source_id, object_id, seq, generation, deleted, touched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(source_id, object_id) DO UPDATE SET
+            seq = excluded.seq, generation = excluded.generation, deleted = excluded.deleted,
+            touched_at = excluded.touched_at",
+    )?
+    .execute(params![
+        source.0,
+        object.0,
+        seq,
+        generation,
+        deleted as i64,
+        UnixNanos::now().0
+    ])?;
+    insert_chain_conn(conn, source, seq, &chain)?;
+    set_head_conn(conn, source, seq, &chain)?;
+    Ok(true)
 }
 
 /// Stamp a container and every object it owns (archive members). For a
@@ -248,10 +359,10 @@ fn touch_set_conn(
     predicate: &str,
     args: &[i64],
 ) -> Result<u64> {
-    if source_state_conn(conn, source)?.is_none() {
+    let Some((head, head_chain)) = head_conn(conn, source)? else {
         return Ok(0);
-    }
-    let mut bound: Vec<i64> = Vec::with_capacity(args.len() + 2);
+    };
+    let mut bound: Vec<i64> = Vec::with_capacity(args.len() + 3);
     bound.push(source.0);
     bound.extend_from_slice(args);
     let count: i64 = conn.query_row(
@@ -262,25 +373,44 @@ fn touch_set_conn(
     if count == 0 {
         return Ok(0);
     }
-    let base: i64 = conn.query_row(
-        "UPDATE sync_sources SET head_seq = head_seq + ?2, updated_at = ?3
-         WHERE source_id = ?1 RETURNING head_seq - ?2",
-        params![source.0, count, UnixNanos::now().0],
-        |r| r.get(0),
-    )?;
+    let base = head;
+    let now = UnixNanos::now().0;
     let base_param = bound.len() + 1;
     bound.push(base);
+    let now_param = bound.len() + 1;
+    bound.push(now);
     let n = conn.execute(
         &format!(
-            "INSERT INTO sync_rows (source_id, object_id, seq, generation, deleted)
+            "INSERT INTO sync_rows (source_id, object_id, seq, generation, deleted, touched_at)
              SELECT ?1, object_id, ?{base_param} + ROW_NUMBER() OVER (ORDER BY object_id), generation,
-                    deleted_at IS NOT NULL
+                    deleted_at IS NOT NULL, ?{now_param}
              FROM objects WHERE source_id = ?1 AND {predicate}
              ON CONFLICT(source_id, object_id) DO UPDATE SET
-                seq = excluded.seq, generation = excluded.generation, deleted = excluded.deleted"
+                seq = excluded.seq, generation = excluded.generation, deleted = excluded.deleted,
+                touched_at = excluded.touched_at"
         ),
         rusqlite::params_from_iter(bound.iter()),
     )?;
+    // The chain is sequential by definition, so the rows just minted are
+    // walked once in sequence order to extend it.
+    let minted: Vec<(i64, i64, i64, bool)> = conn
+        .prepare_cached(
+            "SELECT seq, object_id, generation, deleted FROM sync_rows
+             WHERE source_id = ?1 AND seq > ?2 ORDER BY seq",
+        )?
+        .query_map(params![source.0, base], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut chain = head_chain;
+    let mut last_seq = base;
+    for (seq, object, generation, deleted) in minted {
+        chain = chain_after(&chain, ObjectId(object), generation as u64, deleted);
+        insert_chain_conn(conn, source, seq, &chain)?;
+        last_seq = seq;
+    }
+    debug_assert_eq!(last_seq, base + count);
+    set_head_conn(conn, source, last_seq, &chain)?;
     Ok(n as u64)
 }
 
@@ -308,6 +438,53 @@ fn entries_conn(conn: &Connection, object: ObjectId) -> Result<Vec<SyncEntryImag
             })
         })?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+fn chain_at_conn(conn: &Connection, source: SourceId, seq: u64) -> Result<Option<ChainHash>> {
+    conn.prepare_cached("SELECT chain FROM sync_chain WHERE source_id = ?1 AND seq = ?2")?
+        .query_row(params![source.0, seq as i64], |r| r.get::<_, Vec<u8>>(0))
+        .optional()?
+        .map(chain_from_blob)
+        .transpose()
+}
+
+/// Materialize `(seq, object, generation, deleted)` ledger rows into their
+/// versioned images from the live catalog tables, inside the caller's
+/// snapshot.
+fn materialize_conn(
+    conn: &Connection,
+    touched: Vec<(i64, i64, i64, bool)>,
+) -> Result<Vec<SyncRow>> {
+    let mut rows = Vec::with_capacity(touched.len());
+    let mut object_stmt = conn.prepare_cached(&format!(
+        "SELECT {OBJECT_COLUMNS}, o.archive_container_id FROM objects o WHERE o.object_id = ?1"
+    ))?;
+    for (seq, object_id, generation, deleted) in touched {
+        let object = ObjectId(object_id);
+        let image = if deleted {
+            None
+        } else {
+            let (record, container) = object_stmt.query_row(params![object_id], |r| {
+                Ok((
+                    ObjectRecord::from_row_at(r, 0)?,
+                    r.get::<_, Option<i64>>(22)?.map(ObjectId),
+                ))
+            })?;
+            Some(SyncRowImage {
+                version: SYNC_ROW_IMAGE_VERSION,
+                entries: entries_conn(conn, object)?,
+                object: record,
+                archive_container: container,
+            })
+        };
+        rows.push(SyncRow {
+            seq: seq as u64,
+            object,
+            generation: generation as u64,
+            image,
+        });
+    }
+    Ok(rows)
 }
 
 fn floor_conn(conn: &Connection, source: SourceId, head: u64) -> Result<u64> {
@@ -354,14 +531,26 @@ impl Catalog {
                 params![source.0],
             )?;
             tx.execute(
-                "INSERT INTO sync_sources (source_id, epoch, head_seq, compacted_through, journal_id,
-                    backfill_after, ready, created_at, updated_at)
-                 VALUES (?1, ?2, 0, 0, ?3, 0, 0, ?4, ?4)
-                 ON CONFLICT(source_id) DO UPDATE SET epoch = excluded.epoch, head_seq = 0,
-                    compacted_through = 0, journal_id = excluded.journal_id, backfill_after = 0,
-                    ready = 0, updated_at = excluded.updated_at",
-                params![source.0, epoch.0.as_slice(), journal_id, now],
+                "DELETE FROM sync_chain WHERE source_id = ?1",
+                params![source.0],
             )?;
+            tx.execute(
+                "INSERT INTO sync_sources (source_id, epoch, head_seq, head_chain, compacted_through,
+                    journal_id, backfill_after, ready, created_at, updated_at)
+                 VALUES (?1, ?2, 0, ?5, 0, ?3, 0, 0, ?4, ?4)
+                 ON CONFLICT(source_id) DO UPDATE SET epoch = excluded.epoch, head_seq = 0,
+                    head_chain = excluded.head_chain, compacted_through = 0,
+                    journal_id = excluded.journal_id, backfill_after = 0,
+                    ready = 0, updated_at = excluded.updated_at",
+                params![
+                    source.0,
+                    epoch.0.as_slice(),
+                    journal_id,
+                    now,
+                    CHAIN_GENESIS.as_slice()
+                ],
+            )?;
+            insert_chain_conn(&tx, source, 0, &CHAIN_GENESIS)?;
             let state = source_state_conn(&tx, source)?.expect("just inserted");
             tx.commit()?;
             Ok(state)
@@ -378,6 +567,10 @@ impl Catalog {
             )?;
             tx.execute(
                 "DELETE FROM sync_consumers WHERE source_id = ?1",
+                params![source.0],
+            )?;
+            tx.execute(
+                "DELETE FROM sync_chain WHERE source_id = ?1",
                 params![source.0],
             )?;
             let n = tx.execute(
@@ -497,59 +690,143 @@ impl Catalog {
                      WHERE source_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
                 )?
                 .query_map(params![source.0, after_seq as i64, limit as i64], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get::<_, i64>(3)? != 0,
-                    ))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
-            let mut rows = Vec::with_capacity(touched.len());
-            {
-                let mut object_stmt = tx.prepare_cached(&format!(
-                    "SELECT {OBJECT_COLUMNS}, o.archive_container_id FROM objects o WHERE o.object_id = ?1"
-                ))?;
-                for (seq, object_id, generation, deleted) in touched {
-                    let object = ObjectId(object_id);
-                    let image = if deleted {
-                        None
-                    } else {
-                        let (record, container) =
-                            object_stmt.query_row(params![object_id], |r| {
-                                Ok((
-                                    ObjectRecord::from_row_at(r, 0)?,
-                                    r.get::<_, Option<i64>>(22)?.map(ObjectId),
-                                ))
-                            })?;
-                        Some(SyncRowImage {
-                            version: SYNC_ROW_IMAGE_VERSION,
-                            entries: entries_conn(&tx, object)?,
-                            object: record,
-                            archive_container: container,
-                        })
-                    };
-                    rows.push(SyncRow {
-                        seq: seq as u64,
-                        object,
-                        generation: generation as u64,
-                        image,
-                    });
-                }
-            }
+            let rows = materialize_conn(&tx, touched)?;
             let through_seq = match rows.last() {
                 Some(last) if rows.len() as u32 >= limit => last.seq,
                 _ => state.head_seq,
+            };
+            let after_chain = chain_at_conn(&tx, source, after_seq)?.ok_or_else(|| {
+                CatalogError::InvalidState(format!(
+                    "no history chain retained at cursor {after_seq}"
+                ))
+            })?;
+            let through_chain = if through_seq == state.head_seq {
+                state.head_chain
+            } else {
+                chain_at_conn(&tx, source, through_seq)?.ok_or_else(|| {
+                    CatalogError::InvalidState(format!(
+                        "no history chain retained at sequence {through_seq}"
+                    ))
+                })?
             };
             tx.commit()?;
             Ok(SyncBatch {
                 source_id: source,
                 epoch: state.epoch,
                 after_seq,
+                after_chain,
                 through_seq,
+                through_chain,
                 head_seq: state.head_seq,
                 rows,
             })
+        })
+    }
+
+    /// History chain at `seq`, if that point of history is still retained.
+    pub fn sync_chain_at(&self, source: SourceId, seq: u64) -> Result<Option<ChainHash>> {
+        self.with_reader(|conn| chain_at_conn(conn, source, seq))
+    }
+
+    /// Every retained ledger row of a source as `(object, seq, generation,
+    /// deleted)`, in object order: the input to a Merkle tree over the
+    /// source image, read in one snapshot together with the head it
+    /// describes.
+    pub fn sync_ledger_entries(
+        &self,
+        source: SourceId,
+    ) -> Result<(SyncSourceState, Vec<SyncLedgerEntry>)> {
+        self.with_reader(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let state = source_state_conn(&tx, source)?.ok_or_else(|| {
+                CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
+            })?;
+            let entries = tx
+                .prepare_cached(
+                    "SELECT object_id, seq, generation, deleted FROM sync_rows
+                     WHERE source_id = ?1 ORDER BY object_id",
+                )?
+                .query_map(params![source.0], |r| {
+                    Ok(SyncLedgerEntry {
+                        object: ObjectId(r.get(0)?),
+                        seq: r.get::<_, i64>(1)? as u64,
+                        generation: r.get::<_, i64>(2)? as u64,
+                        deleted: r.get::<_, i64>(3)? != 0,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            tx.commit()?;
+            Ok((state, entries))
+        })
+    }
+
+    /// Materialize the current rows of specific objects (a Merkle repair
+    /// answer), together with the head the images belong to. Objects that
+    /// have no ledger row are absent from the result: at the source they do
+    /// not exist, which the consumer treats as authoritative absence.
+    pub fn sync_rows_for_objects(
+        &self,
+        source: SourceId,
+        objects: &[ObjectId],
+    ) -> Result<(SyncSourceState, Vec<SyncRow>)> {
+        self.with_reader(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let state = source_state_conn(&tx, source)?.ok_or_else(|| {
+                CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
+            })?;
+            let mut touched = Vec::with_capacity(objects.len());
+            {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT seq, object_id, generation, deleted FROM sync_rows
+                     WHERE source_id = ?1 AND object_id = ?2",
+                )?;
+                for object in objects {
+                    if let Some(row) = stmt
+                        .query_row(params![source.0, object.0], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+                        })
+                        .optional()?
+                    {
+                        touched.push(row);
+                    }
+                }
+            }
+            let rows = materialize_conn(&tx, touched)?;
+            tx.commit()?;
+            Ok((state, rows))
+        })
+    }
+
+    /// Rows a consumer has not acknowledged, and how old the oldest is.
+    pub fn sync_backlog(&self, source: SourceId, consumer: [u8; 16]) -> Result<SyncBacklog> {
+        self.with_reader(|conn| {
+            let watermark: i64 = conn
+                .query_row(
+                    "SELECT watermark FROM sync_consumers WHERE source_id = ?1 AND consumer_id = ?2",
+                    params![source.0, consumer.as_slice()],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(deleted), 0), MIN(touched_at) FROM sync_rows
+                 WHERE source_id = ?1 AND seq > ?2",
+                params![source.0, watermark],
+                |r| {
+                    Ok(SyncBacklog {
+                        rows: r.get::<_, i64>(0)? as u64,
+                        tombstones: r.get::<_, i64>(1)? as u64,
+                        oldest_touched_at: r
+                            .get::<_, Option<i64>>(2)?
+                            .filter(|t| *t > 0)
+                            .map(UnixNanos),
+                    })
+                },
+            )
+            .map_err(Into::into)
         })
     }
 
@@ -642,6 +919,12 @@ impl Catalog {
                 tx.execute(
                     "UPDATE sync_sources SET compacted_through = ?2, updated_at = ?3 WHERE source_id = ?1",
                     params![source.0, floor as i64, UnixNanos::now().0],
+                )?;
+                // The chain at the floor itself stays: a consumer exactly
+                // there resumes with it as its `after_chain`.
+                tx.execute(
+                    "DELETE FROM sync_chain WHERE source_id = ?1 AND seq < ?2",
+                    params![source.0, floor as i64],
                 )?;
                 compacted_through = floor;
             }
