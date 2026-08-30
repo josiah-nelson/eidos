@@ -26,6 +26,21 @@ use tantivy::query::{
 use tantivy::schema::{IndexRecordOption, Value};
 use tantivy::{DocAddress, Order, Searcher, TantivyDocument, Term};
 
+fn host_name_matches(stored: &str, query: &str, replicated: bool) -> bool {
+    if stored.eq_ignore_ascii_case(query) {
+        return true;
+    }
+    if !replicated {
+        return false;
+    }
+    let Some((display, suffix)) = stored.rsplit_once('#') else {
+        return false;
+    };
+    suffix.len() == 32
+        && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+        && display.eq_ignore_ascii_case(query)
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecOptions {
     pub limits: QueryLimits,
@@ -541,16 +556,28 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
                 .catalog
                 .list_hosts()
                 .map_err(|e| QueryError::Other { message: e.to_string() })?;
+            let source_records = ctx
+                .catalog
+                .list_sources()
+                .map_err(|e| QueryError::Other { message: e.to_string() })?;
+            let replicated_hosts: HashSet<HostId> = source_records
+                .iter()
+                .filter(|source| source.kind == SourceKind::Remote)
+                .map(|source| source.host_id)
+                .collect();
             let mut wanted: Vec<HostId> = ids.clone();
             for n in names {
                 // A replicated host is stored as `<name>#<node id>` so two
                 // nodes with one display name stay distinct; a query names
                 // the display name and selects every host carrying it.
-                let display = |name: &str| name.split('#').next().unwrap_or(name).to_string();
                 let matched: Vec<HostId> = hosts
                     .iter()
-                    .filter(|h| {
-                        h.name.eq_ignore_ascii_case(n) || display(&h.name).eq_ignore_ascii_case(n)
+                    .filter(|host| {
+                        host_name_matches(
+                            &host.name,
+                            n,
+                            replicated_hosts.contains(&host.id),
+                        )
                     })
                     .map(|h| h.id)
                     .collect();
@@ -561,10 +588,7 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
                 }
                 wanted.extend(matched);
             }
-            let sources: Vec<SourceId> = ctx
-                .catalog
-                .list_sources()
-                .map_err(|e| QueryError::Other { message: e.to_string() })?
+            let sources: Vec<SourceId> = source_records
                 .into_iter()
                 .filter(|s| wanted.contains(&s.host_id))
                 .map(|s| s.id)
@@ -3149,6 +3173,15 @@ mod cursor_property_tests {
                 Err(QueryError::InvalidCursor)
             );
         }
+    }
+
+    #[test]
+    fn display_name_aliases_apply_only_to_replica_host_suffixes() {
+        let node = "0123456789abcdef0123456789abcdef";
+        assert!(host_name_matches(&format!("build#{node}"), "build", true));
+        assert!(host_name_matches("build#2", "build#2", false));
+        assert!(!host_name_matches("build#2", "build", false));
+        assert!(!host_name_matches("build#not-a-node", "build", true));
     }
 
     proptest! {

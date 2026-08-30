@@ -326,6 +326,7 @@ async fn simultaneous_initiation_leaves_exactly_one_session_on_both_sides() {
     enroll_node(&node, &central).await;
     let node_endpoint = node.listening().await;
     let node_id = node.fleet().identity().node_id;
+    let central_id = central.fleet().identity().node_id;
     central
         .catalog
         .fleet_set_peer_endpoint(node_id, Some(&node_endpoint))
@@ -354,6 +355,23 @@ async fn simultaneous_initiation_leaves_exactly_one_session_on_both_sides() {
         "a duplicate was resolved: {:?} {:?}",
         cs.counters,
         ns.counters
+    );
+    assert!(
+        central
+            .catalog
+            .fleet_peer(node_id)
+            .unwrap()
+            .unwrap()
+            .connected,
+        "cleanup of the losing session must not clear its live replacement"
+    );
+    assert!(
+        node.catalog
+            .fleet_peer(central_id)
+            .unwrap()
+            .unwrap()
+            .connected,
+        "both rosters retain the live connection state"
     );
     // Progress did not reset.
     std::fs::write(node.root.join("a/four.txt"), vec![b'4'; 40]).unwrap();
