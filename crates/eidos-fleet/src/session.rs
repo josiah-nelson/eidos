@@ -1717,11 +1717,20 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     ) -> anyhow::Result<()> {
         let catalog = self.ctx.catalog.clone();
         let consumer = self.peer.node_id.0;
-        tokio::task::spawn_blocking(move || {
-            catalog.sync_acknowledge(source, consumer, through_seq)
+        let Some(epoch) = self.shipping.get(&source).map(|s| s.epoch) else {
+            return Ok(());
+        };
+        let epoch = eidos_catalog::sync::SyncEpoch::from_source_epoch(epoch);
+        let result = tokio::task::spawn_blocking(move || {
+            catalog.sync_acknowledge(source, epoch, consumer, through_seq)
         })
         .await
-        .context("acknowledge task")??;
+        .context("acknowledge task")?;
+        if let Err(e) = result {
+            // An acknowledgement for a retired epoch or beyond the head is
+            // stale, not fatal: the next offer re-establishes the cursor.
+            tracing::debug!(source = source.0, error = %e, "ignored a stale acknowledgement");
+        }
         Ok(())
     }
 
