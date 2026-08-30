@@ -157,6 +157,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "core-foundation"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
+name = "core-foundation-sys"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -271,7 +287,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 
 [[package]]
 name = "eidos-archive"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "crc32fast",
  "eidos-domain",
@@ -282,13 +298,15 @@ dependencies = [
 
 [[package]]
 name = "eidos-catalog"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "crossbeam-channel",
  "eidos-content",
  "eidos-domain",
  "eidos-scanner",
+ "eidos-sync",
+ "getrandom",
  "parking_lot",
  "rusqlite",
  "serde",
@@ -301,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-content"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "eidos-domain",
@@ -315,8 +333,9 @@ dependencies = [
 
 [[package]]
 name = "eidos-domain"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "thiserror",
@@ -336,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-query"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "eidos-domain",
  "regex",
@@ -348,10 +367,12 @@ dependencies = [
 
 [[package]]
 name = "eidos-scanner"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
+ "core-foundation",
  "crossbeam-channel",
  "eidos-domain",
+ "libc",
  "serde",
  "thiserror",
  "tracing",
@@ -360,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "eidos-search"
-version = "0.5.0-dev"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "eidos-archive",
@@ -377,6 +398,17 @@ dependencies = [
  "thiserror",
  "tracing",
  "ts-rs",
+]
+
+[[package]]
+name = "eidos-sync"
+version = "0.5.0"
+dependencies = [
+ "blake3",
+ "eidos-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
