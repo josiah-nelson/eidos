@@ -81,6 +81,10 @@ pub struct ReplicaSourceState {
     /// which case this is temporarily `None` and repair stays fenced.
     pub reported_chain: Option<ChainHash>,
     pub reported_compacted: u64,
+    /// Retained-image revision most recently authenticated by Hello.
+    pub reported_image_revision: u64,
+    /// Retained-image revision the replica has reconciled by repair.
+    pub applied_image_revision: u64,
     pub reported_at: Option<UnixNanos>,
     pub applied_at: Option<UnixNanos>,
     pub image_version: u32,
@@ -222,7 +226,8 @@ fn node_id_from_blob(blob: Vec<u8>) -> Result<[u8; 16]> {
 fn state_conn(conn: &Connection, source: SourceId) -> Result<Option<ReplicaSourceState>> {
     conn.prepare_cached(
         "SELECT node_id, remote_source_id, admission, resync_target, reported_head,
-                reported_chain, reported_compacted, reported_at, applied_at, image_version
+                reported_chain, reported_compacted, reported_image_revision,
+                applied_image_revision, reported_at, applied_at, image_version
          FROM sync_replica_sources WHERE source_id = ?1",
     )?
     .query_row(params![source.0], |r| {
@@ -234,14 +239,29 @@ fn state_conn(conn: &Connection, source: SourceId) -> Result<Option<ReplicaSourc
             r.get::<_, i64>(4)?,
             r.get::<_, Option<Vec<u8>>>(5)?,
             r.get::<_, i64>(6)?,
-            r.get::<_, Option<i64>>(7)?,
-            r.get::<_, Option<i64>>(8)?,
-            r.get::<_, i64>(9)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, i64>(8)?,
+            r.get::<_, Option<i64>>(9)?,
+            r.get::<_, Option<i64>>(10)?,
+            r.get::<_, i64>(11)?,
         ))
     })
     .optional()?
     .map(
-        |(node, remote, admission, target, head, chain, compacted, reported, applied, version)| {
+        |(
+            node,
+            remote,
+            admission,
+            target,
+            head,
+            chain,
+            compacted,
+            reported_revision,
+            applied_revision,
+            reported,
+            applied,
+            version,
+        )| {
             Ok(ReplicaSourceState {
                 source_id: source,
                 node_id: node_id_from_blob(node)?,
@@ -251,6 +271,8 @@ fn state_conn(conn: &Connection, source: SourceId) -> Result<Option<ReplicaSourc
                 reported_head: head as u64,
                 reported_chain: optional_chain_from_blob(chain)?,
                 reported_compacted: compacted as u64,
+                reported_image_revision: reported_revision as u64,
+                applied_image_revision: applied_revision as u64,
                 reported_at: reported.map(UnixNanos),
                 applied_at: applied.map(UnixNanos),
                 image_version: version as u32,
@@ -731,19 +753,26 @@ fn source_is_retired_conn(conn: &Connection, source: SourceId) -> Result<bool> {
 
 fn node_is_authorized_conn(conn: &Connection, node: &[u8; 16]) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM fleet_peers WHERE node_id = ?1 AND enabled = 1)",
+        "SELECT EXISTS(
+            SELECT 1 FROM fleet_peers
+            WHERE node_id = ?1 AND enabled = 1 AND role = 'node')",
         params![node.as_slice()],
         |row| row.get::<_, i64>(0),
     )? != 0)
 }
 
-fn source_peer_is_authorized_conn(conn: &Connection, source: SourceId) -> Result<bool> {
+fn source_peer_is_authorized_conn(
+    conn: &Connection,
+    source: SourceId,
+    caller: &[u8; 16],
+) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM sync_replica_sources r
             JOIN fleet_peers p ON p.node_id = r.node_id
-            WHERE r.source_id = ?1 AND p.enabled = 1)",
-        params![source.0],
+            WHERE r.source_id = ?1 AND r.node_id = ?2
+              AND p.enabled = 1 AND p.role = 'node')",
+        params![source.0, caller.as_slice()],
         |row| row.get::<_, i64>(0),
     )? != 0)
 }
@@ -1099,13 +1128,14 @@ impl Catalog {
     /// cursor, creating both on first contact. Returns the replica state.
     pub fn replica_ensure_source(
         &self,
+        caller: [u8; 16],
         node: &RemoteNode,
         descriptor: &RemoteSourceDescriptor,
         epoch: SourceEpoch,
     ) -> Result<ReplicaSourceState> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            if !node_is_authorized_conn(&tx, &node.node_id)? {
+            if caller != node.node_id || !node_is_authorized_conn(&tx, &caller)? {
                 return Err(CatalogError::InvalidState(
                     "replica peer is disabled or no longer enrolled".into(),
                 ));
@@ -1232,13 +1262,16 @@ impl Catalog {
 
     /// Admit a peer's offer of a source (the protocol's `Hello`) and commit
     /// the resulting cursor before answering.
+    #[allow(clippy::too_many_arguments)]
     pub fn replica_admit_hello(
         &self,
+        caller: [u8; 16],
         source: SourceId,
         epoch: SourceEpoch,
         head_seq: u64,
         head_chain: ChainHash,
         compacted_through: u64,
+        image_revision: u64,
     ) -> Result<HelloOutcome> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1250,25 +1283,29 @@ impl Catalog {
                     reason: "replica source is retired".into(),
                 });
             }
-            if !source_peer_is_authorized_conn(&tx, source)? {
+            if !source_peer_is_authorized_conn(&tx, source, &caller)? {
                 return Ok(HelloOutcome::Rejected {
                     reason: "replica peer is disabled or no longer enrolled".into(),
                 });
             }
             let now = UnixNanos::now().0;
-            let same_epoch_rewind = (state.admission.epoch == epoch
-                || state.admission.pending_epoch() == Some(epoch))
+            let same_incarnation = state.admission.epoch == epoch
+                || state.admission.pending_epoch() == Some(epoch);
+            let same_epoch_rewind = same_incarnation
                 && state.reported_at.is_some()
                 && head_seq < state.reported_head;
-            let same_epoch_fork = (state.admission.epoch == epoch
-                || state.admission.pending_epoch() == Some(epoch))
+            let same_epoch_fork = same_incarnation
                 && state.reported_at.is_some()
                 && head_seq == state.reported_head
                 && state.reported_chain.is_some_and(|chain| chain != head_chain);
+            let same_epoch_image_rewind = same_incarnation
+                && state.reported_at.is_some()
+                && image_revision < state.reported_image_revision;
             let reconnecting_pending_epoch = state.admission.pending_epoch() == Some(epoch);
             let malformed = head_seq > MAX_SQLITE_SEQUENCE
                 || compacted_through > MAX_SQLITE_SEQUENCE
                 || compacted_through > head_seq
+                || image_revision > MAX_SQLITE_SEQUENCE
                 || (head_seq == 0 && head_chain != CHAIN_GENESIS);
             let outcome = if malformed {
                 HelloOutcome::Rejected {
@@ -1287,6 +1324,13 @@ impl Catalog {
                         "history fork at sequence {head_seq}: offered head differs from the durable head"
                     ),
                 }
+            } else if same_epoch_image_rewind {
+                HelloOutcome::Rejected {
+                    reason: format!(
+                        "same-epoch retained-image rewind: reported={}, source={image_revision}",
+                        state.reported_image_revision
+                    ),
+                }
             } else {
                 match state.admission.admit_hello(epoch, head_seq) {
                 HelloDecision::Incremental { after_seq }
@@ -1302,6 +1346,7 @@ impl Catalog {
                     epoch,
                     after_seq,
                     requires_repair: after_seq < compacted_through
+                        || image_revision > state.applied_image_revision
                         || repair_pending_conn(&tx, source)?,
                 },
                 HelloDecision::FullResync { new_epoch, .. } => {
@@ -1357,15 +1402,21 @@ impl Catalog {
                         ],
                     )?;
                 }
+                let fresh_epoch = matches!(outcome, HelloOutcome::FullResync { .. })
+                    && !reconnecting_pending_epoch;
                 tx.execute(
                     "UPDATE sync_replica_sources SET reported_head = ?2, reported_chain = ?3,
-                         reported_compacted = ?4, reported_at = ?5
+                         reported_compacted = ?4, reported_image_revision = ?5,
+                         applied_image_revision = CASE WHEN ?6 THEN 0 ELSE applied_image_revision END,
+                         reported_at = ?7
                      WHERE source_id = ?1",
                     params![
                         source.0,
                         head_seq as i64,
                         head_chain.as_slice(),
                         compacted_through as i64,
+                        image_revision as i64,
+                        fresh_epoch,
                         now
                     ],
                 )?;
@@ -1375,15 +1426,20 @@ impl Catalog {
                 tx.execute(
                     "DELETE FROM sync_replica_repairs
                      WHERE source_id = ?1
-                       AND (epoch != ?2 OR through_seq != ?3 OR through_chain != ?4)",
+                       AND (epoch != ?2 OR through_seq != ?3 OR through_chain != ?4
+                            OR image_revision != ?5)",
                     params![
                         source.0,
                         epoch.as_bytes().as_slice(),
                         head_seq as i64,
-                        head_chain.as_slice()
+                        head_chain.as_slice(),
+                        image_revision as i64
                     ],
                 )?;
-                if head_seq > state.admission.applied_seq || state.resync_target.is_some() {
+                if head_seq > state.admission.applied_seq
+                    || state.resync_target.is_some()
+                    || image_revision > state.applied_image_revision
+                {
                     mark_completeness_conn(&tx, source, now, false)?;
                 }
             }
@@ -1396,7 +1452,12 @@ impl Catalog {
     /// Apply a materialized batch: admission, effects, cursor, one
     /// transaction. `Applied` means the acknowledgement may be sent. The
     /// batch's `source_id` is the peer's; `source` is the local replica.
-    pub fn replica_apply_batch(&self, source: SourceId, batch: &SyncBatch) -> Result<BatchOutcome> {
+    pub fn replica_apply_batch(
+        &self,
+        caller: [u8; 16],
+        source: SourceId,
+        batch: &SyncBatch,
+    ) -> Result<BatchOutcome> {
         let epoch = batch.epoch.to_source_epoch();
         let (after_seq, after_chain, through_seq, through_chain) = (
             batch.after_seq,
@@ -1442,7 +1503,7 @@ impl Catalog {
                     reason: "replica source is retired".into(),
                 });
             }
-            if !source_peer_is_authorized_conn(&tx, source)? {
+            if !source_peer_is_authorized_conn(&tx, source, &caller)? {
                 return Ok(BatchOutcome::Rejected {
                     reason: "replica peer is disabled or no longer enrolled".into(),
                 });
@@ -1594,6 +1655,7 @@ impl Catalog {
             let image_complete = through_seq == batch.head_seq
                 && through_seq >= reported_head
                 && state.resync_target.is_none()
+                && state.applied_image_revision >= state.reported_image_revision
                 && !repair_pending_conn(&tx, source)?;
             mark_applied_conn(&tx, source, now, image_complete)?;
             tx.commit()?;
@@ -1607,12 +1669,15 @@ impl Catalog {
 
     /// Compare an offered Merkle leaf manifest against the replica and say
     /// which leaves to request.
+    #[allow(clippy::too_many_arguments)]
     pub fn replica_repair_offer(
         &self,
+        caller: [u8; 16],
         source: SourceId,
         epoch: SourceEpoch,
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
         leaf_bits: u8,
         leaf_hashes: &[[u8; 32]],
     ) -> Result<RepairOfferOutcome> {
@@ -1627,7 +1692,7 @@ impl Catalog {
                     reason: "replica source is retired".into(),
                 });
             }
-            if !source_peer_is_authorized_conn(&tx, source)? {
+            if !source_peer_is_authorized_conn(&tx, source, &caller)? {
                 return Ok(RepairOfferOutcome::Rejected {
                     reason: "replica peer is disabled or no longer enrolled".into(),
                 });
@@ -1644,6 +1709,14 @@ impl Catalog {
                 return Ok(RepairOfferOutcome::Rejected {
                     reason: "history fork: repair chain does not match the durable offered head"
                         .into(),
+                });
+            }
+            if image_revision != state.reported_image_revision {
+                return Ok(RepairOfferOutcome::Rejected {
+                    reason: format!(
+                        "repair retained-image revision {image_revision} does not match the durable offered revision {}",
+                        state.reported_image_revision
+                    ),
                 });
             }
             let pending_epoch = state.admission.pending_epoch() == Some(epoch);
@@ -1673,7 +1746,8 @@ impl Catalog {
             }
             let existing = tx
                 .prepare_cached(
-                    "SELECT epoch, through_seq, through_chain, leaf_bits, leaves, hashes, remaining
+                    "SELECT epoch, through_seq, through_chain, image_revision,
+                            leaf_bits, leaves, hashes, remaining
                      FROM sync_replica_repairs WHERE source_id = ?1",
                 )?
                 .query_row(params![source.0], |row| {
@@ -1682,9 +1756,10 @@ impl Catalog {
                         row.get::<_, i64>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Vec<u8>>(5)?,
-                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 })
                 .optional()?;
@@ -1692,6 +1767,7 @@ impl Catalog {
                 requested_epoch,
                 requested_seq,
                 requested_chain,
+                requested_revision,
                 requested_bits,
                 requested_leaves,
                 requested_hashes,
@@ -1701,6 +1777,7 @@ impl Catalog {
                 let identical_request = requested_epoch.as_slice() == epoch.as_bytes().as_slice()
                     && requested_seq as u64 == through_seq
                     && repair_chain_from_blob(requested_chain)? == through_chain
+                    && requested_revision as u64 == image_revision
                     && requested_bits as u8 == leaf_bits;
                 if identical_request {
                     let requested_leaves: Vec<u32> = serde_json::from_str(&requested_leaves)
@@ -1756,11 +1833,14 @@ impl Catalog {
             let requested_hashes = encode_leaf_hashes(&requested_hashes);
             tx.prepare_cached(
                 "INSERT INTO sync_replica_repairs
-                    (source_id, epoch, through_seq, through_chain, leaf_bits, leaves, hashes, remaining, last_part, requested_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', ?9)
+                    (source_id, epoch, through_seq, through_chain, image_revision,
+                     leaf_bits, leaves, hashes, remaining, last_part, requested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '[]', ?10)
                  ON CONFLICT(source_id) DO UPDATE SET
                     epoch = excluded.epoch, through_seq = excluded.through_seq,
-                    through_chain = excluded.through_chain, leaf_bits = excluded.leaf_bits,
+                    through_chain = excluded.through_chain,
+                    image_revision = excluded.image_revision,
+                    leaf_bits = excluded.leaf_bits,
                     leaves = excluded.leaves, hashes = excluded.hashes,
                     remaining = excluded.remaining, last_part = excluded.last_part,
                     requested_at = excluded.requested_at",
@@ -1770,6 +1850,7 @@ impl Catalog {
                 epoch.as_bytes().as_slice(),
                 through_seq as i64,
                 through_chain.as_slice(),
+                image_revision as i64,
                 leaf_bits as i64,
                 serde_json::to_string(&leaves)?,
                 requested_hashes,
@@ -1788,19 +1869,23 @@ impl Catalog {
     #[allow(clippy::too_many_arguments)]
     pub fn replica_apply_repair(
         &self,
+        caller: [u8; 16],
         source: SourceId,
         epoch: SourceEpoch,
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
         leaf_bits: u8,
         leaves: &[u32],
         rows: &[SyncRow],
     ) -> Result<RepairOutcome> {
         self.replica_apply_repair_part(
+            caller,
             source,
             epoch,
             through_seq,
             through_chain,
+            image_revision,
             leaf_bits,
             leaves,
             rows,
@@ -1814,10 +1899,12 @@ impl Catalog {
     #[allow(clippy::too_many_arguments)]
     pub fn replica_apply_repair_part(
         &self,
+        caller: [u8; 16],
         source: SourceId,
         epoch: SourceEpoch,
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
         leaf_bits: u8,
         leaves: &[u32],
         rows: &[SyncRow],
@@ -1862,7 +1949,7 @@ impl Catalog {
                     reason: "replica source is retired".into(),
                 });
             }
-            if !source_peer_is_authorized_conn(&tx, source)? {
+            if !source_peer_is_authorized_conn(&tx, source, &caller)? {
                 return Ok(RepairOutcome::Rejected {
                     reason: "replica peer is disabled or no longer enrolled".into(),
                 });
@@ -1879,6 +1966,14 @@ impl Catalog {
                 return Ok(RepairOutcome::Rejected {
                     reason: "history fork: repair chain does not match the durable offered head"
                         .into(),
+                });
+            }
+            if image_revision != state.reported_image_revision {
+                return Ok(RepairOutcome::Rejected {
+                    reason: format!(
+                        "repair retained-image revision {image_revision} does not match the durable offered revision {}",
+                        state.reported_image_revision
+                    ),
                 });
             }
             let pending_epoch = state.admission.pending_epoch() == Some(epoch);
@@ -1913,7 +2008,8 @@ impl Catalog {
             let empty_hash = MerkleLeafHasher::new().finalize();
             let request = tx
                 .prepare_cached(
-                    "SELECT epoch, through_seq, through_chain, leaf_bits, leaves, hashes, remaining, last_part
+                    "SELECT epoch, through_seq, through_chain, image_revision,
+                            leaf_bits, leaves, hashes, remaining, last_part
                      FROM sync_replica_repairs WHERE source_id = ?1",
                 )?
                 .query_row(params![source.0], |r| {
@@ -1922,14 +2018,15 @@ impl Catalog {
                         r.get::<_, i64>(1)?,
                         r.get::<_, Vec<u8>>(2)?,
                         r.get::<_, i64>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Vec<u8>>(5)?,
-                        r.get::<_, String>(6)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, Vec<u8>>(6)?,
                         r.get::<_, String>(7)?,
+                        r.get::<_, String>(8)?,
                     ))
                 })
                 .optional()?;
-            let Some((requested_epoch, requested_seq, requested_chain, requested_bits, requested_leaves, requested_hashes, remaining_leaves, last_part)) = request else {
+            let Some((requested_epoch, requested_seq, requested_chain, requested_revision, requested_bits, requested_leaves, requested_hashes, remaining_leaves, last_part)) = request else {
                 return Ok(RepairOutcome::Rejected {
                     reason: "repair response has no outstanding request".into(),
                 });
@@ -1979,6 +2076,7 @@ impl Catalog {
             if requested_epoch.as_slice() != epoch.as_bytes().as_slice()
                 || requested_seq as u64 != through_seq
                 || repair_chain_from_blob(requested_chain)? != through_chain
+                || requested_revision as u64 != image_revision
                 || requested_bits as u8 != leaf_bits
                 || (!applying_new_part && !replaying_applied_part)
                 || (applying_new_part && final_part != (wanted == remaining_scope))
@@ -2144,12 +2242,18 @@ impl Catalog {
             }
             store_admission_conn(&tx, source, &state.admission, state.resync_target)?;
             tx.prepare_cached(
+                "UPDATE sync_replica_sources SET applied_image_revision = ?2
+                 WHERE source_id = ?1",
+            )?
+            .execute(params![source.0, image_revision as i64])?;
+            tx.prepare_cached(
                 "UPDATE sync_replica_repairs SET remaining = '[]', last_part = ?2
                  WHERE source_id = ?1",
             )?
             .execute(params![source.0, serde_json::to_string(leaves)?])?;
             let image_complete = state.resync_target.is_none()
-                && state.admission.applied_seq >= state.reported_head;
+                && state.admission.applied_seq >= state.reported_head
+                && image_revision >= state.reported_image_revision;
             mark_applied_conn(&tx, source, now, image_complete)?;
             tx.commit()?;
             Ok(RepairOutcome::Applied {

@@ -160,12 +160,18 @@ pub struct SyncSourceState {
     /// Deletion rows at or below this sequence may have been collected; a
     /// consumer whose cursor is below it must take the repair path.
     pub compacted_through: u64,
+    /// Monotonic fence for changes to the retained Merkle image that do not
+    /// mint a ledger sequence (currently tombstone collection).
+    pub image_revision: u64,
     /// Native change-journal identity the epoch was minted against, when the
     /// source has one.
     pub journal_id: Option<i64>,
     /// `false` until the backfill of pre-existing live objects has finished;
     /// nothing may be shipped before then.
     pub ready: bool,
+    /// A complete metadata generation is durably published and no scan is
+    /// currently exposing an intermediate ledger image.
+    pub metadata_complete: bool,
     pub backfill_after: ObjectId,
 }
 
@@ -282,8 +288,16 @@ pub(crate) fn image_hash_from_blob(blob: Vec<u8>) -> Result<[u8; 32]> {
 
 fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncSourceState>> {
     conn.query_row(
-        "SELECT epoch, head_seq, compacted_through, journal_id, ready, backfill_after, head_chain
-         FROM sync_sources WHERE source_id = ?1",
+        "SELECT ss.epoch, ss.head_seq, ss.compacted_through, ss.journal_id,
+                ss.ready, ss.backfill_after, ss.head_chain, ss.image_revision,
+                s.published_generation IS NOT NULL
+                    AND s.state IN ('metadata_complete', 'content_pending', 'complete')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM scan_generations g
+                        WHERE g.source_id = ss.source_id AND g.state = 'open')
+         FROM sync_sources ss
+         JOIN sources s ON s.source_id = ss.source_id
+         WHERE ss.source_id = ?1",
         params![source.0],
         |r| {
             Ok((
@@ -294,23 +308,45 @@ fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncS
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, Vec<u8>>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
             ))
         },
     )
     .optional()?
-    .map(|(epoch, head, compacted, journal, ready, after, chain)| {
-        Ok(SyncSourceState {
-            source_id: source,
-            epoch: epoch_from_blob(epoch)?,
-            head_seq: head as u64,
-            head_chain: chain_from_blob(chain)?,
-            compacted_through: compacted as u64,
-            journal_id: journal,
-            ready: ready != 0,
-            backfill_after: ObjectId(after),
-        })
-    })
+    .map(
+        |(epoch, head, compacted, journal, ready, after, chain, image_revision, complete)| {
+            Ok(SyncSourceState {
+                source_id: source,
+                epoch: epoch_from_blob(epoch)?,
+                head_seq: head as u64,
+                head_chain: chain_from_blob(chain)?,
+                compacted_through: compacted as u64,
+                image_revision: image_revision as u64,
+                journal_id: journal,
+                ready: ready != 0,
+                metadata_complete: complete != 0,
+                backfill_after: ObjectId(after),
+            })
+        },
+    )
     .transpose()
+}
+
+fn ensure_ship_ready(state: &SyncSourceState) -> Result<()> {
+    if !state.ready {
+        return Err(CatalogError::InvalidState(format!(
+            "source {} sync backfill has not finished",
+            state.source_id
+        )));
+    }
+    if !state.metadata_complete {
+        return Err(CatalogError::InvalidState(format!(
+            "source {} has no complete metadata generation available to ship",
+            state.source_id
+        )));
+    }
+    Ok(())
 }
 
 /// Head sequence and chain of a sync-enabled source, or `None` when the
@@ -651,6 +687,7 @@ impl Catalog {
                  VALUES (?1, ?2, 0, ?5, 0, ?3, 0, 0, ?4, ?4)
                  ON CONFLICT(source_id) DO UPDATE SET epoch = excluded.epoch, head_seq = 0,
                     head_chain = excluded.head_chain, compacted_through = 0,
+                    image_revision = 0,
                     journal_id = excluded.journal_id, backfill_after = 0,
                     ready = 0, updated_at = excluded.updated_at",
                 params![
@@ -784,11 +821,7 @@ impl Catalog {
             let state = source_state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
             })?;
-            if !state.ready {
-                return Err(CatalogError::InvalidState(format!(
-                    "source {source} sync backfill has not finished"
-                )));
-            }
+            ensure_ship_ready(&state)?;
             if after_seq < state.compacted_through {
                 return Err(CatalogError::InvalidState(format!(
                     "cursor {after_seq} predates retained history (compacted through {})",
@@ -855,6 +888,7 @@ impl Catalog {
             let state = source_state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
             })?;
+            ensure_ship_ready(&state)?;
             let entries = tx
                 .prepare_cached(
                     "SELECT object_id, seq, generation, deleted, image_hash FROM sync_rows
@@ -889,6 +923,7 @@ impl Catalog {
             let state = source_state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
             })?;
+            ensure_ship_ready(&state)?;
             let count = tx.query_row(
                 "SELECT COUNT(*) FROM sync_rows WHERE source_id = ?1",
                 params![source.0],
@@ -918,6 +953,7 @@ impl Catalog {
             let state = source_state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
             })?;
+            ensure_ship_ready(&state)?;
             let count = tx.query_row(
                 "SELECT COUNT(*) FROM sync_rows WHERE source_id = ?1",
                 params![source.0],
@@ -979,6 +1015,7 @@ impl Catalog {
             let state = source_state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
             })?;
+            ensure_ship_ready(&state)?;
             let mut objects = Vec::new();
             let mut stmt = tx.prepare_cached(
                 "SELECT object_id FROM sync_rows WHERE source_id = ?1 ORDER BY object_id",
@@ -1016,6 +1053,7 @@ impl Catalog {
             let state = source_state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
             })?;
+            ensure_ship_ready(&state)?;
             let mut touched = Vec::with_capacity(objects.len());
             {
                 let mut stmt = tx.prepare_cached(
@@ -1172,11 +1210,22 @@ impl Catalog {
             )?;
             let mut compacted_through = state.compacted_through;
             if remaining == 0 && floor > compacted_through {
-                tx.execute(
-                    "UPDATE sync_sources SET compacted_through = ?2, updated_at = ?3 WHERE source_id = ?1",
-                    params![source.0, floor as i64, UnixNanos::now().0],
-                )?;
                 compacted_through = floor;
+            }
+            if removed > 0 || compacted_through != state.compacted_through {
+                tx.execute(
+                    "UPDATE sync_sources
+                     SET compacted_through = ?2,
+                         image_revision = image_revision + ?3,
+                         updated_at = ?4
+                     WHERE source_id = ?1",
+                    params![
+                        source.0,
+                        compacted_through as i64,
+                        i64::from(removed > 0),
+                        UnixNanos::now().0
+                    ],
+                )?;
             }
             // The chain at the floor itself stays: a consumer exactly there
             // resumes with it as its `after_chain`. Physical reclamation is

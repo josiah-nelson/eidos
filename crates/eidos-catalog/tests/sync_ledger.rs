@@ -214,23 +214,49 @@ fn sync_enabled_before_the_initial_scan_stamps_the_root_and_its_identity() {
         .unwrap();
     catalog.sync_enable(source, None).unwrap();
     assert!(catalog.sync_backfill(source, 16).unwrap().done);
-    assert_eq!(catalog.sync_source(source).unwrap().unwrap().head_seq, 0);
+    let pre_scan = catalog.sync_source(source).unwrap().unwrap();
+    assert_eq!(pre_scan.head_seq, 0);
+    assert!(!pre_scan.metadata_complete);
+    assert!(catalog.sync_rows_after(source, 0, u32::MAX).is_err());
+
+    // `begin_scan` commits the root touch before the scan transaction starts.
+    // Neither that in-progress image nor the root left behind by recovery may
+    // be advertised as a complete source.
+    let interrupted = catalog
+        .begin_scan(source, eidos_catalog::scan::ScanKind::Full)
+        .unwrap();
+    let during_scan = catalog.sync_source(source).unwrap().unwrap();
+    assert!(during_scan.head_seq > 0);
+    assert!(!during_scan.metadata_complete);
+    assert!(catalog.sync_rows_after(source, 0, u32::MAX).is_err());
+    interrupted.abort("simulated initial-scan crash").unwrap();
+    let recovered = Catalog::open(dir.path().join("catalog.db")).unwrap();
+    assert!(
+        !recovered
+            .sync_source(source)
+            .unwrap()
+            .unwrap()
+            .metadata_complete
+    );
+    assert!(recovered.sync_rows_after(source, 0, u32::MAX).is_err());
 
     let lister = eidos_scanner::default_lister();
     run_scan(
-        &catalog,
+        &recovered,
         source,
         lister.as_ref(),
         &RunScanOptions::default(),
     )
     .unwrap();
-    let root_object = catalog
+    let root_object = recovered
         .get_source(source)
         .unwrap()
         .unwrap()
         .root_object_id
         .unwrap();
-    let batch = catalog.sync_rows_after(source, 0, u32::MAX).unwrap();
+    let published = recovered.sync_source(source).unwrap().unwrap();
+    assert!(published.metadata_complete);
+    let batch = recovered.sync_rows_after(source, 0, u32::MAX).unwrap();
     let root_row = row_for(&batch, root_object);
     let native = root_row
         .image
@@ -240,13 +266,13 @@ fn sync_enabled_before_the_initial_scan_stamps_the_root_and_its_identity() {
         .native
         .expect("the root stat identity was shipped");
 
-    let before = catalog.sync_source(source).unwrap().unwrap().head_seq;
+    let before = recovered.sync_source(source).unwrap().unwrap().head_seq;
     let mut replacement = native;
     replacement.file_id_low ^= 1 << 48;
-    catalog.set_root_identity(source, replacement).unwrap();
-    let after = catalog.sync_source(source).unwrap().unwrap().head_seq;
+    recovered.set_root_identity(source, replacement).unwrap();
+    let after = recovered.sync_source(source).unwrap().unwrap().head_seq;
     assert_eq!(after, before + 1);
-    let changed = catalog.sync_rows_after(source, before, u32::MAX).unwrap();
+    let changed = recovered.sync_rows_after(source, before, u32::MAX).unwrap();
     assert_eq!(
         row_for(&changed, root_object)
             .image
@@ -256,9 +282,9 @@ fn sync_enabled_before_the_initial_scan_stamps_the_root_and_its_identity() {
             .native,
         Some(replacement)
     );
-    catalog.set_root_identity(source, replacement).unwrap();
+    recovered.set_root_identity(source, replacement).unwrap();
     assert_eq!(
-        catalog.sync_source(source).unwrap().unwrap().head_seq,
+        recovered.sync_source(source).unwrap().unwrap().head_seq,
         after
     );
 }

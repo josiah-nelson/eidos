@@ -458,6 +458,10 @@ ALTER TABLE volumes ADD COLUMN native_feed TEXT NOT NULL DEFAULT 'none';
 -- `compacted_through` to the head; pruned by the collection pass.
 ALTER TABLE sync_sources ADD COLUMN head_chain BLOB NOT NULL
     DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000';
+-- Monotonic revision of the retained Merkle image. Ledger touches advance
+-- `head_seq`; tombstone collection is the only operation that changes the
+-- image without changing that head, so it advances this separate fence.
+ALTER TABLE sync_sources ADD COLUMN image_revision INTEGER NOT NULL DEFAULT 0;
 -- Ledgers written before history chains existed cannot prove any nonzero
 -- cursor. Treat the upgrade as the epoch event ADR-0015 requires and rebuild
 -- the live image rather than blessing the old head with a genesis hash.
@@ -534,6 +538,8 @@ CREATE TABLE sync_replica_sources (
     reported_head      INTEGER NOT NULL DEFAULT 0,
     reported_chain     BLOB,
     reported_compacted INTEGER NOT NULL DEFAULT 0,
+    reported_image_revision INTEGER NOT NULL DEFAULT 0,
+    applied_image_revision  INTEGER NOT NULL DEFAULT 0,
     reported_at        INTEGER,
     applied_at         INTEGER,
     image_version      INTEGER NOT NULL DEFAULT 1,
@@ -568,6 +574,7 @@ CREATE TABLE sync_replica_repairs (
     epoch         BLOB NOT NULL,
     through_seq   INTEGER NOT NULL,
     through_chain BLOB NOT NULL,
+    image_revision INTEGER NOT NULL,
     leaf_bits     INTEGER NOT NULL,
     leaves        TEXT NOT NULL,
     hashes        BLOB NOT NULL,
