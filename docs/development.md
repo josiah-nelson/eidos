@@ -573,3 +573,7 @@ scripts/          check.ps1, check.sh, hooks/
 - Clippy runs with warnings denied; `rustfmt` settings are in `rustfmt.toml`.
 - Tests that need a real filesystem build fixtures in a temp directory and
   clean up after themselves; nothing may depend on a developer's own paths.
+- User-facing capabilities ship with their web UI wiring in the same
+  release. CLI/API-only is an explicit, recorded exception (ADR or release
+  note saying why), not a default; see the definition of done in
+  [overview.md](overview.md).

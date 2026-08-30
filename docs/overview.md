@@ -270,6 +270,13 @@ file-open request against the configured source.
 A feature is complete only when it has documented behavior and failure
 semantics, unit tests for core logic, integration tests covering
 restart/idempotency where relevant, measured performance on an appropriate
-fixture, observable status and errors, a usable web presentation if
-user-facing, and no silent fallback that changes completeness or matching
-semantics.
+fixture, observable status and errors, and no silent fallback that changes
+completeness or matching semantics.
+
+For anything user-facing, the web UI is part of the feature, not a
+follow-up: eidos is a UI-first product, and wiring a capability into the UI
+carries the same weight as writing its tests. A capability that ships
+CLI/API-only is the documented exception (with the reason recorded), never
+the default — and operational state the service knows (forwarding
+destinations, schedules, sizes, retention) must be visible in the UI, not
+only in config files or logs.
