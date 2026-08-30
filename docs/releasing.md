@@ -13,27 +13,26 @@ release for that tag:
 - `.sha256` checksums for every asset.
 
 The workflow builds the web UI, the Rust executable (with the UI embedded),
-the setup UI, the MSI and the bundle, and signs every executable piece with
+the setup UI, both MSIs and both bundles, and signs every executable piece with
 Azure Artifact Signing in the order the Windows Installer and Burn require:
 
 1. `eidos.exe` and `eidos-setup-ui.exe` (before they are bound into the MSI
    and bundle);
-2. `eidos.msi`;
-3. the Burn engine, detached from the bundle with `wix burn detach`, then
+2. `eidos.msi` and `eidos-collector.msi`;
+3. both Burn engines, detached from the bundles with `wix burn detach`, then
    reattached with `wix burn reattach` — this is what the UAC prompt and
    Programs and Features show for repair/uninstall;
-4. the finished `eidos-<tag>-setup.exe`.
+4. the finished unified and collector-only setup executables.
 
 Every signature and timestamp is verified with `Get-AuthenticodeSignature`
 before any asset is uploaded; a failure anywhere uploads nothing. See
 `installer/README.md` for the authoring and `installer/build.ps1` for the
-stages the workflow calls (`-SkipMsi`, `-SkipUi`, `-SkipBundle`).
+stages the workflow calls (the core and `-SkipCollector*` stage flags).
 
-Nothing is built or signed on a pull request. The same MSI/UI/bundle can be
+Nothing is built or signed on a pull request. The same MSIs, UI and bundles can be
 exercised unsigned on demand with `installer.yml`, which builds from a debug
-executable, installs silently per-user on the runner, checks `/api/health`,
-uninstalls with data removal, and keeps `eidos-setup.exe` as a workflow
-artifact:
+executable, exercises the lifecycle paths below, and keeps the installer
+artifacts and logs as a workflow artifact:
 
 ```powershell
 gh workflow run installer.yml --ref <branch>
@@ -41,8 +40,9 @@ gh workflow run installer.yml --ref <branch>
 
 Run it before tagging whenever a change touches `installer/`, `build.ps1`, or
 the way the web UI is embedded — ordinary CI does not cover any of that. It
-covers core-only per-user, core-plus-collector per-machine through the
-unified setup, upgrade from the separate collector package, repair,
+covers core-only per-user, a per-user core with the per-machine collector,
+core-plus-collector per-machine through the unified setup, same-version
+adoption and later upgrade from the separate collector package, repair,
 uninstall keeping data, and explicit purge of exactly one product's data.
 
 ## Release checklist (v0.5)

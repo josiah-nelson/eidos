@@ -300,6 +300,12 @@ jobs:
           foreach ($file in @($env:SETUP, $env:MSI, $env:COLLECTOR_SETUP, $env:COLLECTOR_MSI)) {
             $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $([IO.Path]::GetFileName($file))" | Set-Content -LiteralPath "$file.sha256" -NoNewline
+            $certutil = & certutil.exe -hashfile $file SHA256
+            if ($LASTEXITCODE -ne 0) { throw "certutil could not hash $file ($LASTEXITCODE)" }
+            $verified = ($certutil | Where-Object { $_ -match '^[0-9A-Fa-f ]{64,}$' } | Select-Object -First 1) -replace ' ', ''
+            if ([string]::IsNullOrWhiteSpace($verified) -or $verified.ToLowerInvariant() -ne $hash) {
+              throw "independent checksum verification failed for $file"
+            }
           }
 
       - name: Publish the signed assets for the tag

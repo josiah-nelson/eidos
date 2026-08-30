@@ -36,7 +36,7 @@ eidos fleet central --listen 0.0.0.0:7710     # accept sync sessions on port 771
 eidos fleet invite                             # prints a single-use invitation
 ```
 
-The sync listener is a dedicated TLS endpoint; the web API stays on
+The sync listener is a dedicated TLS endpoint; keep the separate web API on
 loopback. Open port 7710 on the private network the nodes share (the
 installer does not open it). The invitation embeds the central's certificate
 fingerprint, its endpoint (the host name and the listener port; pass
@@ -78,9 +78,8 @@ Either side may dial. A node dials its central by default; a central dials
 a node once it knows where to reach it:
 
 ```powershell
-# on the node: listen for the central
-eidos fleet central --listen 0.0.0.0:7710      # `central` here only sets the listener; the node stays a node
-eidos fleet central --disable                  # (keeps the listener, clears the central role if it was set)
+# on the node: listen without enabling the central role
+eidos fleet central --disable --listen 0.0.0.0:7710
 # on the central: tell it where the node is
 eidos fleet peer <node id> --endpoint node-host:7710
 ```
@@ -143,7 +142,7 @@ private fleet with the release candidate and recorded in the release notes.
 
 | Scenario | Evidence |
 |---|---|
-| Agent offline for at least 72 hours | automated: `a_node_that_restarts_with_unacknowledged_work_resumes_from_the_same_cursor` (catalog), `fifty_offline_edits_one_catch_up` (bakeoff shape); soak: the intermittently connected machine |
+| Agent offline for at least 72 hours | automated checks cover durable cursor restart (`a_node_that_restarts_with_unacknowledged_work_resumes_from_the_same_cursor`) and the fifty-edit catch-up shape; soak: disconnect the intermittently connected machine for at least 72 hours |
 | Central stops before apply commit | by construction: effects and cursor are one SQLite transaction; automated: `a_central_that_stops_before_acknowledging_is_caught_up_by_the_resend` |
 | Central stops after commit but before ACK | automated: same test (durable apply, resend answered `AlreadyApplied`, node acknowledges) |
 | Agent stops with unacknowledged work | automated: `a_node_that_restarts_with_unacknowledged_work_resumes_from_the_same_cursor` |

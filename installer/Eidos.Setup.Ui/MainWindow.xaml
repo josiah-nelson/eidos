@@ -120,6 +120,12 @@
         <TextBlock Margin="0,20,0,0">
           <Run Text="eidos is free software under the " /><Hyperlink Command="{Binding OpenLicenseCommand}">GNU AGPL v3</Hyperlink><Run Text=". Continuing means you accept its terms." />
         </TextBlock>
+        <StackPanel Margin="0,16,0,0" Visibility="{Binding IsUpgrade, Converter={StaticResource Vis}}">
+          <CheckBox IsChecked="{Binding InstallCollector}" Content="{Binding CollectorLabel}" />
+          <TextBlock Style="{StaticResource Hint}" Text="{Binding CollectorHint}" />
+          <TextBlock Foreground="{StaticResource Muted}" FontSize="12" Text="{Binding CollectorScopeNote}" />
+          <TextBlock Foreground="{StaticResource Warn}" Margin="0,8,0,0" Text="{Binding ElevationNote}" />
+        </StackPanel>
       </StackPanel>
     </DataTemplate>
 
@@ -127,7 +133,7 @@
       <StackPanel>
         <RadioButton GroupName="scope" IsChecked="{Binding PerUser}" Content="Just me" />
         <TextBlock Style="{StaticResource Hint}">
-          No administrator rights needed. Installs under your profile, indexes what you can open, and runs while you are signed in.
+          No administrator rights needed for the core. Installs under your profile, indexes what you can open, and runs while you are signed in. Adding the optional collector later requires approval.
         </TextBlock>
         <RadioButton GroupName="scope" IsChecked="{Binding PerMachine}" Content="All users on this computer (Windows service)" />
         <TextBlock Style="{StaticResource Hint}">
@@ -245,7 +251,15 @@
           <Run Text="Installed " /><Run Text="{Binding DetectedScopeText, Mode=OneWay}" /><Run Text=" in " /><Run Text="{Binding InstallDir, Mode=OneWay}" />
         </TextBlock>
         <RadioButton GroupName="maint" IsChecked="{Binding Repair}" Content="Repair" />
-        <TextBlock Style="{StaticResource Hint}" Text="Reinstall the program files and the service registration. Settings and data are untouched." />
+        <TextBlock Style="{StaticResource Hint}" Text="Reinstall the program files and service registration, and apply the collector choice below. Settings and data are untouched." />
+        <Expander Header="Advanced: profiling collector" Margin="0,12,0,0" FontSize="13" Foreground="{StaticResource Ink}" HorizontalContentAlignment="Stretch" IsEnabled="{Binding Repair}">
+          <StackPanel Margin="20,8,0,0">
+            <CheckBox IsChecked="{Binding InstallCollector}" Content="{Binding CollectorLabel}" />
+            <TextBlock Style="{StaticResource Hint}" Text="{Binding CollectorHint}" />
+            <TextBlock Foreground="{StaticResource Muted}" FontSize="12" Text="{Binding CollectorScopeNote}" />
+          </StackPanel>
+        </Expander>
+        <TextBlock Foreground="{StaticResource Warn}" Margin="0,8,0,0" Text="{Binding ElevationNote}" Visibility="{Binding Repair, Converter={StaticResource Vis}}" />
         <RadioButton GroupName="maint" IsChecked="{Binding Uninstall}" Content="Remove" />
         <TextBlock Style="{StaticResource Hint}" Text="Uninstall eidos from this computer." />
       </StackPanel>

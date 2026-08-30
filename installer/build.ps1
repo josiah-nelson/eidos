@@ -2,8 +2,8 @@
 #
 #   .\installer\build.ps1                      # web UI + release exe + every artifact
 #   .\installer\build.ps1 -SkipWeb -SkipRust   # reuse web\dist and target\release\eidos.exe
-#   .\installer\build.ps1 -SkipWeb -SkipRust -SkipBundle      # stop before the bundle (CI signs first)
-#   .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipUi # bundle only, from signed parts
+#   .\installer\build.ps1 -SkipWeb -SkipRust -SkipBundle -SkipCollectorBundle # stop before the bundles (CI signs first)
+#   .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipCollectorMsi -SkipUi # bundles only, from signed parts
 #   .\installer\build.ps1 -SkipWeb -SkipRust -BinDir target\debug
 #
 # eidos-setup.exe is the unified setup: it carries eidos.msi and, as an

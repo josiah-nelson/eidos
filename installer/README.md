@@ -32,14 +32,18 @@ Settings › Apps) for repair or removal; removal offers to delete the data
 folder and shows its size. A newer installed version is reported, an older
 one is upgraded in place with settings and data kept.
 
-*Advanced: profiling collector* on the options page adds the collector
-package (all-users scope: it is a LocalSystem service). The setup UI plans
-that package per action: `Present` when chosen on install or upgrade,
-`Repair` when installed on repair, `Absent` on removal unless the operator
-keeps it, and `None` otherwise - an empty choice never removes an existing
-collector, and the checkbox reflects the installed state on maintenance
-(`DetectPackageComplete`). The package is not vital, so a host that
-refuses it still gets a healthy core. A `RelatedBundle` upgrade of the
+*Advanced: profiling collector* on the options page adds the per-machine
+collector package (it is a LocalSystem service) alongside either scope of the
+core. A just-for-you core remains per-user and the collector causes the bundle
+to elevate. The setup UI plans
+that package per action: `Present` when chosen on install or upgrade (or added
+during repair), `Repair` when an installed collector is kept during repair,
+`Absent` when explicitly unticked or removed, and `None` otherwise - an empty
+choice never removes an existing collector. The checkbox reflects the
+MSI-owned registry state across major
+versions and Burn detection for an exact or newer package. The package is not
+vital, so its MSI failure does not roll back a healthy core; the setup still
+reports that partial result as a failure. A `RelatedBundle` upgrade of the
 separate collector setup's bundle code lets a host set up with
 `eidos-collector-setup.exe` upgrade into this setup; the collector MSI is
 major-upgraded in place, so the study key, spool and configuration stay.
@@ -49,13 +53,14 @@ Unattended:
 ```powershell
 eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_PORT=7700 EIDOS_SERVICE_ACCOUNT_KIND=local-service
 eidos-setup.exe /passive                           # progress only, per-user defaults
-eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_INSTALL_COLLECTOR=1 EIDOS_STUDY_KEY=<64 hex> EIDOS_LANES=usn
+eidos-setup.exe /quiet EIDOS_SCOPE=perUser EIDOS_INSTALL_COLLECTOR=1 EIDOS_STUDY_KEY=<64 hex> EIDOS_LANES=usn
 eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_DATA=1
 eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_COLLECTOR=1 EIDOS_COLLECTOR_REMOVE_DATA=1
 eidos-setup.exe /log setup.log ...                 # explicit log path
 ```
 
-`EIDOS_INSTALL_COLLECTOR` (`1`/`0`/empty = keep as installed),
+`EIDOS_INSTALL_COLLECTOR` (`1` installs or keeps it, `0` removes or leaves it
+out during install/modify, and empty keeps the detected state),
 `EIDOS_REMOVE_COLLECTOR` (`0` keeps the collector service on removal) and
 `EIDOS_COLLECTOR_REMOVE_DATA` drive the collector package; the collector's
 own properties (`EIDOS_STUDY_KEY`, `EIDOS_LANES`, `EIDOS_UPLOAD`,
@@ -95,9 +100,15 @@ Both scopes write the chosen paths and port to `HKMU\Software\eidos` so
 repair, upgrade and uninstall find the same directories, and add an `eidos`
 Start-menu link to the web UI. Uninstall keeps the data directory unless
 `EIDOS_REMOVE_DATA=1`. Major upgrades remove the previous version first
-(service stopped, data untouched) and install the new one.
+(service stopped, data untouched) and install the new one. A named Windows
+service account's password cannot be read back from the Service Control
+Manager: interactive setup asks for it again before an upgrade, and an
+unattended upgrade must pass `EIDOS_SERVICE_PASSWORD` again.
 
-Properties the bootstrapper passes (all public, all remembered):
+Properties the bootstrapper passes are public except for the hidden password.
+Paths, listener settings and non-secret service-account settings are remembered;
+the start choices are recovered from their installed components, while the
+password and removal flags are deliberately one-use:
 `EIDOS_INSTALLDIR`, `EIDOS_DATADIR`, `EIDOS_BIND`, `EIDOS_PORT`,
 `EIDOS_SERVICE_ACCOUNT_KIND`, `EIDOS_SERVICE_DOMAIN`, `EIDOS_SERVICE_USER`,
 `EIDOS_SERVICE_PASSWORD` (hidden), `EIDOS_START_SERVICE`, `EIDOS_START_MENU`,
@@ -181,7 +192,8 @@ in between outlives the list and keeps the directory alive.
   bound executable. The same applies to the collector projects.
 - The collector package is `Scope="perMachine"` with a `Privileged` launch
   condition: the collector is a LocalSystem service and there is nothing to
-  install for a single user.
+  install for a single user. Burn can carry it beside the dual-scope core:
+  choosing a per-user core still elevates for this package only.
 - Service and purge arguments spell the data directory `"[DATAFOLDER]."` for
   the same reason as above, and `observe` normalises that spelling before
   anything else touches the path.

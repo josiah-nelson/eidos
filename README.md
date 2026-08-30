@@ -252,10 +252,11 @@ These numbers are reference measurements, not universal guarantees. Hardware, st
 
 Download `eidos-<version>-setup.exe` from the
 [releases page](https://github.com/josiah-nelson/eidos/releases) and run
-it. The setup installs eidos either for you alone (no administrator rights;
-it runs in the background while you are signed in) or for the whole
-computer as a Windows service, asks where the program and its data should
-live and which port to use, and opens the web interface when it finishes.
+it. The setup installs the core either for you alone (no administrator rights;
+it runs while you are signed in) or for the whole computer as a Windows
+service. Selecting the optional system collector adds a per-machine service
+and requires administrator approval. Setup asks where the program and its data
+should live and which port to use, and opens the web interface when it finishes.
 [docs/installing.md](docs/installing.md) covers every option, unattended
 installs, upgrades and removal.
 

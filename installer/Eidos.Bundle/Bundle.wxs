@@ -60,8 +60,9 @@
     <Variable Name="EIDOS_REMOVE_DATA" Value="" bal:Overridable="yes" />
 
     <!--
-      The collector. EIDOS_INSTALL_COLLECTOR=1 installs it, 0 leaves it out
-      of a fresh install; empty keeps whatever is installed. On removal,
+      The collector. EIDOS_INSTALL_COLLECTOR=1 installs or keeps it, 0 leaves
+      it out or removes it during install/modify, and empty keeps whatever is
+      detected. On removal,
       EIDOS_REMOVE_COLLECTOR=0 keeps the collector service while the core
       goes; its study data stays unless EIDOS_COLLECTOR_REMOVE_DATA=1.
     -->
@@ -109,23 +110,23 @@
       </ExePackage>
 
       <MsiPackage Id="EidosMsi" SourceFile="$(var.MsiPath)" Vital="yes" Compressed="yes" Visible="no">
-        <MsiProperty Name="EIDOS_INSTALLDIR" Value="[EIDOS_INSTALLDIR]" Condition="EIDOS_INSTALLDIR" />
-        <MsiProperty Name="EIDOS_DATADIR" Value="[EIDOS_DATADIR]" Condition="EIDOS_DATADIR" />
-        <MsiProperty Name="EIDOS_BIND" Value="[EIDOS_BIND]" Condition="EIDOS_BIND" />
-        <MsiProperty Name="EIDOS_PORT" Value="[EIDOS_PORT]" Condition="EIDOS_PORT" />
-        <MsiProperty Name="EIDOS_SERVICE_ACCOUNT_KIND" Value="[EIDOS_SERVICE_ACCOUNT_KIND]" Condition="EIDOS_SERVICE_ACCOUNT_KIND" />
-        <MsiProperty Name="EIDOS_SERVICE_DOMAIN" Value="[EIDOS_SERVICE_DOMAIN]" Condition="EIDOS_SERVICE_DOMAIN" />
-        <MsiProperty Name="EIDOS_SERVICE_USER" Value="[EIDOS_SERVICE_USER]" Condition="EIDOS_SERVICE_USER" />
-        <MsiProperty Name="EIDOS_SERVICE_PASSWORD" Value="[EIDOS_SERVICE_PASSWORD]" Condition="EIDOS_SERVICE_PASSWORD" />
-        <MsiProperty Name="EIDOS_START_SERVICE" Value="[EIDOS_START_SERVICE]" Condition="EIDOS_START_SERVICE" />
-        <MsiProperty Name="EIDOS_START_MENU" Value="[EIDOS_START_MENU]" Condition="EIDOS_START_MENU" />
-        <MsiProperty Name="EIDOS_REMOVE_DATA" Value="[EIDOS_REMOVE_DATA]" Condition="EIDOS_REMOVE_DATA" />
+        <MsiProperty Name="EIDOS_INSTALLDIR" Value="[EIDOS_INSTALLDIR]" Condition="EIDOS_INSTALLDIR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_DATADIR" Value="[EIDOS_DATADIR]" Condition="EIDOS_DATADIR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_BIND" Value="[EIDOS_BIND]" Condition="EIDOS_BIND &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_PORT" Value="[EIDOS_PORT]" Condition="EIDOS_PORT &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_SERVICE_ACCOUNT_KIND" Value="[EIDOS_SERVICE_ACCOUNT_KIND]" Condition="EIDOS_SERVICE_ACCOUNT_KIND &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_SERVICE_DOMAIN" Value="[EIDOS_SERVICE_DOMAIN]" Condition="EIDOS_SERVICE_DOMAIN &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_SERVICE_USER" Value="[EIDOS_SERVICE_USER]" Condition="EIDOS_SERVICE_USER &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_SERVICE_PASSWORD" Value="[EIDOS_SERVICE_PASSWORD]" Condition="EIDOS_SERVICE_PASSWORD &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_START_SERVICE" Value="[EIDOS_START_SERVICE]" Condition="EIDOS_START_SERVICE &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_START_MENU" Value="[EIDOS_START_MENU]" Condition="EIDOS_START_MENU &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_REMOVE_DATA" Value="[EIDOS_REMOVE_DATA]" Condition="EIDOS_REMOVE_DATA &lt;&gt; &quot;&quot;" />
       </MsiPackage>
 
       <!--
-        The collector: not vital, so a host that refuses it (no elevation,
-        a policy) still gets a healthy core; the bootstrapper application
-        plans it Present, Repair, Absent, or None per action.
+        The collector is not vital, so a collector-specific MSI failure does
+        not roll back a healthy core. The bootstrapper still reports that
+        partial result as a failure and plans the package per action.
       -->
       <MsiPackage Id="EidosCollectorMsi" SourceFile="$(var.CollectorMsiPath)" Vital="no" Compressed="yes" Visible="no">
         <MsiProperty Name="EIDOS_STUDY_KEY" Value="[EIDOS_STUDY_KEY]" Condition="EIDOS_STUDY_KEY &lt;&gt; &quot;&quot;" />
