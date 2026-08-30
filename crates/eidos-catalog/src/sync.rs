@@ -4,8 +4,9 @@
 //! the same writer transaction, so a shipped batch can certify that every
 //! change through its `through_seq` is represented. It records **touches,
 //! not images**: per object, the per-source sequence at which the object was
-//! last changed, its generation, and whether that change deleted it. Row
-//! images are materialized from the live catalog at ship time
+//! last changed, its generation, whether that change deleted it, and a
+//! canonical digest of the live image at that touch. Row images are
+//! materialized from the live catalog at ship time
 //! ([`Catalog::sync_rows_after`]) inside one read transaction, which is why
 //! "objects touched after the consumer's watermark" is exactly the coalesced
 //! batch the protocol wants and no change log has to exist on disk.
@@ -33,35 +34,42 @@ use std::{collections::BTreeSet, fmt};
 
 const MAX_RETAINED_CHAIN_ROWS: i64 = 1_000_000;
 const CHAIN_PRUNE_BATCH: i64 = 100_000;
+const TOMBSTONE_IMAGE_HASH: [u8; 32] = [0; 32];
 
 /// Version of the row image produced by [`Catalog::sync_rows_after`].
 pub const SYNC_ROW_IMAGE_VERSION: u32 = 1;
 
-/// The history chain hashes touches, not images: the sequence of
-/// `(object, generation, live-or-tombstone)` a source minted. Two
-/// incarnations that stamped the same touches in the same order share a
-/// chain, which is exactly when their histories are interchangeable; a
-/// source restored to an older state and edited again diverges at the first
-/// differing touch. The image itself is materialized at ship time and is
-/// not part of the chain (ADR-0023).
+/// The history chain hashes each touched object's identity, generation, and
+/// canonical image digest. The digest closes the metadata-only and rename-
+/// only fork case where the catalog intentionally does not bump generation.
 fn chain_after(
     previous: &ChainHash,
     object: ObjectId,
     generation: u64,
     deleted: bool,
+    image_hash: &[u8; 32],
 ) -> ChainHash {
     chain_next(
         previous,
         object.0,
         generation,
-        if deleted { None } else { Some(&[]) },
+        if deleted { None } else { Some(image_hash) },
     )
 }
 
 /// The Merkle record of one ledger row, computed identically on the source
 /// and on a replica so divergent leaves can be found without images.
-pub fn record_digest(object: ObjectId, generation: u64, deleted: bool) -> RecordDigest {
-    RecordDigest::from_value(object, generation, if deleted { None } else { Some(&[]) })
+pub fn record_digest(
+    object: ObjectId,
+    generation: u64,
+    deleted: bool,
+    image_hash: &[u8; 32],
+) -> RecordDigest {
+    RecordDigest::from_value(
+        object,
+        generation,
+        if deleted { None } else { Some(image_hash) },
+    )
 }
 
 pub(crate) fn register_merkle_leaf_function(conn: &Connection) -> Result<()> {
@@ -78,13 +86,14 @@ pub(crate) fn register_merkle_leaf_function(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// One `(object, generation, deleted)` triple of a source's retained rows.
+/// One source row and its canonical live-image digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncLedgerEntry {
     pub object: ObjectId,
     pub seq: u64,
     pub generation: u64,
     pub deleted: bool,
+    pub image_hash: [u8; 32],
 }
 
 /// Rows and age a consumer has not acknowledged yet.
@@ -184,6 +193,30 @@ pub struct SyncRowImage {
     pub entries: Vec<SyncEntryImage>,
 }
 
+/// Hash the wire-visible parts of a live row image in a stable order.
+/// Observation bookkeeping may change without minting a sync touch, so it
+/// is normalized away. Entries are set-shaped even though SQLite assigns
+/// them local row ids, and therefore sort by their wire identity.
+pub(crate) fn sync_row_image_hash(image: &SyncRowImage) -> Result<[u8; 32]> {
+    let mut canonical = image.clone();
+    canonical.object.accessed = None;
+    canonical.object.first_seen_generation = 0;
+    canonical.object.last_seen_generation = 0;
+    canonical.object.deleted_at = None;
+    canonical.entries.sort_by(|left, right| {
+        (left.parent, &left.name, left.is_virtual).cmp(&(
+            right.parent,
+            &right.name,
+            right.is_virtual,
+        ))
+    });
+    let encoded = serde_json::to_vec(&canonical)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"eidos-sync-row-image/1\0");
+    hasher.update(&encoded);
+    Ok(*hasher.finalize().as_bytes())
+}
+
 /// One ledger row as shipped: the final image (or a tombstone) for an object
 /// touched after the requested cursor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -240,6 +273,11 @@ fn epoch_from_blob(blob: Vec<u8>) -> Result<SyncEpoch> {
 fn chain_from_blob(blob: Vec<u8>) -> Result<ChainHash> {
     blob.try_into()
         .map_err(|_| CatalogError::InvalidState("sync chain hash is not 32 bytes".into()))
+}
+
+pub(crate) fn image_hash_from_blob(blob: Vec<u8>) -> Result<[u8; 32]> {
+    blob.try_into()
+        .map_err(|_| CatalogError::InvalidState("sync image hash is not 32 bytes".into()))
 }
 
 fn source_state_conn(conn: &Connection, source: SourceId) -> Result<Option<SyncSourceState>> {
@@ -345,14 +383,20 @@ pub(crate) fn touch_conn(conn: &Connection, source: SourceId, object: ObjectId) 
     else {
         return Ok(false);
     };
+    let image_hash = if deleted {
+        TOMBSTONE_IMAGE_HASH
+    } else {
+        sync_row_image_hash(&live_image_conn(conn, object)?)?
+    };
     let seq = head + 1;
-    let chain = chain_after(&head_chain, object, generation as u64, deleted);
+    let chain = chain_after(&head_chain, object, generation as u64, deleted, &image_hash);
     conn.prepare_cached(
-        "INSERT INTO sync_rows (source_id, object_id, seq, generation, deleted, touched_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO sync_rows
+            (source_id, object_id, seq, generation, deleted, touched_at, image_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(source_id, object_id) DO UPDATE SET
             seq = excluded.seq, generation = excluded.generation, deleted = excluded.deleted,
-            touched_at = excluded.touched_at",
+            touched_at = excluded.touched_at, image_hash = excluded.image_hash",
     )?
     .execute(params![
         source.0,
@@ -360,7 +404,8 @@ pub(crate) fn touch_conn(conn: &Connection, source: SourceId, object: ObjectId) 
         seq,
         generation,
         deleted as i64,
-        UnixNanos::now().0
+        UnixNanos::now().0,
+        image_hash.as_slice(),
     ])?;
     insert_chain_conn(conn, source, seq, &chain)?;
     set_head_conn(conn, source, seq, &chain)?;
@@ -417,13 +462,14 @@ fn touch_set_conn(
     bound.push(now);
     let n = conn.execute(
         &format!(
-            "INSERT INTO sync_rows (source_id, object_id, seq, generation, deleted, touched_at)
+            "INSERT INTO sync_rows
+                (source_id, object_id, seq, generation, deleted, touched_at, image_hash)
              SELECT ?1, object_id, ?{base_param} + ROW_NUMBER() OVER (ORDER BY object_id), generation,
-                    deleted_at IS NOT NULL, ?{now_param}
+                    deleted_at IS NOT NULL, ?{now_param}, zeroblob(32)
              FROM objects WHERE source_id = ?1 AND {predicate}
              ON CONFLICT(source_id, object_id) DO UPDATE SET
                 seq = excluded.seq, generation = excluded.generation, deleted = excluded.deleted,
-                touched_at = excluded.touched_at"
+                touched_at = excluded.touched_at, image_hash = excluded.image_hash"
         ),
         rusqlite::params_from_iter(bound.iter()),
     )?;
@@ -441,7 +487,17 @@ fn touch_set_conn(
     let mut chain = head_chain;
     let mut last_seq = base;
     for (seq, object, generation, deleted) in minted {
-        chain = chain_after(&chain, ObjectId(object), generation as u64, deleted);
+        let object = ObjectId(object);
+        let image_hash = if deleted {
+            TOMBSTONE_IMAGE_HASH
+        } else {
+            sync_row_image_hash(&live_image_conn(conn, object)?)?
+        };
+        conn.prepare_cached(
+            "UPDATE sync_rows SET image_hash = ?3 WHERE source_id = ?1 AND object_id = ?2",
+        )?
+        .execute(params![source.0, object.0, image_hash.as_slice()])?;
+        chain = chain_after(&chain, object, generation as u64, deleted, &image_hash);
         insert_chain_conn(conn, source, seq, &chain)?;
         last_seq = seq;
     }
@@ -476,6 +532,25 @@ fn entries_conn(conn: &Connection, object: ObjectId) -> Result<Vec<SyncEntryImag
         .collect::<rusqlite::Result<_>>()?)
 }
 
+fn live_image_conn(conn: &Connection, object: ObjectId) -> Result<SyncRowImage> {
+    let (record, container) = conn
+        .prepare_cached(&format!(
+            "SELECT {OBJECT_COLUMNS}, o.archive_container_id FROM objects o WHERE o.object_id = ?1"
+        ))?
+        .query_row(params![object.0], |r| {
+            Ok((
+                ObjectRecord::from_row_at(r, 0)?,
+                r.get::<_, Option<i64>>(22)?.map(ObjectId),
+            ))
+        })?;
+    Ok(SyncRowImage {
+        version: SYNC_ROW_IMAGE_VERSION,
+        entries: entries_conn(conn, object)?,
+        object: record,
+        archive_container: container,
+    })
+}
+
 fn chain_at_conn(conn: &Connection, source: SourceId, seq: u64) -> Result<Option<ChainHash>> {
     conn.prepare_cached("SELECT chain FROM sync_chain WHERE source_id = ?1 AND seq = ?2")?
         .query_row(params![source.0, seq as i64], |r| r.get::<_, Vec<u8>>(0))
@@ -492,26 +567,12 @@ fn materialize_conn(
     touched: Vec<(i64, i64, i64, bool)>,
 ) -> Result<Vec<SyncRow>> {
     let mut rows = Vec::with_capacity(touched.len());
-    let mut object_stmt = conn.prepare_cached(&format!(
-        "SELECT {OBJECT_COLUMNS}, o.archive_container_id FROM objects o WHERE o.object_id = ?1"
-    ))?;
     for (seq, object_id, generation, deleted) in touched {
         let object = ObjectId(object_id);
         let image = if deleted {
             None
         } else {
-            let (record, container) = object_stmt.query_row(params![object_id], |r| {
-                Ok((
-                    ObjectRecord::from_row_at(r, 0)?,
-                    r.get::<_, Option<i64>>(22)?.map(ObjectId),
-                ))
-            })?;
-            Some(SyncRowImage {
-                version: SYNC_ROW_IMAGE_VERSION,
-                entries: entries_conn(conn, object)?,
-                object: record,
-                archive_container: container,
-            })
+            Some(live_image_conn(conn, object)?)
         };
         rows.push(SyncRow {
             seq: seq as u64,
@@ -773,8 +834,8 @@ impl Catalog {
         self.with_reader(|conn| chain_at_conn(conn, source, seq))
     }
 
-    /// Every retained ledger row of a source as `(object, seq, generation,
-    /// deleted)`, in object order: the input to a Merkle tree over the
+    /// Every retained ledger row of a source, including its live image
+    /// digest, in object order: the input to a Merkle tree over the
     /// source image, read in one snapshot together with the head it
     /// describes.
     pub fn sync_ledger_entries(
@@ -788,7 +849,7 @@ impl Catalog {
             })?;
             let entries = tx
                 .prepare_cached(
-                    "SELECT object_id, seq, generation, deleted FROM sync_rows
+                    "SELECT object_id, seq, generation, deleted, image_hash FROM sync_rows
                      WHERE source_id = ?1 ORDER BY object_id",
                 )?
                 .query_map(params![source.0], |r| {
@@ -797,6 +858,13 @@ impl Catalog {
                         seq: r.get::<_, i64>(1)? as u64,
                         generation: r.get::<_, i64>(2)? as u64,
                         deleted: r.get::<_, i64>(3)? != 0,
+                        image_hash: image_hash_from_blob(r.get(4)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Blob,
+                                Box::new(error),
+                            )
+                        })?,
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -852,13 +920,13 @@ impl Catalog {
             let mut active_leaf = None;
             let mut active = MerkleLeafHasher::new();
             let mut stmt = tx.prepare_cached(
-                "SELECT object_id, generation, deleted,
+                "SELECT object_id, generation, deleted, image_hash,
                     eidos_merkle_leaf(?2, object_id) AS leaf
                  FROM sync_rows WHERE source_id = ?1 ORDER BY leaf, object_id",
             )?;
             let mut rows = stmt.query(params![source.0, leaf_bits as i64])?;
             while let Some(row) = rows.next()? {
-                let leaf = row.get::<_, i64>(3)? as usize;
+                let leaf = row.get::<_, i64>(4)? as usize;
                 if active_leaf.is_some_and(|previous| previous != leaf) {
                     let previous = active_leaf.expect("checked above");
                     hashes[previous] =
@@ -869,6 +937,7 @@ impl Catalog {
                     ObjectId(row.get(0)?),
                     row.get::<_, i64>(1)? as u64,
                     row.get::<_, i64>(2)? != 0,
+                    &image_hash_from_blob(row.get(3)?)?,
                 ));
             }
             if let Some(leaf) = active_leaf {

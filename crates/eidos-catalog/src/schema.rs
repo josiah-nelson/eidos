@@ -413,9 +413,9 @@ CREATE TABLE sync_sources (
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL
 );
--- The ledger stores touches, not images: the sequence at which an object
--- was last changed, its generation, and whether that change was a deletion.
--- Row images are materialized from the live catalog at ship time.
+-- The ledger stores touches, not image copies: the sequence at which an
+-- object was last changed, its generation, deletion state, and a canonical
+-- digest of its live image. Row images are materialized at ship time.
 CREATE TABLE sync_rows (
     source_id  INTEGER NOT NULL,
     object_id  INTEGER NOT NULL,
@@ -452,7 +452,7 @@ ALTER TABLE volumes ADD COLUMN native_feed TEXT NOT NULL DEFAULT 'none';
         r#"
 -- History chain over each source epoch's sequence (eidos-sync identity):
 -- chain(0) is all zeros and chain(n) = blake3(chain(n-1) || object ||
--- generation || live-or-tombstone). A batch carries the chain at both ends
+-- generation || tombstone-or-image-digest). A batch carries the chain at both ends
 -- of its interval so a consumer can fence a source restored to an older
 -- state that has since overtaken the cursor. Retained from
 -- `compacted_through` to the head; pruned by the collection pass.
@@ -478,6 +478,11 @@ INSERT INTO sync_chain (source_id, seq, chain)
     FROM sync_sources;
 -- When the touch happened, so backlog age can be reported per consumer.
 ALTER TABLE sync_rows ADD COLUMN touched_at INTEGER NOT NULL DEFAULT 0;
+-- Canonical digest of the live row image at the time of the touch. This is
+-- part of both the history chain and Merkle record, so metadata-only and
+-- rename-only changes cannot masquerade as identical generations.
+ALTER TABLE sync_rows ADD COLUMN image_hash BLOB NOT NULL
+    DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000';
 
 -- Enrollment makes every eligible source replicate by default; a source may
 -- opt out. `inherit` follows the node's enrollment, `local_only` never ships.
@@ -549,6 +554,7 @@ CREATE TABLE sync_replica_rows (
     seq              INTEGER NOT NULL,
     generation       INTEGER NOT NULL,
     deleted          INTEGER NOT NULL DEFAULT 0,
+    image_hash       BLOB NOT NULL,
     placeholder      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (source_id, remote_object_id)
 ) WITHOUT ROWID;

@@ -24,8 +24,8 @@
 
 use crate::jobs::outbox_append_conn;
 use crate::sync::{
-    record_digest, register_merkle_leaf_function, SyncBatch, SyncEpoch, SyncRow, SyncRowImage,
-    SYNC_ROW_IMAGE_VERSION,
+    image_hash_from_blob, record_digest, register_merkle_leaf_function, sync_row_image_hash,
+    SyncBatch, SyncEpoch, SyncRow, SyncRowImage, SYNC_ROW_IMAGE_VERSION,
 };
 use crate::{Catalog, CatalogError, Result};
 use eidos_domain::{
@@ -172,8 +172,8 @@ pub struct ReplicaCoverage {
 const REMOTE_GENERATION: i64 = 1;
 const MAX_SQLITE_SEQUENCE: u64 = i64::MAX as u64;
 const RETIRE_STEP_ROWS: usize = 10_000;
-const MAX_REPAIR_PART_ROWS: usize = 10_000;
-const MAX_REPAIR_PART_ENTRIES: usize = 100_000;
+const MAX_APPLY_ROWS: usize = 10_000;
+const MAX_APPLY_ENTRIES: usize = 100_000;
 
 fn admission_from_json(json: &str) -> Result<AdmissionState> {
     serde_json::from_str(json).map_err(|e| {
@@ -336,8 +336,8 @@ fn local_object_conn(
     let local = ObjectId(tx.last_insert_rowid());
     tx.prepare_cached(
         "INSERT INTO sync_replica_rows (source_id, remote_object_id, local_object_id, epoch, seq,
-            generation, deleted, placeholder)
-         VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 1)",
+            generation, deleted, image_hash, placeholder)
+         VALUES (?1, ?2, ?3, ?4, 0, 0, 0, zeroblob(32), 1)",
     )?
     .execute(params![source.0, remote.0, local.0, epoch.0.as_slice()])?;
     Ok(local)
@@ -642,16 +642,23 @@ fn prepare_rows_conn(
     Ok(())
 }
 
-fn wire_row_ids_are_valid(row: &SyncRow) -> bool {
+fn wire_row_is_valid(row: &SyncRow) -> bool {
     row.object.0 > 0
         && row.image.as_ref().is_none_or(|image| {
             image.object.id.0 > 0
+                && u64::from(image.object.generation) == row.generation
                 && image.archive_container.is_none_or(|object| object.0 > 0)
                 && image
                     .entries
                     .iter()
                     .all(|entry| entry.parent.is_none_or(|object| object.0 > 0))
         })
+}
+
+fn wire_entry_count(rows: &[SyncRow]) -> Option<usize> {
+    rows.iter().try_fold(0usize, |count, row| {
+        count.checked_add(row.image.as_ref().map_or(0, |image| image.entries.len()))
+    })
 }
 
 fn repair_pending_conn(tx: &Transaction<'_>, source: SourceId) -> Result<bool> {
@@ -713,6 +720,10 @@ fn apply_row_conn(
     let local = match &existing {
         Some(state) => state.local,
         None => local_object_conn(tx, source, epoch, row.object)?,
+    };
+    let image_hash = match &row.image {
+        Some(image) => sync_row_image_hash(image)?,
+        None => [0; 32],
     };
     match &row.image {
         None => {
@@ -821,7 +832,8 @@ fn apply_row_conn(
         }
     }
     tx.prepare_cached(
-        "UPDATE sync_replica_rows SET epoch = ?3, seq = ?4, generation = ?5, deleted = ?6, placeholder = 0
+        "UPDATE sync_replica_rows SET epoch = ?3, seq = ?4, generation = ?5, deleted = ?6,
+             image_hash = ?7, placeholder = 0
          WHERE source_id = ?1 AND remote_object_id = ?2",
     )?
     .execute(params![
@@ -831,6 +843,7 @@ fn apply_row_conn(
         row.seq as i64,
         row.generation as i64,
         row.image.is_none() as i64,
+        image_hash.as_slice(),
     ])?;
     counts.applied += 1;
     Ok(())
@@ -949,19 +962,29 @@ fn mark_completeness_conn(
 }
 
 fn replica_digests_conn(conn: &Connection, source: SourceId) -> Result<Vec<RecordDigest>> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT remote_object_id, generation, deleted FROM sync_replica_rows
+    conn.prepare_cached(
+        "SELECT remote_object_id, generation, deleted, image_hash FROM sync_replica_rows
              WHERE source_id = ?1 AND placeholder = 0 ORDER BY remote_object_id",
-        )?
-        .query_map(params![source.0], |r| {
-            Ok(record_digest(
-                ObjectId(r.get(0)?),
-                r.get::<_, i64>(1)? as u64,
-                r.get::<_, i64>(2)? != 0,
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?)
+    )?
+    .query_map(params![source.0], |r| {
+        Ok((
+            ObjectId(r.get(0)?),
+            r.get::<_, i64>(1)? as u64,
+            r.get::<_, i64>(2)? != 0,
+            r.get::<_, Vec<u8>>(3)?,
+        ))
+    })?
+    .collect::<rusqlite::Result<Vec<_>>>()?
+    .into_iter()
+    .map(|(object, generation, deleted, image_hash)| {
+        Ok(record_digest(
+            object,
+            generation,
+            deleted,
+            &image_hash_from_blob(image_hash)?,
+        ))
+    })
+    .collect::<Result<_>>()
 }
 
 fn replica_leaf_hashes_conn(
@@ -974,14 +997,14 @@ fn replica_leaf_hashes_conn(
     let mut active_leaf = None;
     let mut active = MerkleLeafHasher::new();
     let mut stmt = conn.prepare_cached(
-        "SELECT remote_object_id, generation, deleted,
+        "SELECT remote_object_id, generation, deleted, image_hash,
             eidos_merkle_leaf(?2, remote_object_id) AS leaf
          FROM sync_replica_rows
          WHERE source_id = ?1 AND placeholder = 0 ORDER BY leaf, remote_object_id",
     )?;
     let mut rows = stmt.query(params![source.0, leaf_bits as i64])?;
     while let Some(row) = rows.next()? {
-        let leaf = row.get::<_, i64>(3)? as usize;
+        let leaf = row.get::<_, i64>(4)? as usize;
         if active_leaf.is_some_and(|previous| previous != leaf) {
             let previous = active_leaf.expect("checked above");
             hashes[previous] = std::mem::replace(&mut active, MerkleLeafHasher::new()).finalize();
@@ -991,6 +1014,7 @@ fn replica_leaf_hashes_conn(
             ObjectId(row.get(0)?),
             row.get::<_, i64>(1)? as u64,
             row.get::<_, i64>(2)? != 0,
+            &image_hash_from_blob(row.get(3)?)?,
         ));
     }
     if let Some(leaf) = active_leaf {
@@ -1160,6 +1184,7 @@ impl Catalog {
                 && state.reported_at.is_some()
                 && head_seq == state.reported_head
                 && state.reported_chain.is_some_and(|chain| chain != head_chain);
+            let reconnecting_pending_epoch = state.admission.pending_epoch() == Some(epoch);
             let malformed = head_seq > MAX_SQLITE_SEQUENCE
                 || compacted_through > MAX_SQLITE_SEQUENCE
                 || compacted_through > head_seq
@@ -1201,11 +1226,13 @@ impl Catalog {
                     // Every live object of the new incarnation is stamped at
                     // or below the head offered now; once the stream passes
                     // it, rows of other epochs are authoritatively absent.
-                    state.resync_target = Some(
+                    state.resync_target = Some(if reconnecting_pending_epoch {
                         state
                             .resync_target
-                            .map_or(head_seq, |target| target.max(head_seq)),
-                    );
+                            .map_or(head_seq, |target| target.max(head_seq))
+                    } else {
+                        head_seq
+                    });
                     HelloOutcome::FullResync { epoch: new_epoch }
                 }
                 HelloDecision::RejectAndAlarm {
@@ -1279,6 +1306,7 @@ impl Catalog {
         );
         let rows = batch.rows.as_slice();
         let unique = rows.iter().map(|r| r.object).collect::<BTreeSet<_>>().len() == rows.len();
+        let entry_count = wire_entry_count(rows);
         let empty_snapshot = after_seq == 0
             && through_seq == 0
             && batch.head_seq == 0
@@ -1291,11 +1319,13 @@ impl Catalog {
             || through_seq > MAX_SQLITE_SEQUENCE
             || batch.head_seq > MAX_SQLITE_SEQUENCE
             || through_seq > batch.head_seq
+            || rows.len() > MAX_APPLY_ROWS
+            || entry_count.is_none_or(|count| count > MAX_APPLY_ENTRIES)
             || rows.iter().any(|r| {
                 r.seq <= after_seq
                     || r.seq > through_seq
-                    || r.generation > MAX_SQLITE_SEQUENCE
-                    || !wire_row_ids_are_valid(r)
+                    || r.generation > u64::from(u32::MAX)
+                    || !wire_row_is_valid(r)
             })
         {
             return Ok(BatchOutcome::Rejected {
@@ -1612,18 +1642,14 @@ impl Catalog {
     ) -> Result<RepairOutcome> {
         let unique = rows.iter().map(|r| r.object).collect::<BTreeSet<_>>().len() == rows.len();
         let unique_leaves = leaves.iter().copied().collect::<BTreeSet<_>>().len() == leaves.len();
-        let entry_count = rows.iter().try_fold(0usize, |count, row| {
-            count.checked_add(row.image.as_ref().map_or(0, |image| image.entries.len()))
-        });
+        let entry_count = wire_entry_count(rows);
         if !(MIN_FLEET_LEAF_BITS..=MAX_FLEET_LEAF_BITS).contains(&leaf_bits)
             || through_seq > MAX_SQLITE_SEQUENCE
-            || rows.len() > MAX_REPAIR_PART_ROWS
-            || entry_count.is_none_or(|count| count > MAX_REPAIR_PART_ENTRIES)
+            || rows.len() > MAX_APPLY_ROWS
+            || entry_count.is_none_or(|count| count > MAX_APPLY_ENTRIES)
             || leaves.iter().any(|l| *l >= (1u32 << leaf_bits))
             || rows.iter().any(|r| {
-                r.seq > through_seq
-                    || r.generation > MAX_SQLITE_SEQUENCE
-                    || !wire_row_ids_are_valid(r)
+                r.seq > through_seq || r.generation > u64::from(u32::MAX) || !wire_row_is_valid(r)
             })
             || !unique
             || !unique_leaves
@@ -1757,7 +1783,7 @@ impl Catalog {
                             source.0,
                             leaf_bits as i64,
                             leaves_json,
-                            (MAX_REPAIR_PART_ROWS + 1) as i64
+                            (MAX_APPLY_ROWS + 1) as i64
                         ],
                         |r| {
                             Ok((
@@ -1768,10 +1794,10 @@ impl Catalog {
                         },
                     )?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                if known.len() > MAX_REPAIR_PART_ROWS {
+                if known.len() > MAX_APPLY_ROWS {
                     return Ok(RepairOutcome::Rejected {
                         reason: format!(
-                            "repair leaf scope exceeds the {MAX_REPAIR_PART_ROWS}-mapping transaction limit"
+                            "repair leaf scope exceeds the {MAX_APPLY_ROWS}-mapping transaction limit"
                         ),
                     });
                 }

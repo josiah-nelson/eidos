@@ -969,8 +969,9 @@ impl<'a> Applier<'a> {
 
     /// Orphan cleanup: touched objects with no live entry are gone.
     fn finish(&mut self) -> Result<()> {
-        let touched: Vec<ObjectId> = self.touched.iter().copied().collect();
-        for id in touched {
+        let mut touched: Vec<ObjectId> = self.touched.iter().copied().collect();
+        touched.sort_unstable();
+        for &id in &touched {
             if id == self.root {
                 continue;
             }
@@ -982,6 +983,14 @@ impl<'a> Applier<'a> {
             if live == 0 {
                 self.tombstone_object(id)?;
             }
+        }
+        // Individual outbox writes can happen before a link, unlink, or
+        // orphan cleanup has reached its final row image. Close every
+        // change-feed transaction with one deterministic final-state stamp
+        // per touched object so the durable image digest matches what a
+        // later materialization will ship.
+        for id in touched {
+            crate::sync::touch_conn(self.tx, self.source_id, id)?;
         }
         Ok(())
     }

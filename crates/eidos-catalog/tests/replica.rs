@@ -5,7 +5,7 @@
 //! Each test plays the message exchange by hand so the catalog is the only
 //! thing under test.
 
-use eidos_catalog::changes::{ChangeEvent, ObjectSnapshot};
+use eidos_catalog::changes::{ChangeEvent, NativeKey, ObjectSnapshot};
 use eidos_catalog::fleet::{FleetPeer, NodeId, PeerRole};
 use eidos_catalog::replica::{
     BatchOutcome, HelloOutcome, RemoteNode, RemoteSourceDescriptor, RepairOutcome,
@@ -13,7 +13,9 @@ use eidos_catalog::replica::{
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::sync::{record_digest, SyncBatch, SyncEpoch, SyncRow, CHAIN_GENESIS};
 use eidos_catalog::{Catalog, NewSource};
-use eidos_domain::{ContentState, ObjectId, SourceId, SourceKind, SourceState, UnixNanos};
+use eidos_domain::{
+    ContentState, FileAttributes, ObjectId, SourceId, SourceKind, SourceState, UnixNanos,
+};
 use eidos_sync::identity::SourceEpoch;
 use eidos_sync::merkle::{leaf_index, MerkleTree, MIN_FLEET_LEAF_BITS};
 use std::collections::BTreeSet;
@@ -121,6 +123,60 @@ impl Node {
         };
         self.catalog
             .apply_changes(self.source, &[ChangeEvent::Update { snapshot }], None)
+            .unwrap();
+    }
+
+    fn snapshot(&self, rel: &str) -> ObjectSnapshot {
+        let o = self.catalog.get_object(self.id(rel)).unwrap().unwrap();
+        ObjectSnapshot {
+            native: o.native.expect("native identity"),
+            kind: o.kind,
+            attributes: o.attributes,
+            size: o.size,
+            allocated: o.allocated,
+            link_count: o.link_count,
+            created: o.created,
+            modified: o.modified,
+            changed: o.changed,
+            accessed: o.accessed,
+            reparse_tag: o.reparse_tag,
+        }
+    }
+
+    fn set_attributes(&self, rel: &str, attributes: FileAttributes) {
+        let mut snapshot = self.snapshot(rel);
+        snapshot.attributes = attributes;
+        self.catalog
+            .apply_changes(self.source, &[ChangeEvent::Update { snapshot }], None)
+            .unwrap();
+    }
+
+    fn rename_one(&self, new_name: &str) {
+        let parent = NativeKey::from(
+            self.catalog
+                .get_object(self.id("a"))
+                .unwrap()
+                .unwrap()
+                .native
+                .expect("native identity"),
+        );
+        let snapshot = self.snapshot("a/one.txt");
+        self.catalog
+            .apply_changes(
+                self.source,
+                &[
+                    ChangeEvent::Unlink {
+                        parent,
+                        name: "one.txt".into(),
+                    },
+                    ChangeEvent::Link {
+                        parent,
+                        name: new_name.into(),
+                        snapshot,
+                    },
+                ],
+                None,
+            )
             .unwrap();
     }
 
@@ -583,6 +639,57 @@ fn remote_sequences_that_do_not_fit_sqlite_are_rejected_before_casting() {
         central.catalog.replica_apply_batch(source, &batch).unwrap(),
         BatchOutcome::Rejected { .. }
     ));
+
+    let mut batch = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap();
+    let row = batch
+        .rows
+        .iter_mut()
+        .find(|row| row.image.is_some())
+        .unwrap();
+    row.generation = u64::from(u32::MAX) + 1;
+    row.image = None;
+    assert!(matches!(
+        central.catalog.replica_apply_batch(source, &batch).unwrap(),
+        BatchOutcome::Rejected { .. }
+    ));
+
+    let mut batch = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap();
+    let row = batch
+        .rows
+        .iter_mut()
+        .find(|row| row.image.is_some())
+        .unwrap();
+    row.generation += 1;
+    assert_ne!(
+        row.generation,
+        u64::from(row.image.as_ref().unwrap().object.generation)
+    );
+    assert!(matches!(
+        central.catalog.replica_apply_batch(source, &batch).unwrap(),
+        BatchOutcome::Rejected { .. }
+    ));
+
+    let mut batch = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap();
+    let image = batch
+        .rows
+        .iter_mut()
+        .find_map(|row| row.image.as_mut())
+        .unwrap();
+    let entry = image.entries[0].clone();
+    image.entries = vec![entry; 100_001];
+    assert!(matches!(
+        central.catalog.replica_apply_batch(source, &batch).unwrap(),
+        BatchOutcome::Rejected { .. }
+    ));
     assert_eq!(central.applied_seq(source), 0);
 }
 
@@ -767,6 +874,74 @@ fn a_same_epoch_rewind_is_fenced_and_a_rewritten_history_is_a_fork() {
 }
 
 #[test]
+fn a_same_height_rename_only_rewrite_is_fenced_as_a_history_fork() {
+    let mut node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let checkpoint = node.checkpoint();
+    let generation = node
+        .catalog
+        .get_object(node.id("a/one.txt"))
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    node.rename_one("alpha.txt");
+    assert_eq!(
+        node.catalog
+            .get_object(node.id("a/alpha.txt"))
+            .unwrap()
+            .unwrap()
+            .generation,
+        generation,
+        "rename-only updates do not bump object generation"
+    );
+    converge(&node, &central, 8);
+    let accepted_head = central.applied_seq(source);
+
+    node.restore(&checkpoint);
+    node.rename_one("beta.txt");
+    let fork = node.catalog.sync_source(node.source).unwrap().unwrap();
+    assert_eq!(
+        fork.head_seq, accepted_head,
+        "both branches minted two touches"
+    );
+    assert_eq!(
+        node.catalog
+            .get_object(node.id("a/beta.txt"))
+            .unwrap()
+            .unwrap()
+            .generation,
+        generation
+    );
+    match central
+        .catalog
+        .replica_admit_hello(
+            source,
+            fork.epoch.to_source_epoch(),
+            fork.head_seq,
+            fork.head_chain,
+            fork.compacted_through,
+        )
+        .unwrap()
+    {
+        HelloOutcome::Rejected { reason } => assert!(reason.contains("history fork"), "{reason}"),
+        other => panic!("rename-only fork was admitted: {other:?}"),
+    }
+    assert!(central
+        .catalog
+        .resolve_relative(source, "a/alpha.txt")
+        .unwrap()
+        .is_some());
+    assert!(central
+        .catalog
+        .resolve_relative(source, "a/beta.txt")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn an_epoch_change_streams_a_full_resync_and_retires_rows_the_new_epoch_lacks() {
     let node = Node::new();
     let central = Central::new();
@@ -853,7 +1028,7 @@ fn an_epoch_change_streams_a_full_resync_and_retires_rows_the_new_epoch_lacks() 
         4,
         entries
             .iter()
-            .map(|e| record_digest(e.object, e.generation, e.deleted)),
+            .map(|e| record_digest(e.object, e.generation, e.deleted, &e.image_hash)),
     );
     let replica_tree =
         MerkleTree::with_leaf_bits(4, central.catalog.replica_digests(source).unwrap());
@@ -923,7 +1098,7 @@ fn an_empty_new_epoch_is_a_complete_snapshot_that_retires_the_old_image() {
 }
 
 #[test]
-fn retirement_cannot_publish_complete_below_a_newer_reported_head() {
+fn retirement_targets_are_epoch_local_and_completeness_tracks_newer_heads() {
     let node = Node::new();
     let central = Central::new();
     converge(&node, &central, 8);
@@ -951,8 +1126,8 @@ fn retirement_cannot_publish_complete_below_a_newer_reported_head() {
                 tx.execute(
                     "INSERT INTO sync_replica_rows
                         (source_id, remote_object_id, local_object_id, epoch, seq,
-                         generation, deleted, placeholder)
-                     VALUES (?1, ?2, ?3, ?4, 1, 1, 0, 0)",
+                         generation, deleted, image_hash, placeholder)
+                     VALUES (?1, ?2, ?3, ?4, 1, 1, 0, zeroblob(32), 0)",
                     rusqlite::params![source.0, remote, local, old_epoch.as_bytes().as_slice()],
                 )?;
             }
@@ -999,10 +1174,11 @@ fn retirement_cannot_publish_complete_below_a_newer_reported_head() {
     }
 
     let epoch = SourceEpoch::random_v4(303, 404);
+    let epoch_chain = [0x33; 32];
     assert!(matches!(
         central
             .catalog
-            .replica_admit_hello(source, epoch, 0, CHAIN_GENESIS, 0)
+            .replica_admit_hello(source, epoch, 100, epoch_chain, 0)
             .unwrap(),
         HelloOutcome::FullResync { .. }
     ));
@@ -1011,35 +1187,73 @@ fn retirement_cannot_publish_complete_below_a_newer_reported_head() {
         epoch: SyncEpoch::from_source_epoch(epoch),
         after_seq: 0,
         after_chain: CHAIN_GENESIS,
-        through_seq: 0,
-        through_chain: CHAIN_GENESIS,
-        head_seq: 0,
+        through_seq: 100,
+        through_chain: epoch_chain,
+        head_seq: 100,
         rows: vec![],
     };
     assert!(matches!(
         central.catalog.replica_apply_batch(source, &empty).unwrap(),
         BatchOutcome::Applied { .. }
     ));
-    assert!(central
-        .catalog
-        .replica_source(source)
-        .unwrap()
-        .unwrap()
-        .resync_target
-        .is_some());
+    assert_eq!(
+        central
+            .catalog
+            .replica_source(source)
+            .unwrap()
+            .unwrap()
+            .resync_target,
+        Some(100)
+    );
+
+    let next_epoch = SourceEpoch::random_v4(505, 606);
+    let next_chain = [0x55; 32];
+    assert_eq!(
+        central
+            .catalog
+            .replica_admit_hello(source, next_epoch, 10, next_chain, 0)
+            .unwrap(),
+        HelloOutcome::FullResync { epoch: next_epoch }
+    );
+    assert_eq!(
+        central
+            .catalog
+            .replica_source(source)
+            .unwrap()
+            .unwrap()
+            .resync_target,
+        Some(10),
+        "a new epoch must not inherit the previous epoch's higher target"
+    );
+    let next_empty = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(next_epoch),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 10,
+        through_chain: next_chain,
+        head_seq: 10,
+        rows: vec![],
+    };
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(source, &next_empty)
+            .unwrap(),
+        BatchOutcome::Applied { retired_rows, .. } if retired_rows > 0
+    ));
 
     assert!(matches!(
         central
             .catalog
-            .replica_admit_hello(source, epoch, 1, [0x44; 32], 0)
+            .replica_admit_hello(source, next_epoch, 11, [0x66; 32], 0)
             .unwrap(),
-        HelloOutcome::Resume { after_seq: 0, .. }
+        HelloOutcome::Resume { after_seq: 10, .. }
     ));
-    assert!(central.catalog.replica_continue_retirement(source).unwrap() > 0);
     let state = central.catalog.replica_source(source).unwrap().unwrap();
     assert_eq!(state.resync_target, None);
-    assert_eq!(state.admission.applied_seq, 0);
-    assert_eq!(state.reported_head, 1);
+    assert_eq!(state.admission.applied_seq, 10);
+    assert_eq!(state.reported_head, 11);
     assert!(
         !central
             .catalog
@@ -1520,7 +1734,7 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
         leaf_bits,
         entries
             .iter()
-            .map(|e| record_digest(e.object, e.generation, e.deleted)),
+            .map(|e| record_digest(e.object, e.generation, e.deleted, &e.image_hash)),
     );
     let request = central
         .catalog
@@ -1605,6 +1819,110 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
 }
 
 #[test]
+fn compacted_metadata_only_changes_are_visible_to_merkle_repair() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let before_cursor = central.applied_seq(source);
+    let object = node.id("a/one.txt");
+    let before = node.catalog.get_object(object).unwrap().unwrap();
+    let changed_attributes = FileAttributes(before.attributes.0 ^ 1);
+
+    node.catalog
+        .with_writer(|conn| {
+            conn.execute("DELETE FROM sync_consumers", [])?;
+            Ok(())
+        })
+        .unwrap();
+    node.set_attributes("a/one.txt", changed_attributes);
+    let changed = node.catalog.get_object(object).unwrap().unwrap();
+    assert_eq!(changed.generation, before.generation);
+    assert_eq!(changed.attributes, changed_attributes);
+    node.catalog.sync_collect(node.source, 100).unwrap();
+    let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    assert!(state.compacted_through > before_cursor);
+
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                state.compacted_through,
+            )
+            .unwrap(),
+        HelloOutcome::Resume {
+            requires_repair: true,
+            ..
+        }
+    ));
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
+    let tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
+    );
+    let leaves = match central
+        .catalog
+        .replica_repair_offer(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &tree.leaf_hashes(),
+        )
+        .unwrap()
+    {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("metadata-only divergence was not offered for repair: {other:?}"),
+    };
+    assert!(!leaves.is_empty());
+    let wanted: BTreeSet<_> = leaves.iter().copied().collect();
+    let objects: Vec<_> = entries
+        .iter()
+        .filter(|entry| wanted.contains(&leaf_index(leaf_bits, entry.object)))
+        .map(|entry| entry.object)
+        .collect();
+    let (_, rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &objects)
+        .unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                leaf_bits,
+                &leaves,
+                &rows,
+            )
+            .unwrap(),
+        RepairOutcome::Applied { .. }
+    ));
+    let local = central
+        .catalog
+        .resolve_relative(source, "a/one.txt")
+        .unwrap()
+        .unwrap();
+    let repaired = central.catalog.get_object(local).unwrap().unwrap();
+    assert_eq!(repaired.attributes, changed_attributes);
+    assert_eq!(repaired.generation, before.generation);
+}
+
+#[test]
 fn repair_replay_is_chain_bound_and_rejects_duplicate_objects() {
     let node = Node::new();
     let central = Central::new();
@@ -1645,9 +1963,14 @@ fn repair_replay_is_chain_bound_and_rejects_duplicate_objects() {
     let (_, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
     let mut hashes = MerkleTree::with_leaf_bits(
         leaf_bits,
-        entries
-            .iter()
-            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+        entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
     )
     .leaf_hashes();
     hashes[leaves[0] as usize][0] ^= 0xff;
@@ -1798,9 +2121,14 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
     let leaf_bits = MIN_FLEET_LEAF_BITS;
     let source_tree = MerkleTree::with_leaf_bits(
         leaf_bits,
-        entries
-            .iter()
-            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+        entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
     );
     let request = central
         .catalog
@@ -1923,9 +2251,14 @@ fn an_outstanding_repair_keeps_a_later_batch_reconciling() {
     let leaf_bits = MIN_FLEET_LEAF_BITS;
     let tree = MerkleTree::with_leaf_bits(
         leaf_bits,
-        entries
-            .iter()
-            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+        entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
     );
     let request = central
         .catalog
@@ -2005,9 +2338,14 @@ fn snapshot_fallback_preserves_rows_already_staged_by_repair() {
     let leaf_bits = MIN_FLEET_LEAF_BITS;
     let tree = MerkleTree::with_leaf_bits(
         leaf_bits,
-        entries
-            .iter()
-            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+        entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
     );
     let request = central
         .catalog
@@ -2135,9 +2473,14 @@ fn a_compacted_new_epoch_can_install_its_first_snapshot_by_repair() {
     let leaf_bits = MIN_FLEET_LEAF_BITS;
     let tree = MerkleTree::with_leaf_bits(
         leaf_bits,
-        entries
-            .iter()
-            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+        entries.iter().map(|entry| {
+            record_digest(
+                entry.object,
+                entry.generation,
+                entry.deleted,
+                &entry.image_hash,
+            )
+        }),
     );
     let request = central
         .catalog

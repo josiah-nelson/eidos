@@ -43,12 +43,15 @@ offline for three weeks grows without bound (hardening gate H2).
    transaction that mutates catalog rows. The existing `outbox` table and
    `projection_state` are unchanged and keep serving local projections.
 
-2. **The ledger records touches, not images.** For each source it stores one
-   row per object: the per-source sequence at which the object was last
-   touched, the object generation, and whether the touch was a deletion. It
-   does not store a copy of the object's data. The row image is materialized
-   at ship time from the live catalog tables inside one read transaction that
-   also reads the source head sequence, so the batch is a consistent snapshot.
+2. **The ledger records touches, not image copies.** For each source it stores
+   one row per object: the per-source sequence at which the object was last
+   touched, the object generation, whether the touch was a deletion, and a
+   canonical digest of the live image at that touch. The digest makes
+   metadata-only and rename-only changes visible to history fencing and
+   Merkle repair even when object generation intentionally stays unchanged.
+   The row image itself is materialized at ship time from the live catalog
+   tables inside one read transaction that also reads the source head
+   sequence, so the batch is a consistent snapshot.
    Because a batch already coalesces to the final image per object, "objects
    touched after the consumer's watermark" is exactly the set to ship, and the
    log of intermediate touches never needs to exist on disk.
@@ -59,7 +62,8 @@ offline for three weeks grows without bound (hardening gate H2).
      `compacted_through`, the native journal identity the epoch was minted
      against, and timestamps. One row per sync-enabled source.
    - `sync_rows` — `(source_id, object_id)` primary key, `seq`, `generation`,
-     `deleted` flag. Indexed by `(source_id, seq)` for suffix scans.
+     `deleted` flag, and canonical `image_hash`. Indexed by `(source_id, seq)`
+     for suffix scans.
    - `sync_consumers` — `(source_id, consumer_id)` primary key, `watermark`,
      `updated_at`. `consumer_id` is a stable typed device identity, not the
      simulator's node id (hardening H3.4).
