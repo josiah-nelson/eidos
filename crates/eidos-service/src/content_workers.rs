@@ -240,6 +240,10 @@ pub fn load_workers_override(data_dir: &std::path::Path) -> Option<usize> {
 /// shrinking parks the surplus after their current batch — nothing in
 /// flight is interrupted, and per-source budgets still apply on top.
 pub fn resize_workers(state: &Arc<AppState>, workers: usize) -> std::io::Result<usize> {
+    // The control/claim admission gate serialises resizes: two overlapping
+    // calls would otherwise read the same `spawned` count and spawn the
+    // same worker indices twice, exceeding the cap they just agreed on.
+    let _admission = state.content_pause.admission_guard();
     let workers = workers.clamp(1, MAX_WORKERS);
     let path = state.data_dir.join(WORKERS_MARKER);
     let tmp = path.with_extension("json.tmp");

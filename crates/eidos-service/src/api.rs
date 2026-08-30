@@ -263,25 +263,33 @@ pub(crate) struct Health {
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
-    let sources = st.catalog.list_sources()?;
-    let running = st
-        .scans
-        .lock()
-        .values()
-        .filter(|p| !p.is_finished())
-        .count();
-    Ok(ApiJson(Health {
-        version: env!("CARGO_PKG_VERSION"),
-        schema_version: eidos_domain::SCHEMA_VERSION,
-        host: st.host_name.clone(),
-        uptime_s: st.started_at.elapsed().as_secs(),
-        catalog_path: st.catalog.path().display().to_string(),
-        sources: sources.len(),
-        running_scans: running,
-        export_max_rows: st.export.max_rows,
-        content_status: crate::content_control::content_status(&st),
-        storage: st.storage(),
-    }))
+    // Catalog reads and the (cached) storage walk are blocking work; keep
+    // them off the async runtime workers so health stays answerable while
+    // the blocking pool is busy elsewhere.
+    let view = tokio::task::spawn_blocking(move || -> Result<Health, ApiError> {
+        let sources = st.catalog.list_sources()?;
+        let running = st
+            .scans
+            .lock()
+            .values()
+            .filter(|p| !p.is_finished())
+            .count();
+        Ok(Health {
+            version: env!("CARGO_PKG_VERSION"),
+            schema_version: eidos_domain::SCHEMA_VERSION,
+            host: st.host_name.clone(),
+            uptime_s: st.started_at.elapsed().as_secs(),
+            catalog_path: st.catalog.path().display().to_string(),
+            sources: sources.len(),
+            running_scans: running,
+            export_max_rows: st.export.max_rows,
+            content_status: crate::content_control::content_status(&st),
+            storage: st.storage(),
+        })
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(ApiJson(view))
 }
 
 // ----- sources -------------------------------------------------------------
