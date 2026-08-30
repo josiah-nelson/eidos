@@ -10,7 +10,7 @@ use eidos_observe::{
 };
 use fsevent_stream::ffi::{
     kFSEventStreamCreateFlagFileEvents, kFSEventStreamCreateFlagNoDefer,
-    kFSEventStreamCreateFlagWatchRoot, kFSEventStreamEventIdSinceNow, FSEventsGetCurrentEventId,
+    kFSEventStreamCreateFlagWatchRoot, kFSEventStreamEventIdSinceNow,
 };
 use fsevent_stream::flags::StreamFlags;
 use fsevent_stream::stream::create_event_stream;
@@ -124,13 +124,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     )
     .to_hex()
     .to_string();
+    let stored_cursor = load_cursor(&config.data_dir.join("fsevents.cursor"));
     let shared = Arc::new(Shared {
         key: Mutex::new(None),
         spool: Mutex::new(spool),
         capabilities: Mutex::new(capabilities),
         drops: Mutex::new(DropCounters::default()),
         gaps: Mutex::new(Vec::new()),
-        cursor: Mutex::new(load_cursor(&config.data_dir.join("fsevents.cursor"))),
+        cursor: Mutex::new(match &stored_cursor {
+            StoredCursor::Resumable(cursor) => Some(cursor.clone()),
+            StoredCursor::Absent | StoredCursor::Unusable => None,
+        }),
         endpoint_counts: endpoint_lane.counters.clone(),
         logical_changes: AtomicU64::new(0),
         started: Instant::now(),
@@ -138,6 +142,25 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         build_hash,
         config_hash,
     });
+    // An upgrade from a collector that stored the event store's counter is a
+    // one-time discontinuity: the recorded position can sit ahead of the
+    // events that were delivered, so it is dropped and the stream restarts at
+    // the present. Saying so is the point — the alternative is trusting the
+    // position and skipping those changes without a trace.
+    if stored_cursor == StoredCursor::Unusable {
+        tracing::warn!(
+            "the stored FSEvents position was written with cursor semantics this \
+             collector cannot resume from; restarting the feed at the present and \
+             recording a capture gap"
+        );
+        let now = time_anchor();
+        shared.gaps.lock().expect("gaps lock").push(CaptureGap {
+            started_monotonic_ns: now.monotonic_ns,
+            ended_monotonic_ns: now.monotonic_ns,
+            cause: GapCause::CursorUnusable,
+            estimated_events: None,
+        });
+    }
     append_health(&shared, LifecycleEvent::Started, Some(clean_prior_shutdown))?;
     tracing::info!(
         endpoint_security = ?endpoint_state,
@@ -361,6 +384,15 @@ async fn run_fsevents(
         create_event_stream([Path::new("/")], since, Duration::from_secs(1), flags)?;
     let mut state = LogicalState::new(MAX_TRACKED_IDENTITIES);
     let mut pending_rename = None;
+    // The persisted cursor is the highest event id this stream has actually
+    // processed, never the store's current id. The store's counter includes
+    // events the stream has not been handed yet — coalescing holds them for
+    // the latency window — so persisting it resumes *past* those events and
+    // loses exactly the batch a restart was meant to replay. Resuming from
+    // the highest processed id can instead replay a change already seen,
+    // which is idempotent: the safe direction ADR-0018 chose for the cursor
+    // it publishes with a generation.
+    let mut highest_id = cursor_id(since);
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -369,8 +401,10 @@ async fn run_fsevents(
             batch = stream.next() => {
                 let Some(batch) = batch else { break };
                 let batch_received = Instant::now();
+                let mut batch_highest = None;
                 for event in batch {
                     let backlog_age = bucket_age(batch_received.elapsed().as_secs());
+                    batch_highest = max_cursor(batch_highest, cursor_id(event.id));
                     process_event(
                         &shared,
                         event,
@@ -379,15 +413,21 @@ async fn run_fsevents(
                         backlog_age,
                     )?;
                 }
-                let id = unsafe { FSEventsGetCurrentEventId() };
-                if id != kFSEventStreamEventIdSinceNow {
+                // Events are not guaranteed to arrive in id order, and a
+                // batch carrying only flag-bearing events (history replayed,
+                // stream-level notifications) has no usable id at all. Both
+                // leave the cursor where it is rather than moving it back.
+                let next_id = max_cursor(highest_id, batch_highest);
+                if next_id != highest_id {
+                    let id = next_id.expect("a cursor that advanced has an event id");
                     let cursor = FeedCursor {
                         feed: FeedKind::Fsevents,
-                        version: 1,
+                        version: CURSOR_VERSION,
                         opaque: format!("{id:016x}"),
                     };
                     save_cursor(&cursor_file, id)?;
                     *shared.cursor.lock().expect("cursor lock") = Some(cursor);
+                    highest_id = Some(id);
                 }
             }
         }
@@ -787,29 +827,183 @@ fn utc_ns() -> i64 {
         .unwrap_or_default()
 }
 
-fn load_cursor(file: &Path) -> Option<FeedCursor> {
-    let value = fs::read_to_string(file).ok()?.trim().parse::<u64>().ok()?;
-    Some(FeedCursor {
-        feed: FeedKind::Fsevents,
-        version: 1,
-        opaque: format!("{value:016x}"),
-    })
+/// Cursor semantics, stamped into the file and into [`FeedCursor::version`].
+///
+/// Version 1 stored the event *store's* current id, which sits ahead of the
+/// events the stream was handed. Version 2 stores the highest id this stream
+/// processed. The two are not interchangeable, and nothing in a bare id says
+/// which one it is, so the version is written alongside it.
+const CURSOR_VERSION: u16 = 2;
+
+/// What a cursor file left by a previous run is worth.
+#[derive(Debug, PartialEq, Eq)]
+enum StoredCursor {
+    /// No file, or one that says nothing usable.
+    Absent,
+    /// A position written with the current semantics.
+    Resumable(FeedCursor),
+    /// A version-1 position. It may sit ahead of the events that were
+    /// actually delivered, so resuming from it would skip them *silently* —
+    /// exactly the loss this format version exists to end. It is discarded
+    /// and the discontinuity is reported as a capture gap instead.
+    Unusable,
+}
+
+fn load_cursor(file: &Path) -> StoredCursor {
+    let Ok(text) = fs::read_to_string(file) else {
+        return StoredCursor::Absent;
+    };
+    let text = text.trim();
+    let (version, id) = match text.split_once(' ') {
+        // `<version> <id>`, written by this collector.
+        Some((version, id)) => match (version.parse::<u16>(), id.trim().parse::<u64>()) {
+            (Ok(version), Ok(id)) => (version, id),
+            _ => return StoredCursor::Absent,
+        },
+        // A bare id is the version-1 format.
+        None => match text.parse::<u64>() {
+            Ok(id) => (1, id),
+            Err(_) => return StoredCursor::Absent,
+        },
+    };
+    match (version, cursor_id(id)) {
+        (CURSOR_VERSION, Some(id)) => StoredCursor::Resumable(FeedCursor {
+            feed: FeedKind::Fsevents,
+            version: CURSOR_VERSION,
+            opaque: format!("{id:016x}"),
+        }),
+        // A future version this build does not understand is no more
+        // resumable than an obsolete one, and is reported the same way.
+        (_, Some(_)) => StoredCursor::Unusable,
+        (_, None) => StoredCursor::Absent,
+    }
+}
+
+/// An event id worth remembering as a cursor position. Real ids start at 1;
+/// `0` is the "no id" placeholder, and `kFSEventStreamEventIdSinceNow` is the
+/// sentinel a stream with no stored position is created with. It is
+/// `u64::MAX`, so admitting it would pin the cursor at the maximum and the
+/// stream would never resume from anywhere again.
+fn cursor_id(id: u64) -> Option<u64> {
+    (id != 0 && id != kFSEventStreamEventIdSinceNow).then_some(id)
+}
+
+/// The later of two cursor positions, treating "no position" as the earliest.
+fn max_cursor(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+        (current, candidate) => current.or(candidate),
+    }
 }
 
 fn save_cursor(file: &Path, value: u64) -> anyhow::Result<()> {
     let temporary = file.with_extension("cursor.tmp");
-    fs::write(&temporary, format!("{value}\n"))?;
+    fs::write(&temporary, format!("{CURSOR_VERSION} {value}\n"))?;
     fs::rename(temporary, file)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{increment, native_metadata, LogicalState};
+    use super::{
+        cursor_id, increment, load_cursor, max_cursor, native_metadata, save_cursor, LogicalState,
+        StoredCursor, CURSOR_VERSION,
+    };
     use eidos_observe::StudyKey;
+    use fsevent_stream::ffi::kFSEventStreamEventIdSinceNow;
 
     fn token(value: u64) -> eidos_observe::ObjectToken {
         StudyKey::from_bytes([9; 32]).token("test", &value.to_le_bytes())
+    }
+
+    /// The cursor update the FSEvents loop performs for one delivered batch.
+    fn advance(current: Option<u64>, batch: &[u64]) -> Option<u64> {
+        let mut batch_highest = None;
+        for id in batch {
+            batch_highest = max_cursor(batch_highest, cursor_id(*id));
+        }
+        max_cursor(current, batch_highest)
+    }
+
+    #[test]
+    fn the_feed_cursor_never_moves_backwards() {
+        // Events within a batch, and batches themselves, are not guaranteed
+        // to arrive in id order; the stored position is the highest id
+        // processed either way.
+        let mut cursor = None;
+        cursor = advance(cursor, &[7, 4, 9, 2]);
+        assert_eq!(cursor, Some(9));
+        cursor = advance(cursor, &[5, 8]);
+        assert_eq!(cursor, Some(9), "an older batch leaves the cursor alone");
+        cursor = advance(cursor, &[11]);
+        assert_eq!(cursor, Some(11));
+        // A batch of flag-only events carries nothing to store.
+        cursor = advance(cursor, &[]);
+        assert_eq!(cursor, Some(11));
+    }
+
+    #[test]
+    fn the_since_now_sentinel_never_becomes_a_cursor() {
+        // kFSEventStreamEventIdSinceNow is u64::MAX. Admitting it once would
+        // pin the cursor at the maximum and the stream could never resume.
+        assert_eq!(cursor_id(kFSEventStreamEventIdSinceNow), None);
+        assert_eq!(cursor_id(0), None, "0 is the absent-id placeholder");
+        assert_eq!(cursor_id(1), Some(1));
+
+        let fresh = advance(cursor_id(kFSEventStreamEventIdSinceNow), &[3]);
+        assert_eq!(fresh, Some(3), "a fresh stream starts from its first event");
+        assert_eq!(
+            advance(Some(3), &[kFSEventStreamEventIdSinceNow, 4]),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn a_saved_cursor_reloads_as_the_same_position() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("fsevents.cursor");
+        save_cursor(&file, 0x0000_0000_dead_beef).unwrap();
+        let StoredCursor::Resumable(reloaded) = load_cursor(&file) else {
+            panic!("a cursor this collector wrote is resumable");
+        };
+        assert_eq!(reloaded.version, CURSOR_VERSION);
+        assert_eq!(
+            u64::from_str_radix(&reloaded.opaque, 16).unwrap(),
+            0x0000_0000_dead_beef,
+            "run_fsevents resumes by parsing `opaque` back out as hex"
+        );
+    }
+
+    #[test]
+    fn a_cursor_from_the_store_counter_era_is_not_resumed_from() {
+        // Version 1 wrote a bare id taken from FSEventsGetCurrentEventId(),
+        // which can sit ahead of the events the stream was handed. Trusting
+        // it on upgrade would skip exactly the changes this format version
+        // exists to preserve, and would do it silently.
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("fsevents.cursor");
+
+        std::fs::write(&file, "123456\n").unwrap();
+        assert_eq!(load_cursor(&file), StoredCursor::Unusable);
+
+        // A version this build does not know is no more resumable.
+        std::fs::write(&file, format!("{} 123456\n", CURSOR_VERSION + 1)).unwrap();
+        assert_eq!(load_cursor(&file), StoredCursor::Unusable);
+
+        // Nothing to resume from is not a discontinuity worth reporting: a
+        // first run and an unreadable file both simply start at the present.
+        assert_eq!(
+            load_cursor(&temporary.path().join("absent.cursor")),
+            StoredCursor::Absent
+        );
+        std::fs::write(&file, "not a cursor\n").unwrap();
+        assert_eq!(load_cursor(&file), StoredCursor::Absent);
+        std::fs::write(&file, format!("{CURSOR_VERSION} 0\n")).unwrap();
+        assert_eq!(load_cursor(&file), StoredCursor::Absent);
+
+        // And one written by this collector survives the upgrade check.
+        save_cursor(&file, 77).unwrap();
+        assert!(matches!(load_cursor(&file), StoredCursor::Resumable(_)));
     }
 
     #[test]
