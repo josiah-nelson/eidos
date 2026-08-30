@@ -25,7 +25,8 @@ use crate::{Catalog, CatalogError, Result};
 use eidos_domain::{ObjectId, SourceId, UnixNanos};
 use eidos_sync::identity::{chain_next, SourceEpoch};
 pub use eidos_sync::identity::{ChainHash, CHAIN_GENESIS};
-use eidos_sync::merkle::RecordDigest;
+use eidos_sync::merkle::{leaf_index, RecordDigest};
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -61,6 +62,20 @@ fn chain_after(
 /// and on a replica so divergent leaves can be found without images.
 pub fn record_digest(object: ObjectId, generation: u64, deleted: bool) -> RecordDigest {
     RecordDigest::from_value(object, generation, if deleted { None } else { Some(&[]) })
+}
+
+pub(crate) fn register_merkle_leaf_function(conn: &Connection) -> Result<()> {
+    conn.create_scalar_function(
+        "eidos_merkle_leaf",
+        2,
+        FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let leaf_bits = ctx.get::<i64>(0)? as u8;
+            let object = ObjectId(ctx.get::<i64>(1)?);
+            Ok(leaf_index(leaf_bits, object) as i64)
+        },
+    )?;
+    Ok(())
 }
 
 /// One `(object, generation, deleted)` triple of a source's retained rows.
@@ -292,6 +307,24 @@ fn insert_chain_conn(
          ON CONFLICT(source_id, seq) DO UPDATE SET chain = excluded.chain",
     )?
     .execute(params![source.0, seq, chain.as_slice()])?;
+    // Retention is part of stamping, not optional caller maintenance. Keep
+    // the exact floor chain so a consumer at `compacted_through` can prove
+    // its next batch, and prune older history in a bounded step.
+    let retention_floor = seq.saturating_sub(MAX_RETAINED_CHAIN_ROWS - 1);
+    if retention_floor > 0 {
+        conn.prepare_cached(
+            "UPDATE sync_sources
+             SET compacted_through = MAX(compacted_through, ?2), updated_at = ?3
+             WHERE source_id = ?1",
+        )?
+        .execute(params![source.0, retention_floor, UnixNanos::now().0])?;
+        conn.prepare_cached(
+            "DELETE FROM sync_chain WHERE (source_id, seq) IN (
+                SELECT source_id, seq FROM sync_chain
+                WHERE source_id = ?1 AND seq < ?2 ORDER BY seq LIMIT ?3)",
+        )?
+        .execute(params![source.0, retention_floor, CHAIN_PRUNE_BATCH])?;
+    }
     Ok(())
 }
 

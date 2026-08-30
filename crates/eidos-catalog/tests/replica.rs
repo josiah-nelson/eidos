@@ -15,7 +15,7 @@ use eidos_catalog::sync::{record_digest, SyncBatch, SyncEpoch, SyncRow, CHAIN_GE
 use eidos_catalog::{Catalog, NewSource};
 use eidos_domain::{ContentState, ObjectId, SourceId, SourceKind, SourceState, UnixNanos};
 use eidos_sync::identity::SourceEpoch;
-use eidos_sync::merkle::{leaf_index, MerkleTree};
+use eidos_sync::merkle::{leaf_index, MerkleTree, MIN_FLEET_LEAF_BITS};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -317,6 +317,14 @@ fn a_bounded_stream_reproduces_the_source_image_with_children_before_parents() {
     let s = central.catalog.get_source(source).unwrap().unwrap();
     assert_eq!(s.kind, SourceKind::Remote);
     assert_eq!(s.state, SourceState::MetadataComplete);
+    assert!(central
+        .catalog
+        .set_source_kind(source, SourceKind::WindowsLocal)
+        .is_err());
+    let completeness = central.catalog.source_completeness(source).unwrap();
+    assert!(completeness.metadata_complete);
+    assert!(!completeness.content_complete);
+    assert!(completeness.content_not_replicated);
     assert!(s.root_object_id.is_some());
     // Content is not replicated and says so.
     let two = central
@@ -1038,7 +1046,7 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
     // Repair: the node offers its leaf manifest, the central asks for the
     // leaves that differ, the node answers with those rows.
     let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
-    let leaf_bits = 4;
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
     let tree = MerkleTree::with_leaf_bits(
         leaf_bits,
         entries
@@ -1139,7 +1147,7 @@ fn repair_replay_is_chain_bound_and_rejects_duplicate_objects() {
         .catalog
         .sync_rows_for_objects(node.source, &[object])
         .unwrap();
-    let leaf_bits = 4;
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
     let leaves = [leaf_index(leaf_bits, object)];
 
     // An authoritative response is unusable until the catalog has durably
@@ -1293,9 +1301,12 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
         .unwrap()
         .resync_target
         .is_some());
+    let partial = central.catalog.source_completeness(source).unwrap();
+    assert_eq!(partial.state, SourceState::Reconciling);
+    assert!(!partial.metadata_complete);
 
     let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
-    let leaf_bits = 4;
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
     let source_tree = MerkleTree::with_leaf_bits(
         leaf_bits,
         entries
@@ -1351,6 +1362,13 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
             .resync_target,
         None
     );
+    assert!(
+        central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
     assert_eq!(central.image(source), node.image());
     let replica_tree =
         MerkleTree::with_leaf_bits(leaf_bits, central.catalog.replica_digests(source).unwrap());
@@ -1388,7 +1406,7 @@ fn a_compacted_new_epoch_can_install_its_first_snapshot_by_repair() {
         .sync_rows_after(node.source, 0, u32::MAX)
         .is_err());
 
-    let leaf_bits = 4;
+    let leaf_bits = MIN_FLEET_LEAF_BITS;
     let tree = MerkleTree::with_leaf_bits(
         leaf_bits,
         entries

@@ -24,7 +24,8 @@
 
 use crate::jobs::outbox_append_conn;
 use crate::sync::{
-    record_digest, SyncBatch, SyncEpoch, SyncRow, SyncRowImage, SYNC_ROW_IMAGE_VERSION,
+    record_digest, register_merkle_leaf_function, SyncBatch, SyncEpoch, SyncRow, SyncRowImage,
+    SYNC_ROW_IMAGE_VERSION,
 };
 use crate::{Catalog, CatalogError, Result};
 use eidos_domain::{
@@ -34,7 +35,9 @@ use eidos_domain::{
 use eidos_sync::identity::{
     AdmissionState, BatchDecision, ChainHash, HelloDecision, SourceEpoch, CHAIN_GENESIS,
 };
-use eidos_sync::merkle::{leaf_index, RecordDigest, MAX_FLEET_LEAF_BITS};
+use eidos_sync::merkle::{
+    leaf_index, MerkleLeafHasher, RecordDigest, MAX_FLEET_LEAF_BITS, MIN_FLEET_LEAF_BITS,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -160,6 +163,8 @@ pub struct ReplicaCoverage {
 const REMOTE_GENERATION: i64 = 1;
 const MAX_SQLITE_SEQUENCE: u64 = i64::MAX as u64;
 const RETIRE_STEP_ROWS: usize = 10_000;
+const REPAIR_SCAN_BATCH: usize = 10_000;
+const MAX_REPAIR_ROWS: usize = 100_000;
 
 fn admission_from_json(json: &str) -> Result<AdmissionState> {
     serde_json::from_str(json).map_err(|e| {
@@ -620,22 +625,38 @@ fn retire_other_epochs_conn(
     Ok((stale.len() as u64, !remaining))
 }
 
-fn mark_applied_conn(tx: &Transaction<'_>, source: SourceId, now: i64) -> Result<()> {
+fn mark_applied_conn(
+    tx: &Transaction<'_>,
+    source: SourceId,
+    now: i64,
+    complete: bool,
+) -> Result<()> {
     tx.prepare_cached(
         "UPDATE sync_replica_sources SET applied_at = ?2, updated_at = ?2 WHERE source_id = ?1",
     )?
     .execute(params![source.0, now])?;
-    // The first applied batch publishes the source: from here on the index
-    // follower projects it and search reports it as metadata complete.
+    let (state, reason) = if complete {
+        (SourceState::MetadataComplete, None)
+    } else {
+        (
+            SourceState::Reconciling,
+            Some("fleet snapshot is still arriving"),
+        )
+    };
     tx.prepare_cached(
-        "UPDATE sources SET published_generation = ?2, state = ?3, state_reason = NULL,
-            last_scan_completed_at = COALESCE(last_scan_completed_at, ?4), updated_at = ?4
-         WHERE source_id = ?1 AND (published_generation IS NULL OR state != ?3)",
+        "UPDATE sources SET published_generation = CASE WHEN ?5 THEN ?2 ELSE NULL END,
+            state = ?3, state_reason = ?4,
+            last_scan_completed_at = CASE WHEN ?5 THEN COALESCE(last_scan_completed_at, ?6)
+                                          ELSE last_scan_completed_at END,
+            updated_at = ?6
+         WHERE source_id = ?1",
     )?
     .execute(params![
         source.0,
         REMOTE_GENERATION,
-        SourceState::MetadataComplete.as_str(),
+        state.as_str(),
+        reason,
+        complete,
         now
     ])?;
     Ok(())
@@ -655,6 +676,41 @@ fn replica_digests_conn(conn: &Connection, source: SourceId) -> Result<Vec<Recor
             ))
         })?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+fn replica_leaf_hashes_conn(
+    conn: &Connection,
+    source: SourceId,
+    leaf_bits: u8,
+) -> Result<Vec<[u8; 32]>> {
+    let empty = MerkleLeafHasher::new().finalize();
+    let mut hashes = vec![empty; 1usize << leaf_bits];
+    let mut active_leaf = None;
+    let mut active = MerkleLeafHasher::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT remote_object_id, generation, deleted,
+            eidos_merkle_leaf(?2, remote_object_id) AS leaf
+         FROM sync_replica_rows
+         WHERE source_id = ?1 AND placeholder = 0 ORDER BY leaf, remote_object_id",
+    )?;
+    let mut rows = stmt.query(params![source.0, leaf_bits as i64])?;
+    while let Some(row) = rows.next()? {
+        let leaf = row.get::<_, i64>(3)? as usize;
+        if active_leaf.is_some_and(|previous| previous != leaf) {
+            let previous = active_leaf.expect("checked above");
+            hashes[previous] = std::mem::replace(&mut active, MerkleLeafHasher::new()).finalize();
+        }
+        active_leaf = Some(leaf);
+        active.update(&record_digest(
+            ObjectId(row.get(0)?),
+            row.get::<_, i64>(1)? as u64,
+            row.get::<_, i64>(2)? != 0,
+        ));
+    }
+    if let Some(leaf) = active_leaf {
+        hashes[leaf] = active.finalize();
+    }
+    Ok(hashes)
 }
 
 impl Catalog {
@@ -1012,7 +1068,8 @@ impl Catalog {
                 }
             }
             store_admission_conn(&tx, source, &state.admission, state.resync_target)?;
-            mark_applied_conn(&tx, source, now)?;
+            let image_complete = through_seq == batch.head_seq && state.resync_target.is_none();
+            mark_applied_conn(&tx, source, now, image_complete)?;
             tx.commit()?;
             Ok(BatchOutcome::Applied {
                 through_seq,
@@ -1034,6 +1091,7 @@ impl Catalog {
         leaf_hashes: &[[u8; 32]],
     ) -> Result<RepairOfferOutcome> {
         self.with_writer(|conn| {
+            register_merkle_leaf_function(conn)?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
@@ -1056,16 +1114,14 @@ impl Catalog {
                     ),
                 });
             }
-            if leaf_bits > MAX_FLEET_LEAF_BITS || leaf_hashes.len() != 1usize << leaf_bits {
+            if !(MIN_FLEET_LEAF_BITS..=MAX_FLEET_LEAF_BITS).contains(&leaf_bits)
+                || leaf_hashes.len() != 1usize << leaf_bits
+            {
                 return Ok(RepairOfferOutcome::Rejected {
                     reason: "invalid Merkle shape".into(),
                 });
             }
-            let tree = eidos_sync::merkle::MerkleTree::with_leaf_bits(
-                leaf_bits,
-                replica_digests_conn(&tx, source)?,
-            );
-            let local = tree.leaf_hashes();
+            let local = replica_leaf_hashes_conn(&tx, source, leaf_bits)?;
             let leaves = if state.resync_target.is_some() {
                 // Completing an epoch resync by repair must materialize every
                 // current-epoch row before old epochs are retired. Equal
@@ -1118,8 +1174,9 @@ impl Catalog {
     ) -> Result<RepairOutcome> {
         let unique = rows.iter().map(|r| r.object).collect::<BTreeSet<_>>().len() == rows.len();
         let unique_leaves = leaves.iter().copied().collect::<BTreeSet<_>>().len() == leaves.len();
-        if leaf_bits > MAX_FLEET_LEAF_BITS
+        if !(MIN_FLEET_LEAF_BITS..=MAX_FLEET_LEAF_BITS).contains(&leaf_bits)
             || through_seq > MAX_SQLITE_SEQUENCE
+            || rows.len() > MAX_REPAIR_ROWS
             || leaves.iter().any(|l| *l >= (1u32 << leaf_bits))
             || rows
                 .iter()
@@ -1141,6 +1198,7 @@ impl Catalog {
             });
         }
         self.with_writer(|conn| {
+            register_merkle_leaf_function(conn)?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let mut state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
@@ -1210,37 +1268,64 @@ impl Catalog {
             let now = UnixNanos::now().0;
             let sync_epoch = SyncEpoch::from_source_epoch(epoch);
             let present: BTreeSet<ObjectId> = rows.iter().map(|r| r.object).collect();
-            let known: Vec<(i64, i64, i64)> = tx
-                .prepare_cached(
-                    "SELECT remote_object_id, local_object_id, deleted FROM sync_replica_rows
-                     WHERE source_id = ?1 AND placeholder = 0",
-                )?
-                .query_map(params![source.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<rusqlite::Result<_>>()?;
             let mut removed = 0;
-            for (remote, local, deleted) in known {
-                let object = ObjectId(remote);
-                if !wanted.contains(&leaf_index(leaf_bits, object)) || present.contains(&object) {
-                    continue;
-                }
-                if deleted == 0 {
-                    tx.prepare_cached(
-                        "UPDATE objects SET deleted_at = COALESCE(deleted_at, ?2) WHERE object_id = ?1",
+            let leaves_json = serde_json::to_string(leaves)?;
+            let mut after_remote = i64::MIN;
+            loop {
+                let known = tx
+                    .prepare_cached(
+                        "SELECT remote_object_id, local_object_id, deleted
+                         FROM sync_replica_rows
+                         WHERE source_id = ?1 AND placeholder = 0
+                           AND remote_object_id > ?4
+                           AND eidos_merkle_leaf(?2, remote_object_id) IN
+                               (SELECT value FROM json_each(?3))
+                         ORDER BY remote_object_id LIMIT ?5",
                     )?
-                    .execute(params![local, now])?;
-                    tx.prepare_cached(
-                        "UPDATE entries SET deleted_at = ?2 WHERE object_id = ?1 AND deleted_at IS NULL",
+                    .query_map(
+                        params![
+                            source.0,
+                            leaf_bits as i64,
+                            leaves_json,
+                            after_remote,
+                            REPAIR_SCAN_BATCH as i64
+                        ],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, i64>(2)?,
+                            ))
+                        },
                     )?
-                    .execute(params![local, now])?;
-                    outbox_append_conn(&tx, source, ObjectId(local), "delete", 0)?;
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if known.is_empty() {
+                    break;
                 }
-                // Authoritative absence: the source has no row at all, so
-                // neither does the replica's Merkle image.
-                tx.prepare_cached(
-                    "DELETE FROM sync_replica_rows WHERE source_id = ?1 AND remote_object_id = ?2",
-                )?
-                .execute(params![source.0, remote])?;
-                removed += 1;
+                after_remote = known.last().expect("non-empty batch").0;
+                for (remote, local, deleted) in known {
+                    if present.contains(&ObjectId(remote)) {
+                        continue;
+                    }
+                    if deleted == 0 {
+                        tx.prepare_cached(
+                            "UPDATE objects SET deleted_at = COALESCE(deleted_at, ?2) WHERE object_id = ?1",
+                        )?
+                        .execute(params![local, now])?;
+                        tx.prepare_cached(
+                            "UPDATE entries SET deleted_at = ?2 WHERE object_id = ?1 AND deleted_at IS NULL",
+                        )?
+                        .execute(params![local, now])?;
+                        outbox_append_conn(&tx, source, ObjectId(local), "delete", 0)?;
+                    }
+                    // Authoritative absence: the source has no row at all,
+                    // so neither does the replica's Merkle image.
+                    tx.prepare_cached(
+                        "DELETE FROM sync_replica_rows WHERE source_id = ?1 AND remote_object_id = ?2",
+                    )?
+                    .execute(params![source.0, remote])?;
+                    removed += 1;
+                }
             }
             let mut counts = ApplyCounts::default();
             for row in rows {
@@ -1268,7 +1353,7 @@ impl Catalog {
                 }
             }
             store_admission_conn(&tx, source, &state.admission, state.resync_target)?;
-            mark_applied_conn(&tx, source, now)?;
+            mark_applied_conn(&tx, source, now, state.resync_target.is_none())?;
             tx.prepare_cached("DELETE FROM sync_replica_repairs WHERE source_id = ?1")?
                 .execute(params![source.0])?;
             tx.commit()?;
@@ -1327,11 +1412,12 @@ impl Catalog {
                 return Ok(0);
             }
             let epoch = SyncEpoch::from_source_epoch(state.admission.epoch);
-            let (retired, done) =
-                retire_other_epochs_conn(&tx, source, &epoch, UnixNanos::now().0)?;
+            let now = UnixNanos::now().0;
+            let (retired, done) = retire_other_epochs_conn(&tx, source, &epoch, now)?;
             if done {
                 state.resync_target = None;
                 store_admission_conn(&tx, source, &state.admission, None)?;
+                mark_applied_conn(&tx, source, now, true)?;
             }
             tx.commit()?;
             Ok(retired)

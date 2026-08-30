@@ -220,7 +220,7 @@ export type Sort = { field: SortField, descending: boolean, };
 
 export type SortField = "relevance" | "name" | "path" | "size" | "allocated_size" | "subtree_size" | "modified" | "created";
 
-export type SourceCompleteness = { source_id: SourceId, name: string, state: SourceState, metadata_complete: boolean, content_complete: boolean, content_pending: ApiInt, content_failed: ApiInt, listing_errors: ApiInt, last_scan_completed?: UnixNanos, checkpoint_age_ms?: ApiInt, freshness: Freshness, note?: string, };
+export type SourceCompleteness = { source_id: SourceId, name: string, state: SourceState, metadata_complete: boolean, content_complete: boolean, content_not_replicated: boolean, content_pending: ApiInt, content_failed: ApiInt, listing_errors: ApiInt, last_scan_completed?: UnixNanos, checkpoint_age_ms?: ApiInt, freshness: Freshness, note?: string, };
 
 export type SourceConcurrencyView = { source_id: SourceId, budget: number, reserved: number, peak_reserved: number, };
 

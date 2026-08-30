@@ -308,6 +308,17 @@ fn source_coverage(
         });
     }
     if signals.content_query {
+        if c.content_not_replicated {
+            degraded.push(CoverageReason {
+                kind: CoverageKind::ContentNotReplicated,
+                severity: CoverageSeverity::Info,
+                detail: format!(
+                    "{} replicates metadata only and cannot contribute content matches",
+                    c.name
+                ),
+                remediation: None,
+            });
+        }
         if c.content_pending > 0 {
             degraded.push(CoverageReason {
                 kind: CoverageKind::ContentPending,
@@ -362,6 +373,7 @@ mod tests {
             state: SourceState::Complete,
             metadata_complete: true,
             content_complete: true,
+            content_not_replicated: false,
             content_pending: 0,
             content_failed: 0,
             listing_errors: 0,
@@ -420,6 +432,31 @@ mod tests {
         assert_eq!(
             kinds,
             vec![CoverageKind::ContentPending, CoverageKind::ContentFailed]
+        );
+    }
+
+    #[test]
+    fn metadata_only_replica_degrades_only_content_queries() {
+        let mut c = complete("laptop/fleet");
+        c.content_complete = false;
+        c.content_not_replicated = true;
+        let metadata =
+            CoverageEnvelope::derive(&[c.clone()], &ResponseSignals::default(), UnixNanos::new(0));
+        assert!(metadata.full, "metadata answers remain complete");
+
+        let content = CoverageEnvelope::derive(
+            &[c],
+            &ResponseSignals {
+                content_query: true,
+                ..ResponseSignals::default()
+            },
+            UnixNanos::new(0),
+        );
+        assert!(!content.full);
+        assert_eq!(content.sources[0].degraded.len(), 1);
+        assert_eq!(
+            content.sources[0].degraded[0].kind,
+            CoverageKind::ContentNotReplicated
         );
     }
 

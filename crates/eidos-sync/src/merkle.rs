@@ -29,6 +29,35 @@ pub struct RecordDigest {
     pub deleted: bool,
 }
 
+/// Incremental form of the canonical leaf digest. Storage adapters use it
+/// to hash an ordered cursor without retaining every source row in memory.
+pub struct MerkleLeafHasher(blake3::Hasher);
+
+impl MerkleLeafHasher {
+    pub fn new() -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"eidos-merkle-leaf/1");
+        Self(hasher)
+    }
+
+    pub fn update(&mut self, record: &RecordDigest) {
+        self.0.update(&record.object.raw().to_le_bytes());
+        self.0.update(&record.generation.to_le_bytes());
+        self.0.update(&[u8::from(record.deleted)]);
+        self.0.update(&record.content_hash);
+    }
+
+    pub fn finalize(self) -> [u8; 32] {
+        *self.0.finalize().as_bytes()
+    }
+}
+
+impl Default for MerkleLeafHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RecordDigest {
     pub fn from_value(object: ObjectId, generation: u64, value: Option<&[u8]>) -> Self {
         let (content_hash, deleted) = match value {
@@ -205,15 +234,11 @@ impl MerkleTree {
     }
 
     fn hash_leaf<'a>(records: impl IntoIterator<Item = &'a RecordDigest>) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"eidos-merkle-leaf/1");
+        let mut hasher = MerkleLeafHasher::new();
         for record in records {
-            hasher.update(&record.object.raw().to_le_bytes());
-            hasher.update(&record.generation.to_le_bytes());
-            hasher.update(&[u8::from(record.deleted)]);
-            hasher.update(&record.content_hash);
+            hasher.update(record);
         }
-        *hasher.finalize().as_bytes()
+        hasher.finalize()
     }
 
     fn hash_branch(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
