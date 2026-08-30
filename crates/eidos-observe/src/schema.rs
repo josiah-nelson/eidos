@@ -304,8 +304,12 @@ pub enum ProcessClass {
     SigningToken(ObjectToken),
     /// Compilers, linkers, build drivers, package managers.
     Build,
-    /// Search indexers, thumbnail/metadata scanners (including eidos).
+    /// Search indexers, thumbnail/metadata scanners (including the eidos
+    /// core service).
     Indexer,
+    /// The observatory collector itself: its spool writes and ETW access
+    /// are the cost of observing, not of the workload or of eidos.
+    Collector,
     /// Backup and imaging agents.
     Backup,
     /// Cloud file-sync clients.

@@ -4,6 +4,7 @@
 //! than a bounded read buffer plus one chunk in memory. Every chunk carries
 //! exact byte and line ranges so snippets and file reads are verifiable.
 
+pub mod cdc;
 pub mod chunk;
 pub mod extract;
 pub mod sniff;

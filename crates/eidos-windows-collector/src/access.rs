@@ -51,7 +51,11 @@ pub fn classify_image(image: &str) -> Option<ProcessClass> {
         | "wlanext" | "dashost" | "backgroundtaskhost" | "systemsettings" | "wermgr"
         | "werfault" | "ngen" | "ngentask" | "mscorsvw" => System,
         "searchindexer" | "searchprotocolhost" | "searchfilterhost" | "searchhost" | "eidos"
-        | "everything" | "es" | "locate32" | "eidos-collector" | "eidos-observe" => Indexer,
+        | "everything" | "es" | "locate32" => Indexer,
+        // The collector runs from the shared `eidos.exe`; its own process is
+        // attributed by pid in the access lane, these names cover the
+        // dedicated binaries.
+        "eidos-collector" | "eidos-observe" => Collector,
         "msmpeng"
         | "mssense"
         | "mpdefendercoreservice"

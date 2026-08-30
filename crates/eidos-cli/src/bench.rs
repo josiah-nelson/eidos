@@ -62,6 +62,20 @@ pub enum BenchCommand {
         #[arg(long)]
         query: Option<String>,
     },
+    /// Content-transfer bakeoff: whole-compressed versus fixed and
+    /// content-defined chunking over deterministic edit scenarios (and,
+    /// optionally, files from a read-only corpus directory).
+    Chunking {
+        /// Directory of files to add as scenarios (read-only; a sibling
+        /// `<name>.<ext>.prev` is used as the previous version).
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        #[arg(long, default_value_t = 32)]
+        corpus_limit: usize,
+        /// Write the machine-readable report here (JSON).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Stream one file through the extractor (sniff/decode/chunk/hash) with a
     /// null sink; reports throughput and peak working set. Read-only.
     Content {
@@ -290,6 +304,20 @@ pub fn run(args: BenchArgs) -> anyhow::Result<()> {
             threads,
             query,
         } => bench_chunks(&args.data_dir, sample, threads, query),
+        BenchCommand::Chunking {
+            corpus,
+            corpus_limit,
+            out,
+        } => {
+            let report = eidos_fleet::bakeoff::run(corpus.as_deref(), corpus_limit);
+            if let Some(out) = out {
+                std::fs::write(&out, serde_json::to_vec_pretty(&report)?)
+                    .with_context(|| format!("writing {}", out.display()))?;
+                eprintln!("report written to {}", out.display());
+            }
+            print!("{}", eidos_fleet::bakeoff::render_summary(&report));
+            Ok(())
+        }
     }
 }
 

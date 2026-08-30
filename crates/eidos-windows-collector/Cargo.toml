@@ -9,6 +9,7 @@ description = "Windows observatory collector: USN, ETW, volume, and resource mea
 [dependencies]
 eidos-domain = { workspace = true }
 eidos-observe = { workspace = true }
+eidos-content = { workspace = true }
 eidos-scanner = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }

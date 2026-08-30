@@ -150,8 +150,10 @@ fn run_window(shared: &Arc<Shared>, window_end: Instant) -> Result<(), u32> {
     let own_pid = std::process::id();
     let seeded = shared.with_key(|key| {
         for (pid, image) in running_processes() {
+            // The collector is identified by its own process identity, not
+            // by the `eidos.exe` image name it shares with the indexer.
             let class = if pid == own_pid {
-                ProcessClass::Indexer
+                ProcessClass::Collector
             } else {
                 process_class(&image, key)
             };

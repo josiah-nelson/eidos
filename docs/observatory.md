@@ -307,8 +307,11 @@ ETW access lane (L2, off by default): a real-time session over
 `Microsoft-Windows-Kernel-File` and `Kernel-Process`, decoded through TDH
 metadata, run in randomized windows (`minutes_per_hour`, 60 for
 continuous). Events are attributed to coarse process classes (system,
-indexer, security, build, development, shell, productivity, browser, media,
-cloud sync, backup, virtualization) or a keyed image token, and summarised
+indexer, collector, security, build, development, shell, productivity,
+browser, media, cloud sync, backup, virtualization) or a keyed image token;
+the collector's own process is classed `collector` by process identity, so
+the cost of observing is separable from the cost of eidos even though both
+run from `eidos.exe`, and summarised
 per class: opens, reads, writes, closes, deletes, renames, byte totals,
 I/O-size histograms, distinct and read-then-written objects, and extension
 buckets learned at open. Lost events count as kernel drops; access denied
