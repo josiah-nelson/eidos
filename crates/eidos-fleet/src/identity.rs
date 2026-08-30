@@ -135,6 +135,7 @@ impl NodeIdentity {
         write_synced(&cert_tmp, &cert_der)?;
         write_synced(&record_tmp, &serde_json::to_vec_pretty(&record)?)?;
         replace_file(&key_tmp, &dir.join(KEY_FILE))?;
+        restrict_private_file(&dir.join(KEY_FILE))?;
         replace_file(&cert_tmp, &dir.join(CERT_FILE))?;
         replace_file(&record_tmp, &dir.join(IDENTITY_FILE))?;
         Self::load(&dir)
@@ -146,6 +147,7 @@ impl NodeIdentity {
         // was created; the authentication key must never be read until the
         // directory is private again.
         restrict_dir(dir)?;
+        restrict_private_file(&dir.join(KEY_FILE))?;
         let cert_der = std::fs::read(dir.join(CERT_FILE))
             .with_context(|| format!("reading {}", dir.join(CERT_FILE).display()))?;
         let key_der = std::fs::read(dir.join(KEY_FILE))
@@ -268,50 +270,86 @@ fn lock_identity_dir(dir: &Path) -> anyhow::Result<std::fs::File> {
 fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        let me = std::process::Command::new("whoami")
-            .output()
-            .context("finding the account that owns the fleet identity")?;
-        if !me.status.success() {
-            return Err(anyhow!(
-                "whoami failed while restricting {}: {}",
-                dir.display(),
-                String::from_utf8_lossy(&me.stderr).trim()
-            ));
-        }
-        let me = String::from_utf8(me.stdout)
-            .context("whoami returned a non-UTF-8 account name")?
-            .trim()
-            .to_string();
-        if me.is_empty() {
-            return Err(anyhow!("whoami returned an empty account name"));
-        }
-        let args: Vec<String> = vec![
-            dir.display().to_string(),
-            "/inheritance:r".into(),
-            "/grant:r".into(),
-            "*S-1-5-18:(OI)(CI)F".into(),
-            "/grant:r".into(),
-            "*S-1-5-32-544:(OI)(CI)F".into(),
-            "/grant:r".into(),
-            format!("{me}:(OI)(CI)F"),
-        ];
-        match std::process::Command::new("icacls").args(&args).output() {
-            Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(anyhow!(
-                "icacls could not restrict {}: {}",
-                dir.display(),
-                String::from_utf8_lossy(&o.stderr).trim()
-            )),
-            Err(e) => {
-                Err(e).with_context(|| format!("running icacls to restrict {}", dir.display()))
-            }
-        }
+        restrict_windows_acl(dir, true)
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("restricting {} to mode 0700", dir.display()))
+    }
+}
+
+/// Reassert the private-key ACL independently of its parent. A restored key
+/// can carry an explicit permissive ACE that changing the directory does not
+/// replace, and it must be repaired before the first byte is read.
+fn restrict_private_file(path: &Path) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        restrict_windows_acl(path, false)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {} to mode 0600", path.display()))
+    }
+}
+
+#[cfg(windows)]
+fn restrict_windows_acl(path: &Path, directory: bool) -> anyhow::Result<()> {
+    let me = std::process::Command::new("whoami")
+        .output()
+        .context("finding the account that owns the fleet identity")?;
+    if !me.status.success() {
+        return Err(anyhow!(
+            "whoami failed while restricting {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&me.stderr).trim()
+        ));
+    }
+    let me = String::from_utf8(me.stdout)
+        .context("whoami returned a non-UTF-8 account name")?
+        .trim()
+        .to_string();
+    if me.is_empty() {
+        return Err(anyhow!("whoami returned an empty account name"));
+    }
+
+    // `/inheritance:r` alone preserves explicit ACEs. Reset first so a
+    // restored `Everyone:R` (or a named-user grant) cannot survive, then
+    // remove the inherited ProgramData ACL and install the complete allowlist.
+    run_icacls(path, &["/reset".into()])?;
+    run_icacls(path, &["/inheritance:r".into()])?;
+    let full = if directory { "(OI)(CI)F" } else { "F" };
+    run_icacls(
+        path,
+        &[
+            "/grant:r".into(),
+            format!("*S-1-5-18:{full}"),
+            "/grant:r".into(),
+            format!("*S-1-5-32-544:{full}"),
+            "/grant:r".into(),
+            format!("{me}:{full}"),
+        ],
+    )
+}
+
+#[cfg(windows)]
+fn run_icacls(path: &Path, args: &[String]) -> anyhow::Result<()> {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args(args)
+        .output()
+        .with_context(|| format!("running icacls to restrict {}", path.display()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "icacls could not restrict {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 

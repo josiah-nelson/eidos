@@ -42,7 +42,8 @@ const RECONNECT_MIN: Duration = Duration::from_secs(2);
 /// session can materialize batches and Merkle manifests, so outbound roster size
 /// must not multiply blocking work or memory without a fleet-wide ceiling.
 /// Once full, inbound connections wait in the OS backlog and outbound peers
-/// remain due for a later dial tick.
+/// remain due for a later dial tick. Established sessions have a bounded lease,
+/// so the same subset of a larger roster cannot hold every permit forever.
 const MAX_FLEET_SESSIONS: usize = 64;
 const INBOUND_ATTEMPTS_PER_MINUTE: usize = 20;
 

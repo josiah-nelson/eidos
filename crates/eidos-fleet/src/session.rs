@@ -52,6 +52,10 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const ADMISSION_MAX_FRAME_BYTES: usize = 64 * 1024;
 /// A peer that stops reading cannot hold a session (or shutdown) forever.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Rotate healthy sessions so a full shared admission pool cannot pin the
+/// same subset of a larger roster forever. Durable cursors make reconnects
+/// cheap and preserve progress across the rotation.
+pub const MAX_SESSION_AGE: Duration = Duration::from_secs(15 * 60);
 /// A peer may stay otherwise active while ignoring a source response; bound
 /// those protocol phases independently from the connection keepalive.
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -572,6 +576,8 @@ where
     };
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let lease = tokio::time::sleep(MAX_SESSION_AGE);
+    tokio::pin!(lease);
     let end = loop {
         tokio::select! {
             item = rx.recv() => match item {
@@ -612,6 +618,10 @@ where
             },
             _ = shutdown.changed() => {
                 let _ = session.send(&Message::Goodbye { reason: "shutting down".into() }).await;
+                break SessionEnd::Closed;
+            }
+            _ = &mut lease => {
+                let _ = session.send(&Message::Goodbye { reason: "rotating session capacity".into() }).await;
                 break SessionEnd::Closed;
             }
             _ = session.close_notify.notified() => {
