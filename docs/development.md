@@ -546,7 +546,11 @@ Benchmark records carry workload labels, never file names or secrets.
 ## Logging
 
 `EIDOS_LOG` (or `--log`) accepts `tracing` filter syntax, e.g.
-`EIDOS_LOG=info,eidos_scanner=debug`. `--log-json` emits JSON lines to stderr.
+`EIDOS_LOG=info,eidos_scanner=debug`. The default is `info,tantivy=warn`:
+tantivy's segment bookkeeping is noise at INFO and was ~80% of a day's log
+lines. `--log-json` emits JSON lines to stderr.
+
+The service keeps 14 daily log files and deletes older ones.
 
 ## Layout
 

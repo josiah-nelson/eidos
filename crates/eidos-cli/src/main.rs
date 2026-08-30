@@ -39,7 +39,12 @@ use std::time::Duration;
 #[command(name = "eidos", version, about = "Filesystem indexer")]
 struct Cli {
     /// Log filter (e.g. `info`, `eidos_scanner=debug`).
-    #[arg(long, env = "EIDOS_LOG", default_value = "info", global = true)]
+    #[arg(
+        long,
+        env = "EIDOS_LOG",
+        default_value = "info,tantivy=warn",
+        global = true
+    )]
     log: String,
     /// Emit logs as JSON lines.
     #[arg(long, global = true)]

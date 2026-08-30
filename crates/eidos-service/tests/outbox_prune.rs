@@ -1,6 +1,8 @@
 //! The catalog-index follower releases consumed notification-outbox rows on
-//! every iteration, including idle ones, so a backlog left by an older
-//! binary (which consumed without pruning) drains without new writes.
+//! idle iterations, so a backlog left by an older binary (which consumed
+//! without pruning) drains without new writes — and once nothing is
+//! prunable, an idle iteration takes no writer transaction at all, or the
+//! follower's own prune would bump the write signal and wake it forever.
 
 use eidos_catalog::changes::{ChangeEvent, ObjectSnapshot};
 use eidos_catalog::scan::{run_scan, RunScanOptions};
@@ -111,4 +113,19 @@ fn idle_follower_drains_consumed_backlog() {
         guard += 1;
         assert!(guard < 100, "backlog did not drain");
     }
+
+    // Fully drained: idle iterations must be read-only. A writer
+    // transaction here would bump the write signal and turn the
+    // event-driven follower into a self-waking busy loop (the v0.5.0
+    // regression: ~2,200 writer acquisitions/s while idle).
+    assert!(!state.catalog.outbox_has_prunable().unwrap());
+    let before = state.catalog.writer_stats().acquisitions;
+    for _ in 0..5 {
+        eidos_service::follower::follow_once(&state).unwrap();
+    }
+    let after = state.catalog.writer_stats().acquisitions;
+    assert_eq!(
+        before, after,
+        "an idle follower iteration with nothing to prune took the catalog writer"
+    );
 }
