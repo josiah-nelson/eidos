@@ -191,6 +191,25 @@ async fn central_search_returns_the_replicated_union_with_truthful_origin_and_co
         )
     });
 
+    // Applying the durable rows and publishing their aggregate image are two
+    // deliberately separate bounded maintenance steps. Completeness becomes
+    // true only after the aggregate rebuild has published that image.
+    wait_for(Duration::from_secs(30), || {
+        central
+            .state
+            .catalog
+            .source_completeness(replica)
+            .ok()
+            .filter(|c| c.metadata_complete)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "replica aggregate did not publish after convergence: {:#?}",
+            central.fleet().status()
+        )
+    });
+
     // The ordinary follower projects the replicated rows.
     eidos_service::follower::follow_once(&central.state).unwrap();
 

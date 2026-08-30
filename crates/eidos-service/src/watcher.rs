@@ -18,7 +18,7 @@ use crate::scanner::{self, ScanProgress};
 use crate::state::AppState;
 use eidos_catalog::changes::{ChangeEvent, Checkpoint};
 use eidos_catalog::scan::{PublishOptions, ScanSession, ScanSummary};
-use eidos_domain::{SourceId, SourceKind, SourceState, UnixNanos};
+use eidos_domain::{SourceId, SourceState, UnixNanos};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
