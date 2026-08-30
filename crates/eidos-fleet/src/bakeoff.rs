@@ -29,6 +29,7 @@ pub const FRAME_ROWS: u64 = crate::wire::DEFAULT_BATCH_ROWS as u64;
 /// Manifest entry per chunk: 32-byte hash + 8-byte length.
 const MANIFEST_ENTRY: u64 = 40;
 const ZSTD_LEVEL: i32 = 3;
+const MAX_CORPUS_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,7 +83,8 @@ pub struct Measurement {
     pub compress_ms: f64,
     pub stage_ms: f64,
     pub apply_ms: f64,
-    /// Largest buffer held at once by the shipper.
+    /// Accounted peak of input, retained compressed data, metadata, output,
+    /// and the largest compression/decompression scratch buffer.
     pub peak_working_set_bytes: u64,
     /// Durable staging the central holds before the version is complete.
     pub staging_bytes: u64,
@@ -299,14 +301,18 @@ fn corpus_versions(dir: &Path, limit: usize) -> Vec<Version> {
         .collect();
     paths.sort();
     for path in paths.into_iter().take(limit) {
-        let Ok(b) = std::fs::read(&path) else {
+        let Some(b) = read_bounded_corpus_file(&path) else {
             continue;
         };
-        if b.len() > 256 << 20 {
-            continue;
-        }
         let prev = previous_path(&path);
-        let a = std::fs::read(&prev).unwrap_or_default();
+        let a = if prev.is_file() {
+            let Some(a) = read_bounded_corpus_file(&prev) else {
+                continue;
+            };
+            a
+        } else {
+            Vec::new()
+        };
         out.push(Version {
             name: format!(
                 "corpus:{}",
@@ -319,13 +325,23 @@ fn corpus_versions(dir: &Path, limit: usize) -> Vec<Version> {
     out
 }
 
+fn read_bounded_corpus_file(path: &Path) -> Option<Vec<u8>> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_CORPUS_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    (bytes.len() as u64 <= MAX_CORPUS_FILE_BYTES).then_some(bytes)
+}
+
 struct Chunked {
     /// `(hash, compressed bytes, raw length)` per chunk in order.
     chunks: Vec<([u8; 32], Vec<u8>, usize)>,
     hash_ms: f64,
     chunk_ms: f64,
     compress_ms: f64,
-    peak: u64,
+    retained_bytes: u64,
+    peak_bytes: u64,
 }
 
 fn split(data: &[u8], strategy: Strategy) -> Chunked {
@@ -378,24 +394,41 @@ fn split(data: &[u8], strategy: Strategy) -> Chunked {
         .collect();
     let hash_ms = ms(started.elapsed());
     let started = Instant::now();
-    let mut peak = 0u64;
-    let chunks = bounds
-        .iter()
-        .zip(hashes)
-        .map(|((s, e), hash)| {
-            let compressed = zstd::encode_all(&data[*s..*e], ZSTD_LEVEL)
-                .expect("compressing an in-memory chunk");
-            peak = peak.max((e - s) as u64 + compressed.len() as u64);
-            (hash, compressed, e - s)
-        })
-        .collect();
+    let construction_metadata = bounds
+        .capacity()
+        .saturating_mul(std::mem::size_of::<(usize, usize)>())
+        .saturating_add(
+            hashes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<[u8; 32]>()),
+        ) as u64;
+    let mut peak_bytes = construction_metadata;
+    let mut retained_compressed = 0u64;
+    let mut chunks = Vec::with_capacity(bounds.len());
+    for ((s, e), hash) in bounds.iter().zip(hashes) {
+        let compressed =
+            zstd::encode_all(&data[*s..*e], ZSTD_LEVEL).expect("compressing an in-memory chunk");
+        retained_compressed = retained_compressed.saturating_add(compressed.capacity() as u64);
+        peak_bytes = peak_bytes.max(
+            construction_metadata
+                .saturating_add(retained_compressed)
+                .saturating_add((e - s) as u64),
+        );
+        chunks.push((hash, compressed, e - s));
+    }
     let compress_ms = ms(started.elapsed());
+    let retained_bytes = retained_compressed.saturating_add(
+        chunks
+            .capacity()
+            .saturating_mul(std::mem::size_of::<([u8; 32], Vec<u8>, usize)>()) as u64,
+    );
     Chunked {
         chunks,
         hash_ms,
         chunk_ms,
         compress_ms,
-        peak,
+        retained_bytes,
+        peak_bytes: peak_bytes.max(retained_bytes),
     }
 }
 
@@ -408,12 +441,34 @@ fn measure(name: &str, a: &[u8], b: &[u8], strategy: Strategy) -> Measurement {
     // The central's holdings: compressed chunks of A under the same strategy.
     // Keeping the bytes, not only their hashes, lets the apply measurement
     // reconstruct and verify the exact logical content.
-    let held: HashMap<[u8; 32], Vec<u8>> = split(a, strategy)
+    let split_a = split(a, strategy);
+    let input_bytes = (a.len() as u64).saturating_add(b.len() as u64);
+    let mut peak_working_set_bytes = input_bytes.saturating_add(split_a.peak_bytes);
+    let split_a_retained_bytes = split_a.retained_bytes;
+    let held: HashMap<[u8; 32], Vec<u8>> = split_a
         .chunks
         .into_iter()
         .map(|(hash, compressed, _)| (hash, compressed))
         .collect();
+    let held_bytes = held
+        .values()
+        .map(|compressed| compressed.capacity() as u64)
+        .sum::<u64>()
+        .saturating_add(
+            held.capacity()
+                .saturating_mul(std::mem::size_of::<([u8; 32], Vec<u8>)>()) as u64,
+        );
+    peak_working_set_bytes = peak_working_set_bytes.max(
+        input_bytes
+            .saturating_add(split_a_retained_bytes)
+            .saturating_add(held_bytes),
+    );
     let split_b = split(b, strategy);
+    peak_working_set_bytes = peak_working_set_bytes.max(
+        input_bytes
+            .saturating_add(held_bytes)
+            .saturating_add(split_b.peak_bytes),
+    );
     let chunks = split_b.chunks.len() as u64;
     let compressed_bytes: u64 = split_b.chunks.iter().map(|(_, c, _)| c.len() as u64).sum();
     let mut reused = 0u64;
@@ -435,6 +490,15 @@ fn measure(name: &str, a: &[u8], b: &[u8], strategy: Strategy) -> Measurement {
         records.push(record_bytes);
     }
     let stage_ms = ms(started.elapsed());
+    let records_bytes = records
+        .capacity()
+        .saturating_mul(std::mem::size_of::<u64>()) as u64;
+    peak_working_set_bytes = peak_working_set_bytes.max(
+        input_bytes
+            .saturating_add(held_bytes)
+            .saturating_add(split_b.retained_bytes)
+            .saturating_add(records_bytes),
+    );
     // The manifest is durable staging too: without it the receiver cannot
     // order either reused or novel chunks after a restart.
     let staging_bytes = wire;
@@ -442,6 +506,20 @@ fn measure(name: &str, a: &[u8], b: &[u8], strategy: Strategy) -> Measurement {
     // the logical content the central indexes through its normal pipeline.
     let started = Instant::now();
     let mut assembled = Vec::with_capacity(b.len());
+    let largest_raw_chunk = split_b
+        .chunks
+        .iter()
+        .map(|(_, _, raw)| *raw as u64)
+        .max()
+        .unwrap_or(0);
+    peak_working_set_bytes = peak_working_set_bytes.max(
+        input_bytes
+            .saturating_add(held_bytes)
+            .saturating_add(split_b.retained_bytes)
+            .saturating_add(records_bytes)
+            .saturating_add(assembled.capacity() as u64)
+            .saturating_add(largest_raw_chunk),
+    );
     for (hash, compressed, raw) in &split_b.chunks {
         let encoded = if reuse_allowed {
             held.get(hash).unwrap_or(compressed)
@@ -474,12 +552,7 @@ fn measure(name: &str, a: &[u8], b: &[u8], strategy: Strategy) -> Measurement {
         wire - acknowledged
     };
     let recovery_ms = ms(started.elapsed());
-    let frames = if chunks == 0 {
-        0
-    } else {
-        wire.div_ceil(FRAME_BYTES as u64)
-            .max(chunks.div_ceil(FRAME_ROWS))
-    };
+    let frames = packed_frames(&records);
     Measurement {
         scenario: name.to_string(),
         strategy,
@@ -496,15 +569,45 @@ fn measure(name: &str, a: &[u8], b: &[u8], strategy: Strategy) -> Measurement {
         compress_ms: split_b.compress_ms,
         stage_ms,
         apply_ms,
-        peak_working_set_bytes: split_b.peak.max(if strategy == Strategy::WholeCompressed {
-            b.len() as u64
-        } else {
-            0
-        }),
+        peak_working_set_bytes,
         staging_bytes,
         recovery_bytes,
         recovery_ms,
     }
+}
+
+/// Pack complete records under both byte and row ceilings. A record larger
+/// than one frame is explicitly fragmented; aggregate division cannot model
+/// either record boundaries or the partially filled frames they leave.
+fn packed_frames(records: &[u64]) -> u64 {
+    let byte_cap = FRAME_BYTES as u64;
+    let mut frames = 0u64;
+    let mut used_bytes = 0u64;
+    let mut used_rows = 0u64;
+    for &record in records {
+        if record > byte_cap {
+            if used_rows > 0 {
+                frames += 1;
+                used_bytes = 0;
+                used_rows = 0;
+            }
+            frames += record / byte_cap;
+            let remainder = record % byte_cap;
+            if remainder > 0 {
+                used_bytes = remainder;
+                used_rows = 1;
+            }
+            continue;
+        }
+        if used_rows == FRAME_ROWS || used_bytes.saturating_add(record) > byte_cap {
+            frames += 1;
+            used_bytes = 0;
+            used_rows = 0;
+        }
+        used_bytes += record;
+        used_rows += 1;
+    }
+    frames + u64::from(used_rows > 0)
 }
 
 fn measure_binary_rejection(data: &[u8], strategy: Strategy) -> Measurement {
@@ -704,5 +807,24 @@ mod tests {
             assert_eq!(measurement.transferred_bytes, 0);
             assert_eq!(measurement.frames, 0);
         }
+    }
+
+    #[test]
+    fn frame_count_respects_record_boundaries_rows_and_fragmentation() {
+        let cap = FRAME_BYTES as u64;
+        assert_eq!(packed_frames(&[cap * 3 / 5; 3]), 3);
+        assert_eq!(packed_frames(&vec![1; FRAME_ROWS as usize + 1]), 2);
+        assert_eq!(packed_frames(&[cap * 2 + 1]), 3);
+    }
+
+    #[test]
+    fn working_set_accounts_for_retained_inputs_and_reconstruction() {
+        let a = text(256 << 10, "working-set-a");
+        let b = text(256 << 10, "working-set-b");
+        let measurement = measure("working-set", &a, &b, Strategy::Fixed64K);
+        assert!(
+            measurement.peak_working_set_bytes >= (a.len() + b.len() + b.len()) as u64,
+            "{measurement:?}"
+        );
     }
 }

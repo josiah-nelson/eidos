@@ -2554,6 +2554,49 @@ impl Catalog {
         })
     }
 
+    /// Durably withdraw one remote source on behalf of its authenticated
+    /// origin. The first transaction hides it from search and fences every
+    /// later protocol write; bounded physical cleanup may then be retried.
+    pub fn replica_withdraw_source(
+        &self,
+        caller: [u8; 16],
+        remote_source: SourceId,
+    ) -> Result<Option<SourceId>> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !node_is_authorized_conn(&tx, &caller)? {
+                return Err(CatalogError::InvalidState(
+                    "only an enabled enrolled node may withdraw a source".into(),
+                ));
+            }
+            let source = tx
+                .query_row(
+                    "SELECT source_id FROM sync_replica_sources
+                     WHERE node_id = ?1 AND remote_source_id = ?2",
+                    params![caller.as_slice(), remote_source.0],
+                    |row| row.get::<_, i64>(0).map(SourceId),
+                )
+                .optional()?;
+            let Some(source) = source else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let now = UnixNanos::now().0;
+            tx.execute(
+                "UPDATE sources SET state = ?2,
+                     state_reason = 'withdrawn by its origin', updated_at = ?3
+                 WHERE source_id = ?1",
+                params![source.0, SourceState::Retired.as_str(), now],
+            )?;
+            tx.execute(
+                "DELETE FROM sync_replica_repairs WHERE source_id = ?1",
+                params![source.0],
+            )?;
+            tx.commit()?;
+            Ok(Some(source))
+        })
+    }
+
     /// Retire a replicated source: its rows disappear from search and the
     /// replica mapping is dropped. A later offer starts from scratch.
     pub fn replica_retire_source(&self, source: SourceId) -> Result<bool> {

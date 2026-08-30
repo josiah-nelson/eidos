@@ -21,7 +21,7 @@ use eidos_catalog::{
 };
 use eidos_domain::{ObjectId, SourceCompleteness, SourceId, SourceKind};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use ts_rs::TS;
 
 /// API router plus, optionally, the web UI served from a directory on disk.
@@ -199,6 +199,9 @@ impl IntoResponse for ApiError {
 
 pub(crate) type ApiResult<T> = Result<ApiJson<T>, ApiError>;
 
+const MAX_SHORT_BLOCKING_OPERATIONS: usize = 16;
+static SHORT_BLOCKING_OPERATIONS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
 /// Run a short synchronous catalog/configuration operation without occupying
 /// an async runtime worker. Long query and browse operations use the bounded
 /// admission gate instead; this is for operator mutations and lookups.
@@ -207,9 +210,20 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ApiError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+    let admission = SHORT_BLOCKING_OPERATIONS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_SHORT_BLOCKING_OPERATIONS)))
+        .clone();
+    let permit = admission
+        .try_acquire_owned()
+        .map_err(|_| ApiError::busy("operator work is at capacity", 1))?;
+    tokio::task::spawn_blocking(move || {
+        // Keep the permit with the blocking work even if its HTTP request is
+        // cancelled; spawn_blocking tasks cannot be aborted once running.
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
 }
 
 // ----- health --------------------------------------------------------------

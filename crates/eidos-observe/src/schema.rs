@@ -5,7 +5,8 @@ use crate::families::{
 use crate::privacy::ObjectToken;
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: &str = "eidos-observation/1";
+pub const SCHEMA_VERSION_V1: &str = "eidos-observation/1";
+pub const SCHEMA_VERSION: &str = "eidos-observation/2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedCursor {

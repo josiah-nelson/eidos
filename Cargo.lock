@@ -855,6 +855,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts-rs",
+ "windows-sys 0.61.2",
  "zeroize",
  "zstd",
 ]

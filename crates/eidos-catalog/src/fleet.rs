@@ -7,7 +7,7 @@
 //! invitation secret is stored.
 
 use crate::{Catalog, CatalogError, Result};
-use eidos_domain::{HostId, SourceId, SyncPolicy, UnixNanos};
+use eidos_domain::{HostId, SourceId, SourceState, SyncPolicy, UnixNanos};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -342,6 +342,52 @@ impl Catalog {
                 "DELETE FROM fleet_peers WHERE node_id = ?1",
                 params![node.0.as_slice()],
             )? > 0)
+        })
+    }
+
+    /// Atomically revoke a peer and hide every replica it owns. Physical row
+    /// cleanup is deliberately separate and idempotent, but no replica write
+    /// or search result can cross this transaction boundary.
+    pub fn fleet_forget_peer(&self, node: NodeId) -> Result<Option<Vec<SourceId>>> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let sources: Vec<SourceId> = tx
+                .prepare(
+                    "SELECT source_id FROM sync_replica_sources
+                     WHERE node_id = ?1 ORDER BY source_id",
+                )?
+                .query_map(params![node.0.as_slice()], |row| {
+                    row.get::<_, i64>(0).map(SourceId)
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let existed = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM fleet_peers WHERE node_id = ?1)",
+                params![node.0.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if !existed && sources.is_empty() {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let now = UnixNanos::now().0;
+            tx.execute(
+                "UPDATE sources SET state = ?2,
+                     state_reason = 'retired from the fleet', updated_at = ?3
+                 WHERE source_id IN (
+                     SELECT source_id FROM sync_replica_sources WHERE node_id = ?1)",
+                params![node.0.as_slice(), SourceState::Retired.as_str(), now],
+            )?;
+            tx.execute(
+                "DELETE FROM sync_replica_repairs WHERE source_id IN (
+                     SELECT source_id FROM sync_replica_sources WHERE node_id = ?1)",
+                params![node.0.as_slice()],
+            )?;
+            tx.execute(
+                "DELETE FROM fleet_peers WHERE node_id = ?1",
+                params![node.0.as_slice()],
+            )?;
+            tx.commit()?;
+            Ok(Some(sources))
         })
     }
 

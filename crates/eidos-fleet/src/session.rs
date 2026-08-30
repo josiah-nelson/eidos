@@ -297,6 +297,9 @@ struct ShipState {
     last_error: Option<String>,
 }
 
+type ShippableSource = (SourceId, eidos_catalog::sync::SyncSourceState, u64);
+type ShipperRefresh = (Vec<ShippableSource>, Vec<SourceId>);
+
 /// Parts of a repair answer: the leaves each part completes and their rows.
 type RepairParts = Vec<(Vec<u32>, Vec<SyncRow>)>;
 /// An encoded batch frame with `(through_seq, rows, head_seq)`.
@@ -339,6 +342,7 @@ struct Session<W> {
     credit: i64,
     credit_limit: i64,
     shipping: BTreeMap<SourceId, ShipState>,
+    withdrawn_acked: BTreeSet<SourceId>,
     consuming: BTreeMap<SourceId, ConsumeState>,
     last_rx: Instant,
     last_ping: Option<(u64, Instant)>,
@@ -636,6 +640,7 @@ where
         direction,
         max_frame: peer_max,
         shipping: BTreeMap::new(),
+        withdrawn_acked: BTreeSet::new(),
         consuming: BTreeMap::new(),
         last_rx: Instant::now(),
         last_ping: None,
@@ -956,6 +961,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 .await?;
                 Ok(true)
             }
+            Message::Withdraw { source } => {
+                self.on_withdraw(source).await?;
+                Ok(true)
+            }
             Message::Batch(batch) => {
                 self.on_batch(batch).await?;
                 Ok(true)
@@ -1040,6 +1049,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 self.on_rejected(source, reason);
                 Ok(true)
             }
+            Message::Withdrawn { source } => {
+                if self.peer.role != PeerRole::Central {
+                    return Err(anyhow!(
+                        "only a central may acknowledge a source withdrawal"
+                    ));
+                }
+                self.withdrawn_acked.insert(source);
+                Ok(true)
+            }
             Message::RepairRequest {
                 source,
                 epoch,
@@ -1065,6 +1083,31 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     // ----- consumer role -------------------------------------------------
+
+    async fn on_withdraw(&mut self, remote_source: SourceId) -> anyhow::Result<()> {
+        if !self.ctx.config.read().central || self.peer.role != PeerRole::Node {
+            return Err(anyhow!("only an enrolled node may withdraw its source"));
+        }
+        let catalog = self.ctx.catalog.clone();
+        let caller = self.peer.node_id.0;
+        let local_source = tokio::task::spawn_blocking(move || -> eidos_catalog::Result<_> {
+            let local = catalog.replica_withdraw_source(caller, remote_source)?;
+            if let Some(local) = local {
+                catalog.replica_retire_source(local)?;
+            }
+            Ok(local)
+        })
+        .await
+        .context("source withdrawal task")??;
+        if let Some(local) = local_source {
+            self.consuming.remove(&local);
+        }
+        self.send(&Message::Withdrawn {
+            source: remote_source,
+        })
+        .await?;
+        Ok(())
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn on_offer(
@@ -2198,20 +2241,24 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         let catalog = self.ctx.catalog.clone();
         let peer_role = self.peer.role;
         let consumer = self.peer.node_id.0;
-        let shippable = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Vec<(SourceId, eidos_catalog::sync::SyncSourceState, u64)>> {
+        let (shippable, withdrawals) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<ShipperRefresh> {
                 // Only a central consumes; offering sources to a node would
                 // only draw rejections.
                 if peer_role != PeerRole::Central {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), Vec::new()));
                 }
                 let mut out = Vec::new();
+                let mut withdrawals = Vec::new();
                 for s in catalog.list_sources()? {
-                    if s.kind == SourceKind::Remote
-                        || s.state == SourceState::Retired
-                        || s.published_generation.is_none()
-                        || s.sync_policy != SyncPolicy::Inherit
-                    {
+                    if s.kind == SourceKind::Remote {
+                        continue;
+                    }
+                    if s.state == SourceState::Retired || s.sync_policy == SyncPolicy::LocalOnly {
+                        withdrawals.push(s.id);
+                        continue;
+                    }
+                    if s.published_generation.is_none() {
                         continue;
                     }
                     if let Some(state) = catalog.sync_source(s.id)? {
@@ -2226,12 +2273,19 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                         }
                     }
                 }
-                Ok(out)
-            },
-        )
-        .await
-        .context("source scan task")??;
+                Ok((out, withdrawals))
+            })
+            .await
+            .context("source scan task")??;
         let wanted: BTreeSet<SourceId> = shippable.iter().map(|(id, _, _)| *id).collect();
+        let withdrawals: BTreeSet<SourceId> = withdrawals.into_iter().collect();
+        self.withdrawn_acked
+            .retain(|source| withdrawals.contains(source));
+        let to_withdraw: Vec<SourceId> = withdrawals
+            .iter()
+            .filter(|source| !self.withdrawn_acked.contains(source))
+            .copied()
+            .collect();
         let removed_credit: u64 = self
             .shipping
             .iter()
@@ -2243,6 +2297,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             .sum();
         self.shipping.retain(|id, _| wanted.contains(id));
         replenish_credit(&mut self.credit, self.credit_limit, removed_credit);
+        for source in to_withdraw {
+            self.send(&Message::Withdraw { source }).await?;
+        }
         let mut to_offer: Vec<(SourceId, eidos_catalog::sync::SyncSourceState)> = Vec::new();
         let mut to_ship: Vec<SourceId> = Vec::new();
         for (id, state, durable_cursor) in shippable {

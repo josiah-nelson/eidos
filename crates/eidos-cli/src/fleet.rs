@@ -217,20 +217,23 @@ pub fn run(args: FleetArgs) -> anyhow::Result<()> {
                     config.listen.as_deref().unwrap_or("(none)")
                 );
             } else {
-                let mut config = FleetConfig::load(&args.data_dir)?;
-                if disable {
-                    config.central = false;
-                } else if listen.is_some() {
-                    config.central = true;
-                }
-                if no_listen {
-                    config.listen = None;
-                } else if let Some(l) = listen {
+                if let Some(l) = listen.as_deref() {
                     l.parse::<std::net::SocketAddr>()
                         .map_err(|e| anyhow!("listen address: {e}"))?;
-                    config.listen = Some(l);
                 }
-                config.store(&args.data_dir)?;
+                let config = FleetConfig::edit_locked(&args.data_dir, move |config| {
+                    if disable {
+                        config.central = false;
+                    } else if listen.is_some() {
+                        config.central = true;
+                    }
+                    if no_listen {
+                        config.listen = None;
+                    } else if let Some(l) = listen {
+                        config.listen = Some(l);
+                    }
+                    Ok(())
+                })?;
                 println!(
                     "central: {}  listen: {}  (written to {}; takes effect when the service starts or on its next tick)",
                     config.central,

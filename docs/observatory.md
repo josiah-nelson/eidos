@@ -59,7 +59,10 @@ bounded to 10 GiB and 14 days by default; summaries expire after 90 days.
 SQLite WAL durability is used locally. The spool directory is root-owned and
 mode `0750`; the command socket is root-owned, group `admin`, and mode `0660`.
 
-Exports use the versioned `eidos-observation/1` format, compressed with zstd.
+Exports use the versioned `eidos-observation/2` format, compressed with zstd.
+Version 2 adds the explicit observatory-collector process class; it is not
+labelled as version 1 because older v1 readers cannot decode that enum value.
+Current readers continue to accept additive version 1 bundles.
 Each bundle contains build/config hashes, capabilities, capture gaps, drop
 counters, UTC and monotonic anchors, units, and the bounded records. Run:
 

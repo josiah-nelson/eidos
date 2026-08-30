@@ -68,29 +68,33 @@ async fn set_central(
     Json(body): Json<CentralBody>,
 ) -> ApiResult<FleetConfig> {
     let fleet = fleet(&st)?;
-    let config = blocking(move || {
-        let mut config = fleet.config();
-        if let Some(central) = body.central {
-            config.central = central;
-        }
-        if let Some(listen) = body.listen {
-            let listen = listen.trim().to_string();
+    let central = body.central;
+    let listen = body
+        .listen
+        .map(|listen| listen.trim().to_string())
+        .map(|listen| -> Result<Option<String>, ApiError> {
             if listen.is_empty() {
-                config.listen = None;
+                Ok(None)
             } else {
                 listen
                     .parse::<std::net::SocketAddr>()
                     .map_err(|e| ApiError::bad_request(format!("listen address: {e}")))?;
-                config.listen = Some(listen);
+                Ok(Some(listen))
             }
-        }
-        config
-            .store(fleet.data_dir())
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        })
+        .transpose()?;
+    let config = blocking(move || {
         fleet
-            .reload_config()
-            .map_err(|e| ApiError::internal(e.to_string()))?;
-        Ok(config)
+            .update_config(move |config| {
+                if let Some(central) = central {
+                    config.central = central;
+                }
+                if let Some(listen) = listen {
+                    config.listen = listen;
+                }
+                Ok(())
+            })
+            .map_err(|e| ApiError::internal(e.to_string()))
     })
     .await?;
     Ok(ApiJson(config))
@@ -122,12 +126,16 @@ fn default_endpoint(st: &AppState, config: &FleetConfig) -> Result<String, ApiEr
     let addr: std::net::SocketAddr = listen
         .parse()
         .map_err(|e| ApiError::bad_request(format!("listen address: {e}")))?;
-    let host = if addr.ip().is_unspecified() {
-        st.host_name.clone()
+    Ok(advertised_endpoint(&st.host_name, addr))
+}
+
+fn advertised_endpoint(host_name: &str, addr: std::net::SocketAddr) -> String {
+    if addr.ip().is_unspecified() {
+        format!("{host_name}:{}", addr.port())
     } else {
-        addr.ip().to_string()
-    };
-    Ok(format!("{host}:{}", addr.port()))
+        // SocketAddr formatting preserves the brackets required by IPv6.
+        std::net::SocketAddr::new(addr.ip(), addr.port()).to_string()
+    }
 }
 
 async fn invite(
@@ -313,11 +321,10 @@ async fn forget_peer(
     let node = parse_node(&id)?;
     let catalog_state = st.clone();
     let replica_sources = blocking(move || {
-        let replica_sources = catalog_state.catalog.replica_sources_of(node.0)?;
-        if !catalog_state.catalog.fleet_remove_peer(node)? && replica_sources.is_empty() {
-            return Err(ApiError::not_found(format!("peer {node}")));
-        }
-        Ok(replica_sources)
+        catalog_state
+            .catalog
+            .fleet_forget_peer(node)?
+            .ok_or_else(|| ApiError::not_found(format!("peer {node}")))
     })
     .await?;
     if let Some(fleet) = st.fleet.lock().clone() {
@@ -325,8 +332,8 @@ async fn forget_peer(
     }
     let retired = blocking(move || {
         let mut retired = 0;
-        for replica in replica_sources {
-            if st.catalog.replica_retire_source(replica.source_id)? {
+        for source in replica_sources {
+            if st.catalog.replica_retire_source(source)? {
                 retired += 1;
             }
         }
@@ -368,4 +375,20 @@ async fn set_sync_policy(
     })
     .await?;
     Ok(ApiJson(view))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advertised_endpoint;
+
+    #[test]
+    fn advertised_ipv6_endpoints_keep_their_brackets() {
+        let addr = "[::1]:7710".parse().unwrap();
+        assert_eq!(advertised_endpoint("ignored", addr), "[::1]:7710");
+        let unspecified = "[::]:7710".parse().unwrap();
+        assert_eq!(
+            advertised_endpoint("central-host", unspecified),
+            "central-host:7710"
+        );
+    }
 }

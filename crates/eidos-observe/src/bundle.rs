@@ -1,4 +1,4 @@
-use crate::schema::{ObservationBundle, SCHEMA_VERSION};
+use crate::schema::{ObservationBundle, SCHEMA_VERSION, SCHEMA_VERSION_V1};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -26,7 +26,7 @@ pub fn read_bundle(file: &Path) -> Result<ObservationBundle, BundleError> {
     let input = BufReader::new(File::open(file)?);
     let decoder = zstd::stream::read::Decoder::new(input)?;
     let bundle: ObservationBundle = serde_json::from_reader(decoder)?;
-    if bundle.manifest.schema != SCHEMA_VERSION {
+    if bundle.manifest.schema != SCHEMA_VERSION && bundle.manifest.schema != SCHEMA_VERSION_V1 {
         return Err(BundleError::Schema(bundle.manifest.schema));
     }
     Ok(bundle)
@@ -385,6 +385,22 @@ mod tests {
         let mut exact = BTreeSet::new();
         collect_fields("", &value, &mut exact);
         assert_eq!(inspection.fields, exact.into_iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn current_reader_accepts_the_previous_additive_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("bundle-v1.eidos-observation.zst");
+        let mut expected = bundle();
+        expected.manifest.schema = SCHEMA_VERSION_V1.into();
+        {
+            let output = BufWriter::new(File::create(&file).unwrap());
+            let mut encoder = zstd::stream::write::Encoder::new(output, 1).unwrap();
+            serde_json::to_writer(&mut encoder, &expected).unwrap();
+            encoder.finish().unwrap().flush().unwrap();
+        }
+
+        assert_eq!(read_bundle(&file).unwrap(), expected);
     }
 
     /// The streaming export must produce exactly the bundle the materialising

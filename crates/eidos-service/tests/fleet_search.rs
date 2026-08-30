@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::NewSource;
-use eidos_domain::{CoverageKind, SearchRequest, SourceId, SourceKind};
+use eidos_domain::{CoverageKind, SearchRequest, SourceId, SourceKind, SourceState, SyncPolicy};
 use eidos_fleet::enroll::{create_invite, enroll};
 use eidos_fleet::{Fleet, FleetConfig, NodeIdentity};
 use eidos_search::exec::{search_with_content, ExecOptions};
@@ -167,7 +167,7 @@ async fn central_search_returns_the_replicated_union_with_truthful_origin_and_co
         .ok()
         .flatten()
         .map(|s| s.head_seq);
-    let replica = wait_for(Duration::from_secs(90), || {
+    let mut replica = wait_for(Duration::from_secs(90), || {
         let r = central
             .state
             .catalog
@@ -367,6 +367,54 @@ async fn central_search_returns_the_replicated_union_with_truthful_origin_and_co
     })
     .await
     .expect("the new file became searchable centrally");
+
+    // Changing a source to local-only durably withdraws the already-shipped
+    // metadata. Re-enabling starts a fresh replica rather than reviving the
+    // withdrawn image.
+    node.state
+        .catalog
+        .set_sync_policy(node.source.unwrap(), SyncPolicy::LocalOnly)
+        .unwrap();
+    wait_for(Duration::from_secs(30), || {
+        let source = central.state.catalog.get_source(replica).ok()??;
+        (source.state == SourceState::Retired).then_some(())
+    })
+    .await
+    .expect("local-only policy withdrew the central replica");
+    eidos_service::follower::follow_once(&central.state).unwrap();
+    assert_eq!(central.search("figures").hits.len(), 0);
+
+    node.state
+        .catalog
+        .set_sync_policy(node.source.unwrap(), SyncPolicy::Inherit)
+        .unwrap();
+    replica = wait_for(Duration::from_secs(90), || {
+        central
+            .state
+            .catalog
+            .replica_sources()
+            .ok()?
+            .into_iter()
+            .find_map(|candidate| {
+                let source = central
+                    .state
+                    .catalog
+                    .get_source(candidate.source_id)
+                    .ok()??;
+                (source.state != SourceState::Retired
+                    && central
+                        .state
+                        .catalog
+                        .source_completeness(candidate.source_id)
+                        .ok()?
+                        .metadata_complete)
+                    .then_some(candidate.source_id)
+            })
+    })
+    .await
+    .expect("re-enabled source published a fresh replica");
+    eidos_service::follower::follow_once(&central.state).unwrap();
+    assert_eq!(central.search("figures").hits.len(), 1);
 
     // When the node goes away the replica is preserved and says so.
     node.fleet().shutdown();

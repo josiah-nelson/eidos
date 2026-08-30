@@ -133,6 +133,16 @@ pub enum Message {
         image_revision: u64,
         image_version: u32,
     },
+    /// The origin has made a formerly offered source local-only or retired.
+    /// The consumer durably hides and removes its metadata replica.
+    Withdraw {
+        source: SourceId,
+    },
+    /// A withdrawal is acknowledged only after the replica is no longer
+    /// searchable. Reconnecting replays withdrawals from durable policy.
+    Withdrawn {
+        source: SourceId,
+    },
     Resume {
         source: SourceId,
         epoch: SourceEpoch,
@@ -245,7 +255,11 @@ pub enum Family {
 impl Message {
     pub fn family(&self) -> Family {
         match self {
-            Message::Batch(_) | Message::Ack { .. } | Message::Offer { .. } => Family::Catalog,
+            Message::Batch(_)
+            | Message::Ack { .. }
+            | Message::Offer { .. }
+            | Message::Withdraw { .. }
+            | Message::Withdrawn { .. } => Family::Catalog,
             Message::RepairOffer { .. }
             | Message::RepairRequest { .. }
             | Message::RepairRows { .. } => Family::Repair,
@@ -263,6 +277,8 @@ impl Message {
             Message::Enrolled { .. } => "enrolled",
             Message::EnrollRejected { .. } => "enroll_rejected",
             Message::Offer { .. } => "offer",
+            Message::Withdraw { .. } => "withdraw",
+            Message::Withdrawn { .. } => "withdrawn",
             Message::Resume { .. } => "resume",
             Message::FullResync { .. } => "full_resync",
             Message::NewEpochRequired { .. } => "new_epoch_required",

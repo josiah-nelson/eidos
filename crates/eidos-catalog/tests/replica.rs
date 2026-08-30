@@ -3616,6 +3616,66 @@ fn disabled_or_removed_peers_are_durably_fenced_from_replica_writes() {
 }
 
 #[test]
+fn forgetting_a_peer_atomically_revokes_it_and_hides_its_replicas() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let applied = central.applied_seq(source);
+    node.touch("a/one.txt", 125, 1_700_000_125);
+    let batch = node
+        .catalog
+        .sync_rows_after(node.source, applied, u32::MAX)
+        .unwrap();
+
+    let sources = central
+        .catalog
+        .fleet_forget_peer(NodeId(NODE))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(sources, vec![source]);
+    assert!(central.catalog.fleet_peer(NodeId(NODE)).unwrap().is_none());
+    assert_eq!(
+        central.catalog.get_source(source).unwrap().unwrap().state,
+        SourceState::Retired
+    );
+    match central
+        .catalog
+        .replica_apply_batch(NODE, source, &batch)
+        .unwrap()
+    {
+        BatchOutcome::Rejected { reason } => assert!(reason.contains("retired"), "{reason}"),
+        other => panic!("forgotten peer's batch was accepted: {other:?}"),
+    }
+    let mapping_exists = central
+        .catalog
+        .with_reader(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_replica_sources WHERE source_id = ?1)",
+                [source.0],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    assert!(mapping_exists, "physical cleanup remains a separate phase");
+    assert!(central.catalog.replica_retire_source(source).unwrap());
+    let mapping_exists = central
+        .catalog
+        .with_reader(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_replica_sources WHERE source_id = ?1)",
+                [source.0],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    assert!(!mapping_exists);
+}
+
+#[test]
 fn authenticated_replica_writes_are_bound_to_the_source_owner_and_node_role() {
     let node = Node::new();
     let central = Central::new();
