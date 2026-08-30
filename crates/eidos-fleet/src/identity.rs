@@ -112,6 +112,7 @@ impl NodeIdentity {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         restrict_dir(&dir)?;
         let _lock = lock_identity_dir(&dir)?;
+        remove_private_staging_file(&dir.join(format!("{KEY_FILE}.tmp")))?;
         if Self::exists(data_dir) {
             return Self::load(&dir);
         }
@@ -239,6 +240,22 @@ fn remove_if_present(path: &Path) -> anyhow::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Remove a private-key staging file left by an interrupted publication.
+/// A restored file can carry its own permissive ACL, so repair that ACL before
+/// removing the name; this also closes the load-time exposure reported for an
+/// otherwise complete identity.
+fn remove_private_staging_file(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            restrict_private_file(path)?;
+            remove_if_present(path)
+        }
+        Ok(_) => remove_if_present(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("inspecting {}", path.display())),
     }
 }
 
@@ -482,6 +499,20 @@ mod tests {
         assert!(fingerprints
             .iter()
             .all(|fingerprint| *fingerprint == fingerprints[0]));
+    }
+
+    #[test]
+    fn completed_identity_removes_interrupted_private_key_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_create(dir.path(), "alpha").unwrap();
+        let fleet_dir = NodeIdentity::fleet_dir(dir.path());
+        let staged_key = fleet_dir.join(format!("{KEY_FILE}.tmp"));
+        std::fs::copy(fleet_dir.join(KEY_FILE), &staged_key).unwrap();
+
+        let loaded = NodeIdentity::load_or_create(dir.path(), "ignored").unwrap();
+
+        assert_eq!(loaded.fingerprint, identity.fingerprint);
+        assert!(!staged_key.exists());
     }
 
     #[test]
