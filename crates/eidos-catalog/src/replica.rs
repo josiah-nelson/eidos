@@ -167,6 +167,11 @@ fn admission_to_json(state: &AdmissionState) -> Result<String> {
     Ok(serde_json::to_string(state)?)
 }
 
+fn repair_chain_from_blob(blob: Vec<u8>) -> Result<ChainHash> {
+    blob.try_into()
+        .map_err(|_| CatalogError::InvalidState("repair chain is not 32 bytes".into()))
+}
+
 fn node_id_from_blob(blob: Vec<u8>) -> Result<[u8; 16]> {
     blob.try_into()
         .map_err(|_| CatalogError::InvalidState("fleet node id is not 16 bytes".into()))
@@ -902,6 +907,16 @@ impl Catalog {
                     ),
                 });
             }
+            if rows.iter().any(|row| {
+                row.image.as_ref().is_some_and(|image| {
+                    image.object.id != row.object
+                        || image.object.source_id != state.remote_source_id
+                })
+            }) {
+                return Ok(BatchOutcome::Rejected {
+                    reason: "row image identity does not match its enclosing row and source".into(),
+                });
+            }
             let now = UnixNanos::now().0;
             let sync_epoch = SyncEpoch::from_source_epoch(epoch);
             // A stream from sequence zero of the epoch we asked for is the
@@ -993,8 +1008,9 @@ impl Catalog {
         leaf_bits: u8,
         leaf_hashes: &[[u8; 32]],
     ) -> Result<RepairOfferOutcome> {
-        self.with_reader(|conn| {
-            let state = state_conn(conn, source)?.ok_or_else(|| {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
             })?;
             if state.admission.epoch != epoch || through_seq < state.admission.applied_seq {
@@ -1018,15 +1034,41 @@ impl Catalog {
             }
             let tree = eidos_sync::merkle::MerkleTree::with_leaf_bits(
                 leaf_bits,
-                replica_digests_conn(conn, source)?,
+                replica_digests_conn(&tx, source)?,
             );
             let local = tree.leaf_hashes();
-            let leaves = local
-                .iter()
-                .zip(leaf_hashes)
-                .enumerate()
-                .filter_map(|(leaf, (mine, theirs))| (mine != theirs).then_some(leaf as u32))
-                .collect();
+            let leaves = if state.resync_target.is_some() {
+                // Completing an epoch resync by repair must materialize every
+                // current-epoch row before old epochs are retired. Equal
+                // leaf digests alone cannot retag their stored row mappings.
+                (0..local.len() as u32).collect::<Vec<_>>()
+            } else {
+                local
+                    .iter()
+                    .zip(leaf_hashes)
+                    .enumerate()
+                    .filter_map(|(leaf, (mine, theirs))| (mine != theirs).then_some(leaf as u32))
+                    .collect::<Vec<_>>()
+            };
+            tx.prepare_cached(
+                "INSERT INTO sync_replica_repairs
+                    (source_id, epoch, through_seq, through_chain, leaf_bits, leaves, requested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(source_id) DO UPDATE SET
+                    epoch = excluded.epoch, through_seq = excluded.through_seq,
+                    through_chain = excluded.through_chain, leaf_bits = excluded.leaf_bits,
+                    leaves = excluded.leaves, requested_at = excluded.requested_at",
+            )?
+            .execute(params![
+                source.0,
+                epoch.as_bytes().as_slice(),
+                through_seq as i64,
+                through_chain.as_slice(),
+                leaf_bits as i64,
+                serde_json::to_string(&leaves)?,
+                UnixNanos::now().0,
+            ])?;
+            tx.commit()?;
             Ok(RepairOfferOutcome::Request { leaf_bits, leaves })
         })
     }
@@ -1046,6 +1088,7 @@ impl Catalog {
         rows: &[SyncRow],
     ) -> Result<RepairOutcome> {
         let unique = rows.iter().map(|r| r.object).collect::<BTreeSet<_>>().len() == rows.len();
+        let unique_leaves = leaves.iter().copied().collect::<BTreeSet<_>>().len() == leaves.len();
         if leaf_bits > MAX_FLEET_LEAF_BITS
             || through_seq > MAX_SQLITE_SEQUENCE
             || leaves.iter().any(|l| *l >= (1u32 << leaf_bits))
@@ -1053,6 +1096,7 @@ impl Catalog {
                 .iter()
                 .any(|r| r.seq > through_seq || r.generation > MAX_SQLITE_SEQUENCE)
             || !unique
+            || !unique_leaves
         {
             return Ok(RepairOutcome::Rejected {
                 reason: "malformed repair response".into(),
@@ -1077,6 +1121,16 @@ impl Catalog {
                     reason: "stale repair rows".into(),
                 });
             }
+            if rows.iter().any(|row| {
+                row.image.as_ref().is_some_and(|image| {
+                    image.object.id != row.object
+                        || image.object.source_id != state.remote_source_id
+                })
+            }) {
+                return Ok(RepairOutcome::Rejected {
+                    reason: "row image identity does not match its enclosing row and source".into(),
+                });
+            }
             if through_seq == state.admission.applied_seq
                 && through_chain != state.admission.applied_chain
             {
@@ -1084,6 +1138,40 @@ impl Catalog {
                     reason: format!(
                         "history fork at sequence {through_seq}: repair rows differ at the cursor"
                     ),
+                });
+            }
+            let request = tx
+                .prepare_cached(
+                    "SELECT epoch, through_seq, through_chain, leaf_bits, leaves
+                     FROM sync_replica_repairs WHERE source_id = ?1",
+                )?
+                .query_row(params![source.0], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .optional()?;
+            let Some((requested_epoch, requested_seq, requested_chain, requested_bits, requested_leaves)) = request else {
+                return Ok(RepairOutcome::Rejected {
+                    reason: "repair response has no outstanding request".into(),
+                });
+            };
+            let requested_leaves: Vec<u32> = serde_json::from_str(&requested_leaves).map_err(|e| {
+                CatalogError::InvalidState(format!("repair leaf scope is unreadable: {e}"))
+            })?;
+            let requested_scope: BTreeSet<u32> = requested_leaves.into_iter().collect();
+            if requested_epoch.as_slice() != epoch.as_bytes().as_slice()
+                || requested_seq as u64 != through_seq
+                || repair_chain_from_blob(requested_chain)? != through_chain
+                || requested_bits as u8 != leaf_bits
+                || requested_scope != wanted
+            {
+                return Ok(RepairOutcome::Rejected {
+                    reason: "repair response does not match the outstanding request".into(),
                 });
             }
             let now = UnixNanos::now().0;
@@ -1135,6 +1223,8 @@ impl Catalog {
             }
             store_admission_conn(&tx, source, &state.admission, state.resync_target)?;
             mark_applied_conn(&tx, source, now)?;
+            tx.prepare_cached("DELETE FROM sync_replica_repairs WHERE source_id = ?1")?
+                .execute(params![source.0])?;
             tx.commit()?;
             Ok(RepairOutcome::Applied {
                 through_seq,

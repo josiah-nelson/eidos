@@ -385,6 +385,40 @@ fn a_batch_is_bound_to_the_remote_source_it_names() {
     }
     assert_eq!(central.applied_seq(source), 0);
     assert!(central.image(source).is_empty());
+
+    let mut batch = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap();
+    let row = batch
+        .rows
+        .iter_mut()
+        .find(|row| row.image.is_some())
+        .expect("a live row");
+    row.image.as_mut().unwrap().object.id = ObjectId(row.object.0 + 10_000);
+    match central.catalog.replica_apply_batch(source, &batch).unwrap() {
+        BatchOutcome::Rejected { reason } => assert!(reason.contains("identity"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(central.applied_seq(source), 0);
+    assert!(central.image(source).is_empty());
+
+    let mut batch = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap();
+    let image = batch
+        .rows
+        .iter_mut()
+        .find_map(|row| row.image.as_mut())
+        .expect("a live row");
+    image.object.source_id = SourceId(node.source.0 + 10_000);
+    match central.catalog.replica_apply_batch(source, &batch).unwrap() {
+        BatchOutcome::Rejected { reason } => assert!(reason.contains("identity"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(central.applied_seq(source), 0);
+    assert!(central.image(source).is_empty());
 }
 
 #[test]
@@ -1058,6 +1092,24 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
         }
         other => panic!("{other:?}"),
     }
+    match central
+        .catalog
+        .replica_apply_repair(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &leaves,
+            &rows,
+        )
+        .unwrap()
+    {
+        RepairOutcome::Rejected { reason } => {
+            assert!(reason.contains("outstanding request"), "{reason}")
+        }
+        other => panic!("replayed repair was accepted: {other:?}"),
+    }
     node.catalog
         .sync_acknowledge(node.source, state.epoch, CENTRAL, state.head_seq)
         .unwrap();
@@ -1088,6 +1140,58 @@ fn repair_replay_is_chain_bound_and_rejects_duplicate_objects() {
         .unwrap();
     let leaf_bits = 4;
     let leaves = [leaf_index(leaf_bits, object)];
+
+    // An authoritative response is unusable until the catalog has durably
+    // selected its exact leaf scope from a matching offer.
+    match central
+        .catalog
+        .replica_apply_repair(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &leaves,
+            &rows,
+        )
+        .unwrap()
+    {
+        RepairOutcome::Rejected { reason } => {
+            assert!(reason.contains("outstanding request"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Force exactly the object's leaf to differ, creating the durable
+    // outstanding request used by the remaining checks.
+    let (_, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    let mut hashes = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries
+            .iter()
+            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+    )
+    .leaf_hashes();
+    hashes[leaves[0] as usize][0] ^= 0xff;
+    let requested = central
+        .catalog
+        .replica_repair_offer(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &hashes,
+        )
+        .unwrap();
+    assert!(matches!(
+        requested,
+        eidos_catalog::replica::RepairOfferOutcome::Request {
+            leaves: requested_leaves,
+            ..
+        } if requested_leaves.as_slice() == leaves
+    ));
+
     let mut wrong_chain = state.head_chain;
     wrong_chain[0] ^= 0xff;
     match central
@@ -1104,6 +1208,24 @@ fn repair_replay_is_chain_bound_and_rejects_duplicate_objects() {
         .unwrap()
     {
         RepairOutcome::Rejected { reason } => assert!(reason.contains("history fork"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+
+    let wrong_leaf = (leaves[0] + 1) % (1 << leaf_bits);
+    match central
+        .catalog
+        .replica_apply_repair(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &[wrong_leaf],
+            &[],
+        )
+        .unwrap()
+    {
+        RepairOutcome::Rejected { reason } => assert!(reason.contains("outstanding"), "{reason}"),
         other => panic!("{other:?}"),
     }
 
@@ -1172,13 +1294,38 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
         .is_some());
 
     let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
-    let objects: Vec<_> = entries.iter().map(|entry| entry.object).collect();
+    let leaf_bits = 4;
+    let source_tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries
+            .iter()
+            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+    );
+    let request = central
+        .catalog
+        .replica_repair_offer(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &source_tree.leaf_hashes(),
+        )
+        .unwrap();
+    let leaves = match request {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("{other:?}"),
+    };
+    let wanted: BTreeSet<_> = leaves.iter().copied().collect();
+    let objects: Vec<_> = entries
+        .iter()
+        .filter(|entry| wanted.contains(&leaf_index(leaf_bits, entry.object)))
+        .map(|entry| entry.object)
+        .collect();
     let (_, rows) = node
         .catalog
         .sync_rows_for_objects(node.source, &objects)
         .unwrap();
-    let leaf_bits = 4;
-    let leaves: Vec<u32> = (0..1u32 << leaf_bits).collect();
     assert!(matches!(
         central
             .catalog
@@ -1204,12 +1351,6 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
         None
     );
     assert_eq!(central.image(source), node.image());
-    let source_tree = MerkleTree::with_leaf_bits(
-        leaf_bits,
-        entries
-            .iter()
-            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
-    );
     let replica_tree =
         MerkleTree::with_leaf_bits(leaf_bits, central.catalog.replica_digests(source).unwrap());
     assert_eq!(replica_tree.leaf_hashes(), source_tree.leaf_hashes());

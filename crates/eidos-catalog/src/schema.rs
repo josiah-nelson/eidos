@@ -547,6 +547,18 @@ CREATE TABLE sync_replica_rows (
 ) WITHOUT ROWID;
 CREATE UNIQUE INDEX sync_replica_rows_local ON sync_replica_rows (local_object_id);
 CREATE INDEX sync_replica_rows_epoch ON sync_replica_rows (source_id, epoch);
+-- The Merkle response is authoritative only for the exact divergent leaves
+-- selected from a particular offer. Persist that scope so a replayed or
+-- mismatched response cannot delete rows outside the offer it answers.
+CREATE TABLE sync_replica_repairs (
+    source_id     INTEGER PRIMARY KEY,
+    epoch         BLOB NOT NULL,
+    through_seq   INTEGER NOT NULL,
+    through_chain BLOB NOT NULL,
+    leaf_bits     INTEGER NOT NULL,
+    leaves        TEXT NOT NULL,
+    requested_at  INTEGER NOT NULL
+);
 "#,
     ),
 ];
