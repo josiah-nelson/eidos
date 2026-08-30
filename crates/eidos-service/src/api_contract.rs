@@ -117,6 +117,17 @@ fn typescript_contract() -> String {
     types.add::<crate::export::ExportDocument>();
     types.add::<crate::export::ExportNdjsonHeader>();
     types.add::<crate::export::ExportNdjsonSummary>();
+    types.add::<eidos_fleet::FleetStatus>();
+    types.add::<eidos_fleet::FleetConfig>();
+    types.add::<crate::fleet_api::CentralBody>();
+    types.add::<crate::fleet_api::InviteBody>();
+    types.add::<crate::fleet_api::InviteView>();
+    types.add::<crate::fleet_api::EnrollBody>();
+    types.add::<crate::fleet_api::EnrollView>();
+    types.add::<crate::fleet_api::SyncBody>();
+    types.add::<crate::fleet_api::PeerBody>();
+    types.add::<crate::fleet_api::ForgetView>();
+    types.add::<crate::fleet_api::SyncPolicyBody>();
 
     types.finish()
 }

@@ -19,6 +19,7 @@ mod archive;
 mod bench;
 mod content;
 mod detach;
+mod fleet;
 mod logging;
 mod observe;
 mod profile;
@@ -70,6 +71,8 @@ enum Command {
     Content(content::ContentArgs),
     /// Manage a bounded, privacy-preserving workload observation study.
     Observe(observe::ObserveArgs),
+    /// Fleet identity, enrollment, central role, and sync status.
+    Fleet(fleet::FleetArgs),
 }
 
 /// Everything that configures a running service. Shared by `serve`
@@ -137,6 +140,9 @@ pub struct ServeArgs {
     /// Exports allowed to stream at once (kept below --max-concurrent-queries).
     #[arg(long, env = "EIDOS_EXPORT_CONCURRENCY", default_value_t = 2)]
     pub export_concurrency: usize,
+    /// Do not start the fleet runtime (no identity, listener, or dialers).
+    #[arg(long)]
+    pub no_fleet: bool,
 }
 
 impl ServeArgs {
@@ -178,6 +184,7 @@ impl ServeArgs {
                 max_rows: self.export_max_rows,
                 concurrency: self.export_concurrency,
             },
+            fleet: !self.no_fleet,
         }
     }
 
@@ -240,6 +247,9 @@ impl ServeArgs {
         if self.no_content {
             v.push("--no-content".into());
         }
+        if self.no_fleet {
+            v.push("--no-fleet".into());
+        }
         if self.detach {
             v.push("--detach".into());
         }
@@ -280,6 +290,7 @@ fn main() -> anyhow::Result<()> {
         Command::Archive(args) => archive::run(args),
         Command::Content(args) => content::run(args),
         Command::Observe(args) => observe::run(args, &cli.log),
+        Command::Fleet(args) => fleet::run(args),
         #[cfg(any(windows, target_os = "macos"))]
         Command::Service(args) => service::run(args, cli.log, cli.log_json),
         Command::Search(args) => {

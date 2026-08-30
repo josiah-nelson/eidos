@@ -154,13 +154,11 @@ pub fn render(q: &Query) -> String {
                 };
                 out.push(s);
             }
-            Query::Host { ids } => out.push(format!(
-                "host:{}",
-                ids.iter()
-                    .map(|i| i.0.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )),
+            Query::Host { ids, names } => {
+                let mut parts: Vec<String> = ids.iter().map(|i| i.0.to_string()).collect();
+                parts.extend(names.iter().cloned());
+                out.push(format!("host:{}", parts.join(",")));
+            }
             Query::Source { ids, names } => {
                 let mut parts: Vec<String> = ids.iter().map(|i| i.0.to_string()).collect();
                 parts.extend(names.iter().cloned());

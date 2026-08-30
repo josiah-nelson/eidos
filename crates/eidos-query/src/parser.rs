@@ -769,12 +769,20 @@ impl Parser {
                 Query::Source { ids, names }
             }
             "host" | "h" => {
-                let ids = value
-                    .split(',')
-                    .filter_map(|v| v.trim().trim_start_matches("h:").parse::<i64>().ok())
-                    .map(HostId)
-                    .collect();
-                Query::Host { ids }
+                let mut ids = Vec::new();
+                let mut names = Vec::new();
+                for v in value.split(',') {
+                    let v = v.trim();
+                    if let Ok(n) = v.parse::<i64>() {
+                        ids.push(HostId(n));
+                    } else if let Some(n) = v.strip_prefix("h:").and_then(|x| x.parse::<i64>().ok())
+                    {
+                        ids.push(HostId(n));
+                    } else if !v.is_empty() {
+                        names.push(v.to_string());
+                    }
+                }
+                Query::Host { ids, names }
             }
             "object" | "obj" | "o" => {
                 let ids = value

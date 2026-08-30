@@ -311,7 +311,58 @@ fn source_coverage(
             remediation: Some("see the source's errors view for the affected paths".into()),
         });
     }
-    if signals.content_query {
+    if let Some(remote) = &c.remote {
+        if !remote.connected {
+            let last = remote
+                .applied_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "never".into());
+            degraded.push(CoverageReason {
+                kind: CoverageKind::Offline,
+                severity: CoverageSeverity::Info,
+                detail: format!(
+                    "{} on {} is not connected; results are preserved as replicated at {last}",
+                    c.name, remote.node_name
+                ),
+                remediation: Some("results heal automatically when the node reconnects".into()),
+            });
+        } else if remote.applied_seq < remote.reported_head {
+            degraded.push(CoverageReason {
+                kind: CoverageKind::IndexLag,
+                severity: CoverageSeverity::Info,
+                detail: format!(
+                    "{} is {} change(s) behind {}",
+                    c.name,
+                    remote.reported_head - remote.applied_seq,
+                    remote.node_name
+                ),
+                remediation: Some("replication is in progress; retry shortly".into()),
+            });
+        }
+        if remote.resyncing {
+            degraded.push(CoverageReason {
+                kind: CoverageKind::GenerationReset,
+                severity: CoverageSeverity::Warning,
+                detail: format!(
+                    "{} started a new epoch on {}; rows of the previous epoch may remain until the resync completes",
+                    c.name, remote.node_name
+                ),
+                remediation: None,
+            });
+        }
+        if signals.content_query {
+            degraded.push(CoverageReason {
+                kind: CoverageKind::ContentNotReplicated,
+                severity: CoverageSeverity::Warning,
+                detail: format!(
+                    "{} is replicated metadata only; its content is not indexed here",
+                    c.name
+                ),
+                remediation: Some(format!("search content on {} directly", remote.node_name)),
+            });
+        }
+    }
+    if signals.content_query && c.remote.is_none() {
         if c.content_not_replicated {
             degraded.push(CoverageReason {
                 kind: CoverageKind::ContentNotReplicated,
@@ -357,7 +408,9 @@ fn source_coverage(
     SourceCoverage {
         source_id: c.source_id,
         name: c.name.clone(),
-        watermark: if healthy_live {
+        watermark: if let Some(remote) = &c.remote {
+            remote.applied_at
+        } else if healthy_live {
             Some(now)
         } else {
             c.last_scan_completed
@@ -385,6 +438,7 @@ mod tests {
             checkpoint_age_ms: Some(10),
             freshness: Freshness::Live,
             note: None,
+            remote: None,
         }
     }
 

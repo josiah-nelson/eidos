@@ -534,12 +534,48 @@ fn compile(q: &Query, ctx: &mut Ctx<'_>) -> std::result::Result<Box<dyn TQuery>,
             case_sensitive,
             slop,
         } => compile_text(*field, *mode, value, *case_sensitive, *slop, ctx)?,
-        Query::Host { ids } => {
-            if ids.iter().any(|h| h.0 == 1) {
-                Box::new(AllQuery)
-            } else {
-                ctx.warnings.push("no matching host; v0.5 has a single local host".into());
+        Query::Host { ids, names } => {
+            // A host is the set of its sources; remote sources belong to
+            // the node they were replicated from.
+            let hosts = ctx
+                .catalog
+                .list_hosts()
+                .map_err(|e| QueryError::Other { message: e.to_string() })?;
+            let mut wanted: Vec<HostId> = ids.clone();
+            for n in names {
+                match hosts.iter().find(|h| h.name.eq_ignore_ascii_case(n)) {
+                    Some(h) => wanted.push(h.id),
+                    None => {
+                        return Err(QueryError::Other {
+                            message: format!("unknown host name: {n}"),
+                        })
+                    }
+                }
+            }
+            let sources: Vec<SourceId> = ctx
+                .catalog
+                .list_sources()
+                .map_err(|e| QueryError::Other { message: e.to_string() })?
+                .into_iter()
+                .filter(|s| wanted.contains(&s.host_id))
+                .map(|s| s.id)
+                .collect();
+            ctx.readable.push(format!(
+                "host in [{}]",
+                wanted.iter().map(|h| h.0.to_string()).collect::<Vec<_>>().join(", ")
+            ));
+            if sources.is_empty() {
+                ctx.warnings.push("no source belongs to the requested host".into());
                 Box::new(EmptyQuery)
+            } else {
+                let mut qs: Vec<Box<dyn tantivy::query::Query>> = Vec::new();
+                for sid in sources {
+                    qs.push(Box::new(TermQuery::new(
+                        Term::from_field_u64(ctx.f.source_id, sid.0 as u64),
+                        IndexRecordOption::Basic,
+                    )));
+                }
+                any_of(qs)
             }
         }
         Query::Source { ids, names } => {

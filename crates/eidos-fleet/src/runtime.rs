@@ -86,6 +86,10 @@ impl Fleet {
             registry: Arc::new(Registry::default()),
             platform: std::env::consts::OS.to_string(),
         });
+        // Sessions are RAM: whatever the last process left behind is stale.
+        if let Err(e) = ctx.catalog.fleet_reset_connected() {
+            tracing::warn!(error = %e, "could not reset peer connection flags");
+        }
         let (shutdown, _) = watch::channel(false);
         let fleet = Arc::new(Fleet {
             ctx,

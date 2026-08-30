@@ -240,7 +240,10 @@ fn canonical(query: &Query) -> Query {
             after: after.map(floor_to_day),
             before: before.map(floor_to_day),
         },
-        Query::Host { ids } => Query::Host { ids: sorted(ids) },
+        Query::Host { ids, names } => Query::Host {
+            ids: sorted(ids),
+            names: sorted(names),
+        },
         Query::Object { ids } => Query::Object { ids: sorted(ids) },
         Query::Source { ids, names } => Query::Source {
             ids: sorted(ids),

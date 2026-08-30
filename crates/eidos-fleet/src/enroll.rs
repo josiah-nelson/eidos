@@ -106,6 +106,7 @@ pub async fn enroll(
                 enrolled_at: UnixNanos::now(),
                 last_seen_at: Some(UnixNanos::now()),
                 last_error: None,
+                connected: false,
             };
             catalog.fleet_upsert_peer(&peer)?;
             Ok(Enrollment {

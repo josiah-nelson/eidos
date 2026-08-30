@@ -1230,9 +1230,7 @@ fn reconcile_tick(state: &Arc<AppState>) -> anyhow::Result<()> {
 
 fn reconcile_tick_at(state: &Arc<AppState>, now: UnixNanos) -> anyhow::Result<()> {
     for s in state.catalog.list_sources()? {
-        if s.published_generation.is_none()
-            || s.state == SourceState::Retired
-            || s.kind == SourceKind::Remote
+        if s.published_generation.is_none() || s.state == SourceState::Retired || s.kind.is_remote()
         {
             state.clear_reconciliation_deferral(s.id);
             continue;

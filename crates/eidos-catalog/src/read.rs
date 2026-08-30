@@ -418,7 +418,33 @@ impl Catalog {
                 .ok_or_else(|| CatalogError::NotFound(format!("source {id}")))?;
             let counts = light_counts_conn(conn, &src)?;
             let listing_errors = published_listing_errors_conn(conn, &src)?;
-            Ok(completeness_from(&src, &counts, listing_errors))
+            let mut completeness = completeness_from(&src, &counts, listing_errors);
+            if src.kind == SourceKind::Remote {
+                if let Some(cov) = crate::replica::coverage_conn(conn, id)? {
+                    // A connected origin streams changes continuously, so
+                    // the copy is as fresh as a live feed; otherwise it is
+                    // exactly as old as its last applied batch.
+                    completeness.freshness = if cov.connected {
+                        Freshness::Live
+                    } else {
+                        Freshness::Unknown
+                    };
+                    completeness.content_complete = false;
+                    completeness.remote = Some(eidos_domain::RemoteCompleteness {
+                        node_id: cov.node_id.iter().map(|b| format!("{b:02x}")).collect(),
+                        node_name: cov.node_name,
+                        remote_source_id: cov.remote_source_id,
+                        epoch: cov.epoch.to_string(),
+                        applied_seq: cov.applied_seq,
+                        reported_head: cov.reported_head,
+                        applied_at: cov.applied_at,
+                        reported_at: cov.reported_at,
+                        resyncing: cov.resyncing,
+                        connected: cov.connected,
+                    });
+                }
+            }
+            Ok(completeness)
         })
     }
 
@@ -726,5 +752,6 @@ pub fn completeness_from(
         checkpoint_age_ms,
         freshness,
         note,
+        remote: None,
     }
 }

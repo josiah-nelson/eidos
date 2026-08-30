@@ -537,6 +537,7 @@ where
             .add(&ctx.counters.connections_established_inbound, 1),
     }
     let _ = ctx.catalog.fleet_note_peer_seen(peer.node_id, None);
+    let _ = ctx.catalog.fleet_set_peer_connected(peer.node_id, true);
     tracing::info!(peer = %peer.node_id, name = %peer.name, ?direction, "fleet session established");
 
     // Frames arrive through a task so a slow apply never leaves a partial
@@ -637,6 +638,9 @@ where
     };
     reader.abort();
     ctx.registry.unregister(peer.node_id, key);
+    if !ctx.registry.is_connected(peer.node_id) {
+        let _ = ctx.catalog.fleet_set_peer_connected(peer.node_id, false);
+    }
     ctx.counters.add(&ctx.counters.disconnects, 1);
     if let SessionEnd::Failed(reason) = &end {
         let _ = ctx.catalog.fleet_note_peer_seen(peer.node_id, Some(reason));

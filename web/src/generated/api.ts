@@ -30,6 +30,8 @@ export type ArchiveView = { object_id: ObjectId, path: string | null, record: Ar
 
 export type CatalogWriterStats = { acquisitions: ApiInt, contended_acquisitions: ApiInt, waiting: ApiInt, total_wait_ms: number, max_wait_ms: number, total_hold_ms: number, max_hold_ms: number, };
 
+export type CentralBody = { central?: boolean, listen?: string, };
+
 export type ChildRow = { entry: EntryRecord, object: ObjectRecord, aggregate: DirectoryAggregate | null, };
 
 export type ChildSort = "name" | "size" | "allocated_size" | "modified" | "kind";
@@ -64,9 +66,15 @@ export type CoverageReason = { kind: CoverageKind, severity: CoverageSeverity, d
 
 export type CoverageSeverity = "info" | "warning" | "error";
 
+export type Direction = "outbound" | "inbound";
+
 export type DirectoryAggregate = { object_id: ObjectId, file_count: ApiInt, dir_count: ApiInt, logical_bytes: ApiInt, allocated_bytes: ApiInt, newest_modified: UnixNanos | null, oldest_modified: UnixNanos | null, content_pending: ApiInt, content_indexed: ApiInt, content_failed: ApiInt, content_excluded: ApiInt, generation: ApiInt, complete: boolean, };
 
 export type DirectorySummary = { file_count: ApiInt, directory_count: ApiInt, logical_bytes: ApiInt, allocated_bytes: ApiInt, newest_modified?: UnixNanos, oldest_modified?: UnixNanos, extension_counts?: { [key in string]: ApiInt }, complete: boolean, };
+
+export type EnrollBody = { code: string, };
+
+export type EnrollView = { central: NodeId, central_name: string, endpoint: string, };
 
 export type EntryId = ApiInt;
 
@@ -110,7 +118,15 @@ export type FailureClass = "transient" | "unsupported" | "deterministic" | "reso
 
 export type FileAttributes = number;
 
+export type FleetConfig = { central: boolean, listen: string | null, max_frame_bytes: ApiInt, credit_bytes: ApiInt, batch_rows: number, batch_bytes: ApiInt, reconnect_max_secs: ApiInt, backlog_ceiling_rows: ApiInt, backlog_ceiling_tombstones: ApiInt, repair_leaf_bits: number | null, };
+
+export type FleetCountersView = { connections_attempted: ApiInt, connections_established_outbound: ApiInt, connections_established_inbound: ApiInt, connections_refused_unknown_peer: ApiInt, connections_refused_version: ApiInt, duplicate_sessions_closed: ApiInt, disconnects: ApiInt, enrollments: ApiInt, offers_sent: ApiInt, offers_received: ApiInt, batches_sent: ApiInt, batches_applied: ApiInt, rows_shipped: ApiInt, rows_applied: ApiInt, acks_sent: ApiInt, acks_received: ApiInt, duplicates_acknowledged: ApiInt, stale_batches: ApiInt, rejections_received: ApiInt, rejections_sent: ApiInt, fences: ApiInt, full_resyncs: ApiInt, repairs_offered: ApiInt, repairs_applied: ApiInt, repair_rows_applied: ApiInt, frames_refused_oversize: ApiInt, frames_malformed: ApiInt, bytes_control_sent: ApiInt, bytes_control_received: ApiInt, bytes_catalog_sent: ApiInt, bytes_catalog_received: ApiInt, bytes_repair_sent: ApiInt, bytes_repair_received: ApiInt, materialize_ms_total: ApiInt, apply_ms_total: ApiInt, backfill_steps: ApiInt, collections: ApiInt, tombstones_collected: ApiInt, };
+
+export type FleetStatus = { node_id: NodeId, name: string, fingerprint: string, central: boolean, enrolled: boolean, sync_enabled: boolean, listen?: string, listening?: string, peers: Array<PeerView>, sessions: Array<SessionView>, local_sources: Array<LocalSourceSync>, replica_sources: Array<ReplicaSourceSync>, counters: FleetCountersView, degraded: Array<string>, pending_invites: ApiInt, };
+
 export type FollowerView = { iterations: ApiInt, rebuilds: ApiInt, rows_applied: ApiInt, documents_added: ApiInt, last_seq: ApiInt, last_rebuild_ms: ApiInt, last_error: string | null, last_activity_ms_ago: ApiInt | null, rebuilding_source: ApiInt | null, index_documents: ApiInt, outbox_pending: ApiInt, };
+
+export type ForgetView = { retired_sources: ApiInt, };
 
 export type Freshness = "live" | "periodic" | "unknown";
 
@@ -132,6 +148,10 @@ export type InteractionBatch = { events: Array<InteractionEventBody>, };
 
 export type InteractionEventBody = { session_id: string, action: string, q?: string | null, object_id?: ObjectId | null, source_id?: SourceId | null, presented_rank?: number | null, };
 
+export type InviteBody = { endpoint?: string, name_hint?: string, };
+
+export type InviteView = { code: string, endpoint: string, expires_at: UnixNanos, };
+
 export type JobCounts = { by_stage: { [key in string]: { [key in string]: ApiInt } }, queued: ApiInt, running: ApiInt, failed: ApiInt, oldest_queued_age_ms: ApiInt | null, };
 
 export type JobId = ApiInt;
@@ -146,9 +166,13 @@ export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in
 
 export type LimitQuery = { limit: number, };
 
+export type LocalSourceSync = { source_id: SourceId, name: string, policy: string, enabled: boolean, ready: boolean, epoch?: string, head_seq: ApiInt, compacted_through: ApiInt, backlog_rows: ApiInt, backlog_tombstones: ApiInt, backlog_oldest_age_ms?: ApiInt, degraded: boolean, };
+
 export type MemberQuery = { parent: string | null, prefix: string | null, offset: number, limit: number, };
 
 export type NativeIdentity = { volume_serial: ApiInt, file_id_high: ApiInt, file_id_low: ApiInt, confidence: IdentityConfidence, };
+
+export type NodeId = string;
 
 export type ObjectDetail = { object: ObjectRecord, path: string | null, entries: Array<EntryRecord>, aggregate: DirectoryAggregate | null, policy: Array<PolicyDecision>, source: SourceCompleteness, };
 
@@ -164,6 +188,10 @@ export type ParseView = { query: Query, rendered: string, notes: Array<string>, 
 
 export type PathMode = "exact" | "prefix" | "glob" | "regex";
 
+export type PeerBody = { endpoint?: string, enabled?: boolean, };
+
+export type PeerView = { node_id: NodeId, name: string, role: string, fingerprint: string, endpoint?: string, enabled: boolean, connected: boolean, last_seen_at?: UnixNanos, last_error?: string, next_dial_in_ms?: ApiInt, };
+
 export type PlanStep = { stage: string, description: string, candidates?: ApiInt, verified?: ApiInt, elapsed_ms?: number, };
 
 export type PolicyDecision = { object_id: ObjectId, stage: string, included: boolean, reason: string, rule: string, policy_version: number, user_override: boolean, };
@@ -176,7 +204,7 @@ export type PreviewQuery = { generation?: number | null, ordinal: number, before
 
 export type Priority = "catalog_critical" | "metadata_projection" | "small_text" | "normal_text" | "large_text" | "archive_manifest" | "enrichment";
 
-export type Query = { "op": "all" } | { "op": "and", clauses: Array<Query>, } | { "op": "or", clauses: Array<Query>, } | { "op": "not", clause: Query, } | { "op": "text", field: TextField, mode: TextMode, value: string, case_sensitive: boolean, slop: number, } | { "op": "host", ids: Array<HostId>, } | { "op": "source", ids: Array<SourceId>, names?: Array<string>, } | { "op": "object", ids: Array<ObjectId>, } | { "op": "path", mode: PathMode, value: string, case_sensitive: boolean, } | { "op": "descendant_of", directory: ObjectId, max_depth?: number | null, } | { "op": "extension", values: Array<string>, } | { "op": "kind", values: Array<ObjectKind>, } | { "op": "size", field: SizeField, min?: ApiInt | null, max?: ApiInt | null, } | { "op": "time", field: TimeField, after?: UnixNanos | null, before?: UnixNanos | null, } | { "op": "attributes", all_of: number, none_of: number, } | { "op": "content_state", states: Array<ContentState>, } | { "op": "descendant_extension", extension: string, min_count: ApiInt, max_count?: ApiInt | null, } | { "op": "subtree_size", field: SizeField, min?: ApiInt | null, max?: ApiInt | null, } | { "op": "descendant_count", min?: ApiInt | null, max?: ApiInt | null, } | { "op": "archive", in_archive?: boolean | null, container?: ObjectId | null, max_depth?: number | null, };
+export type Query = { "op": "all" } | { "op": "and", clauses: Array<Query>, } | { "op": "or", clauses: Array<Query>, } | { "op": "not", clause: Query, } | { "op": "text", field: TextField, mode: TextMode, value: string, case_sensitive: boolean, slop: number, } | { "op": "host", ids: Array<HostId>, names?: Array<string>, } | { "op": "source", ids: Array<SourceId>, names?: Array<string>, } | { "op": "object", ids: Array<ObjectId>, } | { "op": "path", mode: PathMode, value: string, case_sensitive: boolean, } | { "op": "descendant_of", directory: ObjectId, max_depth?: number | null, } | { "op": "extension", values: Array<string>, } | { "op": "kind", values: Array<ObjectKind>, } | { "op": "size", field: SizeField, min?: ApiInt | null, max?: ApiInt | null, } | { "op": "time", field: TimeField, after?: UnixNanos | null, before?: UnixNanos | null, } | { "op": "attributes", all_of: number, none_of: number, } | { "op": "content_state", states: Array<ContentState>, } | { "op": "descendant_extension", extension: string, min_count: ApiInt, max_count?: ApiInt | null, } | { "op": "subtree_size", field: SizeField, min?: ApiInt | null, max?: ApiInt | null, } | { "op": "descendant_count", min?: ApiInt | null, max?: ApiInt | null, } | { "op": "archive", in_archive?: boolean | null, container?: ObjectId | null, max_depth?: number | null, };
 
 export type QueryMeta = { q: string | null, rendered: string, mode: ResultMode, sort: Sort, include_retired: boolean, ast: Query, };
 
@@ -185,6 +213,10 @@ export type RebuildPhase = "idle" | "pending" | "running" | "failed";
 export type RebuildStatus = { phase: RebuildPhase, chunks: ApiInt, docs: ApiInt, elapsed_ms: ApiInt, error?: string, };
 
 export type ReconciliationDeferral = { reason: string, next_eligible_at: UnixNanos, };
+
+export type RemoteCompleteness = { node_id: string, node_name: string, remote_source_id: SourceId, epoch: string, applied_seq: ApiInt, reported_head: ApiInt, applied_at?: UnixNanos, reported_at?: UnixNanos, resyncing: boolean, connected: boolean, };
+
+export type ReplicaSourceSync = { source_id: SourceId, name: string, node: NodeId, node_name: string, remote_source_id: SourceId, epoch: string, applied_seq: ApiInt, reported_head: ApiInt, applied_at?: UnixNanos, reported_at?: UnixNanos, resyncing: boolean, connected: boolean, };
 
 export type RequeueView = { queued: ApiInt, };
 
@@ -212,6 +244,10 @@ export type SearchGetQuery = { q: string, mode: ResultMode | null, sort: SortFie
 
 export type SearchView = { query: Query, rendered: string, notes?: Array<string>, schema_version: number, hits: Array<Hit>, next_cursor?: string, total: TotalCount, timing: Timing, completeness: Array<SourceCompleteness>, coverage: CoverageEnvelope, explanation?: Explanation, facets?: Array<Facet>, warnings?: Array<string>, };
 
+export type SessionSourceView = { source_id: SourceId, role: SyncRole, phase: string, cursor: ApiInt, head: ApiInt, in_flight_bytes: ApiInt, last_error?: string, batches: ApiInt, rows: ApiInt, };
+
+export type SessionView = { peer: NodeId, peer_name: string, direction: Direction, since: UnixNanos, remote_addr?: string, last_activity_ms_ago: ApiInt, credit_remaining: ApiInt, sources: Array<SessionSourceView>, };
+
 export type SizeField = "logical" | "allocated";
 
 export type Snippet = { chunk_ordinal: number, byte_start: ApiInt, byte_end: ApiInt, line_start: ApiInt, line_end: ApiInt, text: string, highlights: Array<[number, number]>, };
@@ -220,7 +256,7 @@ export type Sort = { field: SortField, descending: boolean, };
 
 export type SortField = "relevance" | "name" | "path" | "size" | "allocated_size" | "subtree_size" | "modified" | "created";
 
-export type SourceCompleteness = { source_id: SourceId, name: string, state: SourceState, metadata_complete: boolean, content_complete: boolean, content_not_replicated: boolean, content_pending: ApiInt, content_failed: ApiInt, listing_errors: ApiInt, last_scan_completed?: UnixNanos, checkpoint_age_ms?: ApiInt, freshness: Freshness, note?: string, };
+export type SourceCompleteness = { source_id: SourceId, name: string, state: SourceState, metadata_complete: boolean, content_complete: boolean, content_pending: ApiInt, content_failed: ApiInt, listing_errors: ApiInt, last_scan_completed?: UnixNanos, checkpoint_age_ms?: ApiInt, freshness: Freshness, note?: string, remote?: RemoteCompleteness, };
 
 export type SourceConcurrencyView = { source_id: SourceId, budget: number, reserved: number, peak_reserved: number, };
 
@@ -242,7 +278,13 @@ export type SourceView = { source: SourceRecord, counts: SourceCounts, completen
 
 export type StartupRecovery = { aborted_scan_generations: ApiInt, requeued_running_jobs: ApiInt, requeued_unfinished_content: ApiInt, };
 
+export type SyncBody = { enabled: boolean, };
+
 export type SyncPolicy = "inherit" | "local_only";
+
+export type SyncPolicyBody = { policy: SyncPolicy, };
+
+export type SyncRole = "shipping" | "consuming";
 
 export type TextField = "name" | "path" | "content";
 

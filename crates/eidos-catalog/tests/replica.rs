@@ -4894,6 +4894,7 @@ fn a_lost_enrollment_response_can_retry_only_the_committed_roster_entry() {
         endpoint: None,
         enabled: true,
         enrolled_at: UnixNanos::now(),
+        connected: false,
         last_seen_at: None,
         last_error: None,
     };

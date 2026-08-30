@@ -58,6 +58,7 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
         .route("/sources/{id}/archives", post(requeue_archives))
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())
+        .merge(crate::fleet_api::routes())
         .route("/resolve", get(resolve))
         .route("/search", post(search).get(search_get))
         .route(
@@ -115,6 +116,11 @@ impl ApiError {
     }
     pub(crate) fn conflict(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", msg)
+    }
+    pub(crate) fn unavailable(msg: impl Into<String>, retry_after_s: Option<u64>) -> Self {
+        let mut e = Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", msg);
+        e.retry_after_s = retry_after_s;
+        e
     }
     pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
@@ -244,7 +250,7 @@ pub struct SourceView {
     pub reconciliation_deferred: Option<crate::state::ReconciliationDeferral>,
 }
 
-fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, ApiError> {
+pub(crate) fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, ApiError> {
     let counts = st.catalog.source_counts(s.id)?;
     let listing_errors = st.catalog.published_listing_errors(s.id)?;
     let mut completeness = eidos_catalog::read::completeness_from(&s, &counts, listing_errors);
@@ -315,6 +321,11 @@ async fn add_source(
         )));
     }
     let kind = match body.kind {
+        Some(SourceKind::Remote) => {
+            return Err(ApiError::bad_request(
+                "remote sources are created by fleet replication, not by hand",
+            ))
+        }
         Some(k) => k,
         None => match st.lister.volume_info(root) {
             Ok(v) => v.source_kind(),
@@ -412,9 +423,15 @@ async fn scan_source(
     Path(id): Path<i64>,
 ) -> Result<(StatusCode, ApiJson<ScanProgressView>), ApiError> {
     let sid = SourceId(id);
-    st.catalog
+    let source = st
+        .catalog
         .get_source(sid)?
         .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
+    if source.kind == SourceKind::Remote {
+        return Err(ApiError::bad_request(
+            "a replicated source is scanned on its origin node, not here",
+        ));
+    }
     match start_scan(&st, sid) {
         Ok(p) => Ok((StatusCode::ACCEPTED, ApiJson(p.view()))),
         Err(StartScanError::AlreadyRunning) => Err(ApiError::conflict("scan already running")),
@@ -958,6 +975,11 @@ async fn set_content_policy(
         .catalog
         .get_source(sid)?
         .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
+    if s.kind == SourceKind::Remote {
+        return Err(ApiError::bad_request(
+            "a replicated source carries no content here; set its policy on the origin node",
+        ));
+    }
     let enabled = body.enabled.unwrap_or(s.content_enabled);
     let concurrency = body
         .concurrency
