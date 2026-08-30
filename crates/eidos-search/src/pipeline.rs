@@ -305,7 +305,10 @@ pub fn process_object_with_faults(
                 }
             }
         }
-        ContentState::Excluded | ContentState::Unsupported | ContentState::NotApplicable => {
+        ContentState::Excluded
+        | ContentState::Unsupported
+        | ContentState::NotApplicable
+        | ContentState::NotReplicated => {
             return Ok(ProcessResult::Skipped("not a content candidate"));
         }
     }

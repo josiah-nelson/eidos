@@ -220,6 +220,11 @@ pub struct SourceCompleteness {
     pub metadata_complete: bool,
     /// No content jobs are outstanding for the published generation.
     pub content_complete: bool,
+    /// This source intentionally replicates metadata but not file content.
+    /// Metadata-only queries remain complete; content queries must disclose
+    /// that the source cannot contribute matches.
+    #[serde(default)]
+    pub content_not_replicated: bool,
     pub content_pending: u64,
     pub content_failed: u64,
     /// Directories that could not be listed in the published generation.
@@ -330,6 +335,7 @@ mod tests {
             state: SourceState::ContentPending,
             metadata_complete: m,
             content_complete: c,
+            content_not_replicated: false,
             content_pending: 0,
             content_failed: 0,
             listing_errors: 0,

@@ -2,7 +2,7 @@
 
 use eidos_domain::{
     ContentId, ContentState, FileAttributes, HostId, IdentityConfidence, NativeIdentity, ObjectId,
-    ObjectKind, SourceId, SourceKind, SourceState, UnixNanos, VolumeId,
+    ObjectKind, SourceId, SourceKind, SourceState, SyncPolicy, UnixNanos, VolumeId,
 };
 use rusqlite::Row;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,9 @@ pub struct SourceRecord {
     pub content_enabled: bool,
     /// Concurrent content jobs allowed on this source (HDD-aware budget).
     pub content_concurrency: u32,
+    /// Fleet replication policy: `inherit` follows enrollment, `local_only`
+    /// never ships (a `remote` source is never a shipper).
+    pub sync_policy: SyncPolicy,
     pub checkpoint_kind: Option<String>,
     pub checkpoint_at: Option<UnixNanos>,
     pub last_scan_started_at: Option<UnixNanos>,
@@ -67,6 +70,7 @@ impl SourceRecord {
             reconcile_interval_s: r.get("reconcile_interval_s")?,
             content_enabled: r.get::<_, i64>("content_enabled")? != 0,
             content_concurrency: r.get::<_, i64>("content_concurrency")?.max(1) as u32,
+            sync_policy: parse_enum::<SyncPolicy>(r.get::<_, String>("sync_policy")?),
             checkpoint_kind: r.get("checkpoint_kind")?,
             checkpoint_at: r.get::<_, Option<i64>>("checkpoint_at")?.map(UnixNanos),
             last_scan_started_at: r
@@ -95,6 +99,9 @@ impl EnumFallback for ObjectKind {
 }
 impl EnumFallback for ContentState {
     const FALLBACK: Self = ContentState::Pending;
+}
+impl EnumFallback for SyncPolicy {
+    const FALLBACK: Self = SyncPolicy::Inherit;
 }
 
 pub(crate) fn parse_enum<T: EnumFallback>(s: String) -> T {

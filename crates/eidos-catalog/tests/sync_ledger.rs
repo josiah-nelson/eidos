@@ -3,11 +3,15 @@
 //! tombstone collection. Platform neutral except the scan fixture, which
 //! uses the default lister on a temporary tree.
 
+use eidos_catalog::archive::{ArchiveMember, ArchiveRecord};
 use eidos_catalog::changes::{ChangeEvent, NativeKey, ObjectSnapshot};
+use eidos_catalog::content::ContentRecord;
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::sync::{SyncBatch, SyncRow};
 use eidos_catalog::{Catalog, NewSource};
-use eidos_domain::{ObjectId, ObjectKind, SourceId, SourceKind};
+use eidos_domain::{
+    ContentState, Coverage, ObjectId, ObjectKind, SourceId, SourceKind, SyncPolicy, UnixNanos,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -196,6 +200,140 @@ fn source_without_sync_stamps_nothing() {
 }
 
 #[test]
+fn local_only_fences_enable_and_an_already_enabled_export() {
+    let fx = Fx::new();
+    fx.catalog
+        .set_sync_policy(fx.source, SyncPolicy::LocalOnly)
+        .unwrap();
+    let error = fx.catalog.sync_enable(fx.source, None).unwrap_err();
+    assert!(error.to_string().contains("local-only"), "{error}");
+
+    fx.catalog
+        .set_sync_policy(fx.source, SyncPolicy::Inherit)
+        .unwrap();
+    fx.enable_and_backfill(2);
+    let enabled = fx.catalog.sync_source(fx.source).unwrap().unwrap();
+    assert!(enabled.replication_allowed);
+    assert!(fx.catalog.sync_rows_after(fx.source, 0, u32::MAX).is_ok());
+
+    fx.catalog
+        .set_sync_policy(fx.source, SyncPolicy::LocalOnly)
+        .unwrap();
+    let fenced = fx.catalog.sync_source(fx.source).unwrap().unwrap();
+    assert!(!fenced.replication_allowed);
+    for error in [
+        fx.catalog
+            .sync_rows_after(fx.source, 0, u32::MAX)
+            .unwrap_err(),
+        fx.catalog.sync_ledger_entries(fx.source).unwrap_err(),
+        fx.catalog
+            .sync_merkle_leaf_hashes(fx.source, eidos_sync::merkle::MIN_FLEET_LEAF_BITS)
+            .unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("local-only"), "{error}");
+    }
+
+    fx.catalog
+        .set_sync_policy(fx.source, SyncPolicy::Inherit)
+        .unwrap();
+    assert!(fx.catalog.sync_rows_after(fx.source, 0, u32::MAX).is_ok());
+}
+
+#[test]
+fn sync_enabled_before_the_initial_scan_stamps_the_root_and_its_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("one.txt"), b"one").unwrap();
+    let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+    let host = catalog.ensure_host("h", "windows").unwrap();
+    let source = catalog
+        .add_source(&NewSource {
+            host_id: host,
+            name: "pre-enabled".into(),
+            kind: SourceKind::WindowsLocal,
+            root_path: root.display().to_string(),
+            aliases: vec![],
+        })
+        .unwrap();
+    catalog.sync_enable(source, None).unwrap();
+    assert!(catalog.sync_backfill(source, 16).unwrap().done);
+    let pre_scan = catalog.sync_source(source).unwrap().unwrap();
+    assert_eq!(pre_scan.head_seq, 0);
+    assert!(!pre_scan.metadata_complete);
+    assert!(catalog.sync_rows_after(source, 0, u32::MAX).is_err());
+
+    // `begin_scan` commits the root touch before the scan transaction starts.
+    // Neither that in-progress image nor the root left behind by recovery may
+    // be advertised as a complete source.
+    let interrupted = catalog
+        .begin_scan(source, eidos_catalog::scan::ScanKind::Full)
+        .unwrap();
+    let during_scan = catalog.sync_source(source).unwrap().unwrap();
+    assert!(during_scan.head_seq > 0);
+    assert!(!during_scan.metadata_complete);
+    assert!(catalog.sync_rows_after(source, 0, u32::MAX).is_err());
+    interrupted.abort("simulated initial-scan crash").unwrap();
+    let recovered = Catalog::open(dir.path().join("catalog.db")).unwrap();
+    assert!(
+        !recovered
+            .sync_source(source)
+            .unwrap()
+            .unwrap()
+            .metadata_complete
+    );
+    assert!(recovered.sync_rows_after(source, 0, u32::MAX).is_err());
+
+    let lister = eidos_scanner::default_lister();
+    run_scan(
+        &recovered,
+        source,
+        lister.as_ref(),
+        &RunScanOptions::default(),
+    )
+    .unwrap();
+    let root_object = recovered
+        .get_source(source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let published = recovered.sync_source(source).unwrap().unwrap();
+    assert!(published.metadata_complete);
+    let batch = recovered.sync_rows_after(source, 0, u32::MAX).unwrap();
+    let root_row = row_for(&batch, root_object);
+    let native = root_row
+        .image
+        .as_ref()
+        .expect("root is live")
+        .object
+        .native
+        .expect("the root stat identity was shipped");
+
+    let before = recovered.sync_source(source).unwrap().unwrap().head_seq;
+    let mut replacement = native;
+    replacement.file_id_low ^= 1 << 48;
+    recovered.set_root_identity(source, replacement).unwrap();
+    let after = recovered.sync_source(source).unwrap().unwrap().head_seq;
+    assert_eq!(after, before + 1);
+    let changed = recovered.sync_rows_after(source, before, u32::MAX).unwrap();
+    assert_eq!(
+        row_for(&changed, root_object)
+            .image
+            .as_ref()
+            .unwrap()
+            .object
+            .native,
+        Some(replacement)
+    );
+    recovered.set_root_identity(source, replacement).unwrap();
+    assert_eq!(
+        recovered.sync_source(source).unwrap().unwrap().head_seq,
+        after
+    );
+}
+
+#[test]
 fn enable_backfills_live_objects_in_bounded_steps() {
     let fx = Fx::new();
     let live = fx.live_object_count();
@@ -233,6 +371,104 @@ fn enable_backfills_live_objects_in_bounded_steps() {
     let again = fx.catalog.sync_backfill(fx.source, 2).unwrap();
     assert!(again.done);
     assert_eq!(again.stamped, 0);
+}
+
+#[test]
+fn scan_detected_archive_change_stamps_every_retired_virtual_member() {
+    let fx = Fx::new();
+    let archive_path = fx.root.join("pack.zip");
+    std::fs::write(&archive_path, b"PK\x05\x06").unwrap();
+    fx.scan();
+    fx.enable_and_backfill(100);
+
+    let container = fx.id("pack.zip");
+    let generation = fx
+        .catalog
+        .get_object(container)
+        .unwrap()
+        .unwrap()
+        .generation;
+    let members = ["one.txt", "two.txt"]
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, name)| ArchiveMember {
+            ordinal: ordinal as u32,
+            path: name.into(),
+            name: name.into(),
+            parent: String::new(),
+            raw_name: name.into(),
+            is_dir: false,
+            implicit: false,
+            size: 3,
+            compressed: 3,
+            method: 0,
+            crc32: 0,
+            modified: Some(UnixNanos(1)),
+            encrypted: false,
+            flags: 0,
+        })
+        .collect::<Vec<_>>();
+    let archive = ArchiveRecord {
+        object_id: container,
+        source_id: fx.source,
+        generation,
+        format: "zip".into(),
+        member_count: members.len() as u64,
+        dir_count: 0,
+        implicit_dir_count: 0,
+        suspicious_count: 0,
+        declared_size: 6,
+        compressed_size: 6,
+        claimed_entries: members.len() as u64,
+        zip64: false,
+        truncated: false,
+        comment: None,
+        state: ContentState::Indexed,
+        error: None,
+        reason: None,
+        processed_at: UnixNanos::now(),
+        elapsed_ms: 1.0,
+    };
+    let content = ContentRecord {
+        object_id: container,
+        source_id: fx.source,
+        generation,
+        extraction_version: 1,
+        encoding: None,
+        coverage: Coverage::Full,
+        indexed_bytes: 0,
+        total_bytes: 4,
+        chunk_count: 0,
+        line_count: 0,
+        chars: 0,
+        content_id: None,
+        hash_complete: false,
+        state: ContentState::Indexed,
+        failure_class: None,
+        error: None,
+        reason: None,
+        processed_at: UnixNanos::now(),
+        elapsed_ms: 1.0,
+    };
+    assert!(fx
+        .catalog
+        .store_archive(&archive, &members, &content, None)
+        .unwrap());
+    let virtuals = [fx.id("pack.zip/one.txt"), fx.id("pack.zip/two.txt")];
+    let before = fx.catalog.sync_source(fx.source).unwrap().unwrap().head_seq;
+
+    std::fs::write(&archive_path, b"changed archive bytes").unwrap();
+    fx.scan();
+    let changed = fx
+        .catalog
+        .sync_rows_after(fx.source, before, u32::MAX)
+        .unwrap();
+    for object in virtuals {
+        assert!(
+            row_for(&changed, object).image.is_none(),
+            "retired virtual member {object} must ship as a tombstone"
+        );
+    }
 }
 
 #[test]
@@ -290,11 +526,11 @@ fn delete_ships_a_tombstone_collected_only_below_every_watermark() {
     // Two consumers; only one has crossed the tombstone.
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_A, head1)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_A, head1)
         .unwrap());
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_B, head0)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_B, head0)
         .unwrap());
     let kept = fx.catalog.sync_collect(fx.source, 100).unwrap();
     assert_eq!(kept.removed_tombstones, 0);
@@ -309,16 +545,16 @@ fn delete_ships_a_tombstone_collected_only_below_every_watermark() {
     // Rewind is ignored; a beyond-head ack is an error.
     assert!(!fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_A, head0)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_A, head0)
         .unwrap());
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_A, head1 + 1)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_A, head1 + 1)
         .is_err());
 
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_B, head1)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_B, head1)
         .unwrap());
     let collected = fx.catalog.sync_collect(fx.source, 100).unwrap();
     assert_eq!(collected.removed_tombstones, 1);
@@ -379,7 +615,7 @@ fn reenable_mints_a_new_epoch_and_discards_history() {
     let first = fx.catalog.sync_source(fx.source).unwrap().unwrap();
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_A, first.head_seq)
+        .sync_acknowledge(fx.source, first.epoch, CONSUMER_A, first.head_seq)
         .unwrap());
 
     fx.catalog.sync_enable(fx.source, Some(42)).unwrap();

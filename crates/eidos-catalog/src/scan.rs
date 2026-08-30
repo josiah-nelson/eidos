@@ -22,7 +22,7 @@ use crate::policy::{ContentDecision, PolicyCtx, PolicyEngine};
 use crate::{Catalog, CatalogError, RecoveryReport, Result, WriterCoordination, WriterPermit};
 use eidos_domain::{
     extension_of, ContentState, IdentityConfidence, ObjectId, ObjectKind, PolicyStage, SourceId,
-    SourceState, UnixNanos,
+    SourceKind, SourceState, UnixNanos,
 };
 use eidos_scanner::{DirEvent, RawEntry};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -135,6 +135,11 @@ impl Catalog {
             let tx = conn.transaction()?;
             let mut source = crate::read::get_source_conn(&tx, source_id)?
                 .ok_or_else(|| CatalogError::NotFound(format!("source {source_id}")))?;
+            if source.kind == SourceKind::Remote {
+                return Err(CatalogError::InvalidState(format!(
+                    "source {source_id} is a fleet replica and cannot be scanned here"
+                )));
+            }
             let open: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM scan_generations WHERE source_id = ?1 AND state = 'open'",
                 params![source_id.0],
@@ -172,6 +177,11 @@ impl Catalog {
                         "UPDATE sources SET root_object_id = ?2 WHERE source_id = ?1",
                         params![source_id.0, root.0],
                     )?;
+                    // Enrollment may enable and finish an empty-source
+                    // backfill before the first scan. In that ordering the
+                    // newly created root must enter the ledger here; there is
+                    // no later backfill pass to discover it.
+                    crate::sync::touch_conn(&tx, source_id, root)?;
                     source.root_object_id = Some(root);
                     root
                 }
@@ -492,7 +502,13 @@ impl ScanSession {
                 if content_changed {
                     self.record_policy(ex.id, decision)?;
                 }
-                if row_changed {
+                if content_changed {
+                    // Retiring an archive changes the final image of every
+                    // virtual member, not only the physical container. Stamp
+                    // the set after both the member tombstones and container
+                    // update are final so replicas cannot retain ghost rows.
+                    crate::sync::touch_subtree_conn(&self.conn, self.source.id, ex.id)?;
+                } else if row_changed {
                     crate::sync::touch_conn(&self.conn, self.source.id, ex.id)?;
                 }
                 self.stats.objects_updated += 1;
@@ -699,14 +715,34 @@ impl ScanSession {
                 break;
             }
         }
-        // 2b. Sync ledger: every object this publish tombstoned (ADR-0015).
-        crate::sync::stamp_publish_tombstones_conn(&self.conn, self.source.id, now)?;
         // 3. Hard-link counts.
-        self.conn.execute(
+        let mut link_count_changed = self
+            .conn
+            .prepare_cached(
             "UPDATE objects SET link_count = (SELECT COUNT(*) FROM entries e WHERE e.object_id = objects.object_id AND e.deleted_at IS NULL)
-             WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file' AND last_seen_generation = ?2",
-            params![sid, gen],
-        )?;
+             WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file' AND last_seen_generation = ?2
+               AND link_count != (SELECT COUNT(*) FROM entries e WHERE e.object_id = objects.object_id AND e.deleted_at IS NULL)
+             RETURNING object_id",
+        )?
+            .query_map(params![sid, gen], |row| row.get::<_, i64>(0))?
+            .map(|row| row.map(ObjectId))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        link_count_changed.sort_unstable();
+        // 3b. Stamp final publish images after both entry cleanup and the
+        // hard-link count refresh. Objects with removed entries are covered
+        // by the set stamp; a count changed only by a new link needs an
+        // explicit final touch.
+        crate::sync::stamp_publish_changes_conn(&self.conn, self.source.id, now)?;
+        for object in link_count_changed {
+            let removed_entry = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE object_id = ?1 AND deleted_at = ?2)",
+                params![object.0, now],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !removed_entry {
+                crate::sync::touch_conn(&self.conn, self.source.id, object)?;
+            }
+        }
         let hard_links: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM objects WHERE source_id = ?1 AND deleted_at IS NULL AND link_count > 1",
             params![sid],

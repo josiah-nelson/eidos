@@ -101,6 +101,29 @@ str_enum! {
         MacosGeneric => "macos_generic",
         /// Remote SMB share crawled generically with weak freshness semantics.
         Smb => "smb",
+        /// Replicated from an enrolled fleet node; never scanned or watched
+        /// here. Its rows arrive through authenticated sync sessions.
+        Remote => "remote",
+    }
+}
+
+str_enum! {
+    /// Whether a source takes part in fleet replication once its node is
+    /// enrolled.
+    pub enum SyncPolicy {
+        /// Replicate whenever the node is enrolled (the default).
+        Inherit => "inherit",
+        /// Never leave this host.
+        LocalOnly => "local_only",
+    }
+}
+
+impl SourceKind {
+    /// A source whose rows are applied from a peer rather than observed
+    /// locally: nothing on this host scans, watches, reconciles, or extracts
+    /// content for it.
+    pub fn is_remote(self) -> bool {
+        matches!(self, Self::Remote)
     }
 }
 
@@ -146,6 +169,9 @@ str_enum! {
         Stale => "stale",
         /// Not applicable (directories, reparse points).
         NotApplicable => "not_applicable",
+        /// Content exists at the origin node but is not replicated to this
+        /// host (fleet metadata-only replication).
+        NotReplicated => "not_replicated",
     }
 }
 

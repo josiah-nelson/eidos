@@ -18,7 +18,7 @@ use crate::scanner::{self, ScanProgress};
 use crate::state::AppState;
 use eidos_catalog::changes::{ChangeEvent, Checkpoint};
 use eidos_catalog::scan::{PublishOptions, ScanSession, ScanSummary};
-use eidos_domain::{SourceId, SourceState, UnixNanos};
+use eidos_domain::{SourceId, SourceKind, SourceState, UnixNanos};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1230,7 +1230,10 @@ fn reconcile_tick(state: &Arc<AppState>) -> anyhow::Result<()> {
 
 fn reconcile_tick_at(state: &Arc<AppState>, now: UnixNanos) -> anyhow::Result<()> {
     for s in state.catalog.list_sources()? {
-        if s.published_generation.is_none() || s.state == SourceState::Retired {
+        if s.published_generation.is_none()
+            || s.state == SourceState::Retired
+            || s.kind == SourceKind::Remote
+        {
             state.clear_reconciliation_deferral(s.id);
             continue;
         }
@@ -1364,7 +1367,7 @@ mod coordination_tests {
     use eidos_catalog::jobs::NewJob;
     use eidos_catalog::scan::ScanKind;
     use eidos_catalog::NewSource;
-    use eidos_domain::{JobStage, Priority, SourceId, SourceKind, UnixNanos};
+    use eidos_domain::{JobStage, Priority, SourceId, SourceKind, SourceState, UnixNanos};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1610,5 +1613,38 @@ mod coordination_tests {
         session
             .abort("test releases feed recovery ownership")
             .unwrap();
+    }
+
+    #[test]
+    fn remote_sources_are_never_scheduled_for_local_reconciliation() {
+        let fixture = Fixture::new();
+        fixture
+            .state
+            .catalog
+            .with_writer(|conn| {
+                conn.execute(
+                    "UPDATE sources SET kind = 'remote', last_scan_completed_at = 1,
+                         state = 'metadata_complete' WHERE source_id = ?1",
+                    [fixture.source_id.0],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let long_overdue = UnixNanos(1 + DEFAULT_RECONCILE_INTERVAL_S * 10 * 1_000_000_000);
+        reconcile_tick_at(&fixture.state, long_overdue).unwrap();
+        assert!(fixture.state.scan_progress(fixture.source_id).is_none());
+        let source = fixture
+            .state
+            .catalog
+            .get_source(fixture.source_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.kind, SourceKind::Remote);
+        assert_eq!(source.state, SourceState::MetadataComplete);
+        assert!(fixture
+            .state
+            .reconciliation_deferral(fixture.source_id)
+            .is_none());
     }
 }

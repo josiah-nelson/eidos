@@ -44,7 +44,7 @@ export type ContentPolicyBody = { enabled?: boolean | null, concurrency?: number
 
 export type ContentPreview = { object_id: ObjectId, path: string | null, generation: number, object_generation: number, stale: boolean, state: ContentState, coverage: Coverage, indexed_bytes: ApiInt, total_bytes: ApiInt, chunk_count: number, line_count: ApiInt, encoding: string | null, reason: string | null, requested_ordinal: number, chunks: Array<PreviewChunk>, has_more_before: boolean, has_more_after: boolean, truncated: boolean, limits: PreviewLimits, };
 
-export type ContentState = "pending" | "indexed" | "partial" | "failed" | "excluded" | "unsupported" | "stale" | "not_applicable";
+export type ContentState = "pending" | "indexed" | "partial" | "failed" | "excluded" | "unsupported" | "stale" | "not_applicable" | "not_replicated";
 
 export type ContentStats = { by_state: { [key in string]: [ApiInt, ApiInt, ApiInt] }, total_records: ApiInt, indexed_bytes: ApiInt, chunks: ApiInt, };
 
@@ -220,7 +220,7 @@ export type Sort = { field: SortField, descending: boolean, };
 
 export type SortField = "relevance" | "name" | "path" | "size" | "allocated_size" | "subtree_size" | "modified" | "created";
 
-export type SourceCompleteness = { source_id: SourceId, name: string, state: SourceState, metadata_complete: boolean, content_complete: boolean, content_pending: ApiInt, content_failed: ApiInt, listing_errors: ApiInt, last_scan_completed?: UnixNanos, checkpoint_age_ms?: ApiInt, freshness: Freshness, note?: string, };
+export type SourceCompleteness = { source_id: SourceId, name: string, state: SourceState, metadata_complete: boolean, content_complete: boolean, content_not_replicated: boolean, content_pending: ApiInt, content_failed: ApiInt, listing_errors: ApiInt, last_scan_completed?: UnixNanos, checkpoint_age_ms?: ApiInt, freshness: Freshness, note?: string, };
 
 export type SourceConcurrencyView = { source_id: SourceId, budget: number, reserved: number, peak_reserved: number, };
 
@@ -232,15 +232,17 @@ export type SourceDetail = { generations: Array<ScanGeneration>, root_aggregate:
 
 export type SourceId = ApiInt;
 
-export type SourceKind = "windows_local" | "windows_generic" | "macos_local" | "macos_generic" | "smb";
+export type SourceKind = "windows_local" | "windows_generic" | "macos_local" | "macos_generic" | "smb" | "remote";
 
-export type SourceRecord = { id: SourceId, host_id: HostId, name: string, kind: SourceKind, root_path: string, aliases: Array<string>, state: SourceState, state_reason: string | null, policy_version: number, root_object_id: ObjectId | null, published_generation: ApiInt | null, volume_id: VolumeId | null, preserve_offline: boolean, reconcile_interval_s: ApiInt | null, content_enabled: boolean, content_concurrency: number, checkpoint_kind: string | null, checkpoint_at: UnixNanos | null, last_scan_started_at: UnixNanos | null, last_scan_completed_at: UnixNanos | null, created_at: UnixNanos, updated_at: UnixNanos, };
+export type SourceRecord = { id: SourceId, host_id: HostId, name: string, kind: SourceKind, root_path: string, aliases: Array<string>, state: SourceState, state_reason: string | null, policy_version: number, root_object_id: ObjectId | null, published_generation: ApiInt | null, volume_id: VolumeId | null, preserve_offline: boolean, reconcile_interval_s: ApiInt | null, content_enabled: boolean, content_concurrency: number, sync_policy: SyncPolicy, checkpoint_kind: string | null, checkpoint_at: UnixNanos | null, last_scan_started_at: UnixNanos | null, last_scan_completed_at: UnixNanos | null, created_at: UnixNanos, updated_at: UnixNanos, };
 
 export type SourceState = "new" | "enumerating" | "metadata_complete" | "content_pending" | "complete" | "degraded" | "offline" | "stale" | "reconciling" | "retired";
 
 export type SourceView = { source: SourceRecord, counts: SourceCounts, completeness: SourceCompleteness, scan?: ScanProgress, watcher?: WatcherView, reconciliation_deferred?: ReconciliationDeferral, };
 
 export type StartupRecovery = { aborted_scan_generations: ApiInt, requeued_running_jobs: ApiInt, requeued_unfinished_content: ApiInt, };
+
+export type SyncPolicy = "inherit" | "local_only";
 
 export type TextField = "name" | "path" | "content";
 

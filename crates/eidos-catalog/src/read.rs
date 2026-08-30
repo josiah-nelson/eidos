@@ -40,6 +40,11 @@ impl Catalog {
     }
 
     pub fn add_source(&self, s: &NewSource) -> Result<SourceId> {
+        if s.kind == SourceKind::Remote {
+            return Err(CatalogError::InvalidState(
+                "remote sources are created by fleet replication, not by hand".into(),
+            ));
+        }
         self.with_writer(|conn| {
             let now = UnixNanos::now().0;
             conn.execute(
@@ -100,6 +105,24 @@ impl Catalog {
 
     pub fn set_source_kind(&self, id: SourceId, kind: SourceKind) -> Result<()> {
         self.with_writer(|conn| {
+            if kind == SourceKind::Remote {
+                return Err(CatalogError::InvalidState(
+                    "remote source kind is managed by fleet replication".into(),
+                ));
+            }
+            let current = conn
+                .query_row(
+                    "SELECT kind FROM sources WHERE source_id = ?1",
+                    params![id.0],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| CatalogError::NotFound(format!("source {id}")))?;
+            if current == SourceKind::Remote.as_str() {
+                return Err(CatalogError::InvalidState(
+                    "fleet-managed remote source kind cannot be changed".into(),
+                ));
+            }
             conn.execute(
                 "UPDATE sources SET kind = ?2, updated_at = ?3 WHERE source_id = ?1",
                 params![id.0, kind.as_str(), UnixNanos::now().0],
@@ -208,12 +231,17 @@ impl Catalog {
     pub(crate) fn source_is_case_sensitive(conn: &Connection, source: SourceId) -> Result<bool> {
         Ok(conn
             .prepare_cached(
-                "SELECT v.case_sensitive FROM sources s JOIN volumes v ON v.volume_id = s.volume_id
+                "SELECT COALESCE(CASE WHEN s.kind = 'remote' THEN s.case_sensitive ELSE v.case_sensitive END, 'unknown')
+                 FROM sources s LEFT JOIN volumes v ON v.volume_id = s.volume_id
                  WHERE s.source_id = ?1",
             )?
             .query_row(params![source.0], |r| r.get::<_, String>(0))
             .optional()?
             .is_some_and(|value| value == "sensitive"))
+    }
+
+    pub fn is_source_case_sensitive(&self, source: SourceId) -> Result<bool> {
+        self.with_reader(|conn| Self::source_is_case_sensitive(conn, source))
     }
 
     /// Resolve a path relative to the source root. POSIX sources split only
@@ -663,7 +691,9 @@ pub fn completeness_from(
     listing_errors: u64,
 ) -> SourceCompleteness {
     let metadata_complete = src.published_generation.is_some() && src.state.metadata_complete();
-    let content_complete = metadata_complete && counts.content_pending == 0;
+    let content_not_replicated = src.kind == SourceKind::Remote;
+    let content_complete =
+        metadata_complete && counts.content_pending == 0 && !content_not_replicated;
     let freshness = match (src.state, src.checkpoint_kind.as_deref()) {
         (SourceState::Degraded, _) | (SourceState::Offline, _) | (SourceState::Stale, _) => {
             Freshness::Unknown
@@ -677,7 +707,7 @@ pub fn completeness_from(
     let mut note = src.state_reason.clone();
     if src.state == SourceState::Enumerating {
         note = Some("initial enumeration in progress; results are partial".into());
-    } else if src.state == SourceState::Reconciling {
+    } else if src.state == SourceState::Reconciling && note.is_none() {
         note = Some(
             "rescan in progress; showing last published generation plus new observations".into(),
         );
@@ -688,6 +718,7 @@ pub fn completeness_from(
         state: src.state,
         metadata_complete,
         content_complete,
+        content_not_replicated,
         content_pending: counts.content_pending,
         content_failed: counts.content_failed,
         listing_errors,

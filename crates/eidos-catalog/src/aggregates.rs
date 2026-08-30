@@ -19,7 +19,7 @@
 //! directory from its direct children (one query) and keeps walking up only
 //! while an ancestor's extremum is likewise invalidated.
 
-use crate::Result;
+use crate::{CatalogError, Result};
 use eidos_domain::{ContentState, ObjectId, ObjectKind, SourceId, UnixNanos};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
@@ -63,47 +63,76 @@ impl Default for Acc {
 }
 
 impl Acc {
-    fn add_file(&mut self, ext: &str, size: u64, alloc: u64, mtime: Option<i64>, state: &str) {
-        self.file_count += 1;
-        self.logical += size;
-        self.allocated += alloc;
+    fn add_total(value: &mut u64, amount: u64, label: &str) -> Result<()> {
+        *value = value
+            .checked_add(amount)
+            .filter(|total| *total <= i64::MAX as u64)
+            .ok_or_else(|| {
+                CatalogError::InvalidState(format!(
+                    "{label} aggregate exceeds SQLite's signed 64-bit range"
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn add_file(
+        &mut self,
+        ext: &str,
+        size: u64,
+        alloc: u64,
+        mtime: Option<i64>,
+        state: &str,
+    ) -> Result<()> {
+        Self::add_total(&mut self.file_count, 1, "file count")?;
+        Self::add_total(&mut self.logical, size, "logical byte")?;
+        Self::add_total(&mut self.allocated, alloc, "allocated byte")?;
         if let Some(m) = mtime {
             self.newest = Some(self.newest.map_or(m, |n| n.max(m)));
             self.oldest = Some(self.oldest.map_or(m, |o| o.min(m)));
         }
         match state {
-            "pending" | "stale" => self.pending += 1,
-            "indexed" | "partial" => self.indexed += 1,
-            "failed" => self.failed += 1,
-            "excluded" => self.excluded += 1,
+            "pending" | "stale" => Self::add_total(&mut self.pending, 1, "pending count")?,
+            "indexed" | "partial" => Self::add_total(&mut self.indexed, 1, "indexed count")?,
+            "failed" => Self::add_total(&mut self.failed, 1, "failed count")?,
+            "excluded" => Self::add_total(&mut self.excluded, 1, "excluded count")?,
             _ => {}
         }
         let e = self.ext.entry(ext.to_string()).or_insert((0, 0));
-        e.0 += 1;
-        e.1 += size;
+        Self::add_total(&mut e.0, 1, "extension count")?;
+        Self::add_total(&mut e.1, size, "extension byte")?;
+        Ok(())
     }
 
-    fn merge_child(&mut self, child: &Acc) {
-        self.file_count += child.file_count;
-        self.dir_count += child.dir_count + 1;
-        self.logical += child.logical;
-        self.allocated += child.allocated;
+    fn merge(&mut self, child: &Acc, count_child_directory: bool) -> Result<()> {
+        Self::add_total(&mut self.file_count, child.file_count, "file count")?;
+        Self::add_total(
+            &mut self.dir_count,
+            child.dir_count + u64::from(count_child_directory),
+            "directory count",
+        )?;
+        Self::add_total(&mut self.logical, child.logical, "logical byte")?;
+        Self::add_total(&mut self.allocated, child.allocated, "allocated byte")?;
         if let Some(m) = child.newest {
             self.newest = Some(self.newest.map_or(m, |n| n.max(m)));
         }
         if let Some(m) = child.oldest {
             self.oldest = Some(self.oldest.map_or(m, |o| o.min(m)));
         }
-        self.pending += child.pending;
-        self.indexed += child.indexed;
-        self.failed += child.failed;
-        self.excluded += child.excluded;
+        Self::add_total(&mut self.pending, child.pending, "pending count")?;
+        Self::add_total(&mut self.indexed, child.indexed, "indexed count")?;
+        Self::add_total(&mut self.failed, child.failed, "failed count")?;
+        Self::add_total(&mut self.excluded, child.excluded, "excluded count")?;
         self.complete &= child.complete;
         for (k, (c, b)) in &child.ext {
             let e = self.ext.entry(k.clone()).or_insert((0, 0));
-            e.0 += c;
-            e.1 += b;
+            Self::add_total(&mut e.0, *c, "extension count")?;
+            Self::add_total(&mut e.1, *b, "extension byte")?;
         }
+        Ok(())
+    }
+
+    fn merge_child(&mut self, child: &Acc) -> Result<()> {
+        self.merge(child, true)
     }
 }
 
@@ -124,6 +153,7 @@ pub fn rebuild_source(
 ) -> Result<AggStats> {
     let mut children: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     let mut own: HashMap<ObjectId, Acc> = HashMap::new();
+    let mut directories = HashSet::from([root]);
     {
         let mut stmt = conn.prepare_cached(
             "SELECT e.parent_id, e.object_id, e.extension, o.kind, o.size, o.allocated, o.modified, o.content_state
@@ -137,6 +167,7 @@ pub fn rebuild_source(
             let ext: String = r.get(2)?;
             let kind: String = r.get(3)?;
             if kind == ObjectKind::Directory.as_str() {
+                directories.insert(obj);
                 children.entry(parent).or_default().push(obj);
             } else {
                 let size = r.get::<_, i64>(4)? as u64;
@@ -145,25 +176,31 @@ pub fn rebuild_source(
                 let state: String = r.get(7)?;
                 own.entry(parent)
                     .or_default()
-                    .add_file(&ext, size, alloc, mtime, &state);
+                    .add_file(&ext, size, alloc, mtime, &state)?;
             }
         }
     }
 
     // BFS from the root to establish a parent-before-child order.
     let mut order: Vec<(ObjectId, Option<ObjectId>)> = vec![(root, None)];
+    let mut seen = HashSet::from([root]);
     let mut i = 0;
     while i < order.len() {
         let (dir, _) = order[i];
         if let Some(kids) = children.get(&dir) {
             for k in kids {
-                order.push((*k, Some(dir)));
+                // A catalog should be acyclic, but rebuild is also used to
+                // recover old/corrupt catalogs and must remain bounded when
+                // topology is malformed.
+                if seen.insert(*k) {
+                    order.push((*k, Some(dir)));
+                }
             }
         }
         i += 1;
     }
     let reachable = order.len() as u64;
-    let total_dirs = 1 + children.values().map(|v| v.len() as u64).sum::<u64>();
+    let total_dirs = directories.len() as u64;
 
     conn.execute(
         "DELETE FROM directory_extension_counts WHERE object_id IN (SELECT object_id FROM directory_aggregates WHERE source_id = ?1)",
@@ -194,26 +231,7 @@ pub fn rebuild_source(
         if let Some(o) = own.remove(dir) {
             // Own files were accumulated separately from children merges.
             let mut merged = o;
-            merged.dir_count += a.dir_count;
-            merged.file_count += a.file_count;
-            merged.logical += a.logical;
-            merged.allocated += a.allocated;
-            merged.pending += a.pending;
-            merged.indexed += a.indexed;
-            merged.failed += a.failed;
-            merged.excluded += a.excluded;
-            merged.complete &= a.complete;
-            if let Some(m) = a.newest {
-                merged.newest = Some(merged.newest.map_or(m, |n| n.max(m)));
-            }
-            if let Some(m) = a.oldest {
-                merged.oldest = Some(merged.oldest.map_or(m, |o| o.min(m)));
-            }
-            for (k, (c, b)) in a.ext.drain() {
-                let e = merged.ext.entry(k).or_insert((0, 0));
-                e.0 += c;
-                e.1 += b;
-            }
+            merged.merge(&a, false)?;
             a = merged;
         }
         if unlisted.contains(dir) {
@@ -241,7 +259,7 @@ pub fn rebuild_source(
             stats.extension_rows += 1;
         }
         if let Some(p) = parent {
-            acc.entry(*p).or_default().merge_child(&a);
+            acc.entry(*p).or_default().merge_child(&a)?;
         }
     }
     Ok(stats)

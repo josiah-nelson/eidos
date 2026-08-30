@@ -413,9 +413,9 @@ CREATE TABLE sync_sources (
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL
 );
--- The ledger stores touches, not images: the sequence at which an object
--- was last changed, its generation, and whether that change was a deletion.
--- Row images are materialized from the live catalog at ship time.
+-- The ledger stores touches, not image copies: the sequence at which an
+-- object was last changed, its generation, deletion state, and a canonical
+-- digest of its live image. Row images are materialized at ship time.
 CREATE TABLE sync_rows (
     source_id  INTEGER NOT NULL,
     object_id  INTEGER NOT NULL,
@@ -445,6 +445,152 @@ CREATE TABLE sync_consumers (
 -- written before the probe existed distinguishable from a measured `none`.
 ALTER TABLE volumes ADD COLUMN case_sensitive TEXT NOT NULL DEFAULT 'unknown';
 ALTER TABLE volumes ADD COLUMN native_feed TEXT NOT NULL DEFAULT 'none';
+"#,
+    ),
+    (
+        "fleet: history chain, node roster, central replica (ADR-0023)",
+        r#"
+-- History chain over each source epoch's sequence (eidos-sync identity):
+-- chain(0) is all zeros and chain(n) = blake3(chain(n-1) || object ||
+-- generation || tombstone-or-image-digest). A batch carries the chain at both ends
+-- of its interval so a consumer can fence a source restored to an older
+-- state that has since overtaken the cursor. Retained from
+-- `compacted_through` to the head; pruned by the collection pass.
+ALTER TABLE sync_sources ADD COLUMN head_chain BLOB NOT NULL
+    DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000';
+-- Monotonic revision of the retained Merkle image. Ledger touches advance
+-- `head_seq`; tombstone collection is the only operation that changes the
+-- image without changing that head, so it advances this separate fence.
+ALTER TABLE sync_sources ADD COLUMN image_revision INTEGER NOT NULL DEFAULT 0;
+-- Ledgers written before history chains existed cannot prove any nonzero
+-- cursor. Treat the upgrade as the epoch event ADR-0015 requires and rebuild
+-- the live image rather than blessing the old head with a genesis hash.
+DELETE FROM sync_rows;
+DELETE FROM sync_consumers;
+UPDATE sync_sources
+   SET epoch = randomblob(16), head_seq = 0,
+       head_chain = X'0000000000000000000000000000000000000000000000000000000000000000',
+       compacted_through = 0, backfill_after = 0, ready = 0;
+CREATE TABLE sync_chain (
+    source_id INTEGER NOT NULL,
+    seq       INTEGER NOT NULL,
+    chain     BLOB NOT NULL,
+    PRIMARY KEY (source_id, seq)
+) WITHOUT ROWID;
+INSERT INTO sync_chain (source_id, seq, chain)
+    SELECT source_id, 0, X'0000000000000000000000000000000000000000000000000000000000000000'
+    FROM sync_sources;
+-- When the touch happened, so backlog age can be reported per consumer.
+ALTER TABLE sync_rows ADD COLUMN touched_at INTEGER NOT NULL DEFAULT 0;
+-- Canonical digest of the live row image at the time of the touch. This is
+-- part of both the history chain and Merkle record, so metadata-only and
+-- rename-only changes cannot masquerade as identical generations.
+ALTER TABLE sync_rows ADD COLUMN image_hash BLOB NOT NULL
+    DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000';
+
+-- Enrollment makes every eligible source replicate by default; a source may
+-- opt out. `inherit` follows the node's enrollment, `local_only` never ships.
+ALTER TABLE sources ADD COLUMN sync_policy TEXT NOT NULL DEFAULT 'inherit';
+-- Remote replicas have no local `volumes` row. Preserve the origin's name
+-- semantics explicitly so case-colliding paths resolve truthfully.
+ALTER TABLE sources ADD COLUMN case_sensitive TEXT NOT NULL DEFAULT 'unknown';
+
+-- Peers this installation trusts: the roster of enrolled nodes on a
+-- central, or the single central on an enrolled node. `fingerprint` is the
+-- SHA-256 of the peer's certificate public key; `node_id` is derived from it.
+CREATE TABLE fleet_peers (
+    node_id      BLOB PRIMARY KEY,
+    name         TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    fingerprint  BLOB NOT NULL UNIQUE,
+    endpoint     TEXT,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    enrolled_at  INTEGER NOT NULL,
+    last_seen_at INTEGER,
+    last_error   TEXT
+) WITHOUT ROWID;
+-- A node can ship to at most one central. This database invariant closes
+-- the race between concurrent enrollment requests.
+CREATE UNIQUE INDEX fleet_one_central ON fleet_peers (role) WHERE role = 'central';
+-- Single-use enrollment invitations minted by a central. Only the hash of
+-- the secret is stored.
+CREATE TABLE fleet_invites (
+    token_hash BLOB PRIMARY KEY,
+    name_hint  TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at    INTEGER,
+    used_by    BLOB
+) WITHOUT ROWID;
+
+-- A replicated source is an ordinary `sources` row (kind `remote`) whose
+-- objects and entries are applied from a peer's materialized batches, so
+-- projection, search and browse treat it like any other source. This table
+-- binds it to its origin and holds the durable admission cursor (epoch,
+-- applied sequence, chain) that commits in the same transaction as the
+-- effects it certifies.
+CREATE TABLE sync_replica_sources (
+    source_id          INTEGER PRIMARY KEY,
+    node_id            BLOB NOT NULL,
+    remote_source_id   INTEGER NOT NULL,
+    admission          TEXT NOT NULL,
+    resync_target      INTEGER,
+    reported_head      INTEGER NOT NULL DEFAULT 0,
+    reported_chain     BLOB,
+    reported_compacted INTEGER NOT NULL DEFAULT 0,
+    reported_image_revision INTEGER NOT NULL DEFAULT 0,
+    applied_image_revision  INTEGER NOT NULL DEFAULT 0,
+    reported_at        INTEGER,
+    applied_at         INTEGER,
+    image_version      INTEGER NOT NULL DEFAULT 1,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    UNIQUE (node_id, remote_source_id)
+);
+-- One row per remote object the replica knows: its local object id, the
+-- epoch and sequence it was last applied at, and whether that application
+-- was a tombstone. `placeholder` marks a local object allocated because a
+-- child arrived before its parent; it is cleared when the parent's own row
+-- is applied.
+CREATE TABLE sync_replica_rows (
+    source_id        INTEGER NOT NULL,
+    remote_object_id INTEGER NOT NULL,
+    local_object_id  INTEGER NOT NULL,
+    epoch            BLOB NOT NULL,
+    seq              INTEGER NOT NULL,
+    generation       INTEGER NOT NULL,
+    deleted          INTEGER NOT NULL DEFAULT 0,
+    image_hash       BLOB NOT NULL,
+    placeholder      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (source_id, remote_object_id)
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX sync_replica_rows_local ON sync_replica_rows (local_object_id);
+CREATE INDEX sync_replica_rows_epoch ON sync_replica_rows (source_id, epoch);
+-- The Merkle response is authoritative only for the exact divergent leaves
+-- selected from a particular offer. Persist that scope so a replayed or
+-- mismatched response cannot delete rows outside the offer it answers.
+CREATE TABLE sync_replica_repairs (
+    source_id     INTEGER PRIMARY KEY,
+    epoch         BLOB NOT NULL,
+    through_seq   INTEGER NOT NULL,
+    through_chain BLOB NOT NULL,
+    image_revision INTEGER NOT NULL,
+    leaf_bits     INTEGER NOT NULL,
+    leaves        TEXT NOT NULL,
+    hashes        BLOB NOT NULL,
+    remaining     TEXT NOT NULL,
+    last_part     TEXT NOT NULL,
+    requested_at  INTEGER NOT NULL
+);
+"#,
+    ),
+    (
+        "fleet: invalidate repair requests created without a cursor proof",
+        r#"
+-- Repair offers ahead of an active epoch's durable cursor now authenticate
+-- the chain at that cursor. An in-flight request created by older code has
+-- no evidence that this check occurred, so require the peer to re-offer it.
+DELETE FROM sync_replica_repairs;
 "#,
     ),
 ];

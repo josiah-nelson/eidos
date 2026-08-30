@@ -285,7 +285,11 @@ fn source_coverage(
             | SourceState::Complete
             | SourceState::Reconciling
     );
-    if !c.metadata_complete && state_claims_complete {
+    // A remote source in Reconciling is truthfully reporting that its fleet
+    // snapshot or aggregate publication is incomplete. That is not a search
+    // index failure; the catalog has deliberately withheld publication.
+    let replica_is_reconciling = c.state == SourceState::Reconciling && c.content_not_replicated;
+    if !c.metadata_complete && state_claims_complete && !replica_is_reconciling {
         degraded.push(CoverageReason {
             kind: CoverageKind::NotIndexed,
             severity: CoverageSeverity::Warning,
@@ -308,6 +312,17 @@ fn source_coverage(
         });
     }
     if signals.content_query {
+        if c.content_not_replicated {
+            degraded.push(CoverageReason {
+                kind: CoverageKind::ContentNotReplicated,
+                severity: CoverageSeverity::Info,
+                detail: format!(
+                    "{} replicates metadata only and cannot contribute content matches",
+                    c.name
+                ),
+                remediation: None,
+            });
+        }
         if c.content_pending > 0 {
             degraded.push(CoverageReason {
                 kind: CoverageKind::ContentPending,
@@ -362,6 +377,7 @@ mod tests {
             state: SourceState::Complete,
             metadata_complete: true,
             content_complete: true,
+            content_not_replicated: false,
             content_pending: 0,
             content_failed: 0,
             listing_errors: 0,
@@ -424,6 +440,31 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_replica_degrades_only_content_queries() {
+        let mut c = complete("laptop/fleet");
+        c.content_complete = false;
+        c.content_not_replicated = true;
+        let metadata =
+            CoverageEnvelope::derive(&[c.clone()], &ResponseSignals::default(), UnixNanos::new(0));
+        assert!(metadata.full, "metadata answers remain complete");
+
+        let content = CoverageEnvelope::derive(
+            &[c],
+            &ResponseSignals {
+                content_query: true,
+                ..ResponseSignals::default()
+            },
+            UnixNanos::new(0),
+        );
+        assert!(!content.full);
+        assert_eq!(content.sources[0].degraded.len(), 1);
+        assert_eq!(
+            content.sources[0].degraded[0].kind,
+            CoverageKind::ContentNotReplicated
+        );
+    }
+
+    #[test]
     fn response_level_signals_surface() {
         let env = CoverageEnvelope::derive(
             &[complete("g")],
@@ -467,5 +508,19 @@ mod tests {
             Some(UnixNanos::new(1_000)),
             "a live feed does not make mid-reconciliation results authoritative now"
         );
+    }
+
+    #[test]
+    fn a_reconciling_replica_is_not_misreported_as_an_index_failure() {
+        let mut c = complete("remote");
+        c.state = SourceState::Reconciling;
+        c.metadata_complete = false;
+        c.content_not_replicated = true;
+        c.note = Some("fleet snapshot is still arriving".into());
+        let env =
+            CoverageEnvelope::derive(&[c], &ResponseSignals::default(), UnixNanos::new(5_000));
+        let reasons = &env.sources[0].degraded;
+        assert!(reasons.iter().any(|r| r.kind == CoverageKind::Reconciling));
+        assert!(!reasons.iter().any(|r| r.kind == CoverageKind::NotIndexed));
     }
 }
