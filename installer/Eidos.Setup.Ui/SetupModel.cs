@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -51,12 +52,22 @@ namespace Eidos.Setup
     /// </summary>
     public sealed class SetupModel : INotifyPropertyChanged
     {
+        private const int ErrorProductVersion = unchecked((int)0x80070666);
+        private const int ErrorServiceNotActive = unchecked((int)0x80070426);
+        private const int ErrorLogonFailure = unchecked((int)0x8007052E);
+        private const int ErrorInvalidArgument = unchecked((int)0x80070057);
         private const string RegistryKey = @"Software\eidos";
+        private const string CollectorRegistryKey = @"Software\eidos-collector";
+        private const string CollectorBundleUpgradeCode = "5D2B93F8-29ED-4E6C-B101-1355B4A36F3A";
+        private const string UninstallRegistryKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\";
 
         private readonly EidosBootstrapper ba;
+        private readonly HashSet<string> collectorRelatedBundles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private Page page = Page.Loading;
         private SetupState state = SetupState.Detecting;
         private bool installed;
+        private bool rememberedCore;
+        private string rememberedCoreVersion;
         private bool newerInstalled;
         private string olderVersion;
         private bool detectedPerMachine;
@@ -76,6 +87,10 @@ namespace Eidos.Setup
         private bool startMenu = true;
         private bool launchAfter = true;
         private bool removeData;
+        private bool installCollector;
+        private bool collectorInstalled;
+        private bool removeCollector = true;
+        private bool removeCollectorData;
         private bool repair = true;
         private string validation;
         private int progress;
@@ -83,6 +98,7 @@ namespace Eidos.Setup
         private string errorMessage;
         private bool canceled;
         private bool restartRequired;
+        private int? collectorError;
         private string dataSize;
         private LaunchAction plannedAction;
 
@@ -94,17 +110,23 @@ namespace Eidos.Setup
             this.perMachine = Native.IsAdministrator();
             this.ApplyScopeDefaults();
             this.ReadRememberedSettings();
+            this.ReadCollectorState();
 
             ba.DetectBegin += this.OnDetectBegin;
             ba.DetectRelatedBundle += this.OnDetectRelatedBundle;
+            ba.DetectCompatibleMsiPackage += this.OnDetectCompatibleMsiPackage;
+            ba.DetectPackageComplete += this.OnDetectPackageComplete;
             ba.DetectComplete += this.OnDetectComplete;
             ba.PlanPackageBegin += this.OnPlanPackageBegin;
+            ba.PlanCompatibleMsiPackageBegin += this.OnPlanCompatibleMsiPackageBegin;
+            ba.PlanRelatedBundleType += this.OnPlanRelatedBundleType;
             ba.PlanComplete += this.OnPlanComplete;
             ba.ApplyBegin += this.OnApplyBegin;
             ba.Progress += this.OnProgress;
             ba.CacheAcquireProgress += this.OnCacheProgress;
             ba.ExecuteProgress += this.OnExecuteProgress;
             ba.ExecutePackageBegin += this.OnExecutePackageBegin;
+            ba.ExecutePackageComplete += this.OnExecutePackageComplete;
             ba.ExecuteMsiMessage += this.OnExecuteMsiMessage;
             ba.Error += this.OnError;
             ba.ApplyComplete += this.OnApplyComplete;
@@ -222,9 +244,18 @@ namespace Eidos.Setup
             {
                 switch (this.Page)
                 {
-                    case Page.Welcome: return this.olderVersion != null ? "Upgrade" : "Next";
-                    case Page.Options: return this.PerMachine && !Native.IsAdministrator() ? "Install (administrator approval)" : "Install";
-                    case Page.Maintenance: return "Next";
+                    case Page.Welcome: return this.olderVersion != null
+                        ? this.PerMachine && this.Account == AccountKind.User
+                            ? "Next"
+                            : this.NeedsElevation && !Native.IsAdministrator() ? "Upgrade (administrator approval)" : "Upgrade"
+                        : "Next";
+                    case Page.Account: return this.olderVersion != null
+                        ? this.NeedsElevation && !Native.IsAdministrator() ? "Upgrade (administrator approval)" : "Upgrade"
+                        : "Next";
+                    case Page.Options: return this.NeedsElevation && !Native.IsAdministrator() ? "Install (administrator approval)" : "Install";
+                    case Page.Maintenance: return this.Repair
+                        ? this.NeedsElevation && !Native.IsAdministrator() ? "Repair (administrator approval)" : "Repair"
+                        : "Next";
                     case Page.Remove: return "Remove";
                     case Page.Success: return this.plannedAction != LaunchAction.Uninstall && this.launchAfter ? "Open eidos" : "Close";
                     case Page.Failure: return "Close";
@@ -267,6 +298,7 @@ namespace Eidos.Setup
         }
 
         public string DetectedScopeText => this.detectedPerMachine ? "for all users (Windows service)" : "for this user";
+        public bool IsUpgrade => this.olderVersion != null;
 
         // ----- choices ----------------------------------------------------------
 
@@ -277,7 +309,7 @@ namespace Eidos.Setup
             {
                 if (this.Set(ref this.perMachine, value))
                 {
-                    this.Raise(nameof(this.PerUser), nameof(this.PrimaryLabel), nameof(this.ElevationNote), nameof(this.SummaryText), nameof(this.StartLabel));
+                    this.Raise(nameof(this.PerUser), nameof(this.PrimaryLabel), nameof(this.ElevationNote), nameof(this.SummaryText), nameof(this.StartLabel), nameof(this.CollectorScopeNote));
                     this.ApplyScopeDefaults();
                 }
             }
@@ -289,9 +321,13 @@ namespace Eidos.Setup
             set => this.PerMachine = !value;
         }
 
-        public string ElevationNote => this.PerMachine && !Native.IsAdministrator()
-            ? "Windows will ask for administrator approval when the installation starts."
-            : "";
+        private bool NeedsElevation => this.PerMachine || this.InstallCollector;
+
+        public string ElevationNote => !this.NeedsElevation || Native.IsAdministrator()
+            ? ""
+            : this.PerMachine
+                ? "Windows will ask for administrator approval when the installation starts."
+                : "eidos stays installed just for you, but the collector is a system service, so Windows will ask for administrator approval.";
 
         public string InstallDir
         {
@@ -440,7 +476,33 @@ namespace Eidos.Setup
         public bool StartMenu { get => this.startMenu; set { if (this.Set(ref this.startMenu, value)) this.Raise(nameof(this.SummaryText)); } }
         public bool LaunchAfter { get => this.launchAfter; set { if (this.Set(ref this.launchAfter, value)) this.Raise(nameof(this.PrimaryLabel)); } }
         public bool RemoveData { get => this.removeData; set => this.Set(ref this.removeData, value); }
-        public bool Repair { get => this.repair; set { if (this.Set(ref this.repair, value)) this.Raise(nameof(this.Uninstall)); } }
+
+        /// <summary>
+        /// The profiling collector: a separate LocalSystem service with its own
+        /// data directory. It can accompany either core scope and therefore can
+        /// be the only package that elevates. The checkbox reflects the detected
+        /// state on maintenance and upgrade, so leaving it alone never removes
+        /// a collector that is there.
+        /// </summary>
+        public bool InstallCollector
+        {
+            get => this.installCollector;
+            set { if (this.Set(ref this.installCollector, value)) this.Raise(nameof(this.SummaryText), nameof(this.ElevationNote), nameof(this.PrimaryLabel), nameof(this.CollectorScopeNote), nameof(this.SuccessText)); }
+        }
+        public bool CollectorInstalled { get => this.collectorInstalled; private set { if (this.Set(ref this.collectorInstalled, value)) this.Raise(nameof(this.CollectorLabel), nameof(this.RemoveCollectorLabel)); } }
+        public bool CanChooseCollector => true;
+        public string CollectorLabel => this.collectorInstalled ? "Keep the profiling collector installed" : "Install profiling collector";
+        public string CollectorHint => "Runs a separate privileged service alongside eidos and records bounded, privacy-preserving workload measurements. Its data directory, identity and removal are independent of eidos.";
+        public string CollectorScopeNote => this.PerMachine
+            ? ""
+            : this.InstallCollector
+                ? "The collector installs for the computer; the core remains just for you."
+                : "The collector can be added to a just-for-you install, but its system service requires administrator approval.";
+        public bool RemoveCollector { get => this.removeCollector; set { if (this.Set(ref this.removeCollector, value)) this.Raise(nameof(this.SuccessText)); } }
+        public bool RemoveCollectorData { get => this.removeCollectorData; set => this.Set(ref this.removeCollectorData, value); }
+        public string RemoveCollectorLabel => "Also remove the profiling collector service";
+        public string RemoveCollectorDataLabel => "Also delete the collector's study data (spool, configuration, study key)";
+        public bool Repair { get => this.repair; set { if (this.Set(ref this.repair, value)) this.Raise(nameof(this.Uninstall), nameof(this.PrimaryLabel)); } }
         public bool Uninstall { get => !this.repair; set => this.Repair = !value; }
 
         public string RemoveDataLabel => $"Also delete the indexed data in {this.dataDir}{(this.dataSize != null ? " (" + this.dataSize + ")" : "")}";
@@ -470,6 +532,7 @@ namespace Eidos.Setup
                     lines += $"\nStart eidos:\t{(this.startService ? "now and at every sign-in" : "from the Start menu")}";
                 }
                 lines += $"\nStart menu:\t{(this.startMenu ? "eidos shortcuts" : "none")}";
+                lines += $"\nCollector:\t{(this.installCollector ? (this.collectorInstalled ? "kept (separate service)" : "installed as a separate service") : (this.collectorInstalled ? "left as installed" : "not installed"))}";
                 return lines;
             }
         }
@@ -480,13 +543,23 @@ namespace Eidos.Setup
         public string ProgressMessage { get => this.progressMessage; private set => this.Set(ref this.progressMessage, value); }
         public string ErrorMessage { get => this.errorMessage; private set => this.Set(ref this.errorMessage, value); }
         public bool RestartRequired { get => this.restartRequired; private set => this.Set(ref this.restartRequired, value); }
-        public string SuccessText => this.plannedAction == LaunchAction.Uninstall
-            ? (this.removeData ? "The program and its data were removed." : $"The program was removed. Your indexed data is still in {this.dataDir}; delete that folder if you no longer want it.")
-            : this.PerMachine
-                ? $"eidos is running at {this.Url}.\nThe service starts with Windows."
-                : this.startService
-                    ? $"eidos is running at {this.Url}.\nIt runs in the background and starts again when you sign in."
-                    : $"eidos is installed. \"Start eidos\" in the Start menu runs it in the background at {this.Url}.";
+        public string SuccessText
+        {
+            get
+            {
+                if (this.plannedAction == LaunchAction.Uninstall)
+                {
+                    return (this.removeData ? "The program and its data were removed." : $"The program was removed. Your indexed data is still in {this.dataDir}; delete that folder if you no longer want it.")
+                        + (this.collectorInstalled ? (this.removeCollector ? (this.removeCollectorData ? "\nThe profiling collector and its study data were removed." : "\nThe profiling collector service was removed; its study data was kept.") : "\nThe profiling collector service was kept.") : "");
+                }
+                var result = this.PerMachine
+                    ? $"eidos is running at {this.Url}.\nThe service starts with Windows."
+                    : this.startService
+                        ? $"eidos is running at {this.Url}.\nIt runs in the background and starts again when you sign in."
+                        : $"eidos is installed. \"Start eidos\" in the Start menu runs it in the background at {this.Url}.";
+                return result + (this.installCollector ? "\nThe profiling collector runs as the eidos-collector service." : "");
+            }
+        }
 
         public bool Canceled
         {
@@ -503,9 +576,20 @@ namespace Eidos.Setup
                 case Page.Welcome:
                     if (this.olderVersion != null)
                     {
-                        // Upgrade: the MSI reads the remembered settings; keep the scope.
-                        this.PerMachine = this.detectedPerMachine;
-                        this.StartPlan(LaunchAction.Install);
+                        // Upgrade: the MSI reads the remembered core settings.
+                        // The collector checkbox is the one explicit package
+                        // choice that can change independently.
+                        if (this.PerMachine && this.Account == AccountKind.User)
+                        {
+                            // Windows does not expose a service account's
+                            // password. Ask again before the major upgrade
+                            // removes and recreates the service registration.
+                            this.Page = Page.Account;
+                        }
+                        else
+                        {
+                            this.StartPlan(LaunchAction.Install);
+                        }
                     }
                     else
                     {
@@ -524,7 +608,14 @@ namespace Eidos.Setup
                 case Page.Account:
                     if (this.ValidateAccount())
                     {
-                        this.Page = Page.Options;
+                        if (this.olderVersion != null)
+                        {
+                            this.StartPlan(LaunchAction.Install);
+                        }
+                        else
+                        {
+                            this.Page = Page.Options;
+                        }
                     }
                     break;
                 case Page.Options:
@@ -563,7 +654,7 @@ namespace Eidos.Setup
             {
                 case Page.Scope: this.Page = Page.Welcome; break;
                 case Page.Location: this.Page = Page.Scope; break;
-                case Page.Account: this.Page = Page.Location; break;
+                case Page.Account: this.Page = this.olderVersion != null ? Page.Welcome : Page.Location; break;
                 case Page.Options: this.Page = this.PerMachine ? Page.Account : Page.Location; break;
                 case Page.Remove: this.Page = Page.Maintenance; break;
             }
@@ -662,7 +753,46 @@ namespace Eidos.Setup
                         {
                             this.bind = bind;
                         }
+                        this.startMenu = key.GetValue("StartMenu") != null;
+                        if (root == Registry.LocalMachine)
+                        {
+                            this.startService = key.GetValue("StartService") != null;
+                            var kind = key.GetValue("ServiceAccountKind") as string;
+                            this.account = string.Equals(kind, "local-service", StringComparison.OrdinalIgnoreCase) ? AccountKind.LocalService
+                                : string.Equals(kind, "network-service", StringComparison.OrdinalIgnoreCase) ? AccountKind.NetworkService
+                                : string.Equals(kind, "user", StringComparison.OrdinalIgnoreCase) ? AccountKind.User
+                                : AccountKind.LocalSystem;
+                            if (this.account == AccountKind.User)
+                            {
+                                var domain = key.GetValue("ServiceDomain") as string;
+                                var user = key.GetValue("ServiceUser") as string;
+                                if (!string.IsNullOrEmpty(user))
+                                {
+                                    this.accountUser = string.IsNullOrEmpty(domain) || domain == "." ? user : domain + "\\" + user;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            using (var run = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
+                            {
+                                this.startService = run?.GetValue("eidos") != null;
+                            }
+                        }
                         this.detectedPerMachine = root == Registry.LocalMachine;
+                        this.rememberedCore = true;
+                        this.rememberedCoreVersion = key.GetValue("Version") as string;
+                        if (!string.IsNullOrEmpty(this.rememberedCoreVersion))
+                        {
+                            if (this.Engine.CompareVersions(this.Version, this.rememberedCoreVersion) >= 0)
+                            {
+                                this.olderVersion = this.rememberedCoreVersion;
+                            }
+                            else
+                            {
+                                this.newerInstalled = true;
+                            }
+                        }
                         return;
                     }
                 }
@@ -670,6 +800,27 @@ namespace Eidos.Setup
                 {
                     // unreadable hive: fall back to defaults
                 }
+            }
+        }
+
+        /// <summary>
+        /// Burn detects the exact collector ProductCode. A previous major
+        /// version has a different ProductCode, so use the MSI-owned registry
+        /// value to keep that installed package selected during adoption.
+        /// </summary>
+        private void ReadCollectorState()
+        {
+            try
+            {
+                using (var key = Registry.LocalMachine.OpenSubKey(CollectorRegistryKey))
+                {
+                    this.collectorInstalled = key?.GetValue("Version") is string;
+                    this.installCollector = this.collectorInstalled;
+                }
+            }
+            catch
+            {
+                // Detection can still recognize the exact or a newer package.
             }
         }
 
@@ -771,30 +922,33 @@ namespace Eidos.Setup
                 e.SetVariableString("EIDOS_DATADIR", this.dataDir, false);
                 e.SetVariableString("EIDOS_BIND", this.bind, false);
                 e.SetVariableString("EIDOS_PORT", this.port, false);
-                e.SetVariableString("EIDOS_START_MENU", this.startMenu ? "1" : "0", false);
-                e.SetVariableString("EIDOS_START_SERVICE", this.startService ? "1" : "0", false);
                 if (this.PerMachine)
                 {
-                    var kind = this.account == AccountKind.LocalSystem ? "local-system"
-                        : this.account == AccountKind.LocalService ? "local-service"
-                        : this.account == AccountKind.NetworkService ? "network-service" : "user";
-                    e.SetVariableString("EIDOS_SERVICE_ACCOUNT_KIND", kind, false);
-                    if (this.account == AccountKind.User)
-                    {
-                        var name = this.accountUser;
-                        var slash = name.IndexOf('\\');
-                        var domain = slash > 0 ? name.Substring(0, slash) : ".";
-                        var user = slash > 0 ? name.Substring(slash + 1) : name;
-                        e.SetVariableString("EIDOS_SERVICE_DOMAIN", domain, false);
-                        e.SetVariableString("EIDOS_SERVICE_USER", user, false);
-                        e.SetVariableString("EIDOS_SERVICE_PASSWORD", this.password ?? new SecureString(), false);
-                    }
+                    this.SetServiceAccountVariables();
                 }
+            }
+            else if (action == LaunchAction.Install && this.PerMachine && this.account == AccountKind.User)
+            {
+                // A major upgrade recreates the service. The account name is
+                // remembered, but Windows cannot return its password.
+                this.SetServiceAccountVariables();
+            }
+            if (action == LaunchAction.Install || action == LaunchAction.Modify || action == LaunchAction.Repair)
+            {
+                // Unlike the paths and service account, these Boolean choices
+                // are represented by conditioned components rather than MSI
+                // registry searches. Pass the detected value on maintenance
+                // and upgrade so an absent component remains absent.
+                e.SetVariableString("EIDOS_START_MENU", this.startMenu ? "1" : "0", false);
+                e.SetVariableString("EIDOS_START_SERVICE", this.startService ? "1" : "0", false);
             }
             if (action == LaunchAction.Uninstall)
             {
                 e.SetVariableString("EIDOS_REMOVE_DATA", this.removeData ? "1" : "0", false);
+                e.SetVariableString("EIDOS_REMOVE_COLLECTOR", this.removeCollector ? "1" : "0", false);
+                e.SetVariableString("EIDOS_COLLECTOR_REMOVE_DATA", this.removeCollectorData ? "1" : "0", false);
             }
+            e.SetVariableString("EIDOS_INSTALL_COLLECTOR", this.installCollector ? "1" : "0", false);
             if (!this.PerMachine && (action == LaunchAction.Uninstall || action == LaunchAction.Repair || this.olderVersion != null))
             {
                 // The MSI also closes eidos.exe, but stopping it here first
@@ -804,6 +958,24 @@ namespace Eidos.Setup
             }
             var scope = this.PerMachine ? BundleScope.PerMachine : BundleScope.PerUser;
             e.Plan(action, scope);
+        }
+
+        private void SetServiceAccountVariables()
+        {
+            var kind = this.account == AccountKind.LocalSystem ? "local-system"
+                : this.account == AccountKind.LocalService ? "local-service"
+                : this.account == AccountKind.NetworkService ? "network-service" : "user";
+            this.Engine.SetVariableString("EIDOS_SERVICE_ACCOUNT_KIND", kind, false);
+            if (this.account == AccountKind.User)
+            {
+                var name = this.accountUser;
+                var slash = name.IndexOf('\\');
+                var domain = slash > 0 ? name.Substring(0, slash) : ".";
+                var user = slash > 0 ? name.Substring(slash + 1) : name;
+                this.Engine.SetVariableString("EIDOS_SERVICE_DOMAIN", domain, false);
+                this.Engine.SetVariableString("EIDOS_SERVICE_USER", user, false);
+                this.Engine.SetVariableString("EIDOS_SERVICE_PASSWORD", this.password ?? new SecureString(), false);
+            }
         }
 
         private void OnDetectBegin(object sender, DetectBeginEventArgs e)
@@ -817,29 +989,179 @@ namespace Eidos.Setup
             {
                 return;
             }
-            if (this.Engine.CompareVersions(this.Version, e.Version) > 0)
+            if (this.IsCollectorBundle(e.ProductCode, e.PerMachine))
+            {
+                this.collectorRelatedBundles.Add(e.ProductCode);
+                this.CollectorInstalled = true;
+                this.InstallCollector = true;
+                return;
+            }
+            if (!this.rememberedCore)
+            {
+                return;
+            }
+            if (!string.IsNullOrEmpty(this.rememberedCoreVersion))
+            {
+                // The core MSI's owned registry value distinguishes it from
+                // the additional collector-only RelatedBundle relationship.
+                return;
+            }
+            // RelatedBundle also adopts the legacy collector-only bundle.
+            // Only a remembered core installation makes this a core upgrade;
+            // a collector by itself must not block or choose the core's scope.
+            if (this.Engine.CompareVersions(this.Version, e.Version) >= 0
+                && (this.olderVersion == null || this.Engine.CompareVersions(e.Version, this.olderVersion) > 0))
             {
                 this.olderVersion = e.Version;
-                this.detectedPerMachine = e.PerMachine;
             }
-            else
+        }
+
+        private bool IsCollectorBundle(string bundleCode, bool perMachine)
+        {
+            try
+            {
+                var root = perMachine ? Registry.LocalMachine : Registry.CurrentUser;
+                using (var key = root.OpenSubKey(UninstallRegistryKey + bundleCode))
+                {
+                    var upgradeCodes = key?.GetValue("BundleUpgradeCode") as string[];
+                    if (upgradeCodes != null)
+                    {
+                        foreach (var code in upgradeCodes)
+                        {
+                            if (string.Equals(code?.Trim('{', '}'), CollectorBundleUpgradeCode, StringComparison.OrdinalIgnoreCase))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    return string.Equals(key?.GetValue("DisplayName") as string, "eidos observatory collector", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void OnDetectCompatibleMsiPackage(object sender, DetectCompatibleMsiPackageEventArgs e)
+        {
+            if (e.PackageId == "EidosMsi")
             {
                 this.newerInstalled = true;
+            }
+            else if (e.PackageId == "EidosCollectorMsi")
+            {
+                this.CollectorInstalled = true;
+                this.InstallCollector = true;
             }
         }
 
         private void OnDetectComplete(object sender, DetectCompleteEventArgs e)
         {
             var cmd = this.ba.Command;
+            if (e.Status < 0)
+            {
+                this.Fail(e.Status, null);
+                if (cmd.Display != Display.Full)
+                {
+                    this.EndNonInteractive();
+                }
+                this.Requery();
+                return;
+            }
             this.State = SetupState.Ready;
+
+            if (this.newerInstalled && !this.Installed)
+            {
+                // MSI error 1638. Set it before showing the blocking page so
+                // closing the full UI and quiet/passive runs all fail rather
+                // than reporting a successful no-op.
+                this.ExitCode = ErrorProductVersion;
+                this.State = SetupState.Failed;
+                this.Page = Page.Blocked;
+                if (cmd.Display != Display.Full)
+                {
+                    this.EndNonInteractive();
+                }
+                this.Requery();
+                return;
+            }
 
             if (cmd.Display != Display.Full)
             {
                 // Silent/passive: EIDOS_SCOPE=perMachine|perUser selects the scope.
-                var scopeVar = this.Engine.ContainsVariable("EIDOS_SCOPE") ? this.Engine.GetVariableString("EIDOS_SCOPE") : "";
-                this.PerMachine = cmd.Scope == BundleScope.PerMachine
-                    || string.Equals(scopeVar, "perMachine", StringComparison.OrdinalIgnoreCase)
-                    || (this.Installed && this.detectedPerMachine);
+                var scopeVar = this.Variable("EIDOS_SCOPE");
+                var wantCollector = this.Variable("EIDOS_INSTALL_COLLECTOR");
+                var accountKindVar = this.Variable("EIDOS_SERVICE_ACCOUNT_KIND");
+                var startServiceVar = this.Variable("EIDOS_START_SERVICE");
+                var startMenuVar = this.Variable("EIDOS_START_MENU");
+                var removeDataVar = this.Variable("EIDOS_REMOVE_DATA");
+                var collectorStartVar = this.Variable("EIDOS_COLLECTOR_START");
+                var removeCollectorVar = this.Variable("EIDOS_REMOVE_COLLECTOR");
+                var removeCollectorDataVar = this.Variable("EIDOS_COLLECTOR_REMOVE_DATA");
+                if (!this.ValidateNonInteractiveChoice("EIDOS_SCOPE", scopeVar, "perUser", "perMachine")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_INSTALL_COLLECTOR", wantCollector, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_SERVICE_ACCOUNT_KIND", accountKindVar, "local-system", "local-service", "network-service", "user")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_START_SERVICE", startServiceVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_START_MENU", startMenuVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_REMOVE_DATA", removeDataVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_COLLECTOR_START", collectorStartVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_REMOVE_COLLECTOR", removeCollectorVar, "0", "1")
+                    || !this.ValidateNonInteractiveChoice("EIDOS_COLLECTOR_REMOVE_DATA", removeCollectorDataVar, "0", "1"))
+                {
+                    return;
+                }
+                // Maintenance cannot change the installed core's scope. For a
+                // fresh install, scope controls only the dual-scope core; the
+                // optional collector remains a per-machine package and can
+                // elevate alongside a per-user core.
+                this.PerMachine = this.Installed || this.rememberedCore
+                    ? this.detectedPerMachine
+                    : cmd.Scope == BundleScope.PerMachine
+                        || string.Equals(scopeVar, "perMachine", StringComparison.OrdinalIgnoreCase);
+                if (!string.IsNullOrEmpty(accountKindVar))
+                {
+                    // Command-line choices are already stored in Burn for MSI
+                    // forwarding, but the BA must use the same effective value
+                    // for its pre-plan named-account password check.
+                    this.account = string.Equals(accountKindVar, "local-system", StringComparison.OrdinalIgnoreCase) ? AccountKind.LocalSystem
+                        : string.Equals(accountKindVar, "local-service", StringComparison.OrdinalIgnoreCase) ? AccountKind.LocalService
+                        : string.Equals(accountKindVar, "network-service", StringComparison.OrdinalIgnoreCase) ? AccountKind.NetworkService
+                        : AccountKind.User;
+                }
+                // The collector: 1 installs or keeps it, 0 leaves it out or
+                // removes it during install/modify, and empty keeps whatever
+                // is detected. Removal keeps the service only when asked
+                // (EIDOS_REMOVE_COLLECTOR=0) and its data unless
+                // EIDOS_COLLECTOR_REMOVE_DATA=1.
+                this.installCollector = wantCollector == "1" || (this.collectorInstalled && wantCollector != "0");
+                if (!string.IsNullOrEmpty(startServiceVar))
+                {
+                    this.startService = startServiceVar == "1";
+                }
+                else if (this.rememberedCore)
+                {
+                    this.Engine.SetVariableString("EIDOS_START_SERVICE", this.startService ? "1" : "0", false);
+                }
+                if (!string.IsNullOrEmpty(startMenuVar))
+                {
+                    this.startMenu = startMenuVar == "1";
+                }
+                else if (this.rememberedCore)
+                {
+                    this.Engine.SetVariableString("EIDOS_START_MENU", this.startMenu ? "1" : "0", false);
+                }
+                if (cmd.Action == LaunchAction.Install && !this.Installed && this.olderVersion != null
+                    && this.PerMachine && this.account == AccountKind.User
+                    && string.IsNullOrEmpty(this.Variable("EIDOS_SERVICE_PASSWORD")))
+                {
+                    this.Fail(ErrorLogonFailure, "This upgrade must recreate a service that runs as a Windows user. Run setup again with EIDOS_SERVICE_PASSWORD set for that account.");
+                    this.EndNonInteractive();
+                    this.Requery();
+                    return;
+                }
+                this.removeCollector = string.IsNullOrEmpty(removeCollectorVar) || removeCollectorVar == "1";
+                this.removeCollectorData = removeCollectorDataVar == "1";
                 this.installDirEdited = this.dataDirEdited = true; // overridable variables win
                 this.plannedAction = cmd.Action;
                 this.State = SetupState.Planning;
@@ -847,11 +1169,7 @@ namespace Eidos.Setup
                 return;
             }
 
-            if (this.newerInstalled && !this.Installed)
-            {
-                this.Page = Page.Blocked;
-            }
-            else if (cmd.Action == LaunchAction.Uninstall)
+            if (cmd.Action == LaunchAction.Uninstall)
             {
                 this.PerMachine = this.detectedPerMachine;
                 this.ComputeDataSize();
@@ -865,20 +1183,132 @@ namespace Eidos.Setup
             }
             else
             {
+                if (this.olderVersion != null)
+                {
+                    // Show the correct elevation note and plan the fixed scope
+                    // before the operator confirms the upgrade.
+                    this.PerMachine = this.detectedPerMachine;
+                }
                 this.Page = Page.Welcome;
             }
             this.Requery();
         }
 
+        private string Variable(string name)
+        {
+            return this.Engine.ContainsVariable(name) ? (this.Engine.GetVariableString(name) ?? "") : "";
+        }
+
+        private bool ValidateNonInteractiveChoice(string name, string value, params string[] allowed)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return true;
+            }
+            foreach (var choice in allowed)
+            {
+                if (string.Equals(value, choice, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            this.Fail(ErrorInvalidArgument, $"{name} must be empty or one of: {string.Join(", ", allowed)}.");
+            this.EndNonInteractive();
+            this.Requery();
+            return false;
+        }
+
+        private void OnDetectPackageComplete(object sender, DetectPackageCompleteEventArgs e)
+        {
+            if (e.PackageId == "EidosMsi" && e.State == PackageState.Obsolete)
+            {
+                this.newerInstalled = true;
+            }
+            else if (e.PackageId == "EidosCollectorMsi"
+                && (e.State == PackageState.Present || e.State == PackageState.Obsolete || e.State == PackageState.Superseded))
+            {
+                this.CollectorInstalled = true;
+                // Maintenance and upgrades start from the installed state.
+                this.InstallCollector = true;
+            }
+        }
+
         private void OnPlanPackageBegin(object sender, PlanPackageBeginEventArgs e)
         {
+            if (e.PackageId == "EidosCollectorMsi")
+            {
+                switch (this.plannedAction)
+                {
+                    case LaunchAction.Uninstall:
+                    case LaunchAction.UnsafeUninstall:
+                        e.State = this.collectorInstalled && this.removeCollector ? RequestState.Absent : RequestState.None;
+                        break;
+                    case LaunchAction.Repair:
+                        e.State = this.installCollector
+                            ? e.CurrentState == PackageState.Present
+                                ? RequestState.Repair
+                                : e.CurrentState == PackageState.Obsolete || e.CurrentState == PackageState.Superseded
+                                    ? RequestState.None
+                                    : RequestState.Present
+                            : this.collectorInstalled ? RequestState.Absent : RequestState.None;
+                        break;
+                    case LaunchAction.Install:
+                    case LaunchAction.Modify:
+                        // Install or upgrade: present when chosen (or already
+                        // there and not unticked); otherwise untouched, never
+                        // removed as a side effect of an empty choice.
+                        e.State = this.installCollector
+                            ? e.CurrentState == PackageState.Obsolete || e.CurrentState == PackageState.Superseded
+                                ? RequestState.None
+                                : RequestState.Present
+                            : this.collectorInstalled ? RequestState.Absent : RequestState.None;
+                        break;
+                    default:
+                        // Layout, cache and update actions keep Burn's
+                        // action-specific recommendation.
+                        break;
+                }
+                return;
+            }
             // The .NET Framework prerequisite exists for the fallback BA that
             // runs when this UI cannot start. If we are running, it is
             // satisfied: leave it out of the plan so a per-user install never
             // touches the per-machine package cache (which needs elevation).
-            if (e.PackageId.StartsWith("NetFx", StringComparison.OrdinalIgnoreCase))
+            if (e.PackageId.StartsWith("NetFx", StringComparison.OrdinalIgnoreCase)
+                && (this.plannedAction == LaunchAction.Install || this.plannedAction == LaunchAction.Modify
+                    || this.plannedAction == LaunchAction.Repair || this.plannedAction == LaunchAction.Uninstall
+                    || this.plannedAction == LaunchAction.UnsafeUninstall))
             {
                 e.State = RequestState.None;
+            }
+        }
+
+        private void OnPlanCompatibleMsiPackageBegin(object sender, PlanCompatibleMsiPackageBeginEventArgs e)
+        {
+            if (e.PackageId == "EidosCollectorMsi")
+            {
+                // Burn recommends removing a newer compatible MSI on every
+                // bundle uninstall. The collector is independently optional,
+                // so honor the operator's keep/remove choice here too.
+                e.RequestRemove = ((this.plannedAction == LaunchAction.Uninstall || this.plannedAction == LaunchAction.UnsafeUninstall)
+                        && this.removeCollector)
+                    || ((this.plannedAction == LaunchAction.Install || this.plannedAction == LaunchAction.Modify || this.plannedAction == LaunchAction.Repair)
+                        && !this.installCollector);
+            }
+        }
+
+        private void OnPlanRelatedBundleType(object sender, PlanRelatedBundleTypeEventArgs e)
+        {
+            if (e.RecommendedType == RelatedBundlePlanType.Downgrade
+                && this.collectorRelatedBundles.Contains(e.BundleCode))
+            {
+                var removing = (this.plannedAction == LaunchAction.Uninstall || this.plannedAction == LaunchAction.UnsafeUninstall)
+                    ? this.removeCollector
+                    : !this.installCollector;
+                // A newer independently packaged collector must not turn a
+                // core install into Burn's bundle-wide downgrade no-op. Keep
+                // it unrelated, unless the operator explicitly removes it.
+                e.Type = removing ? RelatedBundlePlanType.Upgrade : RelatedBundlePlanType.None;
             }
         }
 
@@ -901,6 +1331,7 @@ namespace Eidos.Setup
         private void OnApplyBegin(object sender, ApplyBeginEventArgs e)
         {
             this.Canceled = false;
+            this.collectorError = null;
         }
 
         private void OnProgress(object sender, ProgressEventArgs e)
@@ -923,6 +1354,17 @@ namespace Eidos.Setup
         {
             this.ProgressMessage = this.plannedAction == LaunchAction.Uninstall ? "Removing eidos…" : "Installing eidos…";
             e.Cancel = this.Canceled;
+        }
+
+        private void OnExecutePackageComplete(object sender, ExecutePackageCompleteEventArgs e)
+        {
+            if (e.PackageId == "EidosCollectorMsi" && e.Status < 0)
+            {
+                // The collector is non-vital so its MSI failure does not roll
+                // back a healthy core. Remember it so the BA still reports the
+                // requested optional-package operation as a failure.
+                this.collectorError = e.Status;
+            }
         }
 
         private void OnExecuteMsiMessage(object sender, ExecuteMsiMessageEventArgs e)
@@ -958,13 +1400,24 @@ namespace Eidos.Setup
         {
             this.ExitCode = e.Status;
             this.RestartRequired = e.Restart != ApplyRestart.None;
-            if (e.Status >= 0)
+            if (e.Status >= 0 && !this.collectorError.HasValue)
             {
-                if (this.plannedAction != LaunchAction.Uninstall && !this.PerMachine && this.startService)
+                if ((this.plannedAction == LaunchAction.Install || this.plannedAction == LaunchAction.Modify || this.plannedAction == LaunchAction.Repair)
+                    && !this.PerMachine && this.startService)
                 {
                     // Per-user has no service: start the background process
                     // now (the Run entry does it at the next sign-in).
-                    this.StartPerUserProcess();
+                    if (!this.StartPerUserProcess())
+                    {
+                        this.Fail(ErrorServiceNotActive, this.ErrorMessage);
+                        if (this.ba.Command.Display != Display.Full)
+                        {
+                            this.EndNonInteractive();
+                            return;
+                        }
+                        this.Requery();
+                        return;
+                    }
                 }
                 this.State = SetupState.Applied;
                 this.Page = Page.Success;
@@ -977,7 +1430,13 @@ namespace Eidos.Setup
             }
             else
             {
-                this.Fail(e.Status, this.ErrorMessage);
+                var status = e.Status < 0 ? e.Status : this.collectorError.Value;
+                var message = e.Status < 0
+                    ? this.ErrorMessage
+                    : this.plannedAction == LaunchAction.Uninstall
+                        ? "eidos was removed, but the profiling collector could not be removed. The setup log has the details."
+                        : "The eidos core operation completed, but the profiling collector operation failed. The setup log has the details.";
+                this.Fail(status, message);
                 if (this.ba.Command.Display != Display.Full)
                 {
                     this.EndNonInteractive();
@@ -1018,7 +1477,7 @@ namespace Eidos.Setup
         /// `eidos serve --detach` launches the background process and returns
         /// once /api/health answers (or if something already answers there).
         /// </summary>
-        private void StartPerUserProcess()
+        private bool StartPerUserProcess()
         {
             try
             {
@@ -1044,18 +1503,23 @@ namespace Eidos.Setup
                     {
                         p.Kill();
                         this.Engine.Log(LogLevel.Error, "eidos serve --detach did not return within 90 s");
-                        return;
+                        this.ErrorMessage = "eidos was installed but did not start within 90 seconds. The setup log has the details.";
+                        return false;
                     }
                     this.Engine.Log(LogLevel.Standard, $"eidos serve --detach exited with {p.ExitCode}");
                     if (p.ExitCode != 0)
                     {
                         this.ErrorMessage = $"eidos could not be started (exit code {p.ExitCode}); see the log in {Path.Combine(data, "logs")}.";
+                        return false;
                     }
                 }
+                return true;
             }
             catch (Exception ex)
             {
                 this.Engine.Log(LogLevel.Error, "starting eidos: " + ex.Message);
+                this.ErrorMessage = "eidos was installed but could not be started. The setup log has the details.";
+                return false;
             }
         }
 
@@ -1091,6 +1555,10 @@ namespace Eidos.Setup
             else if (string.IsNullOrEmpty(message))
             {
                 this.ErrorMessage = $"Error 0x{status:X8}. The log has the details.";
+            }
+            else
+            {
+                this.ErrorMessage = message;
             }
             this.Page = Page.Failure;
             this.Raise(nameof(this.PageTitle));

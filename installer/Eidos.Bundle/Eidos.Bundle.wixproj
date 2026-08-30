@@ -10,8 +10,9 @@
     <InstallerPlatform>x64</InstallerPlatform>
     <Version Condition="'$(Version)' == ''">0.5.0</Version>
     <MsiPath Condition="'$(MsiPath)' == ''">$(MSBuildThisFileDirectory)..\out\eidos.msi</MsiPath>
+    <CollectorMsiPath Condition="'$(CollectorMsiPath)' == ''">$(MSBuildThisFileDirectory)..\out\eidos-collector.msi</CollectorMsiPath>
     <BaDir Condition="'$(BaDir)' == ''">$(MSBuildThisFileDirectory)..\Eidos.Setup.Ui\bin\Release\net472</BaDir>
-    <DefineConstants>$(DefineConstants);Version=$(Version);MsiPath=$(MsiPath);BaDir=$(BaDir)</DefineConstants>
+    <DefineConstants>$(DefineConstants);Version=$(Version);MsiPath=$(MsiPath);CollectorMsiPath=$(CollectorMsiPath);BaDir=$(BaDir)</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>

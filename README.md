@@ -252,10 +252,11 @@ These numbers are reference measurements, not universal guarantees. Hardware, st
 
 Download `eidos-<version>-setup.exe` from the
 [releases page](https://github.com/josiah-nelson/eidos/releases) and run
-it. The setup installs eidos either for you alone (no administrator rights;
-it runs in the background while you are signed in) or for the whole
-computer as a Windows service, asks where the program and its data should
-live and which port to use, and opens the web interface when it finishes.
+it. The setup installs the core either for you alone (no administrator rights;
+it runs while you are signed in) or for the whole computer as a Windows
+service. Selecting the optional system collector adds a per-machine service
+and requires administrator approval. Setup asks where the program and its data
+should live and which port to use, and opens the web interface when it finishes.
 [docs/installing.md](docs/installing.md) covers every option, unattended
 installs, upgrades and removal.
 
@@ -329,6 +330,7 @@ The name also deliberately evokes eidetic memory: not just recalling that someth
 | [Architecture](docs/architecture.md) | Invariants, identity model, catalog, search architecture, scheduler, and fleet evolution |
 | [Roadmap](docs/roadmap.md) | Releases, milestones, acceptance gates, and sequencing |
 | [v0.5 dogfood-fleet sprint](docs/v0.5-dogfood-fleet-sprint.md) | Unified installer, measured multi-node slice, chunking bakeoff, and release gates |
+| [Private fleet](docs/fleet.md) | Enrolling nodes with a central, what replicates, status, bounds, and the failure matrix (experimental) |
 | [Query syntax](docs/query-syntax.md) | Query language used by the UI, CLI, and API |
 | [Development](docs/development.md) | Toolchain, project layout, tests, linting, and benchmarks |
 | [Benchmarks](docs/benchmarks.md) | Reference corpus, methodology, measurements, and known limitations |

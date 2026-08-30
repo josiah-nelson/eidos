@@ -1,11 +1,17 @@
 name: installer
 
-# The unsigned installer smoke test is expensive (web UI, Rust, the .NET setup
-# UI, WiX, and a real per-user install/uninstall on the runner) and is not run
-# on pull requests. Release builds are covered by release.yml on a v* tag; run
-# this by hand when changing installer authoring or build.ps1:
+# The unsigned installer lifecycle test is expensive (web UI, Rust, the .NET
+# setup UI, WiX, and real installs on the runner) and is not run on pull
+# requests. Release builds are covered by release.yml on a v* tag; run this
+# by hand when changing installer authoring, build.ps1, or the collector:
 #
 #   gh workflow run installer.yml --ref <branch>
+#
+# Lifecycle paths covered (sprint track A gate): core-only per-user; mixed
+# per-user-core/per-machine-collector; core-plus-collector per-machine;
+# same-version adoption and later upgrade from the separate collector package
+# without rotating the study key; repair; uninstall keeping data; explicit
+# purge of exactly the requested product's data.
 on:
   workflow_dispatch:
 
@@ -48,110 +54,250 @@ jobs:
       - name: Build both MSIs, the setup UI and both bundles
         shell: pwsh
         run: .\installer\build.ps1 -SkipWeb -SkipRust -BinDir target\debug
-      - name: Silent per-user install, health check, uninstall
-        shell: pwsh
-        timeout-minutes: 10
-        run: |
-          # Start-Process -Wait would wait for the process tree, and a
-          # per-user install leaves eidos.exe running in the background;
-          # wait for the setup process alone.
-          function Run-Setup([string]$arguments) {
-            $p = [Diagnostics.Process]::Start("installer\out\eidos-setup.exe", $arguments)
-            if (-not $p.WaitForExit(480000)) { $p.Kill(); throw "setup did not finish: $arguments" }
-            return $p.ExitCode
-          }
-          $log = "$env:RUNNER_TEMP\eidos-ci-install.log"
-          $code = Run-Setup "/quiet /log `"$log`" EIDOS_PORT=7710"
-          if ($code -ne 0) { Get-Content $log | Select-Object -Last 40; throw "install exit $code" }
-          $r = Invoke-WebRequest http://127.0.0.1:7710/api/health -UseBasicParsing -TimeoutSec 30
-          if ($r.StatusCode -ne 200) { throw "health $($r.StatusCode)" }
-          Get-Process eidos | Format-Table Id,Path -AutoSize
-          $code = Run-Setup "/quiet /uninstall EIDOS_REMOVE_DATA=1 /log `"$log.uninstall`""
-          if ($code -ne 0) { Get-Content "$log.uninstall" | Select-Object -Last 40; throw "uninstall exit $code" }
-          if (Get-Process eidos -ErrorAction SilentlyContinue) { throw "eidos.exe still running after uninstall" }
-          if (Test-Path "$env:LOCALAPPDATA\eidos") { throw "data directory left behind" }
-          if (Test-Path "$env:LOCALAPPDATA\Programs\eidos") { throw "program directory left behind" }
-      - name: Silent collector install and status
-        shell: pwsh
-        timeout-minutes: 10
-        run: |
-          function Run-Setup([string]$exe, [string]$arguments) {
-            $p = [Diagnostics.Process]::Start($exe, $arguments)
-            if (-not $p.WaitForExit(480000)) { $p.Kill(); throw "collector setup did not finish: $arguments" }
-            return $p.ExitCode
-          }
-          $log = "$env:RUNNER_TEMP\eidos-collector-ci.log"
-          $key = '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff'
-          $setup = "installer\out\eidos-collector-setup.exe"
-          $code = Run-Setup $setup "/quiet /log `"$log`" EIDOS_STUDY_KEY=$key EIDOS_LANES=usn,content EIDOS_UPLOAD=$env:RUNNER_TEMP\drop EIDOS_UPLOAD_HOUR=0"
-          if ($code -ne 0) { Get-Content $log | Select-Object -Last 40; throw "install exit $code" }
 
-          $state = (Get-Service eidos-collector).Status
-          if ($state -ne 'Running') { throw "service is $state" }
-          $status = & 'C:\Program Files\eidos-collector\eidos.exe' observe status | ConvertFrom-Json
-          if (-not $status.capabilities.windows.study_key_available) { throw "the study key was not imported" }
-          if (-not $status.lanes.usn) { throw "the usn lane is off" }
-          $config = Get-Content 'C:\ProgramData\eidos-collector\config.json' -Raw | ConvertFrom-Json
-          if (-not $config.lanes.content.enabled) { throw "EIDOS_LANES did not reach config.json" }
-          # 0 is a legitimate hour, and a bundle variable holding "0" is
-          # false to Burn unless the condition compares it as a string.
-          if ($config.upload.hour -ne 0) { throw "EIDOS_UPLOAD_HOUR=0 did not reach config.json" }
+      - name: Build a newer version of everything for the upgrade paths
+        shell: pwsh
+        run: |
+          $out = "$env:GITHUB_WORKSPACE\installer\out\upgrade"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          foreach ($project in 'Eidos.Msi', 'Eidos.Collector.Msi', 'Eidos.Bundle', 'Eidos.Collector.Bundle') {
+            Remove-Item -Recurse -Force "installer\$project\obj", "installer\$project\bin" -ErrorAction SilentlyContinue
+          }
+          $bin = "$env:GITHUB_WORKSPACE\target\debug"
+          $ba = "$env:GITHUB_WORKSPACE\installer\Eidos.Setup.Ui\bin\Release\net472"
+          dotnet build installer\Eidos.Msi\Eidos.Msi.wixproj -c Release -nologo -v minimal -p:Version=99.0.0 -p:BinDir=$bin -p:OutDir="$out\"
+          if ($LASTEXITCODE -ne 0) { throw "building the upgrade core MSI failed ($LASTEXITCODE)" }
+          dotnet build installer\Eidos.Collector.Msi\Eidos.Collector.Msi.wixproj -c Release -nologo -v minimal -p:Version=99.0.0 -p:BinDir=$bin -p:OutDir="$out\"
+          if ($LASTEXITCODE -ne 0) { throw "building the upgrade collector MSI failed ($LASTEXITCODE)" }
+          dotnet build installer\Eidos.Bundle\Eidos.Bundle.wixproj -c Release -nologo -v minimal -p:Version=99.0.0 -p:MsiPath="$out\eidos.msi" -p:CollectorMsiPath="$out\eidos-collector.msi" -p:BaDir=$ba -p:OutDir="$out\"
+          if ($LASTEXITCODE -ne 0) { throw "building the upgrade unified bundle failed ($LASTEXITCODE)" }
+          dotnet build installer\Eidos.Collector.Bundle\Eidos.Collector.Bundle.wixproj -c Release -nologo -v minimal -p:Version=99.0.0 -p:MsiPath="$out\eidos-collector.msi" -p:OutDir="$out\"
+          if ($LASTEXITCODE -ne 0) { throw "building the upgrade collector bundle failed ($LASTEXITCODE)" }
 
-      - name: Collector upgrade keeps the host's own configuration
+      - name: Define helpers
+        shell: pwsh
+        run: |
+          @'
+          function Run-Setup([string]$exe, [string]$arguments, [string]$log) {
+            # Start-Process -Wait would wait for the process tree, and a
+            # per-user install leaves eidos.exe running in the background;
+            # wait for the setup process alone.
+            $safeArguments = $arguments -replace '(?i)(EIDOS_(?:STUDY_KEY|SERVICE_PASSWORD)=)(?:"[^"]*"|\S+)', '$1<redacted>'
+            $p = [Diagnostics.Process]::Start($exe, "$arguments /log `"$log`"")
+            if (-not $p.WaitForExit(600000)) { $p.Kill(); throw "setup did not finish: $exe $safeArguments" }
+            if ($p.ExitCode -ne 0) { Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 60; throw "$exe $safeArguments exited $($p.ExitCode)" }
+          }
+          function Run-SetupExpectFailure([string]$exe, [string]$arguments, [string]$log) {
+            $safeArguments = $arguments -replace '(?i)(EIDOS_(?:STUDY_KEY|SERVICE_PASSWORD)=)(?:"[^"]*"|\S+)', '$1<redacted>'
+            $p = [Diagnostics.Process]::Start($exe, "$arguments /log `"$log`"")
+            if (-not $p.WaitForExit(600000)) { $p.Kill(); throw "setup did not finish: $exe $safeArguments" }
+            if ($p.ExitCode -eq 0) { throw "$exe $safeArguments accepted an invalid unattended value" }
+          }
+          function Wait-Health([int]$port) {
+            $deadline = (Get-Date).AddSeconds(90)
+            while ((Get-Date) -lt $deadline) {
+              try {
+                $r = Invoke-WebRequest "http://127.0.0.1:$port/api/health" -UseBasicParsing -TimeoutSec 5
+                if ($r.StatusCode -eq 200) { return }
+              } catch {}
+              Start-Sleep -Seconds 2
+            }
+            throw "no healthy service on port $port"
+          }
+          function Assert-Service([string]$name, [string]$state) {
+            $s = Get-Service $name -ErrorAction SilentlyContinue
+            if ($null -eq $s) { throw "service $name is not registered" }
+            if ($s.Status -ne $state) { throw "service $name is $($s.Status), expected $state" }
+          }
+          '@ | Set-Content "$env:RUNNER_TEMP\helpers.ps1"
+
+      - name: Core only, per-user (install, health, uninstall with purge)
         shell: pwsh
         timeout-minutes: 15
         run: |
-          # A runtime choice the upgrade must not overwrite, and the identity
-          # it must not rotate.
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          $setup = "installer\out\eidos-setup.exe"
+          Run-Setup $setup "/quiet EIDOS_PORT=7710 EIDOS_START_MENU=0 EIDOS_START_SERVICE=0" "$env:RUNNER_TEMP\core-user-install.log"
+          if (Get-Process eidos -ErrorAction SilentlyContinue) { throw "EIDOS_START_SERVICE=0 still launched eidos.exe" }
+          if (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name eidos -ErrorAction SilentlyContinue) { throw "EIDOS_START_SERVICE=0 still registered sign-in startup" }
+          if (Get-Service eidos-collector -ErrorAction SilentlyContinue) { throw "the collector was installed without being asked for" }
+          $menu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\eidos'
+          if (Test-Path $menu) { throw "EIDOS_START_MENU=0 did not suppress the Start-menu folder" }
+          # Empty maintenance variables must preserve both zero-valued choices.
+          Run-Setup $setup "/quiet /repair" "$env:RUNNER_TEMP\core-user-repair.log"
+          if (Get-Process eidos -ErrorAction SilentlyContinue) { throw "repair changed EIDOS_START_SERVICE=0" }
+          if (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name eidos -ErrorAction SilentlyContinue) { throw "repair added sign-in startup" }
+          if (Test-Path $menu) { throw "repair changed EIDOS_START_MENU=0" }
+          & "$env:LOCALAPPDATA\Programs\eidos\eidos.exe" serve --detach --data-dir "$env:LOCALAPPDATA\eidos" --log-dir "$env:LOCALAPPDATA\eidos\logs" --bind 127.0.0.1:7710
+          if ($LASTEXITCODE -ne 0) { throw "manually starting the per-user core failed ($LASTEXITCODE)" }
+          Wait-Health 7710
+          Run-Setup $setup "/quiet /uninstall EIDOS_REMOVE_DATA=1" "$env:RUNNER_TEMP\core-user-uninstall.log"
+          if (Get-Process eidos -ErrorAction SilentlyContinue) { throw "eidos.exe still running after uninstall" }
+          if (Test-Path "$env:LOCALAPPDATA\eidos") { throw "data directory left behind" }
+          if (Test-Path "$env:LOCALAPPDATA\Programs\eidos") { throw "program directory left behind" }
+
+      - name: Per-user core with the per-machine collector
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          $setup = "installer\out\eidos-setup.exe"
+          Run-Setup $setup "/quiet EIDOS_SCOPE=perUser EIDOS_PORT=7711 EIDOS_INSTALL_COLLECTOR=1" "$env:RUNNER_TEMP\mixed-scope-install.log"
+          Wait-Health 7711
+          if (Get-Service eidos -ErrorAction SilentlyContinue) { throw "the per-user core was changed into a service install" }
+          Assert-Service eidos-collector Running
+          if (-not (Test-Path 'HKCU:\Software\eidos')) { throw "the core was not registered per-user" }
+          if (Test-Path 'HKLM:\Software\eidos') { throw "the core was registered per-machine" }
+          Run-Setup $setup "/quiet /uninstall EIDOS_REMOVE_DATA=1 EIDOS_REMOVE_COLLECTOR=1 EIDOS_COLLECTOR_REMOVE_DATA=1" "$env:RUNNER_TEMP\mixed-scope-uninstall.log"
+          if (Get-Service eidos-collector -ErrorAction SilentlyContinue) { throw "the collector service is still registered" }
+          if (Get-Process eidos -ErrorAction SilentlyContinue) { throw "eidos.exe still running after mixed-scope uninstall" }
+          if (Test-Path "$env:LOCALAPPDATA\eidos") { throw "per-user data directory left behind" }
+          if (Test-Path 'C:\ProgramData\eidos-collector') { throw "collector data directory left behind" }
+
+      - name: Separate collector package first (the pre-unified fleet path)
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          $key = '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff'
+          Run-Setup "installer\out\eidos-collector-setup.exe" "/quiet EIDOS_STUDY_KEY=$key EIDOS_LANES=usn,content EIDOS_UPLOAD=`"$env:RUNNER_TEMP\drop`" EIDOS_UPLOAD_HOUR=0" "$env:RUNNER_TEMP\collector-standalone.log"
+          Assert-Service eidos-collector Running
+          $status = & 'C:\Program Files\eidos-collector\eidos.exe' observe status | ConvertFrom-Json
+          if (-not $status.capabilities.windows.study_key_available) { throw "the study key was not imported" }
+          $config = Get-Content 'C:\ProgramData\eidos-collector\config.json' -Raw | ConvertFrom-Json
+          if (-not $config.lanes.content.enabled) { throw "EIDOS_LANES did not reach config.json" }
+          if ($config.upload.hour -ne 0) { throw "EIDOS_UPLOAD_HOUR=0 did not reach config.json" }
+          # A runtime choice the unified upgrade must not overwrite.
           & 'C:\Program Files\eidos-collector\eidos.exe' observe lanes --enumeration on
-          $before = Get-Content 'C:\ProgramData\eidos-collector\config.json' -Raw | ConvertFrom-Json
-          $key = (Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash
+          (Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash | Set-Content "$env:RUNNER_TEMP\study-key.hash"
 
-          # Real work in flight, so the upgrade has to stop a collector that
-          # is doing something: an unstoppable service fails the upgrade with
-          # error 1921 and rolls it back.
+      - name: Unified setup adopts the same-version separate collector
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          # No collector variable: detection must keep the existing package.
+          $setup = "installer\out\eidos-setup.exe"
+          Run-Setup $setup "/quiet EIDOS_SCOPE=perMachine EIDOS_PORT=7720" "$env:RUNNER_TEMP\unified-adopt.log"
+          Wait-Health 7720
+          Assert-Service eidos Running
+          Assert-Service eidos-collector Running
+          $cargo = Get-Content Cargo.toml -Raw
+          $version = ([regex]::Match($cargo, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value -split '-')[0]
+          if ((Get-ItemProperty 'HKLM:\Software\eidos-collector').Version -ne $version) { throw "the collector package version changed during adoption" }
+          if ((Get-ItemProperty 'HKLM:\Software\eidos').Version -ne $version) { throw "the core package was not installed" }
+          if ((Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash -ne (Get-Content "$env:RUNNER_TEMP\study-key.hash")) { throw "adoption rotated the study key" }
+          # The old collector bundle registration is gone; the visible MSI
+          # registration remains so a collector kept without the core is
+          # independently maintainable from Apps & Features. Bundle entries
+          # carry BundleVersion; the MSI product entry does not. Matching on
+          # BundleUpgradeCode would catch the unified bundle itself, which
+          # lists the collector upgrade code as a RelatedBundle.
+          $arp = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' | Get-ItemProperty
+          $bundle = $arp | Where-Object { $_.DisplayName -eq 'eidos observatory collector' -and $_.BundleVersion }
+          if ($bundle) { throw "the separate collector bundle is still registered: $($bundle.DisplayName)" }
+          $collectorProduct = $arp | Where-Object { $_.DisplayName -eq 'eidos observatory collector' -and $_.WindowsInstaller -eq 1 }
+          if (-not $collectorProduct) { throw "the collector MSI has no maintenance registration" }
+          # The core's fleet identity exists and the loopback API answers.
+          $fleet = Invoke-RestMethod http://127.0.0.1:7720/api/fleet -TimeoutSec 30
+          if (-not $fleet.node_id) { throw "no fleet identity" }
+          if ($fleet.central) { throw "a fresh install must not be a central" }
+          $fleet.node_id | Set-Content "$env:RUNNER_TEMP\node-id"
+          if (-not (Test-Path 'C:\ProgramData\eidos\fleet\node.key')) { throw "fleet key not created" }
+
+      - name: Busy in-place upgrade keeps both products' state
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          # Real work in flight so the upgrade has to stop a busy collector.
           1..200 | ForEach-Object { Set-Content "$env:RUNNER_TEMP\churn-$_.txt" "change $_" }
-          Start-Sleep -Seconds 10
-
-          $out = "$env:GITHUB_WORKSPACE\installer\out\upgrade"
-          New-Item -ItemType Directory -Force $out | Out-Null
-          foreach ($project in 'Eidos.Collector.Msi', 'Eidos.Collector.Bundle') {
-            Remove-Item -Recurse -Force "installer\$project\obj", "installer\$project\bin" -ErrorAction SilentlyContinue
-          }
-          dotnet build installer\Eidos.Collector.Msi\Eidos.Collector.Msi.wixproj -c Release -nologo -v minimal `
-            -p:Version=99.0.0 -p:BinDir="$env:GITHUB_WORKSPACE\target\debug" -p:OutDir="$out\"
-          dotnet build installer\Eidos.Collector.Bundle\Eidos.Collector.Bundle.wixproj -c Release -nologo -v minimal `
-            -p:Version=99.0.0 -p:MsiPath="$out\eidos-collector.msi" -p:OutDir="$out\"
-
-          # No properties: the upgrade must leave every choice alone.
-          $log = "$env:RUNNER_TEMP\eidos-collector-upgrade.log"
-          $p = [Diagnostics.Process]::Start("$out\eidos-collector-setup.exe", "/quiet /log `"$log`"")
-          if (-not $p.WaitForExit(480000)) { $p.Kill(); throw "the upgrade did not finish" }
-          if ($p.ExitCode -ne 0) { Get-Content $log | Select-Object -Last 60; throw "upgrade exit $($p.ExitCode)" }
-
-          if ((Get-Service eidos-collector).Status -ne 'Running') { throw "the service is not running after the upgrade" }
-          if ((Get-ItemProperty 'HKLM:\Software\eidos-collector').Version -ne '99.0.0') { throw "the upgrade did not replace the product" }
+          Start-Sleep -Seconds 5
+          $setup = "installer\out\upgrade\eidos-setup.exe"
+          # No variables: maintenance detection must preserve scope, port and
+          # the optional package selected by the installed state.
+          Run-Setup $setup "/quiet" "$env:RUNNER_TEMP\unified-upgrade.log"
+          Wait-Health 7720
+          Assert-Service eidos Running
+          Assert-Service eidos-collector Running
+          if ((Get-ItemProperty 'HKLM:\Software\eidos-collector').Version -ne '99.0.0') { throw "the collector package was not upgraded" }
+          if ((Get-ItemProperty 'HKLM:\Software\eidos').Version -ne '99.0.0') { throw "the core package was not upgraded" }
+          if ((Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash -ne (Get-Content "$env:RUNNER_TEMP\study-key.hash")) { throw "the upgrade rotated the study key" }
           $after = Get-Content 'C:\ProgramData\eidos-collector\config.json' -Raw | ConvertFrom-Json
           if (-not $after.lanes.enumeration.enabled) { throw "the upgrade overwrote a runtime lane change" }
-          if ($after.upload.destination -ne $before.upload.destination) { throw "the upgrade changed the upload destination" }
-          if ($after.upload.hour -ne $before.upload.hour) { throw "the upgrade changed the upload hour" }
-          if ((Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash -ne $key) { throw "the upgrade replaced the study key" }
+          if ($after.upload.hour -ne 0) { throw "the upgrade changed the upload hour" }
+          $fleet = Invoke-RestMethod http://127.0.0.1:7720/api/fleet -TimeoutSec 30
+          if ($fleet.node_id -ne (Get-Content "$env:RUNNER_TEMP\node-id")) { throw "upgrade changed the fleet node identity" }
 
-      - name: Collector uninstall removes the service and the data
+      - name: Repair keeps both services, the identities and the cursors
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          Run-Setup "installer\out\upgrade\eidos-setup.exe" "/quiet /repair" "$env:RUNNER_TEMP\unified-repair.log"
+          Wait-Health 7720
+          Assert-Service eidos Running
+          Assert-Service eidos-collector Running
+          if ((Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash -ne (Get-Content "$env:RUNNER_TEMP\study-key.hash")) { throw "repair rotated the study key" }
+          $fleet = Invoke-RestMethod http://127.0.0.1:7720/api/fleet -TimeoutSec 30
+          if ($fleet.node_id -ne (Get-Content "$env:RUNNER_TEMP\node-id")) { throw "repair changed the fleet node identity" }
+
+      - name: Invalid unattended choices fail before planning
         shell: pwsh
         timeout-minutes: 10
         run: |
-          $log = "$env:RUNNER_TEMP\eidos-collector-uninstall.log"
-          $setup = "installer\out\upgrade\eidos-collector-setup.exe"
-          $p = [Diagnostics.Process]::Start($setup, "/quiet /uninstall /log `"$log`" EIDOS_COLLECTOR_REMOVE_DATA=1")
-          if (-not $p.WaitForExit(480000)) { $p.Kill(); throw "the uninstall did not finish" }
-          if ($p.ExitCode -ne 0) { Get-Content $log | Select-Object -Last 60; throw "uninstall exit $($p.ExitCode)" }
-          if (Get-Service eidos-collector -ErrorAction SilentlyContinue) { throw "the service is still registered" }
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          $setup = "installer\out\upgrade\eidos-setup.exe"
+          Run-SetupExpectFailure $setup "/quiet EIDOS_SCOPE=machine" "$env:RUNNER_TEMP\invalid-scope.log"
+          Run-SetupExpectFailure $setup "/quiet EIDOS_SERVICE_ACCOUNT_KIND=admin" "$env:RUNNER_TEMP\invalid-account-kind.log"
+          Run-SetupExpectFailure $setup "/quiet EIDOS_START_SERVICE=true" "$env:RUNNER_TEMP\invalid-start.log"
+          Run-SetupExpectFailure $setup "/quiet EIDOS_COLLECTOR_START=true" "$env:RUNNER_TEMP\invalid-collector-start.log"
+          Run-SetupExpectFailure $setup "/quiet /uninstall EIDOS_REMOVE_DATA=true" "$env:RUNNER_TEMP\invalid-core-remove.log"
+          Run-SetupExpectFailure $setup "/quiet /uninstall EIDOS_REMOVE_COLLECTOR=true" "$env:RUNNER_TEMP\invalid-remove.log"
+          Wait-Health 7720
+          Assert-Service eidos Running
+          Assert-Service eidos-collector Running
+
+      - name: Uninstall keeps data by default, for both products
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          Run-Setup "installer\out\upgrade\eidos-setup.exe" "/quiet /uninstall" "$env:RUNNER_TEMP\unified-uninstall-keep.log"
+          if (Get-Service eidos -ErrorAction SilentlyContinue) { throw "the eidos service is still registered" }
+          if (Get-Service eidos-collector -ErrorAction SilentlyContinue) { throw "the collector service is still registered" }
           if (Get-Process eidos -ErrorAction SilentlyContinue) { throw "eidos.exe still running after uninstall" }
-          if (Test-Path 'C:\ProgramData\eidos-collector') { throw "data directory left behind" }
-          if (Test-Path 'C:\Program Files\eidos-collector') { throw "program directory left behind" }
+          if (-not (Test-Path 'C:\ProgramData\eidos\catalog.db')) { throw "the core data was deleted without being asked" }
+          if (-not (Test-Path 'C:\ProgramData\eidos-collector\study.key')) { throw "the collector's study data was deleted without being asked" }
+          if (-not (Test-Path 'C:\ProgramData\eidos\fleet\node.key')) { throw "the fleet identity was deleted without being asked" }
+
+      - name: Reinstall keeps the identities, then purge removes exactly what was asked
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          . "$env:RUNNER_TEMP\helpers.ps1"
+          $setup = "installer\out\upgrade\eidos-setup.exe"
+          Run-Setup $setup "/quiet EIDOS_SCOPE=perMachine EIDOS_PORT=7720 EIDOS_INSTALL_COLLECTOR=1" "$env:RUNNER_TEMP\unified-reinstall.log"
+          Wait-Health 7720
+          if ((Get-FileHash 'C:\ProgramData\eidos-collector\study.key').Hash -ne (Get-Content "$env:RUNNER_TEMP\study-key.hash")) { throw "reinstall rotated the study key" }
+          $fleet = Invoke-RestMethod http://127.0.0.1:7720/api/fleet -TimeoutSec 30
+          if ($fleet.node_id -ne (Get-Content "$env:RUNNER_TEMP\node-id")) { throw "reinstall changed the fleet node identity" }
+          # Purge the core's data, keep the collector service and its data.
+          Run-Setup $setup "/quiet /uninstall EIDOS_REMOVE_DATA=1 EIDOS_REMOVE_COLLECTOR=0" "$env:RUNNER_TEMP\unified-uninstall-core-purge.log"
+          if (Test-Path 'C:\ProgramData\eidos') { throw "core data directory left behind after purge" }
+          if (Test-Path 'C:\Program Files\eidos') { throw "core program directory left behind" }
+          Assert-Service eidos-collector Running
+          if (-not (Test-Path 'C:\ProgramData\eidos-collector\study.key')) { throw "purging the core removed the collector's data" }
+          $collectorProduct = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' | Get-ItemProperty | Where-Object { $_.DisplayName -eq 'eidos observatory collector' -and $_.WindowsInstaller -eq 1 }
+          if (-not $collectorProduct) { throw "the kept collector is orphaned without an Apps & Features entry" }
+          # Now the collector, explicitly, with its data.
+          Run-Setup $setup "/quiet /uninstall EIDOS_REMOVE_COLLECTOR=1 EIDOS_COLLECTOR_REMOVE_DATA=1" "$env:RUNNER_TEMP\unified-uninstall-collector-purge.log"
+          if (Get-Service eidos-collector -ErrorAction SilentlyContinue) { throw "the collector service is still registered" }
+          if (Test-Path 'C:\ProgramData\eidos-collector') { throw "collector data directory left behind after purge" }
+          if (Test-Path 'C:\Program Files\eidos-collector') { throw "collector program directory left behind" }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
         with:
           name: eidos-setup-unsigned
           path: |
@@ -159,3 +305,4 @@ jobs:
             installer/out/eidos.msi
             installer/out/eidos-collector-setup.exe
             installer/out/eidos-collector.msi
+            ${{ runner.temp }}/*.log
