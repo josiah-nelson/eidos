@@ -14,7 +14,15 @@ The always-on lane records:
 - collector start, clean or unclean prior shutdown, heartbeat, sleep/wake,
   clock discontinuity, and process resource buckets;
 - an opaque, versioned FSEvents cursor plus coalescing, kernel/user drop,
-  overflow, root-change, mount, and unmount counters;
+  overflow, root-change, mount, and unmount counters. The cursor is the
+  highest event id the stream *processed*, never the event store's current
+  id: the store's counter includes events coalescing has not handed over
+  yet, so resuming from it would step past them. Replaying a change already
+  seen is idempotent; skipping one is loss. The stored position carries the
+  semantics it was written with, and a position a collector cannot resume
+  from — an older format, or a newer one it does not understand — is
+  discarded rather than trusted, recording a `cursor_unusable` capture gap
+  and restarting the feed at the present;
 - capture gaps with monotonic and UTC anchors; and
 - coarse workload counts.
 

@@ -124,13 +124,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     )
     .to_hex()
     .to_string();
+    let stored_cursor = load_cursor(&config.data_dir.join("fsevents.cursor"));
     let shared = Arc::new(Shared {
         key: Mutex::new(None),
         spool: Mutex::new(spool),
         capabilities: Mutex::new(capabilities),
         drops: Mutex::new(DropCounters::default()),
         gaps: Mutex::new(Vec::new()),
-        cursor: Mutex::new(load_cursor(&config.data_dir.join("fsevents.cursor"))),
+        cursor: Mutex::new(match &stored_cursor {
+            StoredCursor::Resumable(cursor) => Some(cursor.clone()),
+            StoredCursor::Absent | StoredCursor::Unusable => None,
+        }),
         endpoint_counts: endpoint_lane.counters.clone(),
         logical_changes: AtomicU64::new(0),
         started: Instant::now(),
@@ -138,6 +142,25 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         build_hash,
         config_hash,
     });
+    // An upgrade from a collector that stored the event store's counter is a
+    // one-time discontinuity: the recorded position can sit ahead of the
+    // events that were delivered, so it is dropped and the stream restarts at
+    // the present. Saying so is the point — the alternative is trusting the
+    // position and skipping those changes without a trace.
+    if stored_cursor == StoredCursor::Unusable {
+        tracing::warn!(
+            "the stored FSEvents position was written with cursor semantics this \
+             collector cannot resume from; restarting the feed at the present and \
+             recording a capture gap"
+        );
+        let now = time_anchor();
+        shared.gaps.lock().expect("gaps lock").push(CaptureGap {
+            started_monotonic_ns: now.monotonic_ns,
+            ended_monotonic_ns: now.monotonic_ns,
+            cause: GapCause::CursorUnusable,
+            estimated_events: None,
+        });
+    }
     append_health(&shared, LifecycleEvent::Started, Some(clean_prior_shutdown))?;
     tracing::info!(
         endpoint_security = ?endpoint_state,
@@ -399,7 +422,7 @@ async fn run_fsevents(
                     let id = next_id.expect("a cursor that advanced has an event id");
                     let cursor = FeedCursor {
                         feed: FeedKind::Fsevents,
-                        version: 1,
+                        version: CURSOR_VERSION,
                         opaque: format!("{id:016x}"),
                     };
                     save_cursor(&cursor_file, id)?;
@@ -804,13 +827,56 @@ fn utc_ns() -> i64 {
         .unwrap_or_default()
 }
 
-fn load_cursor(file: &Path) -> Option<FeedCursor> {
-    let value = fs::read_to_string(file).ok()?.trim().parse::<u64>().ok()?;
-    Some(FeedCursor {
-        feed: FeedKind::Fsevents,
-        version: 1,
-        opaque: format!("{value:016x}"),
-    })
+/// Cursor semantics, stamped into the file and into [`FeedCursor::version`].
+///
+/// Version 1 stored the event *store's* current id, which sits ahead of the
+/// events the stream was handed. Version 2 stores the highest id this stream
+/// processed. The two are not interchangeable, and nothing in a bare id says
+/// which one it is, so the version is written alongside it.
+const CURSOR_VERSION: u16 = 2;
+
+/// What a cursor file left by a previous run is worth.
+#[derive(Debug, PartialEq, Eq)]
+enum StoredCursor {
+    /// No file, or one that says nothing usable.
+    Absent,
+    /// A position written with the current semantics.
+    Resumable(FeedCursor),
+    /// A version-1 position. It may sit ahead of the events that were
+    /// actually delivered, so resuming from it would skip them *silently* —
+    /// exactly the loss this format version exists to end. It is discarded
+    /// and the discontinuity is reported as a capture gap instead.
+    Unusable,
+}
+
+fn load_cursor(file: &Path) -> StoredCursor {
+    let Ok(text) = fs::read_to_string(file) else {
+        return StoredCursor::Absent;
+    };
+    let text = text.trim();
+    let (version, id) = match text.split_once(' ') {
+        // `<version> <id>`, written by this collector.
+        Some((version, id)) => match (version.parse::<u16>(), id.trim().parse::<u64>()) {
+            (Ok(version), Ok(id)) => (version, id),
+            _ => return StoredCursor::Absent,
+        },
+        // A bare id is the version-1 format.
+        None => match text.parse::<u64>() {
+            Ok(id) => (1, id),
+            Err(_) => return StoredCursor::Absent,
+        },
+    };
+    match (version, cursor_id(id)) {
+        (CURSOR_VERSION, Some(id)) => StoredCursor::Resumable(FeedCursor {
+            feed: FeedKind::Fsevents,
+            version: CURSOR_VERSION,
+            opaque: format!("{id:016x}"),
+        }),
+        // A future version this build does not understand is no more
+        // resumable than an obsolete one, and is reported the same way.
+        (_, Some(_)) => StoredCursor::Unusable,
+        (_, None) => StoredCursor::Absent,
+    }
 }
 
 /// An event id worth remembering as a cursor position. Real ids start at 1;
@@ -832,7 +898,7 @@ fn max_cursor(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
 
 fn save_cursor(file: &Path, value: u64) -> anyhow::Result<()> {
     let temporary = file.with_extension("cursor.tmp");
-    fs::write(&temporary, format!("{value}\n"))?;
+    fs::write(&temporary, format!("{CURSOR_VERSION} {value}\n"))?;
     fs::rename(temporary, file)?;
     Ok(())
 }
@@ -841,6 +907,7 @@ fn save_cursor(file: &Path, value: u64) -> anyhow::Result<()> {
 mod tests {
     use super::{
         cursor_id, increment, load_cursor, max_cursor, native_metadata, save_cursor, LogicalState,
+        StoredCursor, CURSOR_VERSION,
     };
     use eidos_observe::StudyKey;
     use fsevent_stream::ffi::kFSEventStreamEventIdSinceNow;
@@ -896,12 +963,47 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let file = temporary.path().join("fsevents.cursor");
         save_cursor(&file, 0x0000_0000_dead_beef).unwrap();
-        let reloaded = load_cursor(&file).expect("a saved cursor reloads");
+        let StoredCursor::Resumable(reloaded) = load_cursor(&file) else {
+            panic!("a cursor this collector wrote is resumable");
+        };
+        assert_eq!(reloaded.version, CURSOR_VERSION);
         assert_eq!(
             u64::from_str_radix(&reloaded.opaque, 16).unwrap(),
             0x0000_0000_dead_beef,
             "run_fsevents resumes by parsing `opaque` back out as hex"
         );
+    }
+
+    #[test]
+    fn a_cursor_from_the_store_counter_era_is_not_resumed_from() {
+        // Version 1 wrote a bare id taken from FSEventsGetCurrentEventId(),
+        // which can sit ahead of the events the stream was handed. Trusting
+        // it on upgrade would skip exactly the changes this format version
+        // exists to preserve, and would do it silently.
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("fsevents.cursor");
+
+        std::fs::write(&file, "123456\n").unwrap();
+        assert_eq!(load_cursor(&file), StoredCursor::Unusable);
+
+        // A version this build does not know is no more resumable.
+        std::fs::write(&file, format!("{} 123456\n", CURSOR_VERSION + 1)).unwrap();
+        assert_eq!(load_cursor(&file), StoredCursor::Unusable);
+
+        // Nothing to resume from is not a discontinuity worth reporting: a
+        // first run and an unreadable file both simply start at the present.
+        assert_eq!(
+            load_cursor(&temporary.path().join("absent.cursor")),
+            StoredCursor::Absent
+        );
+        std::fs::write(&file, "not a cursor\n").unwrap();
+        assert_eq!(load_cursor(&file), StoredCursor::Absent);
+        std::fs::write(&file, format!("{CURSOR_VERSION} 0\n")).unwrap();
+        assert_eq!(load_cursor(&file), StoredCursor::Absent);
+
+        // And one written by this collector survives the upgrade check.
+        save_cursor(&file, 77).unwrap();
+        assert!(matches!(load_cursor(&file), StoredCursor::Resumable(_)));
     }
 
     #[test]

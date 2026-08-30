@@ -113,6 +113,13 @@ pub enum GapCause {
     JournalRecreated,
     /// The native feed could not be opened (rights, offline volume).
     FeedUnavailable,
+    /// A stored feed position could not be resumed from, so the feed
+    /// restarted at the present instead. Unlike [`GapCause::FeedOverflow`]
+    /// nothing was dropped by the feed: the recorded position itself is not
+    /// trustworthy — written with semantics a later collector cannot honour,
+    /// or otherwise unreadable — and resuming from it would skip changes
+    /// silently rather than report them here.
+    CursorUnusable,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
