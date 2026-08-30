@@ -36,6 +36,10 @@ eidos fleet central --listen 0.0.0.0:7710     # accept sync sessions on port 771
 eidos fleet invite                             # prints a single-use invitation
 ```
 
+The same setup is available in the web UI: the Fleet page's "This node"
+card turns on the central role and binds the listener, and "Invite a node"
+mints the single-use code.
+
 The sync listener is a dedicated TLS endpoint; keep the separate web API on
 loopback. Open port 7710 on the private network the nodes share (the
 installer does not open it). The invitation embeds the central's certificate
@@ -51,6 +55,11 @@ On each node, with the service running:
 eidos fleet enroll eidos-fleet-v1:...          # paste the invitation
 eidos fleet status                             # sessions, cursors, backlog
 ```
+
+Or in the web UI: paste the code into the Fleet page's "Enroll with a
+central" card. The same page carries the roster (per-peer endpoint, sync
+on/off, forget), live sessions with per-source cursors, and each local
+source's ledger state — everything `eidos fleet status` prints.
 
 Enrollment connects to the central pinned to the fingerprint in the code,
 redeems the invitation, and records the central in the node's roster. The

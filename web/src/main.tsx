@@ -8,6 +8,7 @@ import SourceDetailPage from './pages/SourceDetailPage'
 import BrowsePage from './pages/BrowsePage'
 import SearchPage from './pages/SearchPage'
 import ActivityPage from './pages/ActivityPage'
+import FleetPage from './pages/FleetPage'
 import './styles.css'
 
 const queryClient = new QueryClient({
@@ -28,6 +29,7 @@ const router = createBrowserRouter([
       { index: true, element: <Navigate to="/search" replace /> },
       { path: 'search', element: <SearchPage /> },
       { path: 'activity', element: <ActivityPage /> },
+      { path: 'fleet', element: <FleetPage /> },
       { path: 'sources', element: <SourcesPage /> },
       { path: 'sources/:id', element: <SourceDetailPage /> },
       { path: 'browse/:objectId', element: <BrowsePage /> },
