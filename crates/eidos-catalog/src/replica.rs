@@ -36,7 +36,7 @@ use eidos_sync::identity::{
     AdmissionState, BatchDecision, ChainHash, HelloDecision, SourceEpoch, CHAIN_GENESIS,
 };
 use eidos_sync::merkle::{
-    leaf_index, MerkleLeafHasher, RecordDigest, MAX_FLEET_LEAF_BITS, MIN_FLEET_LEAF_BITS,
+    leaf_index, MerkleLeafHasher, RecordDigest, MAX_FLEET_LEAF_BITS, MIN_REPAIR_LEAF_BITS,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -1920,7 +1920,7 @@ impl Catalog {
                     ),
                 });
             }
-            if !(MIN_FLEET_LEAF_BITS..=MAX_FLEET_LEAF_BITS).contains(&leaf_bits)
+            if !(MIN_REPAIR_LEAF_BITS..=MAX_FLEET_LEAF_BITS).contains(&leaf_bits)
                 || leaf_hashes.len() != 1usize << leaf_bits
             {
                 return Ok(RepairOfferOutcome::Rejected {
@@ -2096,7 +2096,7 @@ impl Catalog {
         let unique = rows.iter().map(|r| r.object).collect::<BTreeSet<_>>().len() == rows.len();
         let unique_leaves = leaves.iter().copied().collect::<BTreeSet<_>>().len() == leaves.len();
         let entry_count = wire_entry_count(rows);
-        if !(MIN_FLEET_LEAF_BITS..=MAX_FLEET_LEAF_BITS).contains(&leaf_bits)
+        if !(MIN_REPAIR_LEAF_BITS..=MAX_FLEET_LEAF_BITS).contains(&leaf_bits)
             || through_seq > MAX_SQLITE_SEQUENCE
             || rows.len() > MAX_APPLY_ROWS
             || entry_count.is_none_or(|count| count > MAX_APPLY_ENTRIES)

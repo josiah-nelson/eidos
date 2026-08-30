@@ -60,7 +60,7 @@ const FENCE_RETRY: Duration = Duration::from_secs(60);
 /// A repair offer for a source with fewer objects than this uses a compact
 /// tree; larger sources use the fleet minimum.
 const SMALL_SOURCE_ROWS: u64 = 1 << 16;
-const MIN_LEAF_BITS: u8 = 10;
+const MIN_LEAF_BITS: u8 = eidos_sync::merkle::MIN_REPAIR_LEAF_BITS;
 const MIN_REPAIR_ROW_ESTIMATE: usize = 256;
 const MAX_REPAIR_OBJECTS: usize = 100_000;
 
