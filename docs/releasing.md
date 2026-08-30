@@ -12,9 +12,14 @@ release for that tag:
   collector-only setup for administrators and fleet installs.
 - `.sha256` checksums for every asset.
 
-The workflow builds the web UI, the Rust executable (with the UI embedded),
-the setup UI, both MSIs and both bundles, and signs every executable piece with
-Azure Artifact Signing in the order the Windows Installer and Burn require:
+The workflow runs two jobs in parallel - the full test gate (format, lint,
+the generated API contract, every Rust test on Windows via cargo-nextest,
+and the web lint/tests/build) and the signed build - and a third publishes
+only when both are green, so a red suite wastes some signing work but
+publishes nothing. The build job builds the web UI, the Rust executable
+(with the UI embedded), the setup UI, both MSIs and both bundles, and signs
+every executable piece with Azure Artifact Signing in the order the Windows
+Installer and Burn require:
 
 1. `eidos.exe` and `eidos-setup-ui.exe` (before they are bound into the MSI
    and bundle);
@@ -58,9 +63,8 @@ tags; there is no separate rehearsal to pass first.
    created with. Without it the release gets generated notes.
 3. `scripts\check.ps1` passes on the release commit.
 4. Push the tag from that commit. The workflow refuses a tag that does not
-   match `Cargo.toml`, then runs format, lint, the generated API contract
-   check, every Rust test on Windows and the web lint/tests/build, and only
-   then builds, signs, verifies and publishes.
+   match `Cargo.toml`, runs the full gate and the signed build in parallel,
+   and publishes only when both are green.
 
 `installer.yml` (lifecycle rehearsal on an unsigned build) and
 `sync-soak.yml` stay on demand for changes that touch what they cover.

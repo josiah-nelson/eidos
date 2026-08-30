@@ -3,15 +3,19 @@ name: release
 # A pushed `v*` tag is the release. The tag is the canonical version: it must
 # match the workspace version in Cargo.toml (so the executable reports it),
 # it is stamped into web/package.json, and it names the installers and the
-# GitHub release. The whole test suite runs here first; any failure stops the
-# build before anything is signed.
+# GitHub release.
+#
+# `test` (the full gate) and `build` (compile, package, sign, verify) run in
+# parallel; `publish` waits for both, so nothing reaches the release page
+# unless the whole suite passed on the tagged tree. A red suite wastes some
+# signing work but publishes nothing.
 on:
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -26,7 +30,69 @@ env:
   SIGN_TIMESTAMP: http://timestamp.acs.microsoft.com
 
 jobs:
-  windows:
+  # The same gate as scripts/check.ps1: format, lint, the generated API
+  # contract, every Rust test on Windows, and the web lint/tests/build.
+  test:
+    name: full gate (windows)
+    runs-on: windows-2025
+    steps:
+      - name: Check out the revision being released
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # ci.yml's Windows lint lane and nightly.yml keep this cache warm
+          # on every push/night; a release only reads it.
+          shared-key: windows-dev
+          save-if: false
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        with:
+          tool: cargo-nextest
+
+      - name: Format and lint
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Generated API contract is current
+        shell: pwsh
+        run: |
+          cargo test --locked -p eidos-service export_api_contract --lib
+          if ($LASTEXITCODE -ne 0) { throw "contract export failed ($LASTEXITCODE)" }
+          git diff --exit-code -- web/src/generated/api.ts
+          if ($LASTEXITCODE -ne 0) { throw 'web/src/generated/api.ts is stale; regenerate and commit it' }
+
+      - name: Run the Windows test suite
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+        run: |
+          cargo nextest run --locked
+          cargo test --doc --locked
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Web lint, tests and build
+        working-directory: web
+        run: |
+          npm ci
+          npm run lint
+          npm test
+          npm run build
+
+  build:
     name: signed Windows x86-64 installer
     runs-on: windows-2025
     environment: release
@@ -69,9 +135,7 @@ jobs:
           }
 
       - name: Check out the revision being released
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Take the version from the tag
         id: release_version
@@ -98,59 +162,23 @@ jobs:
           "Releasing $version"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-        with:
-          components: rustfmt, clippy
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Release-profile artifacts; only this job builds them.
+          shared-key: windows-release
 
       - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: Stamp the release version into the web UI
-        shell: pwsh
-        working-directory: web
-        env:
-          EIDOS_RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
-        run: npm version $env:EIDOS_RELEASE_VERSION --no-git-tag-version --allow-same-version
-
-      # The full gate, in the same order as scripts/check.ps1: format, lint,
-      # the generated API contract, every Rust test on Windows, and the web
-      # lint/tests/build. Nothing is built for release or signed until all of
-      # it has passed.
-      - name: Format and lint
-        run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Generated API contract is current
-        shell: pwsh
-        run: |
-          cargo test --locked -p eidos-service export_api_contract --lib
-          if ($LASTEXITCODE -ne 0) { throw "contract export failed ($LASTEXITCODE)" }
-          git diff --exit-code -- web/src/generated/api.ts
-          if ($LASTEXITCODE -ne 0) { throw 'web/src/generated/api.ts is stale; regenerate and commit it' }
-
-      - name: Run the Windows test suite
-        env:
-          CARGO_PROFILE_DEV_DEBUG: 0
-        run: cargo test --locked
-
-      - name: Web lint, tests and build
-        working-directory: web
-        run: |
-          npm ci
-          npm run lint
-          npm test
-          npm run build
-
       - name: Install .NET SDK
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 8.0.x
 
@@ -160,6 +188,19 @@ jobs:
           dotnet tool install --global wix --version 7.0.0
           wix eula accept wix7
           wix --version
+
+      - name: Stamp the release version into the web UI
+        shell: pwsh
+        working-directory: web
+        env:
+          EIDOS_RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        run: npm version $env:EIDOS_RELEASE_VERSION --no-git-tag-version --allow-same-version
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
 
       - name: Build Windows executable
         # The web UI is embedded in the executable; refuse to build without it.
@@ -325,7 +366,6 @@ jobs:
           exclude-interactive-browser-credential: true
 
       - name: Verify every signature and timestamp
-        id: verify
         shell: pwsh
         env:
           SETUP: ${{ steps.names.outputs.setup }}
@@ -363,47 +403,67 @@ jobs:
             }
           }
 
-      - name: Publish the release
-        shell: pwsh
+      - name: Upload the signed assets for publishing
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-assets
+          if-no-files-found: error
+          path: |
+            ${{ steps.names.outputs.setup }}
+            ${{ steps.names.outputs.setup }}.sha256
+            ${{ steps.names.outputs.msi }}
+            ${{ steps.names.outputs.msi }}.sha256
+            ${{ steps.names.outputs.collector_setup }}
+            ${{ steps.names.outputs.collector_setup }}.sha256
+            ${{ steps.names.outputs.collector_msi }}
+            ${{ steps.names.outputs.collector_msi }}.sha256
+
+  # Publishes only when the gate and the signed build both passed.
+  publish:
+    name: publish the release
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # For docs/releases/<tag>.md, the release notes.
+      - name: Check out the revision being released
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the signed assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed-assets
+          path: assets
+
+      - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-          SETUP: ${{ steps.names.outputs.setup }}
-          MSI: ${{ steps.names.outputs.msi }}
-          COLLECTOR_SETUP: ${{ steps.names.outputs.collector_setup }}
-          COLLECTOR_MSI: ${{ steps.names.outputs.collector_msi }}
         run: |
-          $assets = @(
-            $env:SETUP, "$env:SETUP.sha256", $env:MSI, "$env:MSI.sha256",
-            $env:COLLECTOR_SETUP, "$env:COLLECTOR_SETUP.sha256",
-            $env:COLLECTOR_MSI, "$env:COLLECTOR_MSI.sha256"
-          )
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(assets/*)
+          if [ "${#assets[@]}" -ne 8 ]; then
+            echo "expected 8 assets, found ${#assets[@]}:"; printf '%s\n' "${assets[@]}"
+            exit 1
+          fi
 
-          # gh exits non-zero when the tag has no release yet; that is the
-          # ordinary path for a plain `git push origin v1.2.3`.
-          $ErrorActionPreference = 'Continue'
-          gh release view $env:RELEASE_TAG > $null 2>&1
-          $exists = $LASTEXITCODE -eq 0
-          $ErrorActionPreference = 'Stop'
-
-          # The release notes are docs/releases/<tag>.md when it exists;
-          # otherwise GitHub generates them from the merged pull requests.
-          $notes = "docs/releases/$env:RELEASE_TAG.md"
-
-          $arguments = @($env:RELEASE_TAG)
-          if ($exists) {
-            $arguments += '--clobber'
-          } else {
-            $arguments += @('--title', $env:RELEASE_TAG)
-            if (Test-Path -LiteralPath $notes) {
-              $arguments += @('--notes-file', $notes)
-            } else {
-              $arguments += '--generate-notes'
-            }
-            # A tag carrying a pre-release suffix (v1.2.0-rc.1) publishes as a
-            # pre-release so it is not offered as the latest download.
-            if ($env:RELEASE_TAG -match '-') { $arguments += '--prerelease' }
-          }
-          $arguments += $assets
-
-          gh release $(if ($exists) { 'upload' } else { 'create' }) @arguments
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --clobber "${assets[@]}"
+          else
+            args=(--title "$RELEASE_TAG")
+            # The release notes are docs/releases/<tag>.md when it exists;
+            # otherwise GitHub generates them from the merged pull requests.
+            notes="docs/releases/$RELEASE_TAG.md"
+            if [ -f "$notes" ]; then
+              args+=(--notes-file "$notes")
+            else
+              args+=(--generate-notes)
+            fi
+            # A tag carrying a pre-release suffix (v1.2.0-rc.1) publishes as
+            # a pre-release so it is not offered as the latest download.
+            case "$RELEASE_TAG" in *-*) args+=(--prerelease);; esac
+            gh release create "$RELEASE_TAG" "${args[@]}" "${assets[@]}"
+          fi

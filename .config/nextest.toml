@@ -1,0 +1,10 @@
+# The collector daemon tests serve the machine-wide named pipe, so only one
+# may run at a time. Under `cargo test` the in-process PIPE_LOCK serializes
+# them; nextest runs every test in its own process, where that mutex cannot
+# reach, so the serialization lives here instead.
+[test-groups.collector-pipe]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(eidos-windows-collector) & test(/^daemon::tests::/)'
+test-group = 'collector-pipe'
