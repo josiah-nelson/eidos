@@ -738,6 +738,16 @@ impl Parser {
                 } else {
                     (v, 1, None)
                 };
+                // The renderer emits the extension bare (`has:ext`), so it must
+                // be a plain word: a `/`, quote, bracket, or space would be
+                // re-tokenized as something else on the way back in.
+                if ext.is_empty()
+                    || !ext
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '~'))
+                {
+                    return Err(err("invalid extension"));
+                }
                 Query::DescendantExtension {
                     extension: ext.to_ascii_lowercase(),
                     min_count: min,
@@ -1310,5 +1320,33 @@ mod tests {
             q("foo:bar"),
             Query::text(TextField::Name, TextMode::Ranked, "foo:bar")
         );
+    }
+}
+
+#[cfg(test)]
+mod descendant_extension_round_trip {
+    use super::parse_at;
+    use crate::render;
+    use eidos_domain::UnixNanos;
+
+    const NOW: UnixNanos = UnixNanos(1_787_000_000_000_000_000);
+
+    /// Found by the query_parser fuzz target: `has:` accepted any bytes as
+    /// the extension and rendered them bare, so an extension starting with
+    /// `/` came back as a regex and the round trip failed to parse.
+    #[test]
+    fn an_extension_that_cannot_render_bare_is_rejected() {
+        assert!(parse_at("has:/^1/-)6$0.*$/", NOW).is_err());
+        assert!(parse_at("has:\"a b\"", NOW).is_err());
+        assert!(parse_at("has:", NOW).is_err());
+        for input in ["has:cs", "has:.tar.gz>=2", "has:c++:1..3", "has:résumé"] {
+            let parsed = parse_at(input, NOW).unwrap();
+            let rendered = render(&parsed.query);
+            assert_eq!(
+                parse_at(&rendered, NOW).unwrap().query,
+                parsed.query,
+                "{input} -> {rendered}"
+            );
+        }
     }
 }
