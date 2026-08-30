@@ -285,7 +285,11 @@ fn source_coverage(
             | SourceState::Complete
             | SourceState::Reconciling
     );
-    if !c.metadata_complete && state_claims_complete {
+    // A remote source in Reconciling is truthfully reporting that its fleet
+    // snapshot or aggregate publication is incomplete. That is not a search
+    // index failure; the catalog has deliberately withheld publication.
+    let replica_is_reconciling = c.state == SourceState::Reconciling && c.content_not_replicated;
+    if !c.metadata_complete && state_claims_complete && !replica_is_reconciling {
         degraded.push(CoverageReason {
             kind: CoverageKind::NotIndexed,
             severity: CoverageSeverity::Warning,
@@ -504,5 +508,19 @@ mod tests {
             Some(UnixNanos::new(1_000)),
             "a live feed does not make mid-reconciliation results authoritative now"
         );
+    }
+
+    #[test]
+    fn a_reconciling_replica_is_not_misreported_as_an_index_failure() {
+        let mut c = complete("remote");
+        c.state = SourceState::Reconciling;
+        c.metadata_complete = false;
+        c.content_not_replicated = true;
+        c.note = Some("fleet snapshot is still arriving".into());
+        let env =
+            CoverageEnvelope::derive(&[c], &ResponseSignals::default(), UnixNanos::new(5_000));
+        let reasons = &env.sources[0].degraded;
+        assert!(reasons.iter().any(|r| r.kind == CoverageKind::Reconciling));
+        assert!(!reasons.iter().any(|r| r.kind == CoverageKind::NotIndexed));
     }
 }

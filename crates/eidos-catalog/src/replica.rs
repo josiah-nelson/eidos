@@ -1193,6 +1193,20 @@ fn mark_completeness_conn(
     Ok(())
 }
 
+fn mark_aggregates_pending_conn(tx: &Transaction<'_>, source: SourceId, now: i64) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE sources SET published_generation = NULL, state = ?2, state_reason = ?3,
+             updated_at = ?4 WHERE source_id = ?1",
+    )?
+    .execute(params![
+        source.0,
+        SourceState::Reconciling.as_str(),
+        "fleet metadata is applied; directory totals are rebuilding",
+        now
+    ])?;
+    Ok(())
+}
+
 fn replica_digests_conn(conn: &Connection, source: SourceId) -> Result<Vec<RecordDigest>> {
     conn.prepare_cached(
         "SELECT remote_object_id, generation, deleted, image_hash FROM sync_replica_rows
@@ -1618,7 +1632,9 @@ impl Catalog {
             && after_chain == CHAIN_GENESIS
             && through_chain == CHAIN_GENESIS
             && rows.is_empty();
+        let covers_through = empty_snapshot || rows.iter().any(|row| row.seq == through_seq);
         if (after_seq >= through_seq && !empty_snapshot)
+            || !covers_through
             || !unique
             || after_seq > MAX_SQLITE_SEQUENCE
             || through_seq > MAX_SQLITE_SEQUENCE
@@ -1806,7 +1822,13 @@ impl Catalog {
                 && state.applied_image_revision >= state.reported_image_revision
                 && !repair_pending_conn(&tx, source)?
                 && replica_topology_is_closed_conn(&tx, source, &sync_epoch)?;
-            mark_applied_conn(&tx, source, now, image_complete)?;
+            // The durable image is not publishable until its directory
+            // aggregates have been rebuilt and a subtree projection event
+            // has been staged by `replica_rebuild_aggregates`.
+            mark_applied_conn(&tx, source, now, false)?;
+            if image_complete {
+                mark_aggregates_pending_conn(&tx, source, now)?;
+            }
             tx.commit()?;
             Ok(BatchOutcome::Applied {
                 through_seq,
@@ -2420,7 +2442,10 @@ impl Catalog {
                 && state.admission.applied_seq >= state.reported_head
                 && image_revision >= state.reported_image_revision
                 && replica_topology_is_closed_conn(&tx, source, &sync_epoch)?;
-            mark_applied_conn(&tx, source, now, image_complete)?;
+            mark_applied_conn(&tx, source, now, false)?;
+            if image_complete {
+                mark_aggregates_pending_conn(&tx, source, now)?;
+            }
             tx.commit()?;
             Ok(RepairOutcome::Applied {
                 through_seq,
@@ -2440,6 +2465,12 @@ impl Catalog {
     pub fn replica_rebuild_aggregates(&self, source: SourceId) -> Result<()> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let state = state_conn(&tx, source)?.ok_or_else(|| {
+                CatalogError::InvalidState(format!("source {source} is not a replica"))
+            })?;
+            if source_is_retired_conn(&tx, source)? {
+                return Ok(());
+            }
             let root: Option<i64> = tx
                 .query_row(
                     "SELECT root_object_id FROM sources WHERE source_id = ?1",
@@ -2456,7 +2487,18 @@ impl Catalog {
                     REMOTE_GENERATION,
                     &Default::default(),
                 )?;
+                // Earlier row events may already have reached the follower
+                // with stale or absent directory totals. Re-project the
+                // complete tree after aggregate rows are durable.
+                outbox_append_conn(&tx, source, ObjectId(root), "subtree", REMOTE_GENERATION)?;
             }
+            let epoch = SyncEpoch::from_source_epoch(state.admission.epoch);
+            let image_complete = state.resync_target.is_none()
+                && state.admission.applied_seq >= state.reported_head
+                && state.applied_image_revision >= state.reported_image_revision
+                && !repair_pending_conn(&tx, source)?
+                && replica_topology_is_closed_conn(&tx, source, &epoch)?;
+            mark_completeness_conn(&tx, source, UnixNanos::now().0, image_complete)?;
             tx.commit()?;
             Ok(())
         })
@@ -2490,8 +2532,12 @@ impl Catalog {
                 store_admission_conn(&tx, source, &state.admission, None)?;
                 let image_complete = state.admission.applied_seq >= state.reported_head
                     && state.applied_image_revision >= state.reported_image_revision
-                    && !repair_pending_conn(&tx, source)?;
-                mark_applied_conn(&tx, source, now, image_complete)?;
+                    && !repair_pending_conn(&tx, source)?
+                    && replica_topology_is_closed_conn(&tx, source, &epoch)?;
+                mark_applied_conn(&tx, source, now, false)?;
+                if image_complete {
+                    mark_aggregates_pending_conn(&tx, source, now)?;
+                }
             }
             tx.commit()?;
             Ok(retired)

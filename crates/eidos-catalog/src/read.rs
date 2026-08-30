@@ -707,7 +707,7 @@ pub fn completeness_from(
     let mut note = src.state_reason.clone();
     if src.state == SourceState::Enumerating {
         note = Some("initial enumeration in progress; results are partial".into());
-    } else if src.state == SourceState::Reconciling {
+    } else if src.state == SourceState::Reconciling && note.is_none() {
         note = Some(
             "rescan in progress; showing last published generation plus new observations".into(),
         );

@@ -339,6 +339,7 @@ fn converge(node: &Node, central: &Central, limit: u32) -> u64 {
             other => panic!("unexpected hello outcome {other:?}"),
         };
         if after >= state.head_seq {
+            central.catalog.replica_rebuild_aggregates(source).unwrap();
             return applied;
         }
         let batch = node
@@ -475,6 +476,152 @@ fn a_bounded_stream_reproduces_the_source_image_with_children_before_parents() {
         .unwrap();
     let agg = central.catalog.directory_aggregate(root).unwrap().unwrap();
     assert_eq!(agg.file_count, 3);
+}
+
+#[test]
+fn an_advancing_batch_must_carry_the_row_at_its_through_cursor() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, u32::MAX);
+    let source = central.source_for(&node);
+    node.touch("a/one.txt", 101, 1_800_000_000);
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    let after = central
+        .catalog
+        .replica_source(source)
+        .unwrap()
+        .unwrap()
+        .admission
+        .applied_seq;
+    let batch = node
+        .catalog
+        .sync_rows_after(node.source, after, u32::MAX)
+        .unwrap();
+    assert_eq!(batch.through_seq, state.head_seq);
+    assert!(batch.rows.iter().any(|row| row.seq == batch.through_seq));
+
+    let mut empty = batch.clone();
+    empty.rows.clear();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(NODE, source, &empty)
+            .unwrap(),
+        BatchOutcome::Rejected { reason } if reason.contains("malformed batch interval")
+    ));
+
+    let mut omitted_tail = batch;
+    omitted_tail.through_seq += 1;
+    omitted_tail.head_seq = omitted_tail.through_seq;
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(NODE, source, &omitted_tail)
+            .unwrap(),
+        BatchOutcome::Rejected { reason } if reason.contains("malformed batch interval")
+    ));
+}
+
+#[test]
+fn aggregate_publication_is_staged_and_reprojects_the_complete_tree() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, u32::MAX);
+    let source = central.source_for(&node);
+    let root = central
+        .catalog
+        .get_source(source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let before_outbox = central
+        .catalog
+        .with_reader(|conn| {
+            Ok(
+                conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })?,
+            )
+        })
+        .unwrap();
+    let before_bytes = central
+        .catalog
+        .directory_aggregate(root)
+        .unwrap()
+        .unwrap()
+        .logical_bytes;
+
+    node.touch("a/one.txt", 101, 1_800_000_000);
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    let replica = central.catalog.replica_source(source).unwrap().unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                NODE,
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                state.compacted_through,
+                state.image_revision,
+            )
+            .unwrap(),
+        HelloOutcome::Resume { .. }
+    ));
+    let batch = node
+        .catalog
+        .sync_rows_after(node.source, replica.admission.applied_seq, u32::MAX)
+        .unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(NODE, source, &batch)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    let pending = central.catalog.source_completeness(source).unwrap();
+    assert!(!pending.metadata_complete);
+    assert_eq!(
+        pending.note.as_deref(),
+        Some("fleet metadata is applied; directory totals are rebuilding")
+    );
+    assert_eq!(
+        central
+            .catalog
+            .directory_aggregate(root)
+            .unwrap()
+            .unwrap()
+            .logical_bytes,
+        before_bytes,
+        "row application must not publish stale directory totals"
+    );
+
+    central.catalog.replica_rebuild_aggregates(source).unwrap();
+    assert!(
+        central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
+    assert_eq!(
+        central
+            .catalog
+            .directory_aggregate(root)
+            .unwrap()
+            .unwrap()
+            .logical_bytes,
+        before_bytes + 1
+    );
+    let after = central
+        .catalog
+        .outbox_poll(before_outbox, u32::MAX)
+        .unwrap();
+    assert!(after
+        .iter()
+        .any(|row| row.object_id == root && row.op == "subtree"));
 }
 
 #[test]
@@ -1371,6 +1518,14 @@ fn an_empty_new_epoch_is_a_complete_snapshot_that_retires_the_old_image() {
             .root_object_id,
         None
     );
+    central.catalog.replica_rebuild_aggregates(source).unwrap();
+    assert!(
+        central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
 }
 
 #[test]
@@ -1463,6 +1618,19 @@ fn retirement_targets_are_epoch_local_and_completeness_tracks_newer_heads() {
             .unwrap(),
         HelloOutcome::FullResync { .. }
     ));
+    let mut epoch_row = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|row| {
+            row.image
+                .as_ref()
+                .is_some_and(|image| image.entries.iter().any(|entry| entry.parent.is_none()))
+        })
+        .expect("source root row");
+    epoch_row.seq = 100;
     let empty = SyncBatch {
         source_id: node.source,
         epoch: SyncEpoch::from_source_epoch(epoch),
@@ -1471,7 +1639,7 @@ fn retirement_targets_are_epoch_local_and_completeness_tracks_newer_heads() {
         through_seq: 100,
         through_chain: epoch_chain,
         head_seq: 100,
-        rows: vec![],
+        rows: vec![epoch_row.clone()],
     };
     assert!(matches!(
         central
@@ -1530,6 +1698,7 @@ fn retirement_targets_are_epoch_local_and_completeness_tracks_newer_heads() {
         Some(10),
         "a new epoch must not inherit the previous epoch's higher target"
     );
+    epoch_row.seq = 10;
     let next_empty = SyncBatch {
         source_id: node.source,
         epoch: SyncEpoch::from_source_epoch(next_epoch),
@@ -1538,7 +1707,7 @@ fn retirement_targets_are_epoch_local_and_completeness_tracks_newer_heads() {
         through_seq: 10,
         through_chain: next_chain,
         head_seq: 10,
-        rows: vec![],
+        rows: vec![epoch_row],
     };
     assert!(matches!(
         central
@@ -2563,6 +2732,7 @@ fn repair_restarts_when_collection_changes_its_snapshot(tombstone_part_first: bo
     ));
     let replica = central.catalog.replica_source(source).unwrap().unwrap();
     assert_eq!(replica.applied_image_revision, after.image_revision);
+    central.catalog.replica_rebuild_aggregates(source).unwrap();
     assert!(
         central
             .catalog
@@ -3007,6 +3177,7 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
             .resync_target,
         None
     );
+    central.catalog.replica_rebuild_aggregates(source).unwrap();
     assert!(
         central
             .catalog
@@ -3690,6 +3861,7 @@ fn snapshot_fallback_preserves_rows_already_staged_by_repair() {
         BatchOutcome::Applied { .. }
     ));
     assert_eq!(central.image(source), node.image());
+    central.catalog.replica_rebuild_aggregates(source).unwrap();
     assert!(
         central
             .catalog
@@ -4437,6 +4609,162 @@ fn batch_and_repair_sizes_are_bounded_by_sqlite_storage() {
             .unwrap(),
         RepairOutcome::Applied { .. }
     ));
+}
+
+#[test]
+fn bounded_retirement_never_publishes_an_unresolved_current_topology() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, u32::MAX);
+    let source = central.source_for(&node);
+    let old_epoch = central
+        .catalog
+        .replica_source(source)
+        .unwrap()
+        .unwrap()
+        .admission
+        .epoch;
+    central
+        .catalog
+        .with_writer(|conn| {
+            let tx = conn.transaction()?;
+            for remote in 2_000_000..2_010_001 {
+                tx.execute(
+                    "INSERT INTO objects
+                        (source_id, kind, identity_confidence, first_seen_generation,
+                         last_seen_generation)
+                     VALUES (?1, 'file', 'path', 1, 1)",
+                    [source.0],
+                )?;
+                let local = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO sync_replica_rows
+                        (source_id, remote_object_id, local_object_id, epoch, seq,
+                         generation, deleted, image_hash, placeholder)
+                     VALUES (?1, ?2, ?3, ?4, 1, 1, 0, zeroblob(32), 0)",
+                    rusqlite::params![source.0, remote, local, old_epoch.as_bytes().as_slice()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Applying only this child in the new epoch converts its old-epoch root
+    // mapping into a current placeholder. Retirement is deliberately larger
+    // than one bounded step, so completion happens through the continuation.
+    let mut child = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|row| row.object == node.id("a"))
+        .expect("directory a row");
+    child.seq = 1;
+    let epoch = SourceEpoch::random_v4(707, 808);
+    let chain = [0x71; 32];
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(NODE, source, epoch, 1, chain, 0, 0)
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    let batch = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 1,
+        through_chain: chain,
+        head_seq: 1,
+        rows: vec![child],
+    };
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(NODE, source, &batch)
+            .unwrap(),
+        BatchOutcome::Applied { retired_rows, .. } if retired_rows > 0
+    ));
+    assert!(central
+        .catalog
+        .replica_source(source)
+        .unwrap()
+        .unwrap()
+        .resync_target
+        .is_some());
+    assert!(central.catalog.replica_continue_retirement(source).unwrap() > 0);
+    assert!(central
+        .catalog
+        .replica_source(source)
+        .unwrap()
+        .unwrap()
+        .resync_target
+        .is_none());
+    let pending = central.catalog.source_completeness(source).unwrap();
+    assert!(!pending.metadata_complete);
+    assert_eq!(
+        pending.note.as_deref(),
+        Some("fleet snapshot is still arriving")
+    );
+    central.catalog.replica_rebuild_aggregates(source).unwrap();
+    assert!(
+        !central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
+}
+
+#[test]
+fn aggregate_rebuild_rejects_multi_entry_totals_outside_sqlite_range() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, u32::MAX);
+    let source = central.source_for(&node);
+    let root = central
+        .catalog
+        .get_source(source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let one = central
+        .catalog
+        .resolve_relative(source, "a/one.txt")
+        .unwrap()
+        .unwrap();
+    let two = central
+        .catalog
+        .resolve_relative(source, "a/b/two.txt")
+        .unwrap()
+        .unwrap();
+    let before = central.catalog.directory_aggregate(root).unwrap().unwrap();
+    central
+        .catalog
+        .with_writer(|conn| {
+            conn.execute(
+                "UPDATE objects SET size = ?2, allocated = ?2
+                 WHERE object_id IN (?1, ?3)",
+                rusqlite::params![one.0, i64::MAX, two.0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let error = central
+        .catalog
+        .replica_rebuild_aggregates(source)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("logical byte aggregate"), "{error}");
+    assert_eq!(
+        central.catalog.directory_aggregate(root).unwrap().unwrap(),
+        before,
+        "the failed rebuild must roll back instead of storing a negative total"
+    );
 }
 
 #[test]
