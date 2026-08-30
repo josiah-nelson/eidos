@@ -225,7 +225,7 @@ impl Catalog {
                     ])?;
                 }
             }
-            if (batch + 1) % PRUNE_EVERY_BATCHES == 0 {
+            if (batch + 1).is_multiple_of(PRUNE_EVERY_BATCHES) {
                 prune_within(&tx, retention)?;
             }
             tx.commit()?;

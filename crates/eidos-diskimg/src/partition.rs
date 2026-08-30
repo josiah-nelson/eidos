@@ -181,7 +181,7 @@ fn read_gpt_at<R: Read + Seek>(
     let entry_count = u32_at(&header, 80);
     let entry_len = u32_at(&header, 84);
     let entry_crc = u32_at(&header, 88);
-    if !(128..=MAX_GPT_ENTRY_LEN).contains(&entry_len) || entry_len % 8 != 0 {
+    if !(128..=MAX_GPT_ENTRY_LEN).contains(&entry_len) || !entry_len.is_multiple_of(8) {
         return Err(DiskImageError::Corrupt(format!(
             "GPT partition entries are {entry_len} bytes"
         )));
@@ -344,7 +344,9 @@ fn read_gpt_at<R: Read + Seek>(
 
 fn utf16_name(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|&u| u != 0)
         .take(36)

@@ -12,7 +12,7 @@ with no change feed.
 
 | Tool | Version used | Install |
 |---|---|---|
-| Rust (stable, `x86_64-pc-windows-msvc`) | 1.98 (floor 1.85) | `rustup` (https://rustup.rs); components `clippy`, `rustfmt` |
+| Rust (stable, `x86_64-pc-windows-msvc`) | 1.98 (floor 1.88) | `rustup` (https://rustup.rs); components `clippy`, `rustfmt` |
 | MSVC Build Tools + Windows SDK | VS 2026 Build Tools, SDK 10.0.26100 | Visual Studio Installer, "Desktop development with C++" |
 | Node.js / npm | 24.x / 11.x | https://nodejs.org |
 

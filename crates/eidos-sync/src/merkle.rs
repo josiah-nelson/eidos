@@ -12,6 +12,10 @@ use thiserror::Error;
 
 pub const MIN_FLEET_LEAF_BITS: u8 = 17;
 pub const MAX_FLEET_LEAF_BITS: u8 = 20;
+/// Smallest tree a repair offer may use. A source with few objects gets a
+/// compact manifest (2^10 hashes, 32 KiB) instead of the fleet minimum's
+/// 4 MiB; both peers bound offers with this and the wire's frame ceiling.
+pub const MIN_REPAIR_LEAF_BITS: u8 = 10;
 
 /// Leaf an object hashes into in a tree of `1 << leaf_bits` leaves. A pure
 /// function of the object id, so peers agree without exchanging a tree.

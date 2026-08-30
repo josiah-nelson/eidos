@@ -136,7 +136,7 @@ fn the_written_tree_comes_back_intact() {
 
     let quillon = find(&members, "corpus/alcove/quillon.dat");
     assert_eq!(quillon.size, 100_000);
-    assert!(quillon.allocated >= quillon.size && quillon.allocated % 4096 == 0);
+    assert!(quillon.allocated >= quillon.size && quillon.allocated.is_multiple_of(4096));
     assert!(quillon.allocation_exact);
 
     for directory in ["corpus", "corpus/alcove", "corpus/zephyr", "hollow"] {

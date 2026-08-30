@@ -201,7 +201,9 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 /// UTF-16LE with a possible NUL terminator, decoded lossily and trimmed.
 fn utf16_string(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|&u| u != 0)
         .collect();
@@ -329,7 +331,7 @@ fn parse_region_table(
         // Regions are 1 MiB-aligned, 1 MiB-granular, and live past the
         // header area; anything else would let a crafted table point the
         // reader at the headers or outside the file.
-        if offset < MB || offset % MB != 0 || length == 0 || length % MB != 0 {
+        if offset < MB || !offset.is_multiple_of(MB) || length == 0 || !length.is_multiple_of(MB) {
             return Err(DiskImageError::Corrupt(format!(
                 "region entry {i} is {length} bytes at {offset}, not 1 MiB-aligned past the headers"
             )));
@@ -588,7 +590,7 @@ fn parse_parent_locator(
         let value_offset = u32_at(item, at + 4) as usize;
         let key_len = u16_at(item, at + 8) as usize;
         let value_len = u16_at(item, at + 10) as usize;
-        if key_len % 2 != 0 || value_len % 2 != 0 {
+        if !key_len.is_multiple_of(2) || !value_len.is_multiple_of(2) {
             return Err(DiskImageError::Corrupt(
                 "parent locator strings are not UTF-16-aligned".into(),
             ));
@@ -626,7 +628,9 @@ fn parse_parent_locator(
         }
         let decode = |bytes: &[u8]| -> Result<String, DiskImageError> {
             let units = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect::<Vec<_>>();
             let value = String::from_utf16(&units).map_err(|_| {
