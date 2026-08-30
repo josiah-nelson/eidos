@@ -76,6 +76,10 @@ namespace Eidos.Setup
         private bool startMenu = true;
         private bool launchAfter = true;
         private bool removeData;
+        private bool installCollector;
+        private bool collectorInstalled;
+        private bool removeCollector = true;
+        private bool removeCollectorData;
         private bool repair = true;
         private string validation;
         private int progress;
@@ -97,6 +101,7 @@ namespace Eidos.Setup
 
             ba.DetectBegin += this.OnDetectBegin;
             ba.DetectRelatedBundle += this.OnDetectRelatedBundle;
+            ba.DetectPackageComplete += this.OnDetectPackageComplete;
             ba.DetectComplete += this.OnDetectComplete;
             ba.PlanPackageBegin += this.OnPlanPackageBegin;
             ba.PlanComplete += this.OnPlanComplete;
@@ -277,7 +282,11 @@ namespace Eidos.Setup
             {
                 if (this.Set(ref this.perMachine, value))
                 {
-                    this.Raise(nameof(this.PerUser), nameof(this.PrimaryLabel), nameof(this.ElevationNote), nameof(this.SummaryText), nameof(this.StartLabel));
+                    this.Raise(nameof(this.PerUser), nameof(this.PrimaryLabel), nameof(this.ElevationNote), nameof(this.SummaryText), nameof(this.StartLabel), nameof(this.CanChooseCollector), nameof(this.CollectorScopeNote));
+                    if (!this.perMachine && !this.collectorInstalled)
+                    {
+                        this.InstallCollector = false;
+                    }
                     this.ApplyScopeDefaults();
                 }
             }
@@ -440,6 +449,28 @@ namespace Eidos.Setup
         public bool StartMenu { get => this.startMenu; set { if (this.Set(ref this.startMenu, value)) this.Raise(nameof(this.SummaryText)); } }
         public bool LaunchAfter { get => this.launchAfter; set { if (this.Set(ref this.launchAfter, value)) this.Raise(nameof(this.PrimaryLabel)); } }
         public bool RemoveData { get => this.removeData; set => this.Set(ref this.removeData, value); }
+
+        /// <summary>
+        /// The profiling collector: a separate LocalSystem service with its own
+        /// data directory. Offered with the all-users scope, because that is
+        /// what a system service needs and where Windows already asks for
+        /// approval; the checkbox reflects the installed state on maintenance,
+        /// so leaving it alone never removes a collector that is there.
+        /// </summary>
+        public bool InstallCollector
+        {
+            get => this.installCollector;
+            set { if (this.Set(ref this.installCollector, value)) this.Raise(nameof(this.SummaryText), nameof(this.ElevationNote), nameof(this.SuccessText)); }
+        }
+        public bool CollectorInstalled { get => this.collectorInstalled; private set { if (this.Set(ref this.collectorInstalled, value)) this.Raise(nameof(this.CollectorLabel), nameof(this.RemoveCollectorLabel)); } }
+        public bool CanChooseCollector => this.PerMachine;
+        public string CollectorLabel => this.collectorInstalled ? "Keep the profiling collector installed" : "Install profiling collector";
+        public string CollectorHint => "Runs a separate privileged service alongside eidos and records bounded, privacy-preserving workload measurements. Its data directory, identity and removal are independent of eidos.";
+        public string CollectorScopeNote => this.PerMachine ? "" : "Available when installing for all users: the collector is a system service.";
+        public bool RemoveCollector { get => this.removeCollector; set { if (this.Set(ref this.removeCollector, value)) this.Raise(nameof(this.SuccessText)); } }
+        public bool RemoveCollectorData { get => this.removeCollectorData; set => this.Set(ref this.removeCollectorData, value); }
+        public string RemoveCollectorLabel => "Also remove the profiling collector service";
+        public string RemoveCollectorDataLabel => "Also delete the collector's study data (spool, configuration, study key)";
         public bool Repair { get => this.repair; set { if (this.Set(ref this.repair, value)) this.Raise(nameof(this.Uninstall)); } }
         public bool Uninstall { get => !this.repair; set => this.Repair = !value; }
 
@@ -470,6 +501,10 @@ namespace Eidos.Setup
                     lines += $"\nStart eidos:\t{(this.startService ? "now and at every sign-in" : "from the Start menu")}";
                 }
                 lines += $"\nStart menu:\t{(this.startMenu ? "eidos shortcuts" : "none")}";
+                if (this.PerMachine)
+                {
+                    lines += $"\nCollector:\t{(this.installCollector ? (this.collectorInstalled ? "kept (separate service)" : "installed as a separate service") : (this.collectorInstalled ? "left as installed" : "not installed"))}";
+                }
                 return lines;
             }
         }
@@ -482,8 +517,9 @@ namespace Eidos.Setup
         public bool RestartRequired { get => this.restartRequired; private set => this.Set(ref this.restartRequired, value); }
         public string SuccessText => this.plannedAction == LaunchAction.Uninstall
             ? (this.removeData ? "The program and its data were removed." : $"The program was removed. Your indexed data is still in {this.dataDir}; delete that folder if you no longer want it.")
+              + (this.collectorInstalled ? (this.removeCollector ? (this.removeCollectorData ? "\nThe profiling collector and its study data were removed." : "\nThe profiling collector service was removed; its study data was kept.") : "\nThe profiling collector service was kept.") : "")
             : this.PerMachine
-                ? $"eidos is running at {this.Url}.\nThe service starts with Windows."
+                ? $"eidos is running at {this.Url}.\nThe service starts with Windows." + (this.installCollector ? "\nThe profiling collector runs as the eidos-collector service." : "")
                 : this.startService
                     ? $"eidos is running at {this.Url}.\nIt runs in the background and starts again when you sign in."
                     : $"eidos is installed. \"Start eidos\" in the Start menu runs it in the background at {this.Url}.";
@@ -794,7 +830,10 @@ namespace Eidos.Setup
             if (action == LaunchAction.Uninstall)
             {
                 e.SetVariableString("EIDOS_REMOVE_DATA", this.removeData ? "1" : "0", false);
+                e.SetVariableString("EIDOS_REMOVE_COLLECTOR", this.removeCollector ? "1" : "0", false);
+                e.SetVariableString("EIDOS_COLLECTOR_REMOVE_DATA", this.removeCollectorData ? "1" : "0", false);
             }
+            e.SetVariableString("EIDOS_INSTALL_COLLECTOR", this.installCollector ? "1" : "0", false);
             if (!this.PerMachine && (action == LaunchAction.Uninstall || action == LaunchAction.Repair || this.olderVersion != null))
             {
                 // The MSI also closes eidos.exe, but stopping it here first
@@ -839,7 +878,16 @@ namespace Eidos.Setup
                 var scopeVar = this.Engine.ContainsVariable("EIDOS_SCOPE") ? this.Engine.GetVariableString("EIDOS_SCOPE") : "";
                 this.PerMachine = cmd.Scope == BundleScope.PerMachine
                     || string.Equals(scopeVar, "perMachine", StringComparison.OrdinalIgnoreCase)
-                    || (this.Installed && this.detectedPerMachine);
+                    || (this.Installed && this.detectedPerMachine)
+                    || this.Variable("EIDOS_INSTALL_COLLECTOR") == "1";
+                // The collector: 1 installs, 0 leaves it out of a fresh install,
+                // empty keeps whatever is there. Removal keeps the service only
+                // when asked (EIDOS_REMOVE_COLLECTOR=0) and its data unless
+                // EIDOS_COLLECTOR_REMOVE_DATA=1.
+                var wantCollector = this.Variable("EIDOS_INSTALL_COLLECTOR");
+                this.installCollector = wantCollector == "1" || (this.collectorInstalled && wantCollector != "0");
+                this.removeCollector = this.Variable("EIDOS_REMOVE_COLLECTOR") != "0";
+                this.removeCollectorData = this.Variable("EIDOS_COLLECTOR_REMOVE_DATA") == "1";
                 this.installDirEdited = this.dataDirEdited = true; // overridable variables win
                 this.plannedAction = cmd.Action;
                 this.State = SetupState.Planning;
@@ -870,8 +918,44 @@ namespace Eidos.Setup
             this.Requery();
         }
 
+        private string Variable(string name)
+        {
+            return this.Engine.ContainsVariable(name) ? (this.Engine.GetVariableString(name) ?? "") : "";
+        }
+
+        private void OnDetectPackageComplete(object sender, DetectPackageCompleteEventArgs e)
+        {
+            if (e.PackageId == "EidosCollectorMsi")
+            {
+                this.CollectorInstalled = e.State == PackageState.Present;
+                // Maintenance and upgrades start from the installed state.
+                this.installCollector = this.collectorInstalled;
+            }
+        }
+
         private void OnPlanPackageBegin(object sender, PlanPackageBeginEventArgs e)
         {
+            if (e.PackageId == "EidosCollectorMsi")
+            {
+                switch (this.plannedAction)
+                {
+                    case LaunchAction.Uninstall:
+                        e.State = this.collectorInstalled && this.removeCollector ? RequestState.Absent : RequestState.None;
+                        break;
+                    case LaunchAction.Repair:
+                        e.State = this.collectorInstalled ? RequestState.Repair : RequestState.None;
+                        break;
+                    default:
+                        // Install or upgrade: present when chosen (or already
+                        // there and not unticked); otherwise untouched, never
+                        // removed as a side effect of an empty choice.
+                        e.State = this.installCollector ? RequestState.Present
+                            : this.collectorInstalled ? RequestState.Absent
+                            : RequestState.None;
+                        break;
+                }
+                return;
+            }
             // The .NET Framework prerequisite exists for the fallback BA that
             // runs when this UI cannot start. If we are running, it is
             // satisfied: leave it out of the plan so a per-user install never

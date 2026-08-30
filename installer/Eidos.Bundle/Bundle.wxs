@@ -8,7 +8,16 @@
   overridable from the command line for unattended installs:
 
     eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_PORT=7700
+    eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_INSTALL_COLLECTOR=1 EIDOS_STUDY_KEY=<64 hex>
     eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_DATA=1
+    eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_COLLECTOR=1 EIDOS_COLLECTOR_REMOVE_DATA=1
+
+  The observatory collector is a second package in the same chain: a
+  separate LocalSystem service with its own data directory, identity,
+  ACL and uninstall semantics (installer\Eidos.Collector.Msi). The
+  bootstrapper application decides per plan whether it is installed,
+  repaired, removed, or left exactly as it is; the engine never touches it
+  because a variable happened to be empty.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
@@ -28,6 +37,14 @@
     <bal:Condition Condition="VersionNT64" Message="eidos requires 64-bit Windows 10 or later." />
     <util:RegistrySearchRef Id="NETFRAMEWORK45" />
 
+    <!--
+      A host set up with the separate collector setup upgrades into this
+      one: the collector package inside shares the collector MSI's
+      UpgradeCode, so it is major-upgraded in place (study key, spool and
+      configuration kept), and the old bundle registration is removed.
+    -->
+    <RelatedBundle Code="5D2B93F8-29ED-4E6C-B101-1355B4A36F3A" Action="Upgrade" />
+
     <!-- Choices made in the UI, or given on the command line for /quiet. -->
     <Variable Name="EIDOS_SCOPE" Value="" bal:Overridable="yes" />
     <Variable Name="EIDOS_INSTALLDIR" Value="" bal:Overridable="yes" />
@@ -41,6 +58,23 @@
     <Variable Name="EIDOS_START_SERVICE" Value="" bal:Overridable="yes" />
     <Variable Name="EIDOS_START_MENU" Value="" bal:Overridable="yes" />
     <Variable Name="EIDOS_REMOVE_DATA" Value="" bal:Overridable="yes" />
+
+    <!--
+      The collector. EIDOS_INSTALL_COLLECTOR=1 installs it, 0 leaves it out
+      of a fresh install; empty keeps whatever is installed. On removal,
+      EIDOS_REMOVE_COLLECTOR=0 keeps the collector service while the core
+      goes; its study data stays unless EIDOS_COLLECTOR_REMOVE_DATA=1.
+    -->
+    <Variable Name="EIDOS_INSTALL_COLLECTOR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_REMOVE_COLLECTOR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_STUDY_KEY" Value="" Hidden="yes" bal:Overridable="yes" />
+    <Variable Name="EIDOS_LANES" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_UPLOAD" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_UPLOAD_HOUR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_COLLECTOR_INSTALLDIR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_COLLECTOR_DATADIR" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_COLLECTOR_START" Value="" bal:Overridable="yes" />
+    <Variable Name="EIDOS_COLLECTOR_REMOVE_DATA" Value="" bal:Overridable="yes" />
 
     <BootstrapperApplication SourceFile="$(var.BaDir)\eidos-setup-ui.exe">
       <Payload SourceFile="$(var.BaDir)\eidos-setup-ui.exe.config" />
@@ -86,6 +120,22 @@
         <MsiProperty Name="EIDOS_START_SERVICE" Value="[EIDOS_START_SERVICE]" Condition="EIDOS_START_SERVICE" />
         <MsiProperty Name="EIDOS_START_MENU" Value="[EIDOS_START_MENU]" Condition="EIDOS_START_MENU" />
         <MsiProperty Name="EIDOS_REMOVE_DATA" Value="[EIDOS_REMOVE_DATA]" Condition="EIDOS_REMOVE_DATA" />
+      </MsiPackage>
+
+      <!--
+        The collector: not vital, so a host that refuses it (no elevation,
+        a policy) still gets a healthy core; the bootstrapper application
+        plans it Present, Repair, Absent, or None per action.
+      -->
+      <MsiPackage Id="EidosCollectorMsi" SourceFile="$(var.CollectorMsiPath)" Vital="no" Compressed="yes" Visible="no">
+        <MsiProperty Name="EIDOS_STUDY_KEY" Value="[EIDOS_STUDY_KEY]" Condition="EIDOS_STUDY_KEY &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_LANES" Value="[EIDOS_LANES]" Condition="EIDOS_LANES &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_UPLOAD" Value="[EIDOS_UPLOAD]" Condition="EIDOS_UPLOAD &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_UPLOAD_HOUR" Value="[EIDOS_UPLOAD_HOUR]" Condition="EIDOS_UPLOAD_HOUR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_COLLECTOR_INSTALLDIR" Value="[EIDOS_COLLECTOR_INSTALLDIR]" Condition="EIDOS_COLLECTOR_INSTALLDIR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_COLLECTOR_DATADIR" Value="[EIDOS_COLLECTOR_DATADIR]" Condition="EIDOS_COLLECTOR_DATADIR &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_COLLECTOR_START" Value="[EIDOS_COLLECTOR_START]" Condition="EIDOS_COLLECTOR_START &lt;&gt; &quot;&quot;" />
+        <MsiProperty Name="EIDOS_COLLECTOR_REMOVE_DATA" Value="[EIDOS_COLLECTOR_REMOVE_DATA]" Condition="EIDOS_COLLECTOR_REMOVE_DATA &lt;&gt; &quot;&quot;" />
       </MsiPackage>
     </Chain>
   </Bundle>

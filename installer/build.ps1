@@ -6,9 +6,10 @@
 #   .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipUi # bundle only, from signed parts
 #   .\installer\build.ps1 -SkipWeb -SkipRust -BinDir target\debug
 #
-# The indexer setup (eidos.msi, eidos-setup.exe) and the collector setup
-# (eidos-collector.msi, eidos-collector-setup.exe) are independent; each
-# -Skip switch turns off exactly one artifact.
+# eidos-setup.exe is the unified setup: it carries eidos.msi and, as an
+# optional package, eidos-collector.msi. eidos-collector-setup.exe is the
+# administrator/fleet-only collector setup. Each -Skip switch turns off
+# exactly one artifact; the unified bundle needs both MSIs built first.
 #
 # Requires: Node.js, Rust, .NET SDK 8+ (WiX v7 is restored from NuGet; the
 # OSMF EULA is accepted in the project files). Output: installer\out\.
@@ -89,20 +90,6 @@ if (-not $SkipUi) {
     Write-Host "Setup UI: $baDir\eidos-setup-ui.exe" -ForegroundColor Green
 }
 
-if (-not $SkipBundle) {
-    if (-not (Test-Path (Join-Path $out "eidos.msi"))) { throw "missing $out\eidos.msi" }
-    foreach ($required in @("eidos-setup-ui.exe", "WixToolset.BootstrapperApplicationApi.dll", "mbanative.dll")) {
-        if (-not (Test-Path (Join-Path $baDir $required))) { throw "setup UI build is missing $required in $baDir" }
-    }
-    Clean "Eidos.Bundle"
-    Step "dotnet build Eidos.Bundle" {
-        dotnet build (Join-Path $PSScriptRoot "Eidos.Bundle\Eidos.Bundle.wixproj") `
-            -c $Configuration -nologo -v minimal `
-            -p:Version=$msiVersion -p:MsiPath="$out\eidos.msi" -p:BaDir=$baDir -p:OutDir="$out\"
-    }
-    Write-Host "Setup: $out\eidos-setup.exe" -ForegroundColor Green
-}
-
 if (-not $SkipCollectorMsi) {
     Clean "Eidos.Collector.Msi"
     Step "dotnet build Eidos.Collector.Msi" {
@@ -111,6 +98,23 @@ if (-not $SkipCollectorMsi) {
             -p:Version=$msiVersion -p:BinDir=$BinDir -p:OutDir="$out\"
     }
     Write-Host "Collector MSI: $out\eidos-collector.msi" -ForegroundColor Green
+}
+
+if (-not $SkipBundle) {
+    if (-not (Test-Path (Join-Path $out "eidos.msi"))) { throw "missing $out\eidos.msi" }
+    # The unified setup carries the collector package as an optional
+    # second package in its chain.
+    if (-not (Test-Path (Join-Path $out "eidos-collector.msi"))) { throw "missing $out\eidos-collector.msi (build the collector MSI first)" }
+    foreach ($required in @("eidos-setup-ui.exe", "WixToolset.BootstrapperApplicationApi.dll", "mbanative.dll")) {
+        if (-not (Test-Path (Join-Path $baDir $required))) { throw "setup UI build is missing $required in $baDir" }
+    }
+    Clean "Eidos.Bundle"
+    Step "dotnet build Eidos.Bundle" {
+        dotnet build (Join-Path $PSScriptRoot "Eidos.Bundle\Eidos.Bundle.wixproj") `
+            -c $Configuration -nologo -v minimal `
+            -p:Version=$msiVersion -p:MsiPath="$out\eidos.msi" -p:CollectorMsiPath="$out\eidos-collector.msi" -p:BaDir=$baDir -p:OutDir="$out\"
+    }
+    Write-Host "Setup: $out\eidos-setup.exe" -ForegroundColor Green
 }
 
 if (-not $SkipCollectorBundle) {
