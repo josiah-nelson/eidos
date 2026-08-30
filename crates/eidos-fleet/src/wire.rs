@@ -130,6 +130,7 @@ pub enum Message {
         head_seq: u64,
         head_chain: ChainHash,
         compacted_through: u64,
+        image_revision: u64,
         image_version: u32,
     },
     Resume {
@@ -141,6 +142,12 @@ pub enum Message {
     FullResync {
         source: SourceId,
         epoch: SourceEpoch,
+    },
+    /// The consumer cannot prove continuity from its durable cursor in this
+    /// epoch. The shipper must mint and offer a fresh epoch.
+    NewEpochRequired {
+        source: SourceId,
+        reason: String,
     },
     Batch(SyncBatch),
     Ack {
@@ -157,6 +164,8 @@ pub enum Message {
         epoch: SourceEpoch,
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
+        anchor_chain: Option<ChainHash>,
         leaf_bits: u8,
         #[serde(with = "compact_hashes")]
         leaf_hashes: Vec<[u8; 32]>,
@@ -166,6 +175,7 @@ pub enum Message {
         epoch: SourceEpoch,
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
         leaf_bits: u8,
         leaves: Vec<u32>,
     },
@@ -176,6 +186,7 @@ pub enum Message {
         epoch: SourceEpoch,
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
         leaf_bits: u8,
         leaves: Vec<u32>,
         rows: Vec<SyncRow>,
@@ -254,6 +265,7 @@ impl Message {
             Message::Offer { .. } => "offer",
             Message::Resume { .. } => "resume",
             Message::FullResync { .. } => "full_resync",
+            Message::NewEpochRequired { .. } => "new_epoch_required",
             Message::Batch(_) => "batch",
             Message::Ack { .. } => "ack",
             Message::Rejected { .. } => "rejected",
@@ -389,6 +401,8 @@ mod tests {
             epoch: SourceEpoch::from_bytes([1; 16]),
             through_seq: 1,
             through_chain: [2; 32],
+            image_revision: 3,
+            anchor_chain: Some([4; 32]),
             leaf_bits: MAX_REPAIR_LEAF_BITS,
             leaf_hashes: hashes,
         };

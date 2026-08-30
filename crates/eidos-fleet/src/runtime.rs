@@ -719,19 +719,10 @@ fn maintain(
     *fleet.degraded.lock() = degraded;
 
     if config.central {
-        for r in catalog.replica_sources().unwrap_or_default() {
-            let entry = aggregates
-                .entry(r.source_id)
-                .or_insert((Instant::now() - AGGREGATES_EVERY * 2, None));
-            let changed = entry.1 != r.applied_at;
-            if changed && entry.0.elapsed() > AGGREGATES_EVERY {
-                if let Err(e) = catalog.replica_rebuild_aggregates(r.source_id) {
-                    tracing::warn!(source = r.source_id.0, error = %e, "replica aggregates rebuild failed");
-                }
-                *entry = (Instant::now(), r.applied_at);
-            }
+        for mut r in catalog.replica_sources().unwrap_or_default() {
             // An epoch change retires the previous epoch's rows in bounded
-            // steps; finish what the apply path left over.
+            // steps. Finish that first so the aggregate pass can publish the
+            // final image instead of caching an intermediate retirement step.
             if r.resync_target
                 .is_some_and(|target| r.admission.applied_seq >= target)
             {
@@ -741,7 +732,32 @@ fn maintain(
                         tracing::debug!(source = r.source_id.0, rows, "retired previous-epoch rows")
                     }
                     Err(e) => {
-                        tracing::warn!(source = r.source_id.0, error = %e, "epoch retirement step failed")
+                        tracing::warn!(source = r.source_id.0, error = %e, "epoch retirement step failed");
+                        continue;
+                    }
+                }
+                r = match catalog.replica_source(r.source_id) {
+                    Ok(Some(latest)) => latest,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(source = r.source_id.0, error = %e, "could not refresh replica state after retirement");
+                        continue;
+                    }
+                };
+            }
+            if r.resync_target.is_some() {
+                continue;
+            }
+
+            let entry = aggregates
+                .entry(r.source_id)
+                .or_insert((Instant::now() - AGGREGATES_EVERY * 2, None));
+            let changed = entry.1 != r.applied_at;
+            if changed && entry.0.elapsed() > AGGREGATES_EVERY {
+                match catalog.replica_rebuild_aggregates(r.source_id) {
+                    Ok(()) => *entry = (Instant::now(), r.applied_at),
+                    Err(e) => {
+                        tracing::warn!(source = r.source_id.0, error = %e, "replica aggregates rebuild failed")
                     }
                 }
             }

@@ -191,15 +191,13 @@ fn encode_leaf_hashes(hashes: &[[u8; 32]]) -> Vec<u8> {
 }
 
 fn decode_leaf_hashes(encoded: Vec<u8>) -> Result<Vec<[u8; 32]>> {
-    if encoded.len() % 32 != 0 {
+    let (hashes, remainder) = encoded.as_chunks::<32>();
+    if !remainder.is_empty() {
         return Err(CatalogError::InvalidState(
             "repair leaf hashes are not a sequence of 32-byte digests".into(),
         ));
     }
-    Ok(encoded
-        .chunks_exact(32)
-        .map(|chunk| chunk.try_into().expect("chunk size was checked"))
-        .collect())
+    Ok(hashes.to_vec())
 }
 
 fn admission_from_json(json: &str) -> Result<AdmissionState> {

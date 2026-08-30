@@ -208,6 +208,7 @@ enum ShipPhase {
     Repairing {
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
         leaf_bits: u8,
         since: Instant,
     },
@@ -248,6 +249,7 @@ struct PendingRepair {
     epoch: SourceEpoch,
     through_seq: u64,
     through_chain: ChainHash,
+    image_revision: u64,
     leaf_bits: u8,
     remaining: BTreeSet<u32>,
     leaves: Vec<u32>,
@@ -852,6 +854,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 head_seq,
                 head_chain,
                 compacted_through,
+                image_revision,
                 image_version,
             } => {
                 self.on_offer(
@@ -860,6 +863,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     head_seq,
                     head_chain,
                     compacted_through,
+                    image_revision,
                     image_version,
                 )
                 .await?;
@@ -874,6 +878,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 epoch,
                 through_seq,
                 through_chain,
+                image_revision,
+                anchor_chain,
                 leaf_bits,
                 leaf_hashes,
             } => {
@@ -882,6 +888,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     epoch,
                     through_seq,
                     through_chain,
+                    image_revision,
+                    anchor_chain,
                     leaf_bits,
                     leaf_hashes,
                 )
@@ -893,6 +901,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 epoch,
                 through_seq,
                 through_chain,
+                image_revision,
                 leaf_bits,
                 leaves,
                 rows,
@@ -903,6 +912,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     epoch,
                     through_seq,
                     through_chain,
+                    image_revision,
                     leaf_bits,
                     leaves,
                     rows,
@@ -927,6 +937,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 self.on_full_resync(source, epoch).await?;
                 Ok(true)
             }
+            Message::NewEpochRequired { source, reason } => {
+                self.on_new_epoch_required(source, reason).await?;
+                Ok(true)
+            }
             Message::Ack {
                 source,
                 epoch,
@@ -944,6 +958,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 epoch,
                 through_seq,
                 through_chain,
+                image_revision,
                 leaf_bits,
                 leaves,
             } => {
@@ -952,6 +967,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     epoch,
                     through_seq,
                     through_chain,
+                    image_revision,
                     leaf_bits,
                     leaves,
                 )
@@ -963,6 +979,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     // ----- consumer role -------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     async fn on_offer(
         &mut self,
         descriptor: RemoteSourceDescriptor,
@@ -970,6 +987,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         head_seq: u64,
         head_chain: ChainHash,
         compacted_through: u64,
+        image_revision: u64,
         image_version: u32,
     ) -> anyhow::Result<()> {
         self.ctx.counters.add(&self.ctx.counters.offers_received, 1);
@@ -996,16 +1014,19 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             return Ok(());
         }
         let catalog = self.ctx.catalog.clone();
+        let caller = self.peer.node_id.0;
         let node = self.remote_node();
         let outcome =
             tokio::task::spawn_blocking(move || -> anyhow::Result<(SourceId, HelloOutcome)> {
-                let state = catalog.replica_ensure_source(&node, &descriptor, epoch)?;
+                let state = catalog.replica_ensure_source(caller, &node, &descriptor, epoch)?;
                 let outcome = catalog.replica_admit_hello(
+                    caller,
                     state.source_id,
                     epoch,
                     head_seq,
                     head_chain,
                     compacted_through,
+                    image_revision,
                 )?;
                 Ok((state.source_id, outcome))
             })
@@ -1052,6 +1073,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 Message::FullResync {
                     source: remote,
                     epoch,
+                }
+            }
+            HelloOutcome::NewEpochRequired { reason } => {
+                self.ctx.counters.add(&self.ctx.counters.full_resyncs, 1);
+                entry.phase = "awaiting a fresh source epoch".into();
+                entry.last_error = Some(reason.clone());
+                Message::NewEpochRequired {
+                    source: remote,
+                    reason,
                 }
             }
             HelloOutcome::Rejected { reason } => {
@@ -1104,11 +1134,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             return Ok(());
         };
         let catalog = self.ctx.catalog.clone();
+        let caller = self.peer.node_id.0;
         let epoch = batch.epoch.to_source_epoch();
         let rows = batch.rows.len() as u64;
         let started = Instant::now();
         let outcome =
-            tokio::task::spawn_blocking(move || catalog.replica_apply_batch(local, &batch))
+            tokio::task::spawn_blocking(move || catalog.replica_apply_batch(caller, local, &batch))
                 .await
                 .context("apply task")??;
         self.ctx.counters.add(
@@ -1184,12 +1215,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn on_repair_offer(
         &mut self,
         source: SourceId,
         epoch: SourceEpoch,
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
+        anchor_chain: Option<ChainHash>,
         leaf_bits: u8,
         leaf_hashes: Vec<[u8; 32]>,
     ) -> anyhow::Result<()> {
@@ -1222,12 +1256,16 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             return Ok(());
         }
         let catalog = self.ctx.catalog.clone();
+        let caller = self.peer.node_id.0;
         let outcome = tokio::task::spawn_blocking(move || {
             catalog.replica_repair_offer(
+                caller,
                 local,
                 epoch,
                 through_seq,
                 through_chain,
+                image_revision,
+                anchor_chain,
                 leaf_bits,
                 &leaf_hashes,
             )
@@ -1242,6 +1280,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                         epoch,
                         through_seq,
                         through_chain,
+                        image_revision,
                         leaf_bits,
                         remaining: leaves.iter().copied().collect(),
                         leaves: Vec::new(),
@@ -1256,6 +1295,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     epoch,
                     through_seq,
                     through_chain,
+                    image_revision,
                     leaf_bits,
                     leaves,
                 }
@@ -1281,6 +1321,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         epoch: SourceEpoch,
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
         leaf_bits: u8,
         leaves: Vec<u32>,
         rows: Vec<SyncRow>,
@@ -1317,6 +1358,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 if pending.epoch != epoch
                     || pending.through_seq != through_seq
                     || pending.through_chain != through_chain
+                    || pending.image_revision != image_revision
                     || pending.leaf_bits != leaf_bits
                 {
                     invalid = Some("repair rows do not match the outstanding request".to_string());
@@ -1387,12 +1429,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             return Ok(());
         };
         let catalog = self.ctx.catalog.clone();
+        let caller = self.peer.node_id.0;
         let outcome = tokio::task::spawn_blocking(move || {
             catalog.replica_apply_repair(
+                caller,
                 local,
                 pending.epoch,
                 pending.through_seq,
                 pending.through_chain,
+                pending.image_revision,
                 pending.leaf_bits,
                 &pending.leaves,
                 &pending.rows,
@@ -1423,6 +1468,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             }
             RepairOutcome::Rejected { reason } => {
                 self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+                if let Some(state) = self.consuming.get_mut(&source) {
+                    state.phase = "fenced".into();
+                    state.last_error = Some(reason.clone());
+                }
+                Message::Rejected { source, reason }
+            }
+            RepairOutcome::Staged { .. } => {
+                self.ctx.counters.add(&self.ctx.counters.rejections_sent, 1);
+                let reason = "final repair response remained staged".to_string();
                 if let Some(state) = self.consuming.get_mut(&source) {
                     state.phase = "fenced".into();
                     state.last_error = Some(reason.clone());
@@ -1520,6 +1574,47 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         self.ship(source).await
     }
 
+    async fn on_new_epoch_required(
+        &mut self,
+        source: SourceId,
+        reason: String,
+    ) -> anyhow::Result<()> {
+        if self.peer.role != PeerRole::Central {
+            return Err(anyhow!(
+                "only the enrolled central may request a fresh source epoch"
+            ));
+        }
+        if !self.shipping.contains_key(&source) {
+            return Ok(());
+        }
+        let reason = sanitize_peer_reason(&reason);
+        let catalog = self.ctx.catalog.clone();
+        let fresh = tokio::task::spawn_blocking(move || -> eidos_catalog::Result<_> {
+            let current = catalog.sync_source(source)?.ok_or_else(|| {
+                eidos_catalog::CatalogError::InvalidState(format!(
+                    "source {source} is not sync-enabled"
+                ))
+            })?;
+            catalog.sync_enable(source, current.journal_id)
+        })
+        .await
+        .context("new epoch task")??;
+        tracing::warn!(
+            peer = %self.peer.node_id,
+            source = source.0,
+            %reason,
+            "central requested a fresh source epoch"
+        );
+        if let Some(state) = self.shipping.get_mut(&source) {
+            state.epoch = fresh.epoch.to_source_epoch();
+            state.cursor = 0;
+            state.head = 0;
+            state.last_error = Some(reason);
+            state.phase = ShipPhase::Unoffered;
+        }
+        Ok(())
+    }
+
     async fn on_ack(
         &mut self,
         source: SourceId,
@@ -1605,12 +1700,14 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn on_repair_request(
         &mut self,
         source: SourceId,
         epoch: SourceEpoch,
         through_seq: u64,
         through_chain: ChainHash,
+        image_revision: u64,
         leaf_bits: u8,
         leaves: Vec<u32>,
     ) -> anyhow::Result<()> {
@@ -1622,10 +1719,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             ShipPhase::Repairing {
                 through_seq: offered_seq,
                 through_chain: offered_chain,
+                image_revision: offered_revision,
                 leaf_bits: offered_bits,
                 ..
             } if offered_seq == through_seq
                 && offered_chain == through_chain
+                && offered_revision == image_revision
                 && offered_bits == leaf_bits
         );
         let wanted: BTreeSet<u32> = leaves.iter().copied().collect();
@@ -1654,6 +1753,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             if state.epoch.to_source_epoch() != epoch
                 || state.head_seq != through_seq
                 || state.head_chain != through_chain
+                || state.image_revision != image_revision
             {
                 // A request for a head we no longer have describes another
                 // history; the next offer restarts the exchange.
@@ -1675,6 +1775,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 if row_state.epoch.to_source_epoch() != epoch
                     || row_state.head_seq != through_seq
                     || row_state.head_chain != through_chain
+                    || row_state.image_revision != image_revision
                 {
                     return Ok(None);
                 }
@@ -1722,6 +1823,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 epoch,
                 through_seq,
                 through_chain,
+                image_revision,
                 leaf_bits,
                 leaves,
                 rows,
@@ -1796,7 +1898,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         let catalog = self.ctx.catalog.clone();
         let configured = self.ctx.config.read().repair_leaf_bits;
-        let (state, leaf_bits, hashes) =
+        let cursor = self
+            .shipping
+            .get(&source)
+            .map(|state| state.cursor)
+            .unwrap_or(0);
+        let (state, anchor_chain, leaf_bits, hashes) =
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let (_, count) = catalog.sync_ledger_state_and_count(source)?;
                 let leaf_bits = configured
@@ -1807,7 +1914,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     })
                     .clamp(MIN_LEAF_BITS, MAX_REPAIR_LEAF_BITS);
                 let (state, _, hashes) = catalog.sync_merkle_leaf_hashes(source, leaf_bits)?;
-                Ok((state, leaf_bits, hashes))
+                let anchor_chain = catalog.sync_chain_at(source, cursor)?;
+                Ok((state, anchor_chain, leaf_bits, hashes))
             })
             .await
             .context("merkle task")??;
@@ -1816,6 +1924,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             ship.phase = ShipPhase::Repairing {
                 through_seq: state.head_seq,
                 through_chain: state.head_chain,
+                image_revision: state.image_revision,
                 leaf_bits,
                 since: Instant::now(),
             };
@@ -1827,6 +1936,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             epoch,
             through_seq: state.head_seq,
             through_chain: state.head_chain,
+            image_revision: state.image_revision,
+            anchor_chain,
             leaf_bits,
             leaf_hashes: hashes,
         })
@@ -2119,6 +2230,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 head_seq: state.head_seq,
                 head_chain: state.head_chain,
                 compacted_through: state.compacted_through,
+                image_revision: state.image_revision,
                 image_version: SYNC_ROW_IMAGE_VERSION,
             };
             self.ctx.counters.add(&self.ctx.counters.offers_sent, 1);

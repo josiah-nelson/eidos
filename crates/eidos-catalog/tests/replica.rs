@@ -4884,7 +4884,10 @@ fn a_lost_enrollment_response_can_retry_only_the_committed_roster_entry() {
         )
         .unwrap();
     let peer = FleetPeer {
-        node_id: NodeId(NODE),
+        // This fixture already has NODE enrolled for replica tests. Use a
+        // distinct identity so the enrollment retry exercises only this
+        // invitation rather than attempting a forbidden key replacement.
+        node_id: NodeId([0x0B; 16]),
         name: "fallback".into(),
         role: PeerRole::Node,
         fingerprint: [0x24; 32],

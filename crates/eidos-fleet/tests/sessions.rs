@@ -13,7 +13,7 @@ use eidos_fleet::enroll::{create_invite, enroll};
 use eidos_fleet::status::Direction;
 use eidos_fleet::wire::{self, Message};
 use eidos_fleet::{Fleet, FleetConfig, NodeIdentity};
-use eidos_sync::identity::SourceEpoch;
+use eidos_sync::identity::{SourceEpoch, CHAIN_GENESIS};
 use eidos_sync::merkle::{leaf_index, MerkleTree};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -532,6 +532,65 @@ async fn duplicate_ack_does_not_refund_the_next_batch_credit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_history_anchor_request_remints_and_reoffers_the_source_epoch() {
+    let mut node = Host::new("node-re-epoch", false, true, true);
+    let central_dir = tempfile::tempdir().unwrap();
+    let central = NodeIdentity::load_or_create(central_dir.path(), "central-re-epoch").unwrap();
+    admit_peer(&node.catalog, &central, PeerRole::Central);
+    node.start();
+    wait_for(SETTLE, || {
+        node.fleet()
+            .status()
+            .local_sources
+            .first()
+            .is_some_and(|source| source.ready)
+            .then_some(())
+    })
+    .await
+    .expect("source ledger ready");
+
+    let mut stream = raw_connect(&central, &node).await;
+    send(
+        &mut stream,
+        &session_hello(&central, wire::Role::Central, 15, 1 << 20),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut stream).await.unwrap(),
+        Message::Hello(_)
+    ));
+    let (source, old_epoch) = match recv(&mut stream).await.unwrap() {
+        Message::Offer {
+            descriptor, epoch, ..
+        } => (descriptor.remote_source_id, epoch),
+        other => panic!("expected initial offer, got {other:?}"),
+    };
+    send(
+        &mut stream,
+        &Message::NewEpochRequired {
+            source,
+            reason: "the durable cursor predates retained history".into(),
+        },
+    )
+    .await;
+    let new_epoch = match recv(&mut stream).await.unwrap() {
+        Message::Offer { epoch, .. } => epoch,
+        other => panic!("expected a fresh offer, got {other:?}"),
+    };
+    assert_ne!(new_epoch, old_epoch);
+    assert_eq!(
+        node.catalog
+            .sync_source(source)
+            .unwrap()
+            .unwrap()
+            .epoch
+            .to_source_epoch(),
+        new_epoch
+    );
+    node.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multipart_repair_commits_once_before_its_ack() {
     let mut central = Host::new("central-repair", true, true, false);
     central.start();
@@ -567,7 +626,8 @@ async fn multipart_repair_commits_once_before_its_ack() {
             epoch,
             head_seq: 2,
             head_chain: through_chain,
-            compacted_through: 1,
+            compacted_through: 0,
+            image_revision: 1,
             image_version: SYNC_ROW_IMAGE_VERSION,
         },
     )
@@ -605,7 +665,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
     let hashes = MerkleTree::with_leaf_bits(
         leaf_bits,
         rows.iter()
-            .map(|row| record_digest(row.object, row.generation, true)),
+            .map(|row| record_digest(row.object, row.generation, true, &[0; 32])),
     )
     .leaf_hashes();
     send(
@@ -615,6 +675,8 @@ async fn multipart_repair_commits_once_before_its_ack() {
             epoch,
             through_seq: 2,
             through_chain,
+            image_revision: 1,
+            anchor_chain: Some(CHAIN_GENESIS),
             leaf_bits,
             leaf_hashes: hashes,
         },
@@ -638,6 +700,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
             epoch,
             through_seq: 2,
             through_chain,
+            image_revision: 1,
             leaf_bits,
             leaves: vec![requested[0]],
             rows: vec![first_row],
@@ -670,6 +733,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
             epoch,
             through_seq: 2,
             through_chain,
+            image_revision: 1,
             leaf_bits,
             leaves: vec![requested[1]],
             rows: vec![second_row],
