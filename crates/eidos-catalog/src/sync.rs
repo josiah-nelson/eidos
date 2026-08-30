@@ -25,11 +25,11 @@ use crate::{Catalog, CatalogError, Result};
 use eidos_domain::{ObjectId, SourceId, UnixNanos};
 use eidos_sync::identity::{chain_next, SourceEpoch};
 pub use eidos_sync::identity::{ChainHash, CHAIN_GENESIS};
-use eidos_sync::merkle::{leaf_index, RecordDigest};
+use eidos_sync::merkle::{leaf_index, MerkleLeafHasher, RecordDigest, MAX_FLEET_LEAF_BITS};
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 const MAX_RETAINED_CHAIN_ROWS: i64 = 1_000_000;
 const CHAIN_PRUNE_BATCH: i64 = 100_000;
@@ -802,6 +802,126 @@ impl Catalog {
                 .collect::<rusqlite::Result<_>>()?;
             tx.commit()?;
             Ok((state, entries))
+        })
+    }
+
+    /// Read the source head and ledger size in one SQLite snapshot without
+    /// materializing its rows.
+    pub fn sync_ledger_state_and_count(&self, source: SourceId) -> Result<(SyncSourceState, u64)> {
+        self.with_reader(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let state = source_state_conn(&tx, source)?.ok_or_else(|| {
+                CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
+            })?;
+            let count = tx.query_row(
+                "SELECT COUNT(*) FROM sync_rows WHERE source_id = ?1",
+                params![source.0],
+                |r| r.get::<_, i64>(0),
+            )? as u64;
+            tx.commit()?;
+            Ok((state, count))
+        })
+    }
+
+    /// Hash the current ledger directly from an ordered SQLite cursor. The
+    /// sort may spill to SQLite's temporary storage; memory is bounded by the
+    /// leaf manifest rather than by the number of source rows.
+    pub fn sync_merkle_leaf_hashes(
+        &self,
+        source: SourceId,
+        leaf_bits: u8,
+    ) -> Result<(SyncSourceState, u64, Vec<[u8; 32]>)> {
+        if leaf_bits > MAX_FLEET_LEAF_BITS {
+            return Err(CatalogError::InvalidState(format!(
+                "Merkle leaf bits {leaf_bits} exceed {MAX_FLEET_LEAF_BITS}"
+            )));
+        }
+        self.with_reader(|conn| {
+            register_merkle_leaf_function(conn)?;
+            let tx = conn.unchecked_transaction()?;
+            let state = source_state_conn(&tx, source)?.ok_or_else(|| {
+                CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
+            })?;
+            let count = tx.query_row(
+                "SELECT COUNT(*) FROM sync_rows WHERE source_id = ?1",
+                params![source.0],
+                |r| r.get::<_, i64>(0),
+            )? as u64;
+            let empty = MerkleLeafHasher::new().finalize();
+            let mut hashes = vec![empty; 1usize << leaf_bits];
+            let mut active_leaf = None;
+            let mut active = MerkleLeafHasher::new();
+            let mut stmt = tx.prepare_cached(
+                "SELECT object_id, generation, deleted,
+                    eidos_merkle_leaf(?2, object_id) AS leaf
+                 FROM sync_rows WHERE source_id = ?1 ORDER BY leaf, object_id",
+            )?;
+            let mut rows = stmt.query(params![source.0, leaf_bits as i64])?;
+            while let Some(row) = rows.next()? {
+                let leaf = row.get::<_, i64>(3)? as usize;
+                if active_leaf.is_some_and(|previous| previous != leaf) {
+                    let previous = active_leaf.expect("checked above");
+                    hashes[previous] =
+                        std::mem::replace(&mut active, MerkleLeafHasher::new()).finalize();
+                }
+                active_leaf = Some(leaf);
+                active.update(&record_digest(
+                    ObjectId(row.get(0)?),
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? != 0,
+                ));
+            }
+            if let Some(leaf) = active_leaf {
+                hashes[leaf] = active.finalize();
+            }
+            drop(rows);
+            drop(stmt);
+            tx.commit()?;
+            Ok((state, count, hashes))
+        })
+    }
+
+    /// Object ids in selected repair leaves, read without first retaining
+    /// the source's entire ledger. `max_objects` is a hard materialization
+    /// ceiling derived from session credit.
+    pub fn sync_objects_in_merkle_leaves(
+        &self,
+        source: SourceId,
+        leaf_bits: u8,
+        leaves: &BTreeSet<u32>,
+        max_objects: usize,
+    ) -> Result<(SyncSourceState, Vec<ObjectId>)> {
+        if leaf_bits > MAX_FLEET_LEAF_BITS || leaves.iter().any(|leaf| *leaf >= (1u32 << leaf_bits))
+        {
+            return Err(CatalogError::InvalidState(
+                "invalid Merkle leaf scope".into(),
+            ));
+        }
+        self.with_reader(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let state = source_state_conn(&tx, source)?.ok_or_else(|| {
+                CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
+            })?;
+            let mut objects = Vec::new();
+            let mut stmt = tx.prepare_cached(
+                "SELECT object_id FROM sync_rows WHERE source_id = ?1 ORDER BY object_id",
+            )?;
+            let mut rows = stmt.query(params![source.0])?;
+            while let Some(row) = rows.next()? {
+                let object = ObjectId(row.get(0)?);
+                if leaves.contains(&leaf_index(leaf_bits, object)) {
+                    if objects.len() == max_objects {
+                        return Err(CatalogError::InvalidState(format!(
+                            "repair scope exceeds its {max_objects}-object materialization limit"
+                        )));
+                    }
+                    objects.push(object);
+                }
+            }
+            drop(rows);
+            drop(stmt);
+            tx.commit()?;
+            Ok((state, objects))
         })
     }
 

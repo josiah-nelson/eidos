@@ -127,6 +127,11 @@ pub enum BatchOutcome {
 /// Outcome of applying a Merkle repair answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairOutcome {
+    Staged {
+        replaced: u64,
+        removed: u64,
+        remaining_leaves: u64,
+    },
     Applied {
         through_seq: u64,
         replaced: u64,
@@ -164,7 +169,7 @@ const REMOTE_GENERATION: i64 = 1;
 const MAX_SQLITE_SEQUENCE: u64 = i64::MAX as u64;
 const RETIRE_STEP_ROWS: usize = 10_000;
 const REPAIR_SCAN_BATCH: usize = 10_000;
-const MAX_REPAIR_ROWS: usize = 100_000;
+const MAX_REPAIR_PART_ROWS: usize = 10_000;
 
 fn admission_from_json(json: &str) -> Result<AdmissionState> {
     serde_json::from_str(json).map_err(|e| {
@@ -356,6 +361,139 @@ fn row_state_conn(
         .optional()?)
 }
 
+/// Reuse an old-epoch local object when a rebuilt source changes the remote
+/// object id but preserves the filesystem's stable native identity. A child
+/// may already have allocated a placeholder for the new id; in that case its
+/// children and archive members must follow the real local object before the
+/// placeholder is removed.
+fn reuse_native_object_conn(
+    tx: &Transaction<'_>,
+    source: SourceId,
+    epoch: &SyncEpoch,
+    row: &SyncRow,
+) -> Result<Option<RowState>> {
+    let existing = row_state_conn(tx, source, row.object)?;
+    let Some(native) = row.image.as_ref().and_then(|image| image.object.native) else {
+        return Ok(existing);
+    };
+    if existing.as_ref().is_some_and(|state| !state.placeholder) {
+        return Ok(existing);
+    }
+    let excluded_local = existing.as_ref().map(|state| state.local.0);
+    let old = tx
+        .prepare_cached(
+            "SELECT rr.remote_object_id, rr.local_object_id
+             FROM sync_replica_rows rr
+             JOIN objects o ON o.object_id = rr.local_object_id
+             WHERE rr.source_id = ?1 AND rr.epoch != ?2 AND rr.placeholder = 0
+               AND rr.deleted = 0 AND o.deleted_at IS NULL
+               AND o.native_volume_serial = ?3 AND o.native_id_high = ?4
+               AND o.native_id_low = ?5
+               AND (?6 IS NULL OR rr.local_object_id != ?6)",
+        )?
+        .query_row(
+            params![
+                source.0,
+                epoch.0.as_slice(),
+                native.volume_serial as i64,
+                native.file_id_high as i64,
+                native.file_id_low as i64,
+                excluded_local,
+            ],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((old_remote, old_local)) = old else {
+        return Ok(existing);
+    };
+
+    if let Some(placeholder) = existing {
+        // Reparenting can meet stale old-epoch names. The incoming subtree is
+        // authoritative, so remove only the colliding old names first.
+        tx.prepare_cached(
+            "DELETE FROM entries
+             WHERE source_id = ?1 AND parent_id = ?2 AND deleted_at IS NULL
+               AND is_virtual = 0 AND name IN (
+                   SELECT name FROM entries
+                   WHERE source_id = ?1 AND parent_id = ?3
+                     AND deleted_at IS NULL AND is_virtual = 0)",
+        )?
+        .execute(params![source.0, old_local, placeholder.local.0])?;
+        tx.prepare_cached("UPDATE entries SET parent_id = ?2 WHERE parent_id = ?1")?
+            .execute(params![placeholder.local.0, old_local])?;
+        tx.prepare_cached(
+            "UPDATE objects SET archive_container_id = ?2 WHERE archive_container_id = ?1",
+        )?
+        .execute(params![placeholder.local.0, old_local])?;
+        tx.prepare_cached(
+            "UPDATE sources SET root_object_id = ?2 WHERE source_id = ?3 AND root_object_id = ?1",
+        )?
+        .execute(params![placeholder.local.0, old_local, source.0])?;
+        tx.prepare_cached(
+            "DELETE FROM sync_replica_rows WHERE source_id = ?1 AND remote_object_id = ?2",
+        )?
+        .execute(params![source.0, row.object.0])?;
+        tx.prepare_cached("DELETE FROM objects WHERE object_id = ?1")?
+            .execute(params![placeholder.local.0])?;
+    }
+    tx.prepare_cached(
+        "UPDATE sync_replica_rows SET remote_object_id = ?3
+         WHERE source_id = ?1 AND remote_object_id = ?2",
+    )?
+    .execute(params![source.0, old_remote, row.object.0])?;
+    row_state_conn(tx, source, row.object)
+}
+
+/// Resolve native-id remaps before changing names, then remove all current
+/// entries of the incoming objects. This makes a batch of final row images
+/// atomic even when siblings swap names.
+fn prepare_rows_conn(
+    tx: &Transaction<'_>,
+    source: SourceId,
+    epoch: &SyncEpoch,
+    rows: &[SyncRow],
+) -> Result<()> {
+    for row in rows {
+        reuse_native_object_conn(tx, source, epoch, row)?;
+    }
+    let mut remove = tx.prepare_cached("DELETE FROM entries WHERE object_id = ?1")?;
+    for row in rows {
+        if let Some(state) = row_state_conn(tx, source, row.object)? {
+            remove.execute(params![state.local.0])?;
+        }
+    }
+    drop(remove);
+    // A bounded batch or repair part can split the two sides of a rename
+    // swap. Once the incoming object's old names are gone, also remove a
+    // stale sibling occupying each authoritative final name. That sibling's
+    // later row restores its final name; completeness stays withheld until
+    // the batch or repair reaches the reported head.
+    let mut remove_conflict = tx.prepare_cached(
+        "DELETE FROM entries
+         WHERE source_id = ?1 AND parent_id IS ?2 AND name = ?3
+           AND is_virtual = 0 AND deleted_at IS NULL AND object_id != ?4",
+    )?;
+    for row in rows {
+        let Some(image) = &row.image else {
+            continue;
+        };
+        let Some(local) = row_state_conn(tx, source, row.object)?.map(|state| state.local) else {
+            continue;
+        };
+        for entry in &image.entries {
+            if entry.is_virtual {
+                continue;
+            }
+            let parent = match entry.parent {
+                Some(remote) => Some(local_object_conn(tx, source, epoch, remote)?.0),
+                None => None,
+            };
+            remove_conflict.execute(params![source.0, parent, entry.name, local.0])?;
+        }
+    }
+    Ok(())
+}
+
 /// Content at a replica is never present: files say so explicitly, and
 /// everything that had no content to begin with keeps saying so.
 fn replica_content_state(image: &SyncRowImage) -> ContentState {
@@ -383,44 +521,7 @@ fn apply_row_conn(
     now: i64,
     counts: &mut ApplyCounts,
 ) -> Result<()> {
-    let mut existing = row_state_conn(tx, source, row.object)?;
-    // A rebuilt catalog may assign a new remote object id while preserving
-    // the filesystem's stable native identity. Reuse that local object before
-    // applying the new epoch row; otherwise the still-live old epoch row
-    // collides with the source-scoped native-identity unique index.
-    if existing.is_none() {
-        if let Some(native) = row.image.as_ref().and_then(|image| image.object.native) {
-            let old_remote = tx
-                .prepare_cached(
-                    "SELECT rr.remote_object_id
-                     FROM sync_replica_rows rr
-                     JOIN objects o ON o.object_id = rr.local_object_id
-                     WHERE rr.source_id = ?1 AND rr.epoch != ?2 AND rr.placeholder = 0
-                       AND rr.deleted = 0 AND o.deleted_at IS NULL
-                       AND o.native_volume_serial = ?3 AND o.native_id_high = ?4
-                       AND o.native_id_low = ?5",
-                )?
-                .query_row(
-                    params![
-                        source.0,
-                        epoch.0.as_slice(),
-                        native.volume_serial as i64,
-                        native.file_id_high as i64,
-                        native.file_id_low as i64,
-                    ],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?;
-            if let Some(old_remote) = old_remote {
-                tx.prepare_cached(
-                    "UPDATE sync_replica_rows SET remote_object_id = ?3
-                     WHERE source_id = ?1 AND remote_object_id = ?2",
-                )?
-                .execute(params![source.0, old_remote, row.object.0])?;
-                existing = row_state_conn(tx, source, row.object)?;
-            }
-        }
-    }
+    let existing = reuse_native_object_conn(tx, source, epoch, row)?;
     if let Some(state) = &existing {
         // Sequences only order rows within one epoch; a row of another
         // epoch is always superseded by the epoch being streamed.
@@ -635,6 +736,15 @@ fn mark_applied_conn(
         "UPDATE sync_replica_sources SET applied_at = ?2, updated_at = ?2 WHERE source_id = ?1",
     )?
     .execute(params![source.0, now])?;
+    mark_completeness_conn(tx, source, now, complete)
+}
+
+fn mark_completeness_conn(
+    tx: &Transaction<'_>,
+    source: SourceId,
+    now: i64,
+    complete: bool,
+) -> Result<()> {
     let (state, reason) = if complete {
         (SourceState::MetadataComplete, None)
     } else {
@@ -932,6 +1042,9 @@ impl Catalog {
                      WHERE source_id = ?1",
                     params![source.0, head_seq as i64, compacted_through as i64, now],
                 )?;
+                if head_seq > state.admission.applied_seq || state.resync_target.is_some() {
+                    mark_completeness_conn(&tx, source, now, false)?;
+                }
             }
             store_admission_conn(&tx, source, &state.admission, state.resync_target)?;
             tx.commit()?;
@@ -982,6 +1095,20 @@ impl Catalog {
                     reason: format!(
                         "batch source {} does not match replica source {}",
                         batch.source_id, state.remote_source_id
+                    ),
+                });
+            }
+            // A source may advance between Hello and materializing its next
+            // batch. Accept that newer authenticated head, but never let a
+            // batch which would advance the cursor regress the durable head.
+            // Already-applied old batches remain harmlessly idempotent.
+            if batch.head_seq < state.reported_head
+                && through_seq > state.admission.applied_seq
+            {
+                return Ok(BatchOutcome::Rejected {
+                    reason: format!(
+                        "batch head {} regresses the durable offered head {}",
+                        batch.head_seq, state.reported_head
                     ),
                 });
             }
@@ -1054,6 +1181,7 @@ impl Catalog {
                 state.admission.applied(through_seq, through_chain);
             }
             let mut counts = ApplyCounts::default();
+            prepare_rows_conn(&tx, source, &sync_epoch, rows)?;
             for row in rows {
                 apply_row_conn(&tx, source, &sync_epoch, row, false, now, &mut counts)?;
             }
@@ -1068,7 +1196,14 @@ impl Catalog {
                 }
             }
             store_admission_conn(&tx, source, &state.admission, state.resync_target)?;
-            let image_complete = through_seq == batch.head_seq && state.resync_target.is_none();
+            tx.prepare_cached(
+                "UPDATE sync_replica_sources SET reported_head = MAX(reported_head, ?2)
+                 WHERE source_id = ?1",
+            )?
+            .execute(params![source.0, batch.head_seq as i64])?;
+            let image_complete = through_seq == batch.head_seq
+                && through_seq >= state.reported_head
+                && state.resync_target.is_none();
             mark_applied_conn(&tx, source, now, image_complete)?;
             tx.commit()?;
             Ok(BatchOutcome::Applied {
@@ -1096,6 +1231,14 @@ impl Catalog {
             let state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
             })?;
+            if through_seq != state.reported_head {
+                return Ok(RepairOfferOutcome::Rejected {
+                    reason: format!(
+                        "repair head {through_seq} does not match the durable offered head {}",
+                        state.reported_head
+                    ),
+                });
+            }
             let pending_epoch = state.admission.pending_epoch() == Some(epoch);
             if (!pending_epoch && state.admission.epoch != epoch)
                 || (!pending_epoch && through_seq < state.admission.applied_seq)
@@ -1153,6 +1296,7 @@ impl Catalog {
                 serde_json::to_string(&leaves)?,
                 UnixNanos::now().0,
             ])?;
+            mark_completeness_conn(&tx, source, UnixNanos::now().0, false)?;
             tx.commit()?;
             Ok(RepairOfferOutcome::Request { leaf_bits, leaves })
         })
@@ -1172,17 +1316,45 @@ impl Catalog {
         leaves: &[u32],
         rows: &[SyncRow],
     ) -> Result<RepairOutcome> {
+        self.replica_apply_repair_part(
+            source,
+            epoch,
+            through_seq,
+            through_chain,
+            leaf_bits,
+            leaves,
+            rows,
+            true,
+        )
+    }
+
+    /// Apply one bounded part of a durable Merkle repair. Each part owns a
+    /// disjoint subset of the outstanding leaves; the cursor and completeness
+    /// marker advance only with the final part.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replica_apply_repair_part(
+        &self,
+        source: SourceId,
+        epoch: SourceEpoch,
+        through_seq: u64,
+        through_chain: ChainHash,
+        leaf_bits: u8,
+        leaves: &[u32],
+        rows: &[SyncRow],
+        final_part: bool,
+    ) -> Result<RepairOutcome> {
         let unique = rows.iter().map(|r| r.object).collect::<BTreeSet<_>>().len() == rows.len();
         let unique_leaves = leaves.iter().copied().collect::<BTreeSet<_>>().len() == leaves.len();
         if !(MIN_FLEET_LEAF_BITS..=MAX_FLEET_LEAF_BITS).contains(&leaf_bits)
             || through_seq > MAX_SQLITE_SEQUENCE
-            || rows.len() > MAX_REPAIR_ROWS
+            || rows.len() > MAX_REPAIR_PART_ROWS
             || leaves.iter().any(|l| *l >= (1u32 << leaf_bits))
             || rows
                 .iter()
                 .any(|r| r.seq > through_seq || r.generation > MAX_SQLITE_SEQUENCE)
             || !unique
             || !unique_leaves
+            || (!final_part && leaves.is_empty())
         {
             return Ok(RepairOutcome::Rejected {
                 reason: "malformed repair response".into(),
@@ -1203,6 +1375,14 @@ impl Catalog {
             let mut state = state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not a replica"))
             })?;
+            if through_seq != state.reported_head {
+                return Ok(RepairOutcome::Rejected {
+                    reason: format!(
+                        "repair head {through_seq} does not match the durable offered head {}",
+                        state.reported_head
+                    ),
+                });
+            }
             let pending_epoch = state.admission.pending_epoch() == Some(epoch);
             if (!pending_epoch && state.admission.epoch != epoch)
                 || (!pending_epoch && through_seq < state.admission.applied_seq)
@@ -1259,7 +1439,8 @@ impl Catalog {
                 || requested_seq as u64 != through_seq
                 || repair_chain_from_blob(requested_chain)? != through_chain
                 || requested_bits as u8 != leaf_bits
-                || requested_scope != wanted
+                || !wanted.is_subset(&requested_scope)
+                || final_part != (wanted == requested_scope)
             {
                 return Ok(RepairOutcome::Rejected {
                     reason: "repair response does not match the outstanding request".into(),
@@ -1328,8 +1509,26 @@ impl Catalog {
                 }
             }
             let mut counts = ApplyCounts::default();
+            prepare_rows_conn(&tx, source, &sync_epoch, rows)?;
             for row in rows {
                 apply_row_conn(&tx, source, &sync_epoch, row, true, now, &mut counts)?;
+            }
+            let remaining = requested_scope
+                .difference(&wanted)
+                .copied()
+                .collect::<Vec<_>>();
+            if !final_part {
+                tx.prepare_cached(
+                    "UPDATE sync_replica_repairs SET leaves = ?2 WHERE source_id = ?1",
+                )?
+                .execute(params![source.0, serde_json::to_string(&remaining)?])?;
+                mark_applied_conn(&tx, source, now, false)?;
+                tx.commit()?;
+                return Ok(RepairOutcome::Staged {
+                    replaced: counts.applied,
+                    removed,
+                    remaining_leaves: remaining.len() as u64,
+                });
             }
             if pending_epoch {
                 if !state

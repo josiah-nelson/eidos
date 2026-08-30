@@ -378,6 +378,93 @@ fn duplicate_and_overlapping_batches_are_idempotent() {
 }
 
 #[test]
+fn a_batch_cannot_publish_below_the_durable_reported_head() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let applied = central.applied_seq(source);
+    node.touch("a/one.txt", 101, 1_700_000_000);
+    node.touch("a/b/two.txt", 201, 1_700_000_001);
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    assert!(state.head_seq > applied + 1);
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                state.compacted_through,
+            )
+            .unwrap(),
+        HelloOutcome::Resume { .. }
+    ));
+    assert!(
+        !central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
+
+    let mut regressing = node
+        .catalog
+        .sync_rows_after(node.source, applied, 1)
+        .unwrap();
+    assert!(regressing.through_seq < state.head_seq);
+    regressing.head_seq = regressing.through_seq;
+    match central
+        .catalog
+        .replica_apply_batch(source, &regressing)
+        .unwrap()
+    {
+        BatchOutcome::Rejected { reason } => assert!(reason.contains("regresses"), "{reason}"),
+        other => panic!("regressing batch was accepted: {other:?}"),
+    }
+    assert_eq!(central.applied_seq(source), applied);
+    assert!(
+        !central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
+}
+
+#[test]
+fn one_batch_can_swap_two_sibling_names() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    std::fs::write(node.root.join("a/four.txt"), vec![b'4'; 400]).unwrap();
+    node.scan();
+    converge(&node, &central, 8);
+
+    std::fs::rename(node.root.join("a/one.txt"), node.root.join("a/swap.tmp")).unwrap();
+    std::fs::rename(node.root.join("a/four.txt"), node.root.join("a/one.txt")).unwrap();
+    std::fs::rename(node.root.join("a/swap.tmp"), node.root.join("a/four.txt")).unwrap();
+    node.scan();
+    converge(&node, &central, 1);
+
+    assert_eq!(central.image(source), node.image());
+    let one = central
+        .catalog
+        .resolve_relative(source, "a/one.txt")
+        .unwrap()
+        .unwrap();
+    let four = central
+        .catalog
+        .resolve_relative(source, "a/four.txt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(central.catalog.get_object(one).unwrap().unwrap().size, 400);
+    assert_eq!(central.catalog.get_object(four).unwrap().unwrap().size, 100);
+}
+
+#[test]
 fn a_batch_is_bound_to_the_remote_source_it_names() {
     let node = Node::new();
     let central = Central::new();
@@ -825,31 +912,70 @@ fn a_full_resync_replaces_the_root_mapping_when_remote_object_ids_change() {
         .expect("source root row");
     let remote_root = ObjectId(root.object.0 + 1_000_000);
     root.object = remote_root;
-    root.seq = 1;
+    root.seq = 2;
     root.image.as_mut().unwrap().object.id = remote_root;
+    let (_, mut child_rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &[node.id("a")])
+        .unwrap();
+    let mut child = child_rows.pop().expect("child row");
+    child.seq = 1;
+    for entry in &mut child.image.as_mut().unwrap().entries {
+        entry.parent = Some(remote_root);
+    }
     let epoch = SourceEpoch::random_v4(66, 77);
+    let first_chain = [0x66; 32];
     let head_chain = [0x77; 32];
     assert!(matches!(
         central
             .catalog
-            .replica_admit_hello(source, epoch, 1, head_chain, 0)
+            .replica_admit_hello(source, epoch, 2, head_chain, 0)
             .unwrap(),
         HelloOutcome::FullResync { .. }
     ));
-    let snapshot = SyncBatch {
+    let child_first = SyncBatch {
         source_id: node.source,
         epoch: SyncEpoch::from_source_epoch(epoch),
         after_seq: 0,
         after_chain: CHAIN_GENESIS,
         through_seq: 1,
+        through_chain: first_chain,
+        head_seq: 2,
+        rows: vec![child],
+    };
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(source, &child_first)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    let placeholder: i64 = central
+        .catalog
+        .with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT placeholder FROM sync_replica_rows
+                 WHERE source_id = ?1 AND remote_object_id = ?2",
+                [source.0, remote_root.0],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(placeholder, 1);
+    let parent = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 1,
+        after_chain: first_chain,
+        through_seq: 2,
         through_chain: head_chain,
-        head_seq: 1,
+        head_seq: 2,
         rows: vec![root.clone()],
     };
     assert!(matches!(
         central
             .catalog
-            .replica_apply_batch(source, &snapshot)
+            .replica_apply_batch(source, &parent)
             .unwrap(),
         BatchOutcome::Applied { .. }
     ));
@@ -882,6 +1008,7 @@ fn a_full_resync_replaces_the_root_mapping_when_remote_object_ids_change() {
     // Their new root gets a new local row and must replace root_object_id.
     let remote_root_2 = ObjectId(remote_root.0 + 1);
     root.object = remote_root_2;
+    root.seq = 1;
     root.image.as_mut().unwrap().object.id = remote_root_2;
     root.image.as_mut().unwrap().object.native = None;
     let epoch_2 = SourceEpoch::random_v4(88, 99);
@@ -1270,7 +1397,7 @@ fn repair_replay_is_chain_bound_and_rejects_duplicate_objects() {
 #[test]
 fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
     let node = Node::new();
-    let central = Central::new();
+    let mut central = Central::new();
     converge(&node, &central, 8);
     let source = central.source_for(&node);
     node.catalog.sync_enable(node.source, None).unwrap();
@@ -1338,17 +1465,51 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
         .catalog
         .sync_rows_for_objects(node.source, &objects)
         .unwrap();
+    let split = leaves.len() / 2;
+    let (first_leaves, final_leaves) = leaves.split_at(split);
+    let first_scope: BTreeSet<_> = first_leaves.iter().copied().collect();
+    let (first_rows, final_rows): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|row| first_scope.contains(&leaf_index(leaf_bits, row.object)));
     assert!(matches!(
         central
             .catalog
-            .replica_apply_repair(
+            .replica_apply_repair_part(
                 source,
                 state.epoch.to_source_epoch(),
                 state.head_seq,
                 state.head_chain,
                 leaf_bits,
-                &leaves,
-                &rows,
+                first_leaves,
+                &first_rows,
+                false,
+            )
+            .unwrap(),
+        RepairOutcome::Staged {
+            remaining_leaves,
+            ..
+        } if remaining_leaves == final_leaves.len() as u64
+    ));
+    assert!(
+        !central
+            .catalog
+            .source_completeness(source)
+            .unwrap()
+            .metadata_complete
+    );
+    central.reopen();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair_part(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                leaf_bits,
+                final_leaves,
+                &final_rows,
+                true,
             )
             .unwrap(),
         RepairOutcome::Applied { .. }
