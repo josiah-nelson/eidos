@@ -59,7 +59,10 @@ bounded to 10 GiB and 14 days by default; summaries expire after 90 days.
 SQLite WAL durability is used locally. The spool directory is root-owned and
 mode `0750`; the command socket is root-owned, group `admin`, and mode `0660`.
 
-Exports use the versioned `eidos-observation/1` format, compressed with zstd.
+Exports use the versioned `eidos-observation/2` format, compressed with zstd.
+Version 2 adds the explicit observatory-collector process class; it is not
+labelled as version 1 because older v1 readers cannot decode that enum value.
+Current readers continue to accept additive version 1 bundles.
 Each bundle contains build/config hashes, capabilities, capture gaps, drop
 counters, UTC and monotonic anchors, units, and the bounded records. Run:
 
@@ -307,8 +310,11 @@ ETW access lane (L2, off by default): a real-time session over
 `Microsoft-Windows-Kernel-File` and `Kernel-Process`, decoded through TDH
 metadata, run in randomized windows (`minutes_per_hour`, 60 for
 continuous). Events are attributed to coarse process classes (system,
-indexer, security, build, development, shell, productivity, browser, media,
-cloud sync, backup, virtualization) or a keyed image token, and summarised
+indexer, collector, security, build, development, shell, productivity,
+browser, media, cloud sync, backup, virtualization) or a keyed image token;
+the collector's own process is classed `collector` by process identity, so
+the cost of observing is separable from the cost of eidos even though both
+run from `eidos.exe`, and summarised
 per class: opens, reads, writes, closes, deletes, renames, byte totals,
 I/O-size histograms, distinct and read-then-written objects, and extension
 buckets learned at open. Lost events count as kernel drops; access denied

@@ -18,7 +18,7 @@ use crate::scanner::{self, ScanProgress};
 use crate::state::AppState;
 use eidos_catalog::changes::{ChangeEvent, Checkpoint};
 use eidos_catalog::scan::{PublishOptions, ScanSession, ScanSummary};
-use eidos_domain::{SourceId, SourceKind, SourceState, UnixNanos};
+use eidos_domain::{SourceId, SourceState, UnixNanos};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -330,6 +330,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             stop(&status, "source retired".into());
             return;
         }
+        if source.kind.is_remote() {
+            stop(&status, "fleet replicas have no local change feed".into());
+            return;
+        }
         if state
             .scan_progress(source_id)
             .is_some_and(|p| !p.is_finished())
@@ -567,6 +571,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
         };
         if source.state == SourceState::Retired {
             stop(&status, "source retired".into());
+            return;
+        }
+        if source.kind.is_remote() {
+            stop(&status, "fleet replicas have no local change feed".into());
             return;
         }
         if state
@@ -1085,6 +1093,10 @@ pub fn native_scan_sequence(
             .catalog
             .get_source(source_id)?
             .ok_or_else(|| anyhow::anyhow!("source {source_id} not found"))?;
+        anyhow::ensure!(
+            !source.kind.is_remote(),
+            "source {source_id} is a fleet replica and cannot be scanned here"
+        );
         let vi = state
             .lister
             .volume_info(std::path::Path::new(&source.root_path))
@@ -1139,6 +1151,10 @@ pub fn native_scan_sequence(
             .catalog
             .get_source(source_id)?
             .ok_or_else(|| anyhow::anyhow!("source {source_id} not found"))?;
+        anyhow::ensure!(
+            !source.kind.is_remote(),
+            "source {source_id} is a fleet replica and cannot be scanned here"
+        );
         let volume = state
             .lister
             .volume_info(std::path::Path::new(&source.root_path))
@@ -1230,9 +1246,7 @@ fn reconcile_tick(state: &Arc<AppState>) -> anyhow::Result<()> {
 
 fn reconcile_tick_at(state: &Arc<AppState>, now: UnixNanos) -> anyhow::Result<()> {
     for s in state.catalog.list_sources()? {
-        if s.published_generation.is_none()
-            || s.state == SourceState::Retired
-            || s.kind == SourceKind::Remote
+        if s.published_generation.is_none() || s.state == SourceState::Retired || s.kind.is_remote()
         {
             state.clear_reconciliation_deferral(s.id);
             continue;

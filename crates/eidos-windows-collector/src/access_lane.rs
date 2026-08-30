@@ -125,6 +125,14 @@ fn set_view(shared: &Shared, f: impl FnOnce(&mut crate::protocol::EtwView)) {
     f(&mut shared.etw.lock().unwrap());
 }
 
+fn attributed_process_class(pid: u32, image: &str, key: &eidos_observe::StudyKey) -> ProcessClass {
+    if pid == std::process::id() {
+        ProcessClass::Collector
+    } else {
+        process_class(image, key)
+    }
+}
+
 /// Upper bound on events queued between the ETW consumer and the aggregator.
 /// Sized to absorb an ordinary burst; beyond it events are dropped and counted
 /// rather than allowed to grow the collector's memory without limit.
@@ -147,14 +155,11 @@ fn run_window(shared: &Arc<Shared>, window_end: Instant) -> Result<(), u32> {
             .map_err(|_| 8u32)?
     };
     let mut aggregator = AccessAggregator::new();
-    let own_pid = std::process::id();
     let seeded = shared.with_key(|key| {
         for (pid, image) in running_processes() {
-            let class = if pid == own_pid {
-                ProcessClass::Indexer
-            } else {
-                process_class(&image, key)
-            };
+            // The collector is identified by its own process identity, not
+            // by the `eidos.exe` image name it shares with the indexer.
+            let class = attributed_process_class(pid, &image, key);
             aggregator.process_seen(pid, class, false);
         }
     });
@@ -243,7 +248,7 @@ fn handle(shared: &Shared, aggregator: &mut AccessAggregator, event: TraceEvent)
         TraceEvent::Access(event) => aggregator.observe(event),
         TraceEvent::ProcessStart { pid, image } => {
             let class = shared
-                .with_key(|key| process_class(&image, key))
+                .with_key(|key| attributed_process_class(pid, &image, key))
                 .unwrap_or(ProcessClass::Other);
             aggregator.process_seen(pid, class, true);
         }
@@ -330,5 +335,10 @@ mod tests {
         assert!(running_processes()
             .iter()
             .any(|(pid, _)| *pid == std::process::id()));
+        let key = eidos_observe::StudyKey::from_bytes([1; 32]);
+        assert_eq!(
+            attributed_process_class(std::process::id(), "eidos.exe", &key),
+            ProcessClass::Collector
+        );
     }
 }

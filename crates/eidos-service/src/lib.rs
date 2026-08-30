@@ -13,6 +13,7 @@ mod api_json;
 pub mod content_preview;
 pub mod content_workers;
 pub mod export;
+pub mod fleet_api;
 pub mod follower;
 #[cfg(target_os = "macos")]
 mod fsevents_apply;
@@ -54,6 +55,10 @@ pub struct ServiceConfig {
     pub admission: admission::AdmissionConfig,
     /// Bounds on `/api/search/export`.
     pub export: export::ExportLimits,
+    /// Start the fleet runtime (identity, sync listener/dialers as
+    /// configured in `fleet/config.json`). Off only for tests that want a
+    /// service without a network presence.
+    pub fleet: bool,
 }
 
 impl ServiceConfig {
@@ -80,6 +85,7 @@ impl Default for ServiceConfig {
             content_workers: 4,
             admission: admission::AdmissionConfig::default(),
             export: export::ExportLimits::default(),
+            fleet: true,
         }
     }
 }
@@ -114,6 +120,14 @@ where
     let shutdown_state = state.clone();
     let web = config.web_assets();
     rt.block_on(async move {
+        if config.fleet {
+            // The fleet runtime is never a prerequisite for local readiness:
+            // a failure here is reported and the service serves regardless.
+            match eidos_fleet::Fleet::start(state.catalog.clone(), &config.data_dir) {
+                Ok(fleet) => *state.fleet.lock() = Some(fleet),
+                Err(e) => tracing::error!(error = %e, "fleet runtime did not start; local operation continues"),
+            }
+        }
         let app = api::router_with_web(state.clone(), &web);
         let listener = tokio::net::TcpListener::bind(config.bind).await?;
         let local = listener.local_addr().unwrap_or(config.bind);

@@ -738,6 +738,16 @@ impl Parser {
                 } else {
                     (v, 1, None)
                 };
+                // The renderer emits the extension bare (`has:ext`), so it must
+                // be a plain word: a `/`, quote, bracket, or space would be
+                // re-tokenized as something else on the way back in.
+                if ext.is_empty()
+                    || !ext
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '~'))
+                {
+                    return Err(err("invalid extension"));
+                }
                 Query::DescendantExtension {
                     extension: ext.to_ascii_lowercase(),
                     min_count: min,
@@ -769,12 +779,20 @@ impl Parser {
                 Query::Source { ids, names }
             }
             "host" | "h" => {
-                let ids = value
-                    .split(',')
-                    .filter_map(|v| v.trim().trim_start_matches("h:").parse::<i64>().ok())
-                    .map(HostId)
-                    .collect();
-                Query::Host { ids }
+                let mut ids = Vec::new();
+                let mut names = Vec::new();
+                for v in value.split(',') {
+                    let v = v.trim();
+                    if let Ok(n) = v.parse::<i64>() {
+                        ids.push(HostId(n));
+                    } else if let Some(n) = v.strip_prefix("h:").and_then(|x| x.parse::<i64>().ok())
+                    {
+                        ids.push(HostId(n));
+                    } else if !v.is_empty() {
+                        names.push(unquote(v));
+                    }
+                }
+                Query::Host { ids, names }
             }
             "object" | "obj" | "o" => {
                 let ids = value
@@ -1091,6 +1109,19 @@ mod tests {
     }
 
     #[test]
+    fn host_names_and_ids_survive_a_round_trip() {
+        let expected = Query::Host {
+            ids: vec![HostId(7)],
+            names: vec!["work laptop".into()],
+        };
+        let parsed = q("host:7,\"work laptop\"");
+        assert_eq!(parsed, expected);
+        let rendered = crate::render(&parsed);
+        assert_eq!(rendered, "host:7,\"work laptop\"");
+        assert_eq!(q(&rendered), expected);
+    }
+
+    #[test]
     fn bare_words_are_ranked_name_terms() {
         assert_eq!(
             q("readme notes"),
@@ -1289,5 +1320,33 @@ mod tests {
             q("foo:bar"),
             Query::text(TextField::Name, TextMode::Ranked, "foo:bar")
         );
+    }
+}
+
+#[cfg(test)]
+mod descendant_extension_round_trip {
+    use super::parse_at;
+    use crate::render;
+    use eidos_domain::UnixNanos;
+
+    const NOW: UnixNanos = UnixNanos(1_787_000_000_000_000_000);
+
+    /// Found by the query_parser fuzz target: `has:` accepted any bytes as
+    /// the extension and rendered them bare, so an extension starting with
+    /// `/` came back as a regex and the round trip failed to parse.
+    #[test]
+    fn an_extension_that_cannot_render_bare_is_rejected() {
+        assert!(parse_at("has:/^1/-)6$0.*$/", NOW).is_err());
+        assert!(parse_at("has:\"a b\"", NOW).is_err());
+        assert!(parse_at("has:", NOW).is_err());
+        for input in ["has:cs", "has:.tar.gz>=2", "has:c++:1..3", "has:résumé"] {
+            let parsed = parse_at(input, NOW).unwrap();
+            let rendered = render(&parsed.query);
+            assert_eq!(
+                parse_at(&rendered, NOW).unwrap().query,
+                parsed.query,
+                "{input} -> {rendered}"
+            );
+        }
     }
 }

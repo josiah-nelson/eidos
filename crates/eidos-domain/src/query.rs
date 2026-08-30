@@ -47,8 +47,12 @@ pub enum Query {
         #[serde(default)]
         slop: u32,
     },
+    /// Restrict to hosts by id and/or by name (names are resolved by the
+    /// executor against the catalog's host table).
     Host {
         ids: Vec<HostId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        names: Vec<String>,
     },
     /// Restrict to sources by id and/or by configured name (names are
     /// resolved by the executor against the catalog).

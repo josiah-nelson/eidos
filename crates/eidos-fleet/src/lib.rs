@@ -20,6 +20,7 @@
 //! - [`enroll`]: the invitation exchange.
 //! - [`config`], [`metrics`], [`status`]: what the service reads and shows.
 
+pub mod bakeoff;
 pub mod config;
 pub mod enroll;
 pub mod identity;

@@ -174,6 +174,8 @@ pub struct ReplicaCoverage {
     pub reported_at: Option<UnixNanos>,
     pub resyncing: bool,
     pub alarms: u64,
+    /// A session with the origin node is open.
+    pub connected: bool,
 }
 
 const REMOTE_GENERATION: i64 = 1;
@@ -1267,6 +1269,40 @@ fn replica_leaf_hashes_conn(
     Ok(hashes)
 }
 
+/// Coverage facts of a replicated source, for the completeness row of a
+/// search response. `None` for a local source.
+pub(crate) fn coverage_conn(
+    conn: &Connection,
+    source: SourceId,
+) -> Result<Option<ReplicaCoverage>> {
+    let Some(state) = state_conn(conn, source)? else {
+        return Ok(None);
+    };
+    let peer: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT name, connected FROM fleet_peers WHERE node_id = ?1",
+            params![state.node_id.as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(Some(ReplicaCoverage {
+        node_id: state.node_id,
+        node_name: peer
+            .as_ref()
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| "unknown node".into()),
+        connected: peer.is_some_and(|(_, c)| c != 0),
+        remote_source_id: state.remote_source_id,
+        epoch: state.admission.epoch,
+        applied_seq: state.admission.applied_seq,
+        reported_head: state.reported_head,
+        applied_at: state.applied_at,
+        reported_at: state.reported_at,
+        resyncing: state.resync_target.is_some(),
+        alarms: 0,
+    }))
+}
+
 impl Catalog {
     /// Make sure a peer's source has a local `sources` row and a durable
     /// cursor, creating both on first contact. Returns the replica state.
@@ -1377,31 +1413,7 @@ impl Catalog {
 
     /// Coverage facts of a replicated source, `None` for a local one.
     pub fn replica_coverage(&self, source: SourceId) -> Result<Option<ReplicaCoverage>> {
-        self.with_reader(|conn| {
-            let Some(state) = state_conn(conn, source)? else {
-                return Ok(None);
-            };
-            let node_name: String = conn
-                .query_row(
-                    "SELECT name FROM fleet_peers WHERE node_id = ?1",
-                    params![state.node_id.as_slice()],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or_else(|| "unknown node".into());
-            Ok(Some(ReplicaCoverage {
-                node_id: state.node_id,
-                node_name,
-                remote_source_id: state.remote_source_id,
-                epoch: state.admission.epoch,
-                applied_seq: state.admission.applied_seq,
-                reported_head: state.reported_head,
-                applied_at: state.applied_at,
-                reported_at: state.reported_at,
-                resyncing: state.resync_target.is_some(),
-                alarms: 0,
-            }))
-        })
+        self.with_reader(|conn| coverage_conn(conn, source))
     }
 
     /// Admit a peer's offer of a source (the protocol's `Hello`) and commit
@@ -2539,6 +2551,49 @@ impl Catalog {
             }
             tx.commit()?;
             Ok(retired)
+        })
+    }
+
+    /// Durably withdraw one remote source on behalf of its authenticated
+    /// origin. The first transaction hides it from search and fences every
+    /// later protocol write; bounded physical cleanup may then be retried.
+    pub fn replica_withdraw_source(
+        &self,
+        caller: [u8; 16],
+        remote_source: SourceId,
+    ) -> Result<Option<SourceId>> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !node_is_authorized_conn(&tx, &caller)? {
+                return Err(CatalogError::InvalidState(
+                    "only an enabled enrolled node may withdraw a source".into(),
+                ));
+            }
+            let source = tx
+                .query_row(
+                    "SELECT source_id FROM sync_replica_sources
+                     WHERE node_id = ?1 AND remote_source_id = ?2",
+                    params![caller.as_slice(), remote_source.0],
+                    |row| row.get::<_, i64>(0).map(SourceId),
+                )
+                .optional()?;
+            let Some(source) = source else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let now = UnixNanos::now().0;
+            tx.execute(
+                "UPDATE sources SET state = ?2,
+                     state_reason = 'withdrawn by its origin', updated_at = ?3
+                 WHERE source_id = ?1",
+                params![source.0, SourceState::Retired.as_str(), now],
+            )?;
+            tx.execute(
+                "DELETE FROM sync_replica_repairs WHERE source_id = ?1",
+                params![source.0],
+            )?;
+            tx.commit()?;
+            Ok(Some(source))
         })
     }
 

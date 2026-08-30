@@ -242,6 +242,37 @@ pub struct SourceCompleteness {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub note: Option<String>,
+    /// Present for a source replicated from a fleet node: where it comes
+    /// from and how far behind the origin this copy is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub remote: Option<RemoteCompleteness>,
+}
+
+/// Replication facts of a source that lives on another node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct RemoteCompleteness {
+    /// Hex node id of the origin.
+    pub node_id: String,
+    pub node_name: String,
+    /// The source's id on the origin node.
+    pub remote_source_id: SourceId,
+    pub epoch: String,
+    /// Sequence durably applied here.
+    pub applied_seq: u64,
+    /// Head the origin last reported.
+    pub reported_head: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub applied_at: Option<UnixNanos>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reported_at: Option<UnixNanos>,
+    /// An epoch change is being streamed; rows of the previous epoch may
+    /// still be visible until the stream passes the origin's head.
+    pub resyncing: bool,
+    /// A sync session with the origin is open right now.
+    pub connected: bool,
 }
 
 /// Strength of the freshness guarantee for a source.
@@ -343,6 +374,7 @@ mod tests {
             checkpoint_age_ms: None,
             freshness: Freshness::Live,
             note: None,
+            remote: None,
         };
         let resp = SearchResponse {
             schema_version: 1,

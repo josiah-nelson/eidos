@@ -11,6 +11,9 @@ repository.workspace = true
 eidos-domain = { workspace = true }
 eidos-catalog = { workspace = true }
 eidos-sync = { workspace = true }
+eidos-content = { workspace = true }
+zstd = { workspace = true }
+blake3 = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -27,6 +30,7 @@ base64 = { workspace = true }
 getrandom = { workspace = true }
 ts-rs = { workspace = true }
 zeroize = { workspace = true }
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

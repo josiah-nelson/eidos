@@ -2,7 +2,7 @@
 //! cannot infer causality from system I/O alone (sprint section 7).
 
 use crate::wire::Family;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use ts_rs::TS;
 
@@ -13,7 +13,7 @@ macro_rules! counters {
             $(pub $field: AtomicU64,)*
         }
 
-        #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, TS)]
+        #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
         pub struct $view {
             $(pub $field: u64,)*
         }

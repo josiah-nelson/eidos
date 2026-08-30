@@ -83,6 +83,10 @@ pub fn run(args: SourceArgs) -> anyhow::Result<()> {
                     Err(_) => eidos_scanner::GENERIC_SOURCE_KIND,
                 },
             };
+            anyhow::ensure!(
+                kind != SourceKind::Remote,
+                "remote sources are created by fleet replication, not by hand"
+            );
             let id = catalog.add_source(&NewSource {
                 host_id: host,
                 name: name.clone(),
@@ -98,8 +102,7 @@ pub fn run(args: SourceArgs) -> anyhow::Result<()> {
         SourceCommand::List => {
             for s in catalog.list_sources()? {
                 let counts = catalog.source_counts(s.id)?;
-                let listing_errors = catalog.published_listing_errors(s.id)?;
-                let c = eidos_catalog::read::completeness_from(&s, &counts, listing_errors);
+                let c = catalog.source_completeness(s.id)?;
                 println!(
                     "{:<4} {:<16} {:<16} {:<18} gen={:<3} files={:<8} dirs={:<6} logical={:<12} alloc={:<12} pending={} excluded={} errors={} meta_complete={} {}",
                     s.id.0,
@@ -128,6 +131,10 @@ pub fn run(args: SourceArgs) -> anyhow::Result<()> {
             let s = catalog
                 .find_source_by_name(&name)?
                 .with_context(|| format!("no source named '{name}'"))?;
+            anyhow::ensure!(
+                !s.kind.is_remote(),
+                "replicated source '{name}' carries no content here"
+            );
             let enabled = if enable {
                 true
             } else if disable {
@@ -153,6 +160,10 @@ pub fn run(args: SourceArgs) -> anyhow::Result<()> {
             let s = catalog
                 .find_source_by_name(&name)?
                 .with_context(|| format!("no source named '{name}'"))?;
+            anyhow::ensure!(
+                !s.kind.is_remote(),
+                "replicated source '{name}' is scanned on its origin node"
+            );
             if let Ok(v) = lister.volume_info(std::path::Path::new(&s.root_path)) {
                 catalog.upsert_volume(host, s.id, &v)?;
             }

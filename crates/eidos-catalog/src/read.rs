@@ -418,7 +418,36 @@ impl Catalog {
                 .ok_or_else(|| CatalogError::NotFound(format!("source {id}")))?;
             let counts = light_counts_conn(conn, &src)?;
             let listing_errors = published_listing_errors_conn(conn, &src)?;
-            Ok(completeness_from(&src, &counts, listing_errors))
+            let mut completeness = completeness_from(&src, &counts, listing_errors);
+            if src.kind == SourceKind::Remote {
+                // Replicas in v0.5 carry metadata only. Keep this false even
+                // if the replica bookkeeping row is missing or unreadable so
+                // no caller can infer complete content from zero pending jobs.
+                completeness.content_complete = false;
+                if let Some(cov) = crate::replica::coverage_conn(conn, id)? {
+                    // A connected origin streams changes continuously, so
+                    // the copy is as fresh as a live feed; otherwise it is
+                    // exactly as old as its last applied batch.
+                    completeness.freshness = if cov.connected {
+                        Freshness::Live
+                    } else {
+                        Freshness::Unknown
+                    };
+                    completeness.remote = Some(eidos_domain::RemoteCompleteness {
+                        node_id: cov.node_id.iter().map(|b| format!("{b:02x}")).collect(),
+                        node_name: cov.node_name,
+                        remote_source_id: cov.remote_source_id,
+                        epoch: cov.epoch.to_string(),
+                        applied_seq: cov.applied_seq,
+                        reported_head: cov.reported_head,
+                        applied_at: cov.applied_at,
+                        reported_at: cov.reported_at,
+                        resyncing: cov.resyncing,
+                        connected: cov.connected,
+                    });
+                }
+            }
+            Ok(completeness)
         })
     }
 
@@ -692,8 +721,10 @@ pub fn completeness_from(
 ) -> SourceCompleteness {
     let metadata_complete = src.published_generation.is_some() && src.state.metadata_complete();
     let content_not_replicated = src.kind == SourceKind::Remote;
-    let content_complete =
-        metadata_complete && counts.content_pending == 0 && !content_not_replicated;
+    let content_complete = metadata_complete
+        && counts.content_pending == 0
+        && counts.content_failed == 0
+        && !content_not_replicated;
     let freshness = match (src.state, src.checkpoint_kind.as_deref()) {
         (SourceState::Degraded, _) | (SourceState::Offline, _) | (SourceState::Stale, _) => {
             Freshness::Unknown
@@ -726,5 +757,50 @@ pub fn completeness_from(
         checkpoint_age_ms,
         freshness,
         note,
+        remote: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(kind: SourceKind) -> SourceRecord {
+        SourceRecord {
+            id: SourceId(1),
+            host_id: HostId(1),
+            name: "docs".into(),
+            kind,
+            root_path: "C:\\docs".into(),
+            aliases: Vec::new(),
+            state: SourceState::MetadataComplete,
+            state_reason: None,
+            policy_version: 1,
+            root_object_id: None,
+            published_generation: Some(1),
+            volume_id: None,
+            preserve_offline: true,
+            reconcile_interval_s: None,
+            content_enabled: true,
+            content_concurrency: 1,
+            sync_policy: eidos_domain::SyncPolicy::Inherit,
+            checkpoint_kind: None,
+            checkpoint_at: None,
+            last_scan_started_at: None,
+            last_scan_completed_at: Some(UnixNanos(1)),
+            created_at: UnixNanos(1),
+            updated_at: UnixNanos(1),
+        }
+    }
+
+    #[test]
+    fn failed_content_is_not_complete() {
+        let counts = SourceCounts {
+            content_failed: 1,
+            ..SourceCounts::default()
+        };
+        let completeness = completeness_from(&source(SourceKind::WindowsGeneric), &counts, 0);
+        assert!(completeness.metadata_complete);
+        assert!(!completeness.content_complete);
     }
 }

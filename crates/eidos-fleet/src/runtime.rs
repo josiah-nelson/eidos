@@ -86,6 +86,10 @@ impl Fleet {
             registry: Arc::new(Registry::default()),
             platform: std::env::consts::OS.to_string(),
         });
+        // Sessions are RAM: whatever the last process left behind is stale.
+        if let Err(e) = ctx.catalog.fleet_reset_connected() {
+            tracing::warn!(error = %e, "could not reset peer connection flags");
+        }
         let (shutdown, _) = watch::channel(false);
         let fleet = Arc::new(Fleet {
             ctx,
@@ -147,6 +151,16 @@ impl Fleet {
         let config = FleetConfig::load(&self.data_dir)?;
         *self.ctx.config.write() = config;
         Ok(())
+    }
+
+    /// Atomically edit, publish, and activate the fleet configuration.
+    pub fn update_config(
+        &self,
+        edit: impl FnOnce(&mut FleetConfig) -> anyhow::Result<()>,
+    ) -> anyhow::Result<FleetConfig> {
+        let config = FleetConfig::edit_locked(&self.data_dir, edit)?;
+        *self.ctx.config.write() = config.clone();
+        Ok(config)
     }
 
     pub fn status(&self) -> FleetStatus {

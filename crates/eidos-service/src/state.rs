@@ -81,6 +81,9 @@ pub struct AppState {
     pub content_rebuild: bool,
     /// Synchronous durable-state repairs performed by [`AppState::open`].
     pub startup_recovery: StartupRecovery,
+    /// The fleet runtime, once `run_with` has started it on the tokio
+    /// runtime. `None` while starting up or when disabled.
+    pub fleet: Mutex<Option<Arc<eidos_fleet::Fleet>>>,
 }
 
 impl AppState {
@@ -193,6 +196,7 @@ impl AppState {
             auto_reconcile: config.auto_reconcile,
             content_rebuild: rebuild_content,
             startup_recovery,
+            fleet: Mutex::new(None),
         };
         Ok(state)
     }
@@ -288,6 +292,10 @@ impl AppState {
         // Shed queued expensive work at once: graceful shutdown then waits
         // only for the operations that already hold a permit.
         self.admission.close();
+        // Sessions say goodbye and stop; nothing durable depends on them.
+        if let Some(fleet) = self.fleet.lock().take() {
+            fleet.shutdown();
+        }
         // Do not hold the registry lock while cancellation waits for an
         // in-flight watcher mutation to finish. The mutation may start a
         // recovery scan, and shutdown should not introduce a lock-order

@@ -7,7 +7,7 @@
 //! invitation secret is stored.
 
 use crate::{Catalog, CatalogError, Result};
-use eidos_domain::{SourceId, SyncPolicy, UnixNanos};
+use eidos_domain::{HostId, SourceId, SourceState, SyncPolicy, UnixNanos};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -75,6 +75,14 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// One row of the catalog's host table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct HostRecord {
+    pub id: HostId,
+    pub name: String,
+    pub platform: String,
+}
+
 /// What a peer is to this installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +123,10 @@ pub struct FleetPeer {
     pub enrolled_at: UnixNanos,
     pub last_seen_at: Option<UnixNanos>,
     pub last_error: Option<String>,
+    /// A sync session with the peer is open right now (reset when the
+    /// service starts).
+    #[serde(default)]
+    pub connected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,7 +149,7 @@ fn blob16(blob: Vec<u8>, what: &str) -> Result<[u8; 16]> {
         .map_err(|_| CatalogError::InvalidState(format!("{what} is not 16 bytes")))
 }
 
-/// `(node_id, name, role, fingerprint, endpoint, enabled, enrolled_at, last_seen_at, last_error)`
+/// `(node_id, name, role, fingerprint, endpoint, enabled, enrolled_at, last_seen_at, last_error, connected)`
 type PeerRow = (
     Vec<u8>,
     String,
@@ -148,6 +160,7 @@ type PeerRow = (
     i64,
     Option<i64>,
     Option<String>,
+    i64,
 );
 
 fn peer_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRow> {
@@ -161,11 +174,12 @@ fn peer_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRow> {
         r.get(6)?,
         r.get(7)?,
         r.get(8)?,
+        r.get(9)?,
     ))
 }
 
 fn peer_build(row: PeerRow) -> Result<FleetPeer> {
-    let (id, name, role, fp, endpoint, enabled, enrolled, seen, error) = row;
+    let (id, name, role, fp, endpoint, enabled, enrolled, seen, error, connected) = row;
     Ok(FleetPeer {
         node_id: NodeId(blob16(id, "fleet node id")?),
         name,
@@ -177,11 +191,11 @@ fn peer_build(row: PeerRow) -> Result<FleetPeer> {
         enrolled_at: UnixNanos(enrolled),
         last_seen_at: seen.map(UnixNanos),
         last_error: error,
+        connected: connected != 0,
     })
 }
 
-const PEER_COLUMNS: &str =
-    "node_id, name, role, fingerprint, endpoint, enabled, enrolled_at, last_seen_at, last_error";
+const PEER_COLUMNS: &str = "node_id, name, role, fingerprint, endpoint, enabled, enrolled_at, last_seen_at, last_error, connected";
 
 pub(crate) fn peer_conn(conn: &Connection, node: NodeId) -> Result<Option<FleetPeer>> {
     conn.prepare_cached(&format!(
@@ -274,6 +288,41 @@ impl Catalog {
         })
     }
 
+    /// Record whether a session with the peer is open. Sessions are RAM;
+    /// [`Catalog::fleet_reset_connected`] clears every flag at service start.
+    pub fn fleet_set_peer_connected(&self, node: NodeId, connected: bool) -> Result<()> {
+        self.with_writer(|conn| {
+            conn.execute(
+                "UPDATE fleet_peers SET connected = ?2 WHERE node_id = ?1",
+                params![node.0.as_slice(), connected as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn fleet_reset_connected(&self) -> Result<()> {
+        self.with_writer(|conn| {
+            conn.execute("UPDATE fleet_peers SET connected = 0", [])?;
+            Ok(())
+        })
+    }
+
+    /// Hosts known to the catalog (this one and every enrolled origin).
+    pub fn list_hosts(&self) -> Result<Vec<HostRecord>> {
+        self.with_reader(|conn| {
+            conn.prepare_cached("SELECT host_id, name, platform FROM hosts ORDER BY host_id")?
+                .query_map([], |r| {
+                    Ok(HostRecord {
+                        id: HostId(r.get(0)?),
+                        name: r.get(1)?,
+                        platform: r.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(Into::into)
+        })
+    }
+
     pub fn fleet_note_peer_seen(&self, node: NodeId, error: Option<&str>) -> Result<()> {
         self.with_writer(|conn| {
             conn.execute(
@@ -293,6 +342,52 @@ impl Catalog {
                 "DELETE FROM fleet_peers WHERE node_id = ?1",
                 params![node.0.as_slice()],
             )? > 0)
+        })
+    }
+
+    /// Atomically revoke a peer and hide every replica it owns. Physical row
+    /// cleanup is deliberately separate and idempotent, but no replica write
+    /// or search result can cross this transaction boundary.
+    pub fn fleet_forget_peer(&self, node: NodeId) -> Result<Option<Vec<SourceId>>> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let sources: Vec<SourceId> = tx
+                .prepare(
+                    "SELECT source_id FROM sync_replica_sources
+                     WHERE node_id = ?1 ORDER BY source_id",
+                )?
+                .query_map(params![node.0.as_slice()], |row| {
+                    row.get::<_, i64>(0).map(SourceId)
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let existed = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM fleet_peers WHERE node_id = ?1)",
+                params![node.0.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if !existed && sources.is_empty() {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let now = UnixNanos::now().0;
+            tx.execute(
+                "UPDATE sources SET state = ?2,
+                     state_reason = 'retired from the fleet', updated_at = ?3
+                 WHERE source_id IN (
+                     SELECT source_id FROM sync_replica_sources WHERE node_id = ?1)",
+                params![node.0.as_slice(), SourceState::Retired.as_str(), now],
+            )?;
+            tx.execute(
+                "DELETE FROM sync_replica_repairs WHERE source_id IN (
+                     SELECT source_id FROM sync_replica_sources WHERE node_id = ?1)",
+                params![node.0.as_slice()],
+            )?;
+            tx.execute(
+                "DELETE FROM fleet_peers WHERE node_id = ?1",
+                params![node.0.as_slice()],
+            )?;
+            tx.commit()?;
+            Ok(Some(sources))
         })
     }
 

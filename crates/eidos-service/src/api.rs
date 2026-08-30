@@ -21,7 +21,7 @@ use eidos_catalog::{
 };
 use eidos_domain::{ObjectId, SourceCompleteness, SourceId, SourceKind};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use ts_rs::TS;
 
 /// API router plus, optionally, the web UI served from a directory on disk.
@@ -58,6 +58,7 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
         .route("/sources/{id}/archives", post(requeue_archives))
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())
+        .merge(crate::fleet_api::routes())
         .route("/resolve", get(resolve))
         .route("/search", post(search).get(search_get))
         .route(
@@ -115,6 +116,11 @@ impl ApiError {
     }
     pub(crate) fn conflict(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", msg)
+    }
+    pub(crate) fn unavailable(msg: impl Into<String>, retry_after_s: Option<u64>) -> Self {
+        let mut e = Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", msg);
+        e.retry_after_s = retry_after_s;
+        e
     }
     pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
@@ -193,6 +199,33 @@ impl IntoResponse for ApiError {
 
 pub(crate) type ApiResult<T> = Result<ApiJson<T>, ApiError>;
 
+const MAX_SHORT_BLOCKING_OPERATIONS: usize = 16;
+static SHORT_BLOCKING_OPERATIONS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+/// Run a short synchronous catalog/configuration operation without occupying
+/// an async runtime worker. Long query and browse operations use the bounded
+/// admission gate instead; this is for operator mutations and lookups.
+pub(crate) async fn blocking<T, F>(f: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+{
+    let admission = SHORT_BLOCKING_OPERATIONS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_SHORT_BLOCKING_OPERATIONS)))
+        .clone();
+    let permit = admission
+        .try_acquire_owned()
+        .map_err(|_| ApiError::busy("operator work is at capacity", 1))?;
+    tokio::task::spawn_blocking(move || {
+        // Keep the permit with the blocking work even if its HTTP request is
+        // cancelled; spawn_blocking tasks cannot be aborted once running.
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
 // ----- health --------------------------------------------------------------
 
 #[derive(Serialize, TS)]
@@ -244,16 +277,21 @@ pub struct SourceView {
     pub reconciliation_deferred: Option<crate::state::ReconciliationDeferral>,
 }
 
-fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, ApiError> {
+pub(crate) fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, ApiError> {
     let counts = st.catalog.source_counts(s.id)?;
     let listing_errors = st.catalog.published_listing_errors(s.id)?;
-    let mut completeness = eidos_catalog::read::completeness_from(&s, &counts, listing_errors);
+    let mut completeness = if s.kind.is_remote() {
+        st.catalog.source_completeness(s.id)?
+    } else {
+        eidos_catalog::read::completeness_from(&s, &counts, listing_errors)
+    };
     let scan = st.scan_progress(s.id).map(|p| p.view());
     let watcher = st.watcher_status(s.id).map(|w| w.view());
     let reconciliation_deferred = st.reconciliation_deferral(s.id);
     // A stored checkpoint only means "live" while a watcher is actually
     // consuming it.
-    if completeness.freshness == eidos_domain::Freshness::Live
+    if !s.kind.is_remote()
+        && completeness.freshness == eidos_domain::Freshness::Live
         && !watcher.as_ref().is_some_and(|w| w.live)
     {
         completeness.freshness = eidos_domain::Freshness::Unknown;
@@ -315,6 +353,11 @@ async fn add_source(
         )));
     }
     let kind = match body.kind {
+        Some(SourceKind::Remote) => {
+            return Err(ApiError::bad_request(
+                "remote sources are created by fleet replication, not by hand",
+            ))
+        }
         Some(k) => k,
         None => match st.lister.volume_info(root) {
             Ok(v) => v.source_kind(),
@@ -412,12 +455,13 @@ async fn scan_source(
     Path(id): Path<i64>,
 ) -> Result<(StatusCode, ApiJson<ScanProgressView>), ApiError> {
     let sid = SourceId(id);
-    st.catalog
-        .get_source(sid)?
-        .ok_or_else(|| ApiError::not_found(format!("source {sid}")))?;
-    match start_scan(&st, sid) {
+    let result = blocking(move || Ok(start_scan(&st, sid))).await?;
+    match result {
         Ok(p) => Ok((StatusCode::ACCEPTED, ApiJson(p.view()))),
         Err(StartScanError::AlreadyRunning) => Err(ApiError::conflict("scan already running")),
+        Err(StartScanError::RemoteSource) => Err(ApiError::bad_request(
+            "a replicated source is scanned on its origin node, not here",
+        )),
         Err(StartScanError::Catalog(e)) => Err(e.into()),
     }
 }
@@ -954,22 +998,31 @@ async fn set_content_policy(
     Json(body): Json<ContentPolicyBody>,
 ) -> ApiResult<SourceView> {
     let sid = SourceId(id);
-    let s = st
-        .catalog
-        .get_source(sid)?
-        .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
-    let enabled = body.enabled.unwrap_or(s.content_enabled);
-    let concurrency = body
-        .concurrency
-        .unwrap_or(s.content_concurrency)
-        .clamp(1, 64);
-    st.catalog.set_content_policy(sid, enabled, concurrency)?;
-    st.content_budgets().set(sid, concurrency);
-    let s = st
-        .catalog
-        .get_source(sid)?
-        .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
-    Ok(ApiJson(source_view(&st, s)?))
+    let view = blocking(move || {
+        let s = st
+            .catalog
+            .get_source(sid)?
+            .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
+        if s.kind == SourceKind::Remote {
+            return Err(ApiError::bad_request(
+                "a replicated source carries no content here; set its policy on the origin node",
+            ));
+        }
+        let enabled = body.enabled.unwrap_or(s.content_enabled);
+        let concurrency = body
+            .concurrency
+            .unwrap_or(s.content_concurrency)
+            .clamp(1, 64);
+        st.catalog.set_content_policy(sid, enabled, concurrency)?;
+        st.content_budgets().set(sid, concurrency);
+        let s = st
+            .catalog
+            .get_source(sid)?
+            .ok_or_else(|| ApiError::not_found(format!("source {id}")))?;
+        source_view(&st, s)
+    })
+    .await?;
+    Ok(ApiJson(view))
 }
 
 #[derive(Serialize, TS)]

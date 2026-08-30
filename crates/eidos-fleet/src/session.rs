@@ -110,6 +110,13 @@ struct Active {
 #[derive(Default)]
 pub struct Registry {
     active: Mutex<HashMap<NodeId, Active>>,
+    /// Serializes a registry change with the durable `connected` flag it
+    /// implies. An ending session checks the registry and then writes
+    /// `false`; without this lock its replacement could register and write
+    /// `true` between those two steps and be reported as disconnected until
+    /// the next change. Held only around the change and the one catalog
+    /// write, never across an await, and never by status readers.
+    presence: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -170,12 +177,69 @@ impl Registry {
         views
     }
 
+    /// Ask the active session for one peer to close. The session's normal
+    /// cleanup removes it from the registry and clears durable presence.
+    pub fn close_peer(&self, peer: NodeId) -> bool {
+        let active = self.active.lock();
+        let Some(session) = active.get(&peer) else {
+            return false;
+        };
+        session.close.store(true, Ordering::Relaxed);
+        session.close_notify.notify_one();
+        true
+    }
+
     /// Ask every session to close (shutdown).
     pub fn close_all(&self) {
         for a in self.active.lock().values() {
             a.close.store(true, Ordering::Relaxed);
             a.close_notify.notify_one();
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn register(registry: &Registry, peer: NodeId) -> Arc<AtomicBool> {
+        let close = Arc::new(AtomicBool::new(false));
+        registry
+            .register(
+                peer,
+                SessionKey {
+                    initiator: peer,
+                    nonce: 1,
+                },
+                close.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(Mutex::new(SessionView {
+                    peer,
+                    peer_name: format!("peer-{peer}"),
+                    direction: Direction::Inbound,
+                    since: UnixNanos(1),
+                    remote_addr: None,
+                    last_activity_ms_ago: 0,
+                    credit_remaining: 0,
+                    sources: Vec::new(),
+                })),
+            )
+            .expect("unique peer");
+        close
+    }
+
+    #[test]
+    fn closing_one_peer_does_not_revoke_other_sessions() {
+        let registry = Registry::default();
+        let first = NodeId([1; 16]);
+        let second = NodeId([2; 16]);
+        let first_close = register(&registry, first);
+        let second_close = register(&registry, second);
+
+        assert!(registry.close_peer(first));
+        assert!(first_close.load(Ordering::Relaxed));
+        assert!(!second_close.load(Ordering::Relaxed));
+        assert!(!registry.close_peer(NodeId([3; 16])));
     }
 }
 
@@ -233,6 +297,9 @@ struct ShipState {
     last_error: Option<String>,
 }
 
+type ShippableSource = (SourceId, eidos_catalog::sync::SyncSourceState, u64);
+type ShipperRefresh = (Vec<ShippableSource>, Vec<SourceId>);
+
 /// Parts of a repair answer: the leaves each part completes and their rows.
 type RepairParts = Vec<(Vec<u32>, Vec<SyncRow>)>;
 /// An encoded batch frame with `(through_seq, rows, head_seq)`.
@@ -275,6 +342,7 @@ struct Session<W> {
     credit: i64,
     credit_limit: i64,
     shipping: BTreeMap<SourceId, ShipState>,
+    withdrawn_acked: BTreeSet<SourceId>,
     consuming: BTreeMap<SourceId, ConsumeState>,
     last_rx: Instant,
     last_ping: Option<(u64, Instant)>,
@@ -505,17 +573,23 @@ where
         credit_remaining: credit,
         sources: Vec::new(),
     }));
-    if ctx
-        .registry
-        .register(
+    let registered = {
+        // The durable `connected` flag is written under the same lock as
+        // the registry change it reflects (see `Registry::presence`).
+        let _presence = ctx.registry.presence.lock();
+        let registered = ctx.registry.register(
             peer.node_id,
             key,
             close.clone(),
             close_notify.clone(),
             view.clone(),
-        )
-        .is_err()
-    {
+        );
+        if registered.is_ok() {
+            let _ = ctx.catalog.fleet_set_peer_connected(peer.node_id, true);
+        }
+        registered
+    };
+    if registered.is_err() {
         ctx.counters.add(&ctx.counters.duplicate_sessions_closed, 1);
         let _ = send(
             &mut wr,
@@ -566,6 +640,7 @@ where
         direction,
         max_frame: peer_max,
         shipping: BTreeMap::new(),
+        withdrawn_acked: BTreeSet::new(),
         consuming: BTreeMap::new(),
         last_rx: Instant::now(),
         last_ping: None,
@@ -636,7 +711,13 @@ where
         }
     };
     reader.abort();
-    ctx.registry.unregister(peer.node_id, key);
+    {
+        let _presence = ctx.registry.presence.lock();
+        ctx.registry.unregister(peer.node_id, key);
+        if !ctx.registry.is_connected(peer.node_id) {
+            let _ = ctx.catalog.fleet_set_peer_connected(peer.node_id, false);
+        }
+    }
     ctx.counters.add(&ctx.counters.disconnects, 1);
     if let SessionEnd::Failed(reason) = &end {
         let _ = ctx.catalog.fleet_note_peer_seen(peer.node_id, Some(reason));
@@ -695,6 +776,7 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
         enrolled_at: UnixNanos::now(),
         last_seen_at: Some(UnixNanos::now()),
         last_error: None,
+        connected: false,
     };
     let catalog = ctx.catalog.clone();
     let redeemed = match tokio::task::spawn_blocking(move || {
@@ -879,6 +961,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 .await?;
                 Ok(true)
             }
+            Message::Withdraw { source } => {
+                self.on_withdraw(source).await?;
+                Ok(true)
+            }
             Message::Batch(batch) => {
                 self.on_batch(batch).await?;
                 Ok(true)
@@ -963,6 +1049,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 self.on_rejected(source, reason);
                 Ok(true)
             }
+            Message::Withdrawn { source } => {
+                if self.peer.role != PeerRole::Central {
+                    return Err(anyhow!(
+                        "only a central may acknowledge a source withdrawal"
+                    ));
+                }
+                self.withdrawn_acked.insert(source);
+                Ok(true)
+            }
             Message::RepairRequest {
                 source,
                 epoch,
@@ -988,6 +1083,31 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     // ----- consumer role -------------------------------------------------
+
+    async fn on_withdraw(&mut self, remote_source: SourceId) -> anyhow::Result<()> {
+        if !self.ctx.config.read().central || self.peer.role != PeerRole::Node {
+            return Err(anyhow!("only an enrolled node may withdraw its source"));
+        }
+        let catalog = self.ctx.catalog.clone();
+        let caller = self.peer.node_id.0;
+        let local_source = tokio::task::spawn_blocking(move || -> eidos_catalog::Result<_> {
+            let local = catalog.replica_withdraw_source(caller, remote_source)?;
+            if let Some(local) = local {
+                catalog.replica_retire_source(local)?;
+            }
+            Ok(local)
+        })
+        .await
+        .context("source withdrawal task")??;
+        if let Some(local) = local_source {
+            self.consuming.remove(&local);
+        }
+        self.send(&Message::Withdrawn {
+            source: remote_source,
+        })
+        .await?;
+        Ok(())
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn on_offer(
@@ -2121,20 +2241,24 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         let catalog = self.ctx.catalog.clone();
         let peer_role = self.peer.role;
         let consumer = self.peer.node_id.0;
-        let shippable = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Vec<(SourceId, eidos_catalog::sync::SyncSourceState, u64)>> {
+        let (shippable, withdrawals) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<ShipperRefresh> {
                 // Only a central consumes; offering sources to a node would
                 // only draw rejections.
                 if peer_role != PeerRole::Central {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), Vec::new()));
                 }
                 let mut out = Vec::new();
+                let mut withdrawals = Vec::new();
                 for s in catalog.list_sources()? {
-                    if s.kind == SourceKind::Remote
-                        || s.state == SourceState::Retired
-                        || s.published_generation.is_none()
-                        || s.sync_policy != SyncPolicy::Inherit
-                    {
+                    if s.kind == SourceKind::Remote {
+                        continue;
+                    }
+                    if s.state == SourceState::Retired || s.sync_policy == SyncPolicy::LocalOnly {
+                        withdrawals.push(s.id);
+                        continue;
+                    }
+                    if s.published_generation.is_none() {
                         continue;
                     }
                     if let Some(state) = catalog.sync_source(s.id)? {
@@ -2149,12 +2273,19 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                         }
                     }
                 }
-                Ok(out)
-            },
-        )
-        .await
-        .context("source scan task")??;
+                Ok((out, withdrawals))
+            })
+            .await
+            .context("source scan task")??;
         let wanted: BTreeSet<SourceId> = shippable.iter().map(|(id, _, _)| *id).collect();
+        let withdrawals: BTreeSet<SourceId> = withdrawals.into_iter().collect();
+        self.withdrawn_acked
+            .retain(|source| withdrawals.contains(source));
+        let to_withdraw: Vec<SourceId> = withdrawals
+            .iter()
+            .filter(|source| !self.withdrawn_acked.contains(source))
+            .copied()
+            .collect();
         let removed_credit: u64 = self
             .shipping
             .iter()
@@ -2166,6 +2297,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             .sum();
         self.shipping.retain(|id, _| wanted.contains(id));
         replenish_credit(&mut self.credit, self.credit_limit, removed_credit);
+        for source in to_withdraw {
+            self.send(&Message::Withdraw { source }).await?;
+        }
         let mut to_offer: Vec<(SourceId, eidos_catalog::sync::SyncSourceState)> = Vec::new();
         let mut to_ship: Vec<SourceId> = Vec::new();
         for (id, state, durable_cursor) in shippable {

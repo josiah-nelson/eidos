@@ -507,7 +507,8 @@ CREATE TABLE fleet_peers (
     enabled      INTEGER NOT NULL DEFAULT 1,
     enrolled_at  INTEGER NOT NULL,
     last_seen_at INTEGER,
-    last_error   TEXT
+    last_error   TEXT,
+    connected    INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 -- A node can ship to at most one central. This database invariant closes
 -- the race between concurrent enrollment requests.

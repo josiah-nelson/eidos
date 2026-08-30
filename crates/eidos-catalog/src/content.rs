@@ -11,7 +11,7 @@ use crate::{Catalog, CatalogError, Result};
 use eidos_content::Chunk;
 use eidos_domain::{
     ContentId, ContentState, Coverage, FailureClass, JobId, JobStage, ObjectId, Priority, SourceId,
-    UnixNanos,
+    SourceKind, UnixNanos,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -656,13 +656,18 @@ impl Catalog {
         concurrency: u32,
     ) -> Result<()> {
         self.with_writer(|conn| {
+            let source_row = crate::read::get_source_conn(conn, source)?
+                .ok_or_else(|| CatalogError::NotFound(format!("source {source}")))?;
+            if source_row.kind == SourceKind::Remote {
+                return Err(CatalogError::InvalidState(format!(
+                    "source {source} is a metadata-only fleet replica"
+                )));
+            }
             let n = conn.execute(
                 "UPDATE sources SET content_enabled = ?2, content_concurrency = ?3, updated_at = ?4 WHERE source_id = ?1",
                 params![source.0, enabled as i64, concurrency.max(1) as i64, UnixNanos::now().0],
             )?;
-            if n == 0 {
-                return Err(CatalogError::NotFound(format!("source {source}")));
-            }
+            debug_assert_eq!(n, 1);
             Ok(())
         })
     }

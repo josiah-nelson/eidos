@@ -977,6 +977,11 @@ pub fn run_scan(
     let source = catalog
         .get_source(source_id)?
         .ok_or_else(|| CatalogError::NotFound(format!("source {source_id}")))?;
+    if source.kind == SourceKind::Remote {
+        return Err(CatalogError::InvalidState(format!(
+            "source {source_id} is a fleet replica and cannot be scanned here"
+        )));
+    }
     let mut session = catalog.begin_scan(source_id, opts.kind)?;
     if let Some((rows, interval)) = opts.batching {
         session.set_batching(rows, interval);

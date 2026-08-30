@@ -26,6 +26,10 @@ pre-export inspector.
    probes, and resource samples that carry the lane states in force.
    Aggregate counts are exact because they name no object; every per-object
    scalar stays bucketed and every identity stays a keyed token.
+   The later explicit `collector` process-class value advances the serialized
+   contract to `eidos-observation/2`; adding an enum value under the v1 label
+   would make a v1 reader reject a bundle that still claimed to be v1. V2
+   readers retain support for the additive v1 bundle shape.
 2. Run the collector as a LocalSystem service (`eidos-collector`) because
    reading every local USN journal needs volume-management rights, and
    drive it over a local named pipe with bounded JSON frames. The same

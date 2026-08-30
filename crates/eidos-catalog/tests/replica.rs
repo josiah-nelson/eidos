@@ -268,6 +268,7 @@ impl Central {
                 fingerprint: [0xA5; 32],
                 endpoint: None,
                 enabled: true,
+                connected: false,
                 enrolled_at: UnixNanos(1),
                 last_seen_at: None,
                 last_error: None,
@@ -3615,6 +3616,66 @@ fn disabled_or_removed_peers_are_durably_fenced_from_replica_writes() {
 }
 
 #[test]
+fn forgetting_a_peer_atomically_revokes_it_and_hides_its_replicas() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let applied = central.applied_seq(source);
+    node.touch("a/one.txt", 125, 1_700_000_125);
+    let batch = node
+        .catalog
+        .sync_rows_after(node.source, applied, u32::MAX)
+        .unwrap();
+
+    let sources = central
+        .catalog
+        .fleet_forget_peer(NodeId(NODE))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(sources, vec![source]);
+    assert!(central.catalog.fleet_peer(NodeId(NODE)).unwrap().is_none());
+    assert_eq!(
+        central.catalog.get_source(source).unwrap().unwrap().state,
+        SourceState::Retired
+    );
+    match central
+        .catalog
+        .replica_apply_batch(NODE, source, &batch)
+        .unwrap()
+    {
+        BatchOutcome::Rejected { reason } => assert!(reason.contains("retired"), "{reason}"),
+        other => panic!("forgotten peer's batch was accepted: {other:?}"),
+    }
+    let mapping_exists = central
+        .catalog
+        .with_reader(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_replica_sources WHERE source_id = ?1)",
+                [source.0],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    assert!(mapping_exists, "physical cleanup remains a separate phase");
+    assert!(central.catalog.replica_retire_source(source).unwrap());
+    let mapping_exists = central
+        .catalog
+        .with_reader(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_replica_sources WHERE source_id = ?1)",
+                [source.0],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    assert!(!mapping_exists);
+}
+
+#[test]
 fn authenticated_replica_writes_are_bound_to_the_source_owner_and_node_role() {
     let node = Node::new();
     let central = Central::new();
@@ -3637,6 +3698,7 @@ fn authenticated_replica_writes_are_bound_to_the_source_owner_and_node_role() {
             fingerprint: [0xB6; 32],
             endpoint: None,
             enabled: true,
+            connected: false,
             enrolled_at: UnixNanos(2),
             last_seen_at: None,
             last_error: None,
@@ -3717,6 +3779,7 @@ fn authenticated_replica_writes_are_bound_to_the_source_owner_and_node_role() {
             fingerprint: [0xA5; 32],
             endpoint: None,
             enabled: true,
+            connected: false,
             enrolled_at: UnixNanos(1),
             last_seen_at: None,
             last_error: None,
@@ -4013,6 +4076,7 @@ fn two_nodes_with_the_same_source_name_and_path_stay_distinct() {
             fingerprint: [0xB6; 32],
             endpoint: None,
             enabled: true,
+            connected: false,
             enrolled_at: UnixNanos(1),
             last_seen_at: None,
             last_error: None,
@@ -4854,6 +4918,7 @@ fn one_certificate_fingerprint_cannot_enroll_as_two_node_ids() {
         enrolled_at: UnixNanos(1),
         last_seen_at: None,
         last_error: None,
+        connected: false,
     };
     central.catalog.fleet_upsert_peer(&first).unwrap();
     let mut collision = first.clone();
@@ -4894,6 +4959,7 @@ fn a_lost_enrollment_response_can_retry_only_the_committed_roster_entry() {
         endpoint: None,
         enabled: true,
         enrolled_at: UnixNanos::now(),
+        connected: false,
         last_seen_at: None,
         last_error: None,
     };

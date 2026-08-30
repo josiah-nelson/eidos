@@ -423,6 +423,7 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
         if !s.content_enabled
             || s.published_generation.is_none()
             || matches!(s.state, SourceState::Retired | SourceState::Offline)
+            || s.kind.is_remote()
         {
             continue;
         }

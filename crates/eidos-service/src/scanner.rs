@@ -5,7 +5,7 @@ use crate::state::{
 };
 use crate::watcher;
 use eidos_catalog::scan::{ScanKind, ScanSession, ScanSummary};
-use eidos_domain::{JobStage, SourceId, UnixNanos};
+use eidos_domain::{JobStage, SourceId, SourceKind, UnixNanos};
 use eidos_scanner::WalkOptions;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,8 +110,21 @@ impl ScanProgress {
 pub enum StartScanError {
     #[error("a scan is already running for this source")]
     AlreadyRunning,
+    #[error("a fleet replica is scanned on its origin node, not here")]
+    RemoteSource,
     #[error("{0}")]
     Catalog(#[from] eidos_catalog::CatalogError),
+}
+
+fn ensure_scannable(state: &AppState, source_id: SourceId) -> Result<(), StartScanError> {
+    let source = state
+        .catalog
+        .get_source(source_id)?
+        .ok_or_else(|| eidos_catalog::CatalogError::NotFound(format!("source {source_id}")))?;
+    if source.kind == SourceKind::Remote {
+        return Err(StartScanError::RemoteSource);
+    }
+    Ok(())
 }
 
 /// Result of asking the scheduler to start a reconciliation. Deferral is a
@@ -155,6 +168,7 @@ pub fn start_scan(
     state: &Arc<AppState>,
     source_id: SourceId,
 ) -> Result<Arc<ScanProgress>, StartScanError> {
+    ensure_scannable(state, source_id)?;
     let progress = {
         let mut scans = state.scans.lock();
         if let Some(p) = scans.get(&source_id) {
@@ -203,6 +217,7 @@ fn start_automatic_scan_with(
     now: UnixNanos,
     coordinate_content: bool,
 ) -> Result<AutomaticScanOutcome, StartScanError> {
+    ensure_scannable(state, source_id)?;
     let progress = {
         let mut scans = state.scans.lock();
         if let Some(p) = scans.get(&source_id) {
@@ -290,6 +305,10 @@ pub fn enumerate(
         .catalog
         .get_source(source_id)?
         .ok_or_else(|| anyhow::anyhow!("source {source_id} not found"))?;
+    anyhow::ensure!(
+        source.kind != SourceKind::Remote,
+        "source {source_id} is a fleet replica and cannot be scanned here"
+    );
     // Refresh volume capabilities (read-only probe).
     match state
         .lister
