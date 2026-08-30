@@ -86,14 +86,9 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
 
           $response = gh api -X GET "repos/$env:GITHUB_REPOSITORY/actions/workflows/installer.yml/runs?event=workflow_dispatch&status=completed&per_page=100" | ConvertFrom-Json
-          $matching = @()
-          foreach ($run in $response.workflow_runs) {
-            if ($run.conclusion -ne 'success') { continue }
-            git cat-file -e "$($run.head_sha)^{commit}" 2>$null
-            if ($LASTEXITCODE -ne 0) { continue }
-            git diff --quiet $run.head_sha HEAD -- .
-            if ($LASTEXITCODE -eq 0) { $matching += $run }
-          }
+          $matching = @($response.workflow_runs | Where-Object {
+            $_.conclusion -eq 'success' -and $_.head_sha -eq $env:GITHUB_SHA
+          })
           if ($matching.Count -eq 0) {
             throw 'release requires a successful manual installer.yml run for this exact source tree'
           }
