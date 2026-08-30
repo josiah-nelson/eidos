@@ -73,6 +73,7 @@ fn scheduler(shared: Arc<Shared>) {
         set_view(&shared, |v| {
             v.enabled = settings.enabled;
             v.destination = settings.destination.clone();
+            v.hour = settings.hour;
             v.pending = waiting;
         });
         if !settings.enabled || settings.destination.trim().is_empty() {

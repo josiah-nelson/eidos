@@ -617,6 +617,44 @@ fn handle_request(shared: &Arc<Shared>, request: Request) -> Response {
             }
         }
         Request::Probe { volume } => crate::lanes::probe_now(shared, volume.as_deref()),
+        Request::SetUpload {
+            enabled,
+            destination,
+            hour,
+        } => {
+            let mut config = shared.config.lock().unwrap();
+            // Same load-through-save file lock as `SetLanes`, for the same
+            // reason: coordinate with `observe configure` in another process.
+            match CollectorConfig::edit_locked(&shared.data_dir, |updated| {
+                updated.upload = config.upload.clone();
+                if let Some(enabled) = enabled {
+                    updated.upload.enabled = enabled;
+                }
+                if let Some(destination) = &destination {
+                    updated.upload.destination = destination.trim().to_string();
+                }
+                if let Some(hour) = hour {
+                    updated.upload.hour = hour.min(23);
+                }
+                Ok(())
+            }) {
+                Ok(updated) => {
+                    let upload = updated.upload.clone();
+                    *config = updated;
+                    drop(config);
+                    // Reflect the change in status immediately instead of
+                    // waiting for the scheduler's next minute tick.
+                    let mut view = shared.upload.lock().unwrap();
+                    view.enabled = upload.enabled;
+                    view.destination = upload.destination;
+                    view.hour = upload.hour;
+                    Response::Accepted
+                }
+                Err(error) => Response::Error {
+                    message: format!("configuration not saved: {error}"),
+                },
+            }
+        }
     }
 }
 

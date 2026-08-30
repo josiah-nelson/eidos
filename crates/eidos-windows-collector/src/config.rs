@@ -44,7 +44,10 @@ pub struct UploadConfig {
 impl Default for UploadConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Installing the collector is already the opt-in: it exists to
+            // deposit observations somewhere, so delivery is on by default
+            // and simply idles until a destination is configured.
+            enabled: true,
             destination: String::new(),
             // Off-hours by default, so a fleet is not copying bundles while
             // the workload it measures is busiest.

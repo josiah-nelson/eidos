@@ -481,6 +481,55 @@ impl DirectoryLister for WinLister {
         })
     }
 
+/// Every present drive letter with its type, capabilities, and capacity —
+/// the pick-list for onboarding. A drive that cannot be probed is skipped
+/// rather than failing the enumeration; capacity reads that fail leave
+/// zeros (the UI treats 0 total as unknown).
+pub fn list_volume_candidates() -> Vec<crate::VolumeCandidate> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives,
+    };
+    let lister = crate::default_lister();
+    // SAFETY: no arguments; returns a bitmask of present drive letters.
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let root = format!("{}:\\", (b'A' + i as u8) as char);
+        let wide: Vec<u16> = root.encode_utf16().chain([0]).collect();
+        // SAFETY: `wide` is a valid NUL-terminated wide string.
+        let drive_type = match unsafe { GetDriveTypeW(wide.as_ptr()) } {
+            2 => "removable",
+            3 => "fixed",
+            4 => "remote",
+            5 => "cdrom",
+            6 => "ramdisk",
+            _ => continue,
+        };
+        let info = match lister.volume_info(Path::new(&root)) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let (mut free, mut total) = (0u64, 0u64);
+        // SAFETY: out-pointers to valid u64s; the last parameter is optional.
+        unsafe {
+            GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut());
+        }
+        out.push(crate::VolumeCandidate {
+            root,
+            drive_type: drive_type.to_string(),
+            filesystem: info.filesystem,
+            volume_name: info.volume_name,
+            total_bytes: total,
+            free_bytes: free,
+            supports_usn: info.supports_usn,
+        });
+    }
+    out
+}
+
     fn volume_info(&self, root: &Path) -> Result<VolumeInfo, ScanError> {
         let h = open_directory(root)?;
         let mut serial32: u32 = 0;

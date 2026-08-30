@@ -12,8 +12,10 @@ mod api_contract;
 mod api_json;
 pub mod content_control;
 pub mod content_preview;
+pub mod collector_api;
 pub mod content_workers;
 pub mod export;
+pub mod update_check;
 pub mod fleet_api;
 pub mod follower;
 #[cfg(target_os = "macos")]
@@ -55,6 +57,9 @@ pub struct ServiceConfig {
     /// (`content-workers.json` in the data directory) wins over this value
     /// at startup.
     pub content_workers: usize,
+    /// Daily read-only check against GitHub releases; the result is
+    /// advisory (a health field and a UI notice), never a download.
+    pub update_check: bool,
     /// Bounds and deadlines for expensive HTTP operations.
     pub admission: admission::AdmissionConfig,
     /// Bounds on `/api/search/export`.
@@ -87,6 +92,7 @@ impl Default for ServiceConfig {
             auto_reconcile: true,
             content: true,
             content_workers: 4,
+            update_check: true,
             admission: admission::AdmissionConfig::default(),
             export: export::ExportLimits::default(),
             fleet: true,

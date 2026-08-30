@@ -32,6 +32,14 @@ pub enum Request {
     Probe {
         volume: Option<String>,
     },
+    /// Configure bundle forwarding at runtime; persisted into the
+    /// configuration file like `SetLanes`.
+    SetUpload {
+        enabled: Option<bool>,
+        destination: Option<String>,
+        /// Local hour 0-23 (clamped) at or after which the day's upload runs.
+        hour: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +77,10 @@ pub struct CollectorStatus {
 pub struct UploadView {
     pub enabled: bool,
     pub destination: String,
+    /// Local hour the daily delivery runs at or after. `serde(default)`
+    /// keeps status decodable from a pre-0.6 daemon that does not send it.
+    #[serde(default)]
+    pub hour: u32,
     pub last_upload_utc_ns: Option<i64>,
     pub uploaded_total: u64,
     /// Why the most recent attempt failed, cleared by the next success.

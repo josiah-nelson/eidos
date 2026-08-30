@@ -27,6 +27,12 @@ tracing = { workspace = true }
 ts-rs = { workspace = true }
 parking_lot = { workspace = true }
 rust-embed = { workspace = true }
+# Release update check (read-only GitHub API poll).
+ureq = { version = "3.4", features = ["json"] }
+
+[target.'cfg(windows)'.dependencies]
+# Control-pipe client for the collector's status/forwarding surface.
+eidos-windows-collector = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
