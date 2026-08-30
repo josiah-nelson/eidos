@@ -10,6 +10,7 @@ import type {
   ChildrenView,
   ContentPolicyBody,
   ContentPreview,
+  ContentStatusView,
   ErrorRecord,
   ExportFormat,
   ExtensionCount,
@@ -143,6 +144,10 @@ export const api = {
   parse: (q: string) => request<ParseView>(`/api/search/parse?q=${encodeURIComponent(q)}`),
   indexStatus: () => request<IndexStatus>('/api/index'),
   activity: () => request<ActivityView>('/api/activity'),
+  contentStatus: () => request<ContentStatusView>('/api/content/status'),
+  /** Stop or start claiming content jobs; answers with the resulting state. */
+  setContentPaused: (paused: boolean) =>
+    request<ContentStatusView>(`/api/content/${paused ? 'pause' : 'resume'}`, { method: 'POST' }),
   setContentPolicy: (id: ApiRouteId, body: ContentPolicyBody) =>
     request<SourceView>(`/api/sources/${id}/content`, {
       method: 'POST',

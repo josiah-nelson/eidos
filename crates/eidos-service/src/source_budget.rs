@@ -114,6 +114,14 @@ impl SourceBudgets {
         self.slots.lock().get(&id).map(|s| s.peak).unwrap_or(0)
     }
 
+    /// Units held across every source: one per batch being extracted, and so
+    /// the count of workers that are mid-batch. Unlike [`Self::snapshot`]
+    /// this allocates nothing, which is what lets `/api/health` report the
+    /// pipeline's flow on every call.
+    pub fn reserved_total(&self) -> u32 {
+        self.slots.lock().values().map(|s| s.reserved).sum()
+    }
+
     /// Take one unit of `id`'s budget, or `None` when it is exhausted.
     ///
     /// A source whose policy has not been read yet admits nothing, so a

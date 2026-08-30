@@ -1578,8 +1578,11 @@ mod coordination_tests {
         assert_eq!(fixture.wait(&progress).generation, 3);
     }
 
+    // A queued backlog defers a rescan only while something is going to
+    // claim it. The two switches that stop claiming are independent, so each
+    // has to release the deferral on its own.
     #[test]
-    fn paused_content_queue_does_not_block_automatic_reconciliation() {
+    fn a_disabled_content_queue_does_not_block_automatic_reconciliation() {
         use std::sync::atomic::Ordering;
 
         let fixture = Fixture::new();
@@ -1592,7 +1595,32 @@ mod coordination_tests {
         let outcome =
             start_automatic_scan(&fixture.state, fixture.source_id, fixture.next_due()).unwrap();
         let AutomaticScanOutcome::Started(progress) = outcome else {
-            panic!("a paused content queue should not defer reconciliation");
+            panic!("a disabled content queue should not defer reconciliation");
+        };
+        assert_eq!(fixture.wait(&progress).generation, 2);
+    }
+
+    #[test]
+    fn an_operator_paused_content_queue_does_not_block_automatic_reconciliation() {
+        let fixture = Fixture::new();
+        fixture.queue_content(1);
+
+        let due = fixture.next_due();
+        assert!(
+            matches!(
+                start_automatic_scan(&fixture.state, fixture.source_id, due).unwrap(),
+                AutomaticScanOutcome::Deferred(_)
+            ),
+            "the same queue defers while claiming is allowed"
+        );
+
+        fixture.state.content_pause.set_paused(true).unwrap();
+        // Past the remembered deferral's retry window, so this tick is a
+        // fresh decision rather than the previous answer replayed.
+        let later = UnixNanos(due.0 + 61 * 1_000_000_000);
+        let outcome = start_automatic_scan(&fixture.state, fixture.source_id, later).unwrap();
+        let AutomaticScanOutcome::Started(progress) = outcome else {
+            panic!("an operator-paused content queue should not defer reconciliation");
         };
         assert_eq!(fixture.wait(&progress).generation, 2);
     }

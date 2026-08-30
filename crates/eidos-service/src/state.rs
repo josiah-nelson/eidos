@@ -54,6 +54,10 @@ pub struct AppState {
     pub content_workers: Arc<crate::content_workers::ContentWorkersStatus>,
     /// Global content switch (`--no-content` keeps workers idle).
     pub content_enabled: AtomicBool,
+    /// Operator pause on claiming, and its durable marker. Unlike
+    /// `content_enabled` this survives a restart; see
+    /// [`crate::content_control`].
+    pub content_pause: crate::content_control::ContentPause,
     pub content_worker_count: usize,
     pub exec_opts: eidos_search::exec::ExecOptions,
     /// Bounds and counters for `/api/search/export`.
@@ -176,6 +180,7 @@ impl AppState {
             follower: Arc::new(crate::follower::FollowerStatus::default()),
             content_workers: Arc::new(crate::content_workers::ContentWorkersStatus::default()),
             content_enabled: AtomicBool::new(config.content),
+            content_pause: crate::content_control::ContentPause::load(&config.data_dir),
             content_worker_count: config.content_workers,
             exec_opts: eidos_search::exec::ExecOptions::default(),
             export: export_limits,

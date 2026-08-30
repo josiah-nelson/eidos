@@ -169,6 +169,10 @@ pub fn start_scan(
     source_id: SourceId,
 ) -> Result<Arc<ScanProgress>, StartScanError> {
     ensure_scannable(state, source_id)?;
+    // Register scan ownership under the same gate workers hold through their
+    // claim transaction. A manual scan may intentionally overlap work that
+    // was already claimed, but no new batch can slip in after registration.
+    let _admission = state.content_pause.admission_guard();
     let progress = {
         let mut scans = state.scans.lock();
         if let Some(p) = scans.get(&source_id) {
@@ -218,6 +222,11 @@ fn start_automatic_scan_with(
     coordinate_content: bool,
 ) -> Result<AutomaticScanOutcome, StartScanError> {
     ensure_scannable(state, source_id)?;
+    // This makes the content decision and scan registration one admission
+    // step with respect to resume and worker claims. If resume wins, its
+    // queued backlog defers this scan; if the scan wins, workers observe the
+    // registered source and leave it idle until the scan finishes.
+    let _admission = state.content_pause.admission_guard();
     let progress = {
         let mut scans = state.scans.lock();
         if let Some(p) = scans.get(&source_id) {
@@ -243,7 +252,14 @@ fn start_automatic_scan_with(
             let (queued, running) = state
                 .catalog
                 .active_job_counts(source_id, JobStage::ContentText)?;
+            // A queued backlog only justifies deferring a rescan if
+            // something is going to claim it. A paused pipeline claims
+            // nothing, so — exactly as with `--no-content` — its queue must
+            // not hold reconciliation off indefinitely. Jobs already
+            // `running` still defer: those are draining and touching the
+            // volume the scan would walk.
             let content_scheduled = state.content_enabled.load(Ordering::Relaxed)
+                && !state.content_pause.is_paused()
                 && state
                     .catalog
                     .get_source(source_id)?
