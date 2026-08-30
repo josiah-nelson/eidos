@@ -458,6 +458,15 @@ ALTER TABLE volumes ADD COLUMN native_feed TEXT NOT NULL DEFAULT 'none';
 -- `compacted_through` to the head; pruned by the collection pass.
 ALTER TABLE sync_sources ADD COLUMN head_chain BLOB NOT NULL
     DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000';
+-- Ledgers written before history chains existed cannot prove any nonzero
+-- cursor. Treat the upgrade as the epoch event ADR-0015 requires and rebuild
+-- the live image rather than blessing the old head with a genesis hash.
+DELETE FROM sync_rows;
+DELETE FROM sync_consumers;
+UPDATE sync_sources
+   SET epoch = randomblob(16), head_seq = 0,
+       head_chain = X'0000000000000000000000000000000000000000000000000000000000000000',
+       compacted_through = 0, backfill_after = 0, ready = 0;
 CREATE TABLE sync_chain (
     source_id INTEGER NOT NULL,
     seq       INTEGER NOT NULL,
@@ -481,7 +490,7 @@ CREATE TABLE fleet_peers (
     node_id      BLOB PRIMARY KEY,
     name         TEXT NOT NULL,
     role         TEXT NOT NULL,
-    fingerprint  BLOB NOT NULL,
+    fingerprint  BLOB NOT NULL UNIQUE,
     endpoint     TEXT,
     enabled      INTEGER NOT NULL DEFAULT 1,
     enrolled_at  INTEGER NOT NULL,

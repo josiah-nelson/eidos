@@ -6,11 +6,14 @@
 //! thing under test.
 
 use eidos_catalog::changes::{ChangeEvent, ObjectSnapshot};
-use eidos_catalog::replica::{BatchOutcome, HelloOutcome, RemoteNode, RemoteSourceDescriptor};
+use eidos_catalog::fleet::{FleetPeer, NodeId, PeerRole};
+use eidos_catalog::replica::{
+    BatchOutcome, HelloOutcome, RemoteNode, RemoteSourceDescriptor, RepairOutcome,
+};
 use eidos_catalog::scan::{run_scan, RunScanOptions};
-use eidos_catalog::sync::{record_digest, SyncRow};
+use eidos_catalog::sync::{record_digest, SyncBatch, SyncEpoch, SyncRow, CHAIN_GENESIS};
 use eidos_catalog::{Catalog, NewSource};
-use eidos_domain::{ContentState, ObjectId, SourceId, SourceKind, SourceState};
+use eidos_domain::{ContentState, ObjectId, SourceId, SourceKind, SourceState, UnixNanos};
 use eidos_sync::identity::SourceEpoch;
 use eidos_sync::merkle::{leaf_index, MerkleTree};
 use std::collections::BTreeSet;
@@ -274,7 +277,7 @@ fn converge(node: &Node, central: &Central, limit: u32) -> u64 {
         match central.catalog.replica_apply_batch(source, &batch).unwrap() {
             BatchOutcome::Applied { through_seq, .. } => {
                 node.catalog
-                    .sync_acknowledge(node.source, CENTRAL, through_seq)
+                    .sync_acknowledge(node.source, state.epoch, CENTRAL, through_seq)
                     .unwrap();
                 applied += 1;
             }
@@ -366,6 +369,67 @@ fn duplicate_and_overlapping_batches_are_idempotent() {
 }
 
 #[test]
+fn a_batch_is_bound_to_the_remote_source_it_names() {
+    let node = Node::new();
+    let central = Central::new();
+    let source = central.source_for(&node);
+    let mut batch = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap();
+    batch.source_id = SourceId(node.source.0 + 1_000);
+
+    match central.catalog.replica_apply_batch(source, &batch).unwrap() {
+        BatchOutcome::Rejected { reason } => assert!(reason.contains("does not match"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(central.applied_seq(source), 0);
+    assert!(central.image(source).is_empty());
+}
+
+#[test]
+fn remote_sequences_that_do_not_fit_sqlite_are_rejected_before_casting() {
+    let node = Node::new();
+    let central = Central::new();
+    let source = central.source_for(&node);
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                state.epoch.to_source_epoch(),
+                i64::MAX as u64 + 1,
+                state.head_chain,
+                0,
+            )
+            .unwrap(),
+        HelloOutcome::Rejected { .. }
+    ));
+    let mut batch = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap();
+    batch.through_seq = u64::MAX;
+    batch.head_seq = u64::MAX;
+    assert!(matches!(
+        central.catalog.replica_apply_batch(source, &batch).unwrap(),
+        BatchOutcome::Rejected { .. }
+    ));
+    assert_eq!(central.applied_seq(source), 0);
+}
+
+#[test]
+fn a_replicated_source_cannot_be_enabled_as_a_second_hop_shipper() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    assert!(central.catalog.sync_enable(source, None).is_err());
+    assert!(central.catalog.sync_source(source).unwrap().is_none());
+}
+
+#[test]
 fn a_central_that_stops_before_acknowledging_is_caught_up_by_the_resend() {
     let node = Node::new();
     let mut central = Central::new();
@@ -389,7 +453,7 @@ fn a_central_that_stops_before_acknowledging_is_caught_up_by_the_resend() {
     match ship_batch(&node, &central, source, 0, u32::MAX) {
         BatchOutcome::AlreadyApplied { applied_seq } => {
             node.catalog
-                .sync_acknowledge(node.source, CENTRAL, applied_seq)
+                .sync_acknowledge(node.source, batch.epoch, CENTRAL, applied_seq)
                 .unwrap();
         }
         other => panic!("{other:?}"),
@@ -433,6 +497,26 @@ fn a_node_that_restarts_with_unacknowledged_work_resumes_from_the_same_cursor() 
 }
 
 #[test]
+fn an_ack_from_a_retired_epoch_cannot_advance_the_new_epoch() {
+    let node = Node::new();
+    let first = node.catalog.sync_source(node.source).unwrap().unwrap();
+    node.catalog.sync_enable(node.source, None).unwrap();
+    while !node.catalog.sync_backfill(node.source, 2).unwrap().done {}
+    let second = node.catalog.sync_source(node.source).unwrap().unwrap();
+    assert_ne!(first.epoch, second.epoch);
+
+    assert!(node
+        .catalog
+        .sync_acknowledge(node.source, first.epoch, CENTRAL, first.head_seq)
+        .is_err());
+    assert!(node.catalog.sync_consumers(node.source).unwrap().is_empty());
+    assert!(node
+        .catalog
+        .sync_acknowledge(node.source, second.epoch, CENTRAL, second.head_seq)
+        .unwrap());
+}
+
+#[test]
 fn a_same_epoch_rewind_is_fenced_and_a_rewritten_history_is_a_fork() {
     let mut node = Node::new();
     let central = Central::new();
@@ -462,6 +546,16 @@ fn a_same_epoch_rewind_is_fenced_and_a_rewritten_history_is_a_fork() {
         HelloOutcome::Rejected { reason } => assert!(reason.contains("rewind"), "{reason}"),
         other => panic!("{other:?}"),
     }
+    assert_eq!(
+        central
+            .catalog
+            .replica_source(source)
+            .unwrap()
+            .unwrap()
+            .reported_head,
+        applied,
+        "a rejected rewind cannot replace the last accepted coverage report"
+    );
     // The restored node keeps working and overtakes the cursor with a
     // different history: same cursor, different chain, fenced as a fork.
     node.touch("c/three.txt", 333, 1_700_000_002);
@@ -537,6 +631,12 @@ fn an_epoch_change_streams_a_full_resync_and_retires_rows_the_new_epoch_lacks() 
             epoch: state.epoch.to_source_epoch()
         }
     );
+    // The source keeps changing after the hello. Its latest touch now falls
+    // beyond the resync target, so crossing the old target is not yet a
+    // complete snapshot and must not retire the previous image.
+    node.touch("a/one.txt", 123, 1_700_000_100);
+    let streaming = node.catalog.sync_source(node.source).unwrap().unwrap();
+    assert!(streaming.head_seq > state.head_seq);
     // Stream the new epoch in small pieces: until the stream passes the
     // offered head the old row is still there (search stays available),
     // afterwards it is gone.
@@ -551,14 +651,23 @@ fn an_epoch_change_streams_a_full_resync_and_retires_rows_the_new_epoch_lacks() 
                 ..
             } => {
                 node.catalog
-                    .sync_acknowledge(node.source, CENTRAL, through_seq)
+                    .sync_acknowledge(node.source, state.epoch, CENTRAL, through_seq)
                     .unwrap();
                 if retired_rows > 0 {
                     saw_retirement = true;
                     assert_eq!(retired_rows, 1, "only the vanished file is retired");
                 }
+                if through_seq == state.head_seq {
+                    assert_eq!(retired_rows, 0, "the batch has not reached its own head");
+                    let one = central
+                        .catalog
+                        .resolve_relative(source, "a/one.txt")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(central.catalog.get_object(one).unwrap().unwrap().size, 100);
+                }
                 after = through_seq;
-                if through_seq >= state.head_seq {
+                if through_seq >= streaming.head_seq {
                     break;
                 }
             }
@@ -572,12 +681,280 @@ fn an_epoch_change_streams_a_full_resync_and_retires_rows_the_new_epoch_lacks() 
         .resolve_relative(source, "c/three.txt")
         .unwrap()
         .is_none());
+    let (_, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    let source_tree = MerkleTree::with_leaf_bits(
+        4,
+        entries
+            .iter()
+            .map(|e| record_digest(e.object, e.generation, e.deleted)),
+    );
+    let replica_tree =
+        MerkleTree::with_leaf_bits(4, central.catalog.replica_digests(source).unwrap());
+    assert_eq!(replica_tree.leaf_hashes(), source_tree.leaf_hashes());
     // The retired epoch can never be admitted again.
     let outcome = central
         .catalog
         .replica_admit_hello(source, first_epoch, 1, [0u8; 32], 0)
         .unwrap();
     assert!(matches!(outcome, HelloOutcome::Rejected { .. }));
+}
+
+#[test]
+fn an_empty_new_epoch_is_a_complete_snapshot_that_retires_the_old_image() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let epoch = SourceEpoch::random_v4(44, 55);
+    assert_eq!(
+        central
+            .catalog
+            .replica_admit_hello(source, epoch, 0, CHAIN_GENESIS, 0)
+            .unwrap(),
+        HelloOutcome::FullResync { epoch }
+    );
+    let snapshot = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 0,
+        through_chain: CHAIN_GENESIS,
+        head_seq: 0,
+        rows: Vec::new(),
+    };
+    match central
+        .catalog
+        .replica_apply_batch(source, &snapshot)
+        .unwrap()
+    {
+        BatchOutcome::Applied {
+            through_seq,
+            retired_rows,
+            ..
+        } => {
+            assert_eq!(through_seq, 0);
+            assert!(retired_rows > 0);
+        }
+        other => panic!("{other:?}"),
+    }
+    let state = central.catalog.replica_source(source).unwrap().unwrap();
+    assert_eq!(state.admission.epoch, epoch);
+    assert_eq!(state.admission.applied_seq, 0);
+    assert_eq!(state.resync_target, None);
+    assert!(central.image(source).is_empty());
+    assert!(central.catalog.replica_digests(source).unwrap().is_empty());
+    assert_eq!(
+        central
+            .catalog
+            .get_source(source)
+            .unwrap()
+            .unwrap()
+            .root_object_id,
+        None
+    );
+}
+
+#[test]
+fn a_full_resync_replaces_the_root_mapping_when_remote_object_ids_change() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let old_root = central
+        .catalog
+        .get_source(source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let mut root = node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|row| {
+            row.image
+                .as_ref()
+                .is_some_and(|image| image.entries.iter().any(|entry| entry.parent.is_none()))
+        })
+        .expect("source root row");
+    let remote_root = ObjectId(root.object.0 + 1_000_000);
+    root.object = remote_root;
+    root.seq = 1;
+    root.image.as_mut().unwrap().object.id = remote_root;
+    let epoch = SourceEpoch::random_v4(66, 77);
+    let head_chain = [0x77; 32];
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(source, epoch, 1, head_chain, 0)
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    let snapshot = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 1,
+        through_chain: head_chain,
+        head_seq: 1,
+        rows: vec![root.clone()],
+    };
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(source, &snapshot)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    let new_root = central
+        .catalog
+        .with_reader(|conn| {
+            Ok(ObjectId(conn.query_row(
+                "SELECT local_object_id FROM sync_replica_rows
+                 WHERE source_id = ?1 AND remote_object_id = ?2",
+                [source.0, remote_root.0],
+                |row| row.get(0),
+            )?))
+        })
+        .unwrap();
+    assert_eq!(
+        new_root, old_root,
+        "stable native identity reuses the local row"
+    );
+    assert_eq!(
+        central
+            .catalog
+            .get_source(source)
+            .unwrap()
+            .unwrap()
+            .root_object_id,
+        Some(new_root)
+    );
+
+    // Generic/path-derived sources may not have a native identity to remap.
+    // Their new root gets a new local row and must replace root_object_id.
+    let remote_root_2 = ObjectId(remote_root.0 + 1);
+    root.object = remote_root_2;
+    root.image.as_mut().unwrap().object.id = remote_root_2;
+    root.image.as_mut().unwrap().object.native = None;
+    let epoch_2 = SourceEpoch::random_v4(88, 99);
+    let head_chain_2 = [0x88; 32];
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(source, epoch_2, 1, head_chain_2, 0)
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    let snapshot_2 = SyncBatch {
+        source_id: node.source,
+        epoch: SyncEpoch::from_source_epoch(epoch_2),
+        after_seq: 0,
+        after_chain: CHAIN_GENESIS,
+        through_seq: 1,
+        through_chain: head_chain_2,
+        head_seq: 1,
+        rows: vec![root],
+    };
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_batch(source, &snapshot_2)
+            .unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    let newest_root = central
+        .catalog
+        .with_reader(|conn| {
+            Ok(ObjectId(conn.query_row(
+                "SELECT local_object_id FROM sync_replica_rows
+                 WHERE source_id = ?1 AND remote_object_id = ?2",
+                [source.0, remote_root_2.0],
+                |row| row.get(0),
+            )?))
+        })
+        .unwrap();
+    assert_ne!(newest_root, old_root);
+    assert_eq!(
+        central
+            .catalog
+            .get_source(source)
+            .unwrap()
+            .unwrap()
+            .root_object_id,
+        Some(newest_root)
+    );
+}
+
+#[test]
+fn unused_child_first_placeholders_are_removed_when_an_epoch_is_retired() {
+    let node = Node::new();
+    let central = Central::new();
+    let source = central.source_for(&node);
+    node.touch("a", 0, 1_700_000_000);
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                state.compacted_through,
+            )
+            .unwrap(),
+        HelloOutcome::Resume { .. }
+    ));
+    let mut after = 0;
+    loop {
+        let batch = node.catalog.sync_rows_after(node.source, after, 1).unwrap();
+        let through = batch.through_seq;
+        assert!(matches!(
+            central.catalog.replica_apply_batch(source, &batch).unwrap(),
+            BatchOutcome::Applied { .. }
+        ));
+        let placeholders: i64 = central
+            .catalog
+            .with_reader(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM sync_replica_rows WHERE source_id = ?1 AND placeholder = 1",
+                    [source.0],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        if placeholders > 0 {
+            break;
+        }
+        after = through;
+        assert!(
+            after < state.head_seq,
+            "fixture never produced a placeholder"
+        );
+    }
+
+    node.catalog.sync_disable(node.source).unwrap();
+    std::fs::remove_dir_all(node.root.join("a")).unwrap();
+    node.scan();
+    node.catalog.sync_enable(node.source, None).unwrap();
+    while !node.catalog.sync_backfill(node.source, 2).unwrap().done {}
+    converge(&node, &central, 2);
+    let placeholders: i64 = central
+        .catalog
+        .with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM sync_replica_rows WHERE source_id = ?1 AND placeholder = 1",
+                [source.0],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(placeholders, 0);
 }
 
 #[test]
@@ -682,7 +1059,7 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
         other => panic!("{other:?}"),
     }
     node.catalog
-        .sync_acknowledge(node.source, CENTRAL, state.head_seq)
+        .sync_acknowledge(node.source, state.epoch, CENTRAL, state.head_seq)
         .unwrap();
     assert_eq!(central.applied_seq(source), state.head_seq);
     assert_eq!(central.image(source), node.image());
@@ -698,6 +1075,147 @@ fn a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves() {
 }
 
 #[test]
+fn repair_replay_is_chain_bound_and_rejects_duplicate_objects() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    let object = node.id("a/one.txt");
+    let (_, rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &[object])
+        .unwrap();
+    let leaf_bits = 4;
+    let leaves = [leaf_index(leaf_bits, object)];
+    let mut wrong_chain = state.head_chain;
+    wrong_chain[0] ^= 0xff;
+    match central
+        .catalog
+        .replica_apply_repair(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            wrong_chain,
+            leaf_bits,
+            &leaves,
+            &rows,
+        )
+        .unwrap()
+    {
+        RepairOutcome::Rejected { reason } => assert!(reason.contains("history fork"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+
+    let mut conflicting = rows[0].clone();
+    conflicting.image.as_mut().unwrap().object.size = 999;
+    match central
+        .catalog
+        .replica_apply_repair(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &leaves,
+            &[rows[0].clone(), conflicting],
+        )
+        .unwrap()
+    {
+        RepairOutcome::Rejected { reason } => assert!(reason.contains("malformed"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    let local = central
+        .catalog
+        .resolve_relative(source, "a/one.txt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        central.catalog.get_object(local).unwrap().unwrap().size,
+        100
+    );
+}
+
+#[test]
+fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+    node.catalog.sync_enable(node.source, None).unwrap();
+    while !node.catalog.sync_backfill(node.source, 2).unwrap().done {}
+    let state = node.catalog.sync_source(node.source).unwrap().unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                state.compacted_through,
+            )
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    let first = node.catalog.sync_rows_after(node.source, 0, 1).unwrap();
+    assert!(matches!(
+        central.catalog.replica_apply_batch(source, &first).unwrap(),
+        BatchOutcome::Applied { .. }
+    ));
+    assert!(central
+        .catalog
+        .replica_source(source)
+        .unwrap()
+        .unwrap()
+        .resync_target
+        .is_some());
+
+    let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    let objects: Vec<_> = entries.iter().map(|entry| entry.object).collect();
+    let (_, rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &objects)
+        .unwrap();
+    let leaf_bits = 4;
+    let leaves: Vec<u32> = (0..1u32 << leaf_bits).collect();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                leaf_bits,
+                &leaves,
+                &rows,
+            )
+            .unwrap(),
+        RepairOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        central
+            .catalog
+            .replica_source(source)
+            .unwrap()
+            .unwrap()
+            .resync_target,
+        None
+    );
+    assert_eq!(central.image(source), node.image());
+    let source_tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries
+            .iter()
+            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+    );
+    let replica_tree =
+        MerkleTree::with_leaf_bits(leaf_bits, central.catalog.replica_digests(source).unwrap());
+    assert_eq!(replica_tree.leaf_hashes(), source_tree.leaf_hashes());
+}
+
+#[test]
 fn two_nodes_with_the_same_source_name_and_path_stay_distinct() {
     let a = Node::new();
     let b = Node::new();
@@ -705,7 +1223,7 @@ fn two_nodes_with_the_same_source_name_and_path_stay_distinct() {
     converge(&a, &central, 8);
     let node_b = RemoteNode {
         node_id: [0x0B; 16],
-        name: "node-b".into(),
+        name: "node-a".into(),
         platform: "windows".into(),
     };
     let mut descriptor = b.descriptor();
@@ -725,7 +1243,7 @@ fn two_nodes_with_the_same_source_name_and_path_stay_distinct() {
         .map(|s| s.name)
         .collect();
     assert!(names.contains("node-a/docs"));
-    assert!(names.contains("node-b/docs"));
+    assert!(names.contains("node-a/docs#2"));
     let hosts: BTreeSet<_> = central
         .catalog
         .list_sources()
@@ -734,4 +1252,117 @@ fn two_nodes_with_the_same_source_name_and_path_stay_distinct() {
         .map(|s| s.host_id)
         .collect();
     assert_eq!(hosts.len(), 2);
+}
+
+#[test]
+fn node_id_text_rejects_non_ascii_without_panicking() {
+    let malformed = format!("a{}x", "é".repeat(15));
+    assert_eq!(malformed.len(), 32);
+    assert_eq!(NodeId::parse_hex(&malformed), None);
+}
+
+#[test]
+fn one_certificate_fingerprint_cannot_enroll_as_two_node_ids() {
+    let central = Central::new();
+    let first = FleetPeer {
+        node_id: NodeId([1; 16]),
+        name: "first".into(),
+        role: PeerRole::Node,
+        fingerprint: [9; 32],
+        endpoint: None,
+        enabled: true,
+        enrolled_at: UnixNanos(1),
+        last_seen_at: None,
+        last_error: None,
+    };
+    central.catalog.fleet_upsert_peer(&first).unwrap();
+    let mut collision = first.clone();
+    collision.node_id = NodeId([2; 16]);
+    collision.name = "second".into();
+    assert!(central.catalog.fleet_upsert_peer(&collision).is_err());
+    assert_eq!(
+        central
+            .catalog
+            .fleet_peer_by_fingerprint(&first.fingerprint)
+            .unwrap()
+            .unwrap()
+            .node_id,
+        first.node_id
+    );
+}
+
+#[test]
+fn the_history_chain_migration_reincarnates_existing_sync_ledgers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut conn = rusqlite::Connection::open(&path).unwrap();
+    let predecessor = eidos_catalog::schema::MIGRATIONS.len() - 1;
+    for (index, (description, sql)) in eidos_catalog::schema::MIGRATIONS
+        .iter()
+        .take(predecessor)
+        .enumerate()
+    {
+        let version = index as i64 + 1;
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(sql).unwrap();
+        tx.execute(
+            "INSERT INTO schema_migrations (version, description, applied_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![version, description, version],
+        )
+        .unwrap();
+        tx.pragma_update(None, "user_version", version).unwrap();
+        tx.commit().unwrap();
+    }
+    conn.execute(
+        "INSERT INTO hosts (host_id, name, platform, created_at) VALUES (1, 'old', 'windows', 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sources (source_id, host_id, name, kind, root_path, created_at, updated_at)
+         VALUES (1, 1, 'old-source', 'windows_local', 'C:\\old', 1, 1)",
+        [],
+    )
+    .unwrap();
+    let old_epoch = [3u8; 16];
+    conn.execute(
+        "INSERT INTO sync_sources (source_id, epoch, head_seq, compacted_through, backfill_after,
+             ready, created_at, updated_at) VALUES (1, ?1, 7, 2, 99, 1, 1, 1)",
+        [old_epoch.as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sync_rows (source_id, object_id, seq, generation, deleted)
+         VALUES (1, 99, 7, 4, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sync_consumers (source_id, consumer_id, watermark, updated_at)
+         VALUES (1, ?1, 7, 1)",
+        [CENTRAL.as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let catalog = Catalog::open(path).unwrap();
+    let state = catalog.sync_source(SourceId(1)).unwrap().unwrap();
+    assert_ne!(state.epoch.0, old_epoch);
+    assert_eq!(state.head_seq, 0);
+    assert_eq!(state.compacted_through, 0);
+    assert_eq!(state.backfill_after, ObjectId(0));
+    assert!(!state.ready);
+    assert_eq!(state.head_chain, CHAIN_GENESIS);
+    assert_eq!(
+        catalog.sync_chain_at(SourceId(1), 0).unwrap(),
+        Some(CHAIN_GENESIS)
+    );
+    assert!(catalog.sync_consumers(SourceId(1)).unwrap().is_empty());
+    let rows: i64 = catalog
+        .with_reader(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM sync_rows", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    assert_eq!(rows, 0);
 }

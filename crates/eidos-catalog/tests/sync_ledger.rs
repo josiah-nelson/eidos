@@ -290,11 +290,11 @@ fn delete_ships_a_tombstone_collected_only_below_every_watermark() {
     // Two consumers; only one has crossed the tombstone.
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_A, head1)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_A, head1)
         .unwrap());
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_B, head0)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_B, head0)
         .unwrap());
     let kept = fx.catalog.sync_collect(fx.source, 100).unwrap();
     assert_eq!(kept.removed_tombstones, 0);
@@ -309,16 +309,16 @@ fn delete_ships_a_tombstone_collected_only_below_every_watermark() {
     // Rewind is ignored; a beyond-head ack is an error.
     assert!(!fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_A, head0)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_A, head0)
         .unwrap());
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_A, head1 + 1)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_A, head1 + 1)
         .is_err());
 
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_B, head1)
+        .sync_acknowledge(fx.source, fx.all_rows().epoch, CONSUMER_B, head1)
         .unwrap());
     let collected = fx.catalog.sync_collect(fx.source, 100).unwrap();
     assert_eq!(collected.removed_tombstones, 1);
@@ -379,7 +379,7 @@ fn reenable_mints_a_new_epoch_and_discards_history() {
     let first = fx.catalog.sync_source(fx.source).unwrap().unwrap();
     assert!(fx
         .catalog
-        .sync_acknowledge(fx.source, CONSUMER_A, first.head_seq)
+        .sync_acknowledge(fx.source, first.epoch, CONSUMER_A, first.head_seq)
         .unwrap());
 
     fx.catalog.sync_enable(fx.source, Some(42)).unwrap();

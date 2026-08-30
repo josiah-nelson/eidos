@@ -511,15 +511,21 @@ impl Catalog {
         let epoch = SyncEpoch::mint()?;
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let exists: Option<i64> = tx
+            let kind: Option<String> = tx
                 .query_row(
-                    "SELECT 1 FROM sources WHERE source_id = ?1",
+                    "SELECT kind FROM sources WHERE source_id = ?1",
                     params![source.0],
                     |r| r.get(0),
                 )
                 .optional()?;
-            if exists.is_none() {
-                return Err(CatalogError::NotFound(format!("source {source}")));
+            match kind.as_deref() {
+                None => return Err(CatalogError::NotFound(format!("source {source}"))),
+                Some("remote") => {
+                    return Err(CatalogError::InvalidState(
+                        "a replicated source cannot be sync-enabled as a shipper".into(),
+                    ))
+                }
+                Some(_) => {}
             }
             let now = UnixNanos::now().0;
             tx.execute(
@@ -836,6 +842,7 @@ impl Catalog {
     pub fn sync_acknowledge(
         &self,
         source: SourceId,
+        epoch: SyncEpoch,
         consumer: [u8; 16],
         through_seq: u64,
     ) -> Result<bool> {
@@ -844,6 +851,12 @@ impl Catalog {
             let state = source_state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
             })?;
+            if epoch != state.epoch {
+                return Err(CatalogError::InvalidState(format!(
+                    "acknowledgement is for retired epoch {epoch}; active epoch is {}",
+                    state.epoch
+                )));
+            }
             if through_seq > state.head_seq {
                 return Err(CatalogError::InvalidState(format!(
                     "acknowledgement {through_seq} is beyond head {}",

@@ -27,9 +27,16 @@ impl NodeId {
         if s.len() != 32 {
             return None;
         }
+        let hex = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        let bytes = s.as_bytes();
         let mut out = [0u8; 16];
         for (i, byte) in out.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+            *byte = (hex(bytes[i * 2])? << 4) | hex(bytes[i * 2 + 1])?;
         }
         Some(Self(out))
     }
