@@ -40,6 +40,11 @@ impl Catalog {
     }
 
     pub fn add_source(&self, s: &NewSource) -> Result<SourceId> {
+        if s.kind == SourceKind::Remote {
+            return Err(CatalogError::InvalidState(
+                "remote sources are created by fleet replication, not by hand".into(),
+            ));
+        }
         self.with_writer(|conn| {
             let now = UnixNanos::now().0;
             conn.execute(
@@ -208,12 +213,17 @@ impl Catalog {
     pub(crate) fn source_is_case_sensitive(conn: &Connection, source: SourceId) -> Result<bool> {
         Ok(conn
             .prepare_cached(
-                "SELECT v.case_sensitive FROM sources s JOIN volumes v ON v.volume_id = s.volume_id
+                "SELECT COALESCE(CASE WHEN s.kind = 'remote' THEN s.case_sensitive ELSE v.case_sensitive END, 'unknown')
+                 FROM sources s LEFT JOIN volumes v ON v.volume_id = s.volume_id
                  WHERE s.source_id = ?1",
             )?
             .query_row(params![source.0], |r| r.get::<_, String>(0))
             .optional()?
             .is_some_and(|value| value == "sensitive"))
+    }
+
+    pub fn is_source_case_sensitive(&self, source: SourceId) -> Result<bool> {
+        self.with_reader(|conn| Self::source_is_case_sensitive(conn, source))
     }
 
     /// Resolve a path relative to the source root. POSIX sources split only

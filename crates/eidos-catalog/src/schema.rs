@@ -482,6 +482,9 @@ ALTER TABLE sync_rows ADD COLUMN touched_at INTEGER NOT NULL DEFAULT 0;
 -- Enrollment makes every eligible source replicate by default; a source may
 -- opt out. `inherit` follows the node's enrollment, `local_only` never ships.
 ALTER TABLE sources ADD COLUMN sync_policy TEXT NOT NULL DEFAULT 'inherit';
+-- Remote replicas have no local `volumes` row. Preserve the origin's name
+-- semantics explicitly so case-colliding paths resolve truthfully.
+ALTER TABLE sources ADD COLUMN case_sensitive TEXT NOT NULL DEFAULT 'unknown';
 
 -- Peers this installation trusts: the roster of enrolled nodes on a
 -- central, or the single central on an enrolled node. `fingerprint` is the
@@ -497,6 +500,9 @@ CREATE TABLE fleet_peers (
     last_seen_at INTEGER,
     last_error   TEXT
 ) WITHOUT ROWID;
+-- A node can ship to at most one central. This database invariant closes
+-- the race between concurrent enrollment requests.
+CREATE UNIQUE INDEX fleet_one_central ON fleet_peers (role) WHERE role = 'central';
 -- Single-use enrollment invitations minted by a central. Only the hash of
 -- the secret is stored.
 CREATE TABLE fleet_invites (

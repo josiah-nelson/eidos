@@ -22,7 +22,7 @@ use crate::policy::{ContentDecision, PolicyCtx, PolicyEngine};
 use crate::{Catalog, CatalogError, RecoveryReport, Result, WriterCoordination, WriterPermit};
 use eidos_domain::{
     extension_of, ContentState, IdentityConfidence, ObjectId, ObjectKind, PolicyStage, SourceId,
-    SourceState, UnixNanos,
+    SourceKind, SourceState, UnixNanos,
 };
 use eidos_scanner::{DirEvent, RawEntry};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -135,6 +135,11 @@ impl Catalog {
             let tx = conn.transaction()?;
             let mut source = crate::read::get_source_conn(&tx, source_id)?
                 .ok_or_else(|| CatalogError::NotFound(format!("source {source_id}")))?;
+            if source.kind == SourceKind::Remote {
+                return Err(CatalogError::InvalidState(format!(
+                    "source {source_id} is a fleet replica and cannot be scanned here"
+                )));
+            }
             let open: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM scan_generations WHERE source_id = ?1 AND state = 'open'",
                 params![source_id.0],

@@ -30,6 +30,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+const MAX_RETAINED_CHAIN_ROWS: i64 = 1_000_000;
+const CHAIN_PRUNE_BATCH: i64 = 100_000;
+
 /// Version of the row image produced by [`Catalog::sync_rows_after`].
 pub const SYNC_ROW_IMAGE_VERSION: u32 = 1;
 
@@ -914,7 +917,17 @@ impl Catalog {
             let state = source_state_conn(&tx, source)?.ok_or_else(|| {
                 CatalogError::InvalidState(format!("source {source} is not sync-enabled"))
             })?;
-            let floor = floor_conn(&tx, source, state.head_seq)?;
+            let consumer_floor = floor_conn(&tx, source, state.head_seq)?;
+            let retention_floor = tx
+                .query_row(
+                    "SELECT seq FROM sync_chain WHERE source_id = ?1
+                     ORDER BY seq DESC LIMIT 1 OFFSET ?2",
+                    params![source.0, MAX_RETAINED_CHAIN_ROWS - 1],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0) as u64;
+            let floor = consumer_floor.max(retention_floor);
             let removed = tx.execute(
                 "DELETE FROM sync_rows WHERE (source_id, object_id) IN (
                     SELECT source_id, object_id FROM sync_rows
@@ -933,14 +946,18 @@ impl Catalog {
                     "UPDATE sync_sources SET compacted_through = ?2, updated_at = ?3 WHERE source_id = ?1",
                     params![source.0, floor as i64, UnixNanos::now().0],
                 )?;
-                // The chain at the floor itself stays: a consumer exactly
-                // there resumes with it as its `after_chain`.
-                tx.execute(
-                    "DELETE FROM sync_chain WHERE source_id = ?1 AND seq < ?2",
-                    params![source.0, floor as i64],
-                )?;
                 compacted_through = floor;
             }
+            // The chain at the floor itself stays: a consumer exactly there
+            // resumes with it as its `after_chain`. Physical reclamation is
+            // bounded so a long-offline consumer cannot create one giant
+            // writer transaction when the retention cap advances the floor.
+            tx.execute(
+                "DELETE FROM sync_chain WHERE (source_id, seq) IN (
+                    SELECT source_id, seq FROM sync_chain
+                    WHERE source_id = ?1 AND seq < ?2 ORDER BY seq LIMIT ?3)",
+                params![source.0, compacted_through as i64, CHAIN_PRUNE_BATCH],
+            )?;
             tx.commit()?;
             Ok(CollectStats {
                 removed_tombstones: removed,

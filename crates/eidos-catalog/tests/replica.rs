@@ -81,6 +81,7 @@ impl Node {
             kind: SourceKind::WindowsLocal,
             root_path: self.root.display().to_string(),
             aliases: vec![],
+            case_sensitive: false,
         }
     }
 
@@ -1354,6 +1355,108 @@ fn repair_that_finishes_an_epoch_resync_retires_the_previous_epoch() {
     let replica_tree =
         MerkleTree::with_leaf_bits(leaf_bits, central.catalog.replica_digests(source).unwrap());
     assert_eq!(replica_tree.leaf_hashes(), source_tree.leaf_hashes());
+}
+
+#[test]
+fn a_compacted_new_epoch_can_install_its_first_snapshot_by_repair() {
+    let node = Node::new();
+    let central = Central::new();
+    converge(&node, &central, 8);
+    let source = central.source_for(&node);
+
+    node.catalog.sync_enable(node.source, None).unwrap();
+    while !node.catalog.sync_backfill(node.source, 2).unwrap().done {}
+    node.delete("a/b/two.txt");
+    let collected = node.catalog.sync_collect(node.source, 100).unwrap();
+    assert!(collected.compacted_through > 0);
+    let (state, entries) = node.catalog.sync_ledger_entries(node.source).unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_admit_hello(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                state.compacted_through,
+            )
+            .unwrap(),
+        HelloOutcome::FullResync { .. }
+    ));
+    assert!(node
+        .catalog
+        .sync_rows_after(node.source, 0, u32::MAX)
+        .is_err());
+
+    let leaf_bits = 4;
+    let tree = MerkleTree::with_leaf_bits(
+        leaf_bits,
+        entries
+            .iter()
+            .map(|entry| record_digest(entry.object, entry.generation, entry.deleted)),
+    );
+    let request = central
+        .catalog
+        .replica_repair_offer(
+            source,
+            state.epoch.to_source_epoch(),
+            state.head_seq,
+            state.head_chain,
+            leaf_bits,
+            &tree.leaf_hashes(),
+        )
+        .unwrap();
+    let leaves = match request {
+        eidos_catalog::replica::RepairOfferOutcome::Request { leaves, .. } => leaves,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(leaves.len(), 1usize << leaf_bits);
+    let objects: Vec<_> = entries.iter().map(|entry| entry.object).collect();
+    let (_, rows) = node
+        .catalog
+        .sync_rows_for_objects(node.source, &objects)
+        .unwrap();
+    assert!(matches!(
+        central
+            .catalog
+            .replica_apply_repair(
+                source,
+                state.epoch.to_source_epoch(),
+                state.head_seq,
+                state.head_chain,
+                leaf_bits,
+                &leaves,
+                &rows,
+            )
+            .unwrap(),
+        RepairOutcome::Applied { .. }
+    ));
+    assert_eq!(central.image(source), node.image());
+    let replica = central.catalog.replica_source(source).unwrap().unwrap();
+    assert_eq!(replica.admission.epoch, state.epoch.to_source_epoch());
+    assert_eq!(replica.resync_target, None);
+}
+
+#[test]
+fn replica_sources_preserve_the_origins_case_sensitivity() {
+    let node = Node::new();
+    let central = Central::new();
+    let mut descriptor = node.descriptor();
+    descriptor.case_sensitive = true;
+    let source = central
+        .catalog
+        .replica_ensure_source(
+            &RemoteNode {
+                node_id: NODE,
+                name: "node-a".into(),
+                platform: "macos".into(),
+            },
+            &descriptor,
+            node.epoch(),
+        )
+        .unwrap()
+        .source_id;
+    assert!(central.catalog.is_source_case_sensitive(source).unwrap());
 }
 
 #[test]
