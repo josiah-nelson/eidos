@@ -3,6 +3,7 @@
 
 import type {
   ActivityView,
+  CentralBody,
   AddSourceBody,
   ApiErrorBody,
   ApiInt,
@@ -11,6 +12,11 @@ import type {
   ContentPolicyBody,
   ContentPreview,
   ContentStatusView,
+  EnrollView,
+  FleetConfig,
+  FleetStatus,
+  ForgetView,
+  InviteView,
   ErrorRecord,
   ExportFormat,
   ExtensionCount,
@@ -19,6 +25,8 @@ import type {
   IndexStatus,
   ObjectDetail,
   ParseView,
+  PeerBody,
+  PeerView,
   ResolveView,
   ResultMode,
   RetryBody,
@@ -149,6 +157,23 @@ export const api = {
   /** Stop or start claiming content jobs; answers with the resulting state. */
   setContentPaused: (paused: boolean) =>
     request<ContentStatusView>(`/api/content/${paused ? 'pause' : 'resume'}`, { method: 'POST' }),
+  fleetStatus: () => request<FleetStatus>('/api/fleet'),
+  setFleetCentral: (body: CentralBody) =>
+    request<FleetConfig>('/api/fleet/central', { method: 'POST', body: JSON.stringify(body) }),
+  fleetInvite: (endpoint?: string, nameHint?: string) =>
+    request<InviteView>('/api/fleet/invite', {
+      method: 'POST',
+      body: JSON.stringify({ endpoint: endpoint || undefined, name_hint: nameHint || undefined }),
+    }),
+  fleetEnroll: (code: string) =>
+    request<EnrollView>('/api/fleet/enroll', { method: 'POST', body: JSON.stringify({ code }) }),
+  setFleetSync: (enabled: boolean) =>
+    request<FleetStatus>('/api/fleet/sync', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  fleetLeave: () => request<FleetStatus>('/api/fleet/leave', { method: 'POST' }),
+  updateFleetPeer: (id: string, body: PeerBody) =>
+    request<PeerView>(`/api/fleet/peers/${id}`, { method: 'POST', body: JSON.stringify(body) }),
+  forgetFleetPeer: (id: string) =>
+    request<ForgetView>(`/api/fleet/peers/${id}`, { method: 'DELETE' }),
   contentWorkers: () => request<WorkersView>('/api/content/workers'),
   /** Resize the global extraction pool; durable across restarts. */
   setContentWorkers: (workers: number) =>
