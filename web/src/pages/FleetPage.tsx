@@ -96,10 +96,7 @@ export default function FleetPage() {
       </div>
 
       <div className="cards">
-        {/* Only the listener controls remount when the authoritative value
-            changes. Join selection and request feedback live outside this
-            keyed boundary and survive an unrelated listener refresh. */}
-        <ThisNode key={f.listen ?? ''} f={f} />
+        <ThisNode f={f} />
         {f.central ? <MasterDiscovery f={f} /> : !f.enrolled ? <JoinCard f={f} /> : null}
       </div>
 
@@ -255,13 +252,10 @@ function JoinRequestRow({ request }: { request: JoinRequestView }) {
   )
 }
 
-// Role and listener controls for the node this UI talks to. This component is
-// keyed by the server's listener value so its draft cannot overwrite a newer
-// CLI or browser update; unrelated join state lives outside this boundary.
+// Role and listener controls for the node this UI talks to.
 function ThisNode({ f }: { f: FleetStatus }) {
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['fleet'] })
-  const [listen, setListen] = useState(f.listen ?? '')
   const central = useMutation({
     mutationFn: (body: { central?: boolean; listen?: string }) => api.setFleetCentral(body),
     onSuccess: invalidate,
@@ -290,25 +284,12 @@ function ThisNode({ f }: { f: FleetStatus }) {
           />{' '}
           act as fleet master
         </label>
-        <label>
-          Sync listener (host:port; empty stops listening)
-          <span style={{ display: 'flex', gap: 6 }}>
-            <input
-              type="text"
-              value={listen}
-              placeholder="0.0.0.0:7710"
-              onChange={(e) => setListen(e.target.value)}
-            />
-            <button
-              type="button"
-              className="btn small"
-              disabled={central.isPending || listen === (f.listen ?? '')}
-              onClick={() => central.mutate({ listen })}
-            >
-              Apply
-            </button>
-          </span>
-        </label>
+        <ListenerControl
+          key={f.listen ?? ''}
+          f={f}
+          pending={central.isPending}
+          onApply={(listen) => central.mutate({ listen })}
+        />
         {f.listening && f.listening !== f.listen && <div className="muted small">bound to {f.listening}</div>}
         {central.isError && <div className="error-text">{central.error.message}</div>}
       </div>
@@ -339,6 +320,39 @@ function ThisNode({ f }: { f: FleetStatus }) {
         </div>
       )}
     </div>
+  )
+}
+
+function ListenerControl({
+  f,
+  pending,
+  onApply,
+}: {
+  f: FleetStatus
+  pending: boolean
+  onApply: (listen: string) => void
+}) {
+  const [listen, setListen] = useState(f.listen ?? '')
+  return (
+    <label>
+      Sync listener (host:port; empty stops listening)
+      <span style={{ display: 'flex', gap: 6 }}>
+        <input
+          type="text"
+          value={listen}
+          placeholder="0.0.0.0:7710"
+          onChange={(e) => setListen(e.target.value)}
+        />
+        <button
+          type="button"
+          className="btn small"
+          disabled={pending || listen === (f.listen ?? '')}
+          onClick={() => onApply(listen)}
+        >
+          Apply
+        </button>
+      </span>
+    </label>
   )
 }
 
