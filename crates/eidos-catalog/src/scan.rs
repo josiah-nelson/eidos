@@ -758,17 +758,27 @@ impl ScanSession {
             params![sid, gen, now],
         )?;
         // 6. Publish.
-        let pending: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM objects WHERE source_id = ?1 AND deleted_at IS NULL AND content_state IN ('pending','stale')",
+        let (pending, failed): (i64, i64) = self.conn.query_row(
+            "SELECT
+                SUM(CASE WHEN content_state IN ('pending','stale') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN content_state = 'failed' THEN 1 ELSE 0 END)
+             FROM objects WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file'",
             params![sid],
-            |r| r.get(0),
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                ))
+            },
         )?;
         let final_state = if opts.degraded.is_some() {
             SourceState::Degraded
-        } else if pending > 0 {
+        } else if !self.source.content_enabled {
+            SourceState::MetadataComplete
+        } else if pending > 0 || failed > 0 {
             SourceState::ContentPending
         } else {
-            SourceState::MetadataComplete
+            SourceState::Complete
         };
         self.conn.execute(
             "UPDATE scan_generations SET state = 'published', finished_at = ?3, published_at = ?3, dirs_listed = ?4,
@@ -939,7 +949,7 @@ pub fn recover_open_generations(conn: &mut Connection) -> Result<RecoveryReport>
             SourceId(sid),
             gen,
             "scan interrupted before publication (recovered at startup)",
-            None,
+            Some(SourceState::Degraded),
         )?;
         report.aborted_generations.push((SourceId(sid), gen));
     }

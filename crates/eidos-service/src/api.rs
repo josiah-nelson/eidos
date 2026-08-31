@@ -412,7 +412,7 @@ async fn add_source(
         st.catalog.upsert_volume(st.host_id, id, &v)?;
     }
     if body.scan {
-        let _ = start_scan(&st, id);
+        start_scan(&st, id).map_err(start_scan_api_error)?;
     }
     let s = st
         .catalog
@@ -489,11 +489,20 @@ async fn scan_source(
     let result = blocking(move || Ok(start_scan(&st, sid))).await?;
     match result {
         Ok(p) => Ok((StatusCode::ACCEPTED, ApiJson(p.view()))),
-        Err(StartScanError::AlreadyRunning) => Err(ApiError::conflict("scan already running")),
-        Err(StartScanError::RemoteSource) => Err(ApiError::bad_request(
-            "a replicated source is scanned on its origin node, not here",
-        )),
-        Err(StartScanError::Catalog(e)) => Err(e.into()),
+        Err(error) => Err(start_scan_api_error(error)),
+    }
+}
+
+fn start_scan_api_error(error: StartScanError) -> ApiError {
+    match error {
+        StartScanError::AlreadyRunning => ApiError::conflict("scan already running"),
+        StartScanError::RemoteSource => {
+            ApiError::bad_request("a replicated source is scanned on its origin node, not here")
+        }
+        StartScanError::Catalog(error) => error.into(),
+        StartScanError::Spawn(error) => {
+            ApiError::internal(format!("the scan could not be started: {error}"))
+        }
     }
 }
 

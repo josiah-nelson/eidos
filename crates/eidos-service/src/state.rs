@@ -149,6 +149,13 @@ impl AppState {
                 "re-queued content records left `indexing` by a previous process"
             );
         }
+        let refreshed_source_states = catalog.refresh_source_content_states()?;
+        if refreshed_source_states > 0 {
+            tracing::info!(
+                sources = refreshed_source_states,
+                "reconciled source lifecycle states from durable content rows"
+            );
+        }
         // Interaction capture bounds itself from its own insert path, but a
         // service that is restarted often may never reach that point; one
         // prune at startup makes the bound hold regardless.

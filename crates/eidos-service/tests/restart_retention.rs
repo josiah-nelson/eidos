@@ -12,9 +12,10 @@ use eidos_catalog::scan::{run_scan, RunScanOptions, ScanKind};
 use eidos_catalog::NewSource;
 use eidos_content::Limits;
 use eidos_domain::{
-    ContentState, JobId, JobStage, JobState, ObjectId, ObjectKind, SearchRequest, SourceId,
-    SourceKind, SourceState,
+    ContentState, FileAttributes, JobId, JobStage, JobState, ObjectId, ObjectKind, SearchRequest,
+    SourceId, SourceKind, SourceState,
 };
+use eidos_scanner::{DirEvent, DirToken, RawEntry};
 use eidos_search::exec::{search_with_content, ExecOptions};
 use eidos_search::pipeline::{drain_content_jobs, process_object, ProcessResult};
 use eidos_service::state::{AppState, StartupRecovery};
@@ -63,6 +64,20 @@ fn open_state(data: &Path) -> Arc<AppState> {
             auto_reconcile: false,
             content_workers: 1,
             scan_threads: 1,
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+}
+
+fn open_auto_state(data: &Path) -> Arc<AppState> {
+    Arc::new(
+        AppState::open(&ServiceConfig {
+            data_dir: data.to_path_buf(),
+            auto_reconcile: true,
+            content_workers: 1,
+            scan_threads: 1,
+            fleet: false,
             ..Default::default()
         })
         .unwrap(),
@@ -394,4 +409,84 @@ async fn restart_retains_published_truth_and_repairs_only_interrupted_work() {
     assert_eq!(body["startup_recovery"]["requeued_unfinished_content"], "1");
     assert_eq!(body["jobs"]["queued"], "3");
     assert_eq!(body["jobs"]["running"], "0");
+}
+
+#[test]
+fn interrupted_initial_generation_is_retried_and_published_after_restart() {
+    let fixture = fixture();
+    let state = open_auto_state(&fixture.data);
+    let source = state
+        .catalog
+        .add_source(&NewSource {
+            host_id: state.host_id,
+            name: "initial-recovery".into(),
+            kind: SourceKind::WindowsGeneric,
+            root_path: fixture.root.display().to_string(),
+            aliases: vec![],
+        })
+        .unwrap();
+
+    // Commit one visible batch but leak the still-open generation exactly as
+    // process termination would. This is the state that used to strand a
+    // source forever: no publication, pending objects, and no runnable jobs.
+    let mut interrupted = state.catalog.begin_scan(source, ScanKind::Full).unwrap();
+    interrupted
+        .ingest(DirEvent {
+            token: DirToken(0),
+            parent: None,
+            path: fixture.root.clone(),
+            depth: 0,
+            result: Ok(vec![RawEntry {
+                name: "crash-window.txt".into(),
+                name_lossy: false,
+                kind: ObjectKind::File,
+                attributes: FileAttributes::default(),
+                size: 12,
+                allocated: Some(12),
+                created: None,
+                modified: None,
+                changed: None,
+                accessed: None,
+                native_id: None,
+                reparse_tag: 0,
+            }]),
+            child_tokens: vec![],
+        })
+        .unwrap();
+    interrupted.commit().unwrap();
+    assert_eq!(
+        state.catalog.source_counts(source).unwrap().content_pending,
+        1
+    );
+    std::mem::forget(interrupted);
+    drop(state);
+
+    let state = open_auto_state(&fixture.data);
+    assert_eq!(state.startup_recovery.aborted_scan_generations, 1);
+    let recovered = state.catalog.get_source(source).unwrap().unwrap();
+    assert_eq!(recovered.published_generation, None);
+    assert_eq!(recovered.state, SourceState::Degraded);
+    assert!(recovered
+        .state_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("recovered at startup"));
+
+    state.start_background().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let current = state.catalog.get_source(source).unwrap().unwrap();
+        if current.published_generation.is_some() {
+            assert_ne!(current.state, SourceState::Degraded);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recovered initial scan never published: {current:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(state.catalog.open_scan_generation(source).unwrap(), None);
+    assert_eq!(state.catalog.source_counts(source).unwrap().files, 2);
+    state.request_shutdown();
 }

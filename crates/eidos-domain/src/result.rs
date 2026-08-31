@@ -47,6 +47,7 @@ impl SearchResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct TotalCount {
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub value: u64,
     /// `false` when `value` is a lower bound.
     pub exact: bool,
@@ -97,7 +98,9 @@ pub struct Hit {
     pub parent_id: Option<ObjectId>,
     /// Lowercase extension without dot; empty for none.
     pub extension: String,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub size: u64,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub allocated_size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -135,7 +138,11 @@ pub struct ContentSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub generation: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_u64_string::deserialize"
+    )]
     #[ts(optional)]
     pub indexed_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,9 +179,13 @@ impl ContentSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct Snippet {
     pub chunk_ordinal: u32,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub byte_start: u64,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub byte_end: u64,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub line_start: u64,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub line_end: u64,
     pub text: String,
     /// Character (not byte) ranges within `text` to highlight.
@@ -184,9 +195,13 @@ pub struct Snippet {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct DirectorySummary {
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub file_count: u64,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub directory_count: u64,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub logical_bytes: u64,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub allocated_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -195,7 +210,11 @@ pub struct DirectorySummary {
     #[ts(optional)]
     pub oldest_modified: Option<UnixNanos>,
     /// Sparse descendant extension counts (top entries only).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "crate::json::u64_string_map::deserialize"
+    )]
     pub extension_counts: BTreeMap<String, u64>,
     /// Whether the aggregate reflects a published, complete generation.
     pub complete: bool,
@@ -206,7 +225,11 @@ pub struct ArchiveSummary {
     pub container_id: ObjectId,
     pub depth: u32,
     pub member_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_u64_string::deserialize"
+    )]
     #[ts(optional)]
     pub compressed_size: Option<u64>,
 }
@@ -225,17 +248,23 @@ pub struct SourceCompleteness {
     /// that the source cannot contribute matches.
     #[serde(default)]
     pub content_not_replicated: bool,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub content_pending: u64,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub content_failed: u64,
     /// Directories that could not be listed in the published generation.
     /// Their previous contents (if any) are preserved; aggregates beneath
     /// them are flagged incomplete.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::u64_string::deserialize")]
     pub listing_errors: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub last_scan_completed: Option<UnixNanos>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_u64_string::deserialize"
+    )]
     #[ts(optional)]
     pub checkpoint_age_ms: Option<u64>,
     pub freshness: Freshness,
@@ -259,8 +288,10 @@ pub struct RemoteCompleteness {
     pub remote_source_id: SourceId,
     pub epoch: String,
     /// Sequence durably applied here.
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub applied_seq: u64,
     /// Head the origin last reported.
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub reported_head: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -297,10 +328,18 @@ pub struct Explanation {
 pub struct PlanStep {
     pub stage: String,
     pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_u64_string::deserialize"
+    )]
     #[ts(optional)]
     pub candidates: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_u64_string::deserialize"
+    )]
     #[ts(optional)]
     pub verified: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -319,6 +358,7 @@ pub struct Facet {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct FacetValue {
     pub value: String,
+    #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -342,10 +382,18 @@ pub struct FacetValue {
 /// response was produced for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct FacetRange {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_i64_string::deserialize"
+    )]
     #[ts(optional)]
     pub from: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_i64_string::deserialize"
+    )]
     #[ts(optional)]
     pub to: Option<i64>,
     /// Query text selecting exactly this bucket, e.g. `size:>=1M size:<16M`.
@@ -394,5 +442,15 @@ mod tests {
         };
         assert!(resp.all_sources_complete(false));
         assert!(!resp.all_sources_complete(true));
+
+        let mut wire = serde_json::to_value(&resp).unwrap();
+        wire["total"]["value"] = serde_json::json!("0");
+        wire["completeness"][0]["content_pending"] = serde_json::json!("0");
+        wire["completeness"][0]["content_failed"] = serde_json::json!("0");
+        wire["completeness"][0]["listing_errors"] = serde_json::json!("0");
+        assert_eq!(
+            serde_json::from_value::<SearchResponse>(wire).unwrap(),
+            resp
+        );
     }
 }
