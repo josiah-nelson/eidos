@@ -531,6 +531,26 @@ impl Catalog {
         })
     }
 
+    /// Whether [`Self::outbox_prune`] would delete anything: a consumed
+    /// row at or below every projection's position. Reader-side, so an
+    /// idle follower can skip the prune's writer transaction entirely —
+    /// every writer transaction bumps the write signal, and an
+    /// unconditional prune would wake the follower it just put to sleep.
+    pub fn outbox_has_prunable(&self) -> Result<bool> {
+        self.with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM outbox
+                    WHERE consumed_at IS NOT NULL
+                      AND seq <= (SELECT COALESCE(MIN(outbox_seq), 0)
+                                  FROM projection_state)
+                 )",
+                [],
+                |r| r.get::<_, i64>(0),
+            )? != 0)
+        })
+    }
+
     /// Total outbox rows on disk, consumed or not.
     pub fn outbox_retained(&self) -> Result<u64> {
         self.with_reader(|conn| {

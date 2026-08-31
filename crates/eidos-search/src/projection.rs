@@ -225,8 +225,16 @@ impl CatalogIndex {
         if rows.is_empty() {
             // Idle iterations still release a bounded slice of consumed rows
             // so a backlog left by an upgrade, or one larger than the
-            // per-iteration allowance, drains without waiting for writes.
-            catalog.outbox_prune(batch.max(1).saturating_mul(4))?;
+            // per-iteration allowance, drains without waiting for writes —
+            // but only when something is actually prunable. The prune is a
+            // writer transaction and every writer transaction bumps the
+            // write signal, so pruning unconditionally here made an idle
+            // follower wake itself in a tight loop forever (~2,200 writer
+            // acquisitions/s, ~90% writer hold time measured on v0.5.0),
+            // starving scan batches and content workers.
+            if catalog.outbox_has_prunable()? {
+                catalog.outbox_prune(batch.max(1).saturating_mul(4))?;
+            }
             return Ok((rebuilt, None));
         }
         let stats = self.apply_outbox(catalog, &rows)?;

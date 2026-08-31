@@ -762,6 +762,7 @@ name = "eidos-cli"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "eidos-catalog",
  "eidos-content",

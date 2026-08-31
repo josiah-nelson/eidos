@@ -458,12 +458,14 @@ fn interrupted_enumeration_never_publishes() {
     let c = f.catalog.source_completeness(f.source).unwrap();
     assert!(!c.metadata_complete);
 
-    // Startup recovery marks it aborted and truthful.
+    // Startup recovery marks it aborted and leaves the source degraded so the
+    // reconciler can distinguish an interrupted first scan from a deliberately
+    // unscanned source.
     let report = f.catalog.recover().unwrap();
     assert_eq!(report.aborted_generations, vec![(f.source, 1)]);
     let src = f.catalog.get_source(f.source).unwrap().unwrap();
     assert_eq!(src.published_generation, None);
-    assert_eq!(src.state, SourceState::New);
+    assert_eq!(src.state, SourceState::Degraded);
     let gens = f.catalog.list_generations(f.source, 10).unwrap();
     assert_eq!(gens[0].state, "aborted");
 

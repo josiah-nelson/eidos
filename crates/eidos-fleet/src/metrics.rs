@@ -15,7 +15,10 @@ macro_rules! counters {
 
         #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
         pub struct $view {
-            $(pub $field: u64,)*
+            $(
+                #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
+                pub $field: u64,
+            )*
         }
 
         impl $name {

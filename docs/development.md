@@ -20,16 +20,8 @@ with no change feed.
 
 ## Commands
 
-Install the pre-push hook once per clone. CI lints Windows but does not test
-it (see `docs/adr/0019`), so on a Windows machine this hook is the only
-automated check that runs the suite on Windows before code lands:
-
-```powershell
-git config core.hooksPath scripts/hooks
-```
-
-It runs `check.ps1 -SkipWeb -SkipRelease` on pushes that touch Rust, skips
-pushes that do not, and is bypassed for one push with `git push --no-verify`.
+Pushes do not run a local test hook. Run the relevant checks while developing;
+the complete Windows suite runs in the nightly and release gates.
 
 ```powershell
 # Windows. One-shot: format check, clippy (deny warnings), all tests,
@@ -52,10 +44,10 @@ scripts/check.sh               # --skip-web / --skip-release to shorten
 `scripts/macos/build-agent.sh` builds the `Eidos.app` bundle the macOS agent
 is installed from; see [installing-macos.md](installing-macos.md).
 
-CI runs the Rust gate on both Windows and macOS, because the enumeration and
-change-feed adapters differ per platform and the contracts they share are only
-proven when both run them. The Windows lane also checks formatting and that
-the generated API contract in `web/src/generated/api.ts` is not stale.
+Pull-request CI lints all Windows targets and runs the functional Rust gate on
+macOS, where the native adapters differ. The nightly and release workflows run
+the complete Windows suite. CI also checks formatting and that the generated
+API contract in `web/src/generated/api.ts` is not stale.
 
 Tests never touch user data: every integration test builds its own fixture
 under a `tempfile::tempdir()`. USN-journal tests need an elevated session
@@ -334,6 +326,17 @@ virtual paths, queued/running jobs, an unfinished content publication, and an
 open scan. It asserts a healthy catalog projection and content index reopen
 without rebuild, then checks the exact recovery counters and Activity JSON.
 
+### Extraction worker pool
+
+`eidos content workers` shows the global extraction pool;
+`eidos content workers N` (or `POST /api/content/workers`, or the pool
+input on the Activity page) resizes it at runtime, clamped to 1..=64. The
+choice is durable: it is written to `content-workers.json` in the data
+directory before it takes effect, and overrides `--content-workers` on
+restart. Per-volume `content_concurrency` caps apply on top of the pool,
+so one slow disk cannot absorb every worker — raising a volume's cap past
+the pool size has no effect until the pool grows too.
+
 ### Pausing content extraction
 
 Extraction is the one background job that reads the source volumes
@@ -546,7 +549,11 @@ Benchmark records carry workload labels, never file names or secrets.
 ## Logging
 
 `EIDOS_LOG` (or `--log`) accepts `tracing` filter syntax, e.g.
-`EIDOS_LOG=info,eidos_scanner=debug`. `--log-json` emits JSON lines to stderr.
+`EIDOS_LOG=info,eidos_scanner=debug`. The default is `info,tantivy=warn`:
+tantivy's segment bookkeeping is noise at INFO and was ~80% of a day's log
+lines. `--log-json` emits JSON lines to stderr.
+
+The service keeps 14 daily log files and deletes older ones.
 
 ## Layout
 

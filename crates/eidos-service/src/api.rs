@@ -229,6 +229,18 @@ where
 
 // ----- health --------------------------------------------------------------
 
+/// On-disk footprint of the durable stores, computed lazily and cached
+/// briefly by [`AppState::storage`].
+#[derive(Debug, Clone, Copy, Default, Serialize, TS)]
+pub struct StorageView {
+    /// `catalog.db` plus its WAL and shared-memory files.
+    pub catalog_db_bytes: u64,
+    /// The name/metadata (catalog) index directory.
+    pub catalog_index_bytes: u64,
+    /// The content (chunk) index directory.
+    pub content_index_bytes: u64,
+}
+
 #[derive(Serialize, TS)]
 pub(crate) struct Health {
     version: &'static str,
@@ -246,27 +258,38 @@ pub(crate) struct Health {
     /// `/api/activity` and the CLI use, so a health check and the Activity
     /// page can never disagree about the pipeline.
     content_status: crate::content_control::ContentStatusView,
+    /// On-disk footprint of the catalog and indexes.
+    storage: StorageView,
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
-    let sources = st.catalog.list_sources()?;
-    let running = st
-        .scans
-        .lock()
-        .values()
-        .filter(|p| !p.is_finished())
-        .count();
-    Ok(ApiJson(Health {
-        version: env!("CARGO_PKG_VERSION"),
-        schema_version: eidos_domain::SCHEMA_VERSION,
-        host: st.host_name.clone(),
-        uptime_s: st.started_at.elapsed().as_secs(),
-        catalog_path: st.catalog.path().display().to_string(),
-        sources: sources.len(),
-        running_scans: running,
-        export_max_rows: st.export.max_rows,
-        content_status: crate::content_control::content_status(&st),
-    }))
+    // Catalog reads and the (cached) storage walk are blocking work; keep
+    // them off the async runtime workers so health stays answerable while
+    // the blocking pool is busy elsewhere.
+    let view = tokio::task::spawn_blocking(move || -> Result<Health, ApiError> {
+        let sources = st.catalog.list_sources()?;
+        let running = st
+            .scans
+            .lock()
+            .values()
+            .filter(|p| !p.is_finished())
+            .count();
+        Ok(Health {
+            version: env!("CARGO_PKG_VERSION"),
+            schema_version: eidos_domain::SCHEMA_VERSION,
+            host: st.host_name.clone(),
+            uptime_s: st.started_at.elapsed().as_secs(),
+            catalog_path: st.catalog.path().display().to_string(),
+            sources: sources.len(),
+            running_scans: running,
+            export_max_rows: st.export.max_rows,
+            content_status: crate::content_control::content_status(&st),
+            storage: st.storage(),
+        })
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(ApiJson(view))
 }
 
 // ----- sources -------------------------------------------------------------
@@ -389,7 +412,7 @@ async fn add_source(
         st.catalog.upsert_volume(st.host_id, id, &v)?;
     }
     if body.scan {
-        let _ = start_scan(&st, id);
+        start_scan(&st, id).map_err(start_scan_api_error)?;
     }
     let s = st
         .catalog
@@ -466,11 +489,20 @@ async fn scan_source(
     let result = blocking(move || Ok(start_scan(&st, sid))).await?;
     match result {
         Ok(p) => Ok((StatusCode::ACCEPTED, ApiJson(p.view()))),
-        Err(StartScanError::AlreadyRunning) => Err(ApiError::conflict("scan already running")),
-        Err(StartScanError::RemoteSource) => Err(ApiError::bad_request(
-            "a replicated source is scanned on its origin node, not here",
-        )),
-        Err(StartScanError::Catalog(e)) => Err(e.into()),
+        Err(error) => Err(start_scan_api_error(error)),
+    }
+}
+
+fn start_scan_api_error(error: StartScanError) -> ApiError {
+    match error {
+        StartScanError::AlreadyRunning => ApiError::conflict("scan already running"),
+        StartScanError::RemoteSource => {
+            ApiError::bad_request("a replicated source is scanned on its origin node, not here")
+        }
+        StartScanError::Catalog(error) => error.into(),
+        StartScanError::Spawn(error) => {
+            ApiError::internal(format!("the scan could not be started: {error}"))
+        }
     }
 }
 
@@ -1079,6 +1111,8 @@ pub struct ActivityView {
     pub admission: crate::admission::AdmissionView,
     /// Process-wide catalog writer wait time, including scan batch handoffs.
     pub catalog_writer: eidos_catalog::CatalogWriterStats,
+    /// On-disk footprint of the catalog and indexes.
+    pub storage: StorageView,
     pub sources: Vec<ActivitySourceView>,
     pub recent_failures: Vec<eidos_catalog::jobs::JobRecord>,
 }
@@ -1129,6 +1163,7 @@ async fn activity(State(st): State<Arc<AppState>>) -> ApiResult<ActivityView> {
             content_rebuild: st2.content_index.rebuild_status(),
             admission: st2.admission.view(),
             catalog_writer: st2.catalog.writer_stats(),
+            storage: st2.storage(),
             sources,
             recent_failures: st2.catalog.recent_failed_jobs(20)?,
         })

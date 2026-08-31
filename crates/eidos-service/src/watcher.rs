@@ -903,11 +903,17 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
 
 /// Restore a source from `offline` to its truthful completeness state.
 pub fn restore_state(state: &AppState, source_id: SourceId) -> anyhow::Result<()> {
+    let source = state
+        .catalog
+        .get_source(source_id)?
+        .ok_or_else(|| anyhow::anyhow!("source {source_id} not found"))?;
     let counts = state.catalog.source_counts(source_id)?;
-    let st = if counts.content_pending > 0 {
+    let st = if !source.content_enabled {
+        SourceState::MetadataComplete
+    } else if counts.content_pending > 0 || counts.content_failed > 0 {
         SourceState::ContentPending
     } else {
-        SourceState::MetadataComplete
+        SourceState::Complete
     };
     state.catalog.set_source_state(source_id, st, None)?;
     Ok(())
@@ -1246,9 +1252,36 @@ fn reconcile_tick(state: &Arc<AppState>) -> anyhow::Result<()> {
 
 fn reconcile_tick_at(state: &Arc<AppState>, now: UnixNanos) -> anyhow::Result<()> {
     for s in state.catalog.list_sources()? {
-        if s.published_generation.is_none() || s.state == SourceState::Retired || s.kind.is_remote()
-        {
+        if s.state == SourceState::Retired || s.kind.is_remote() {
             state.clear_reconciliation_deferral(s.id);
+            continue;
+        }
+        if s.published_generation.is_none() {
+            // A deliberately configured-but-unscanned source remains `new`.
+            // Crash recovery marks an interrupted first generation degraded;
+            // retry that state automatically because no published generation
+            // or content worker can otherwise make progress.
+            if s.state == SourceState::Degraded && state.auto_reconcile {
+                tracing::info!(source = s.id.0, "retrying interrupted initial scan");
+                match scanner::start_automatic_scan(state, s.id, now) {
+                    Ok(scanner::AutomaticScanOutcome::Started(_)) => {
+                        tracing::info!(source = s.id.0, "initial scan recovery started");
+                    }
+                    Ok(scanner::AutomaticScanOutcome::Deferred(d)) => {
+                        tracing::info!(
+                            source = s.id.0,
+                            reason = %d.reason,
+                            next_eligible_at = d.next_eligible_at.0,
+                            "initial scan recovery deferred"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(source = s.id.0, error = %e, "initial scan recovery start failed");
+                    }
+                }
+            } else {
+                state.clear_reconciliation_deferral(s.id);
+            }
             continue;
         }
         let has_feed =

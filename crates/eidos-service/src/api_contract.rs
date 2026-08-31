@@ -105,6 +105,8 @@ fn typescript_contract() -> String {
     types.add::<crate::api::ParseView>();
     types.add::<crate::api::ContentPolicyBody>();
     types.add::<crate::content_control::ContentStatusView>();
+    types.add::<crate::content_control::WorkersBody>();
+    types.add::<crate::content_control::WorkersView>();
     types.add::<crate::api::ActivityView>();
     types.add::<crate::api::IndexStatus>();
     types.add::<crate::content_preview::PreviewQuery>();

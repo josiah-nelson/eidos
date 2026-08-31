@@ -14,6 +14,11 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// Keeps the non-blocking file writer alive; drop flushes it.
 pub struct LogGuard(#[allow(dead_code)] Option<tracing_appender::non_blocking::WorkerGuard>);
 
+/// Daily files kept on disk; the appender deletes older ones. Fleet nodes
+/// run unattended for months, so retention is bounded here rather than by
+/// an operator remembering to clean up.
+const LOG_RETENTION_DAYS: usize = 14;
+
 /// File name prefix; the appender adds `.<date>`.
 pub const FILE_PREFIX: &str = "eidos.log";
 
@@ -35,6 +40,7 @@ pub fn init(
             let appender = RollingFileAppender::builder()
                 .rotation(Rotation::DAILY)
                 .filename_prefix(FILE_PREFIX)
+                .max_log_files(LOG_RETENTION_DAYS)
                 .build(dir)
                 .with_context(|| format!("opening the log file in {}", dir.display()))?;
             let (writer, guard) = tracing_appender::non_blocking(appender);

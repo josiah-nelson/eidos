@@ -6,7 +6,7 @@ export type ApiInt = string;
 
 export type ActivitySourceView = { source_id: SourceId, name: string, state: SourceState, content_enabled: boolean, content_concurrency: number, content_reserved: number, content_peak_reserved: number, jobs_queued: ApiInt, jobs_running: ApiInt, jobs_failed: ApiInt, jobs_failed_bytes: ApiInt, content_states: { [key in string]: ApiInt }, content_bytes_indexed: ApiInt, reconciliation_deferred?: ReconciliationDeferral, };
 
-export type ActivityView = { content_enabled: boolean, content_status: ContentStatusView, startup_recovery: StartupRecovery, jobs: JobCounts, content: ContentStats, archives: ArchiveStats, workers: ContentWorkersView, follower: FollowerView, content_index_documents: ApiInt, content_rebuild: RebuildStatus, admission: AdmissionView, catalog_writer: CatalogWriterStats, sources: Array<ActivitySourceView>, recent_failures: Array<JobRecord>, };
+export type ActivityView = { content_enabled: boolean, content_status: ContentStatusView, startup_recovery: StartupRecovery, jobs: JobCounts, content: ContentStats, archives: ArchiveStats, workers: ContentWorkersView, follower: FollowerView, content_index_documents: ApiInt, content_rebuild: RebuildStatus, admission: AdmissionView, catalog_writer: CatalogWriterStats, storage: StorageView, sources: Array<ActivitySourceView>, recent_failures: Array<JobRecord>, };
 
 export type AddSourceBody = { name: string, root_path: string, kind?: SourceKind | null, aliases: Array<string>, scan: boolean, };
 
@@ -136,7 +136,7 @@ export type ForgetView = { retired_sources: ApiInt, };
 
 export type Freshness = "live" | "periodic" | "unknown";
 
-export type Health = { version: string, schema_version: number, host: string, uptime_s: ApiInt, catalog_path: string, sources: number, running_scans: number, export_max_rows: ApiInt, content_status: ContentStatusView, };
+export type Health = { version: string, schema_version: number, host: string, uptime_s: ApiInt, catalog_path: string, sources: number, running_scans: number, export_max_rows: ApiInt, content_status: ContentStatusView, storage: StorageView, };
 
 export type Hit = { object_id: ObjectId, entry_id?: EntryId, source_id: SourceId, host_id: HostId, kind: ObjectKind, name: string, path?: string, parent_id?: ObjectId, extension: string, size: ApiInt, allocated_size: ApiInt, modified?: UnixNanos, created?: UnixNanos, changed?: UnixNanos, attributes: FileAttributes, hard_link_count: number, content: ContentSummary, score?: number, snippets?: Array<Snippet>, directory?: DirectorySummary, archive?: ArchiveSummary, source_state: SourceState, };
 
@@ -284,6 +284,8 @@ export type SourceView = { source: SourceRecord, counts: SourceCounts, completen
 
 export type StartupRecovery = { aborted_scan_generations: ApiInt, requeued_running_jobs: ApiInt, requeued_unfinished_content: ApiInt, };
 
+export type StorageView = { catalog_db_bytes: ApiInt, catalog_index_bytes: ApiInt, content_index_bytes: ApiInt, };
+
 export type SyncBody = { enabled: boolean, };
 
 export type SyncPolicy = "inherit" | "local_only";
@@ -315,3 +317,7 @@ export type WatcherState = "starting" | "live" | "reconciling" | "stopped";
 export type WatcherView = { state: WatcherState, live: boolean, detail: string | null, feed: WatcherFeed, batches: ApiInt, events: ApiInt, records: ApiInt, reconciles: ApiInt, last_position: ApiInt, last_batch_ms_ago: ApiInt | null, last_apply_ms: ApiInt, uptime_s: ApiInt, };
 
 export type WorkerCurrent = { worker: string, source_id: SourceId, object_id: ObjectId, path: string, size: ApiInt, started_ms_ago: ApiInt, };
+
+export type WorkersBody = { workers: number, };
+
+export type WorkersView = { workers: number, max: number, };
