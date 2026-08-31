@@ -97,7 +97,7 @@ async fn typed_search_and_fleet_clients_accept_api_v2_integer_strings() {
     assert_eq!(fleet_json["name"], "api-v2-test");
     // CLI JSON is reserialized from FleetStatus. Reaching this assertion is
     // the important boundary: the service response itself contained strings.
-    assert!(fleet_json["pending_invites"].is_number());
+    assert!(fleet_json["join_requests"].is_array());
 
     state.request_shutdown();
     let _ = stop_tx.send(());

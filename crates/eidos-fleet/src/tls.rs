@@ -30,14 +30,16 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(ring::default_provider())
 }
 
-/// Accepts exactly one certificate: the pinned one.
+/// Accepts exactly one certificate when pinned. `None` is used only for the
+/// first join request, where the certificate observed on this connection is
+/// returned to the caller and durably pinned before any retry or sync.
 #[derive(Debug)]
-struct Pinned {
-    fingerprint: [u8; 32],
+struct ServerIdentity {
+    fingerprint: Option<[u8; 32]>,
     provider: Arc<CryptoProvider>,
 }
 
-impl ServerCertVerifier for Pinned {
+impl ServerCertVerifier for ServerIdentity {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -46,7 +48,10 @@ impl ServerCertVerifier for Pinned {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if fingerprint_of(end_entity.as_ref()) == self.fingerprint {
+        if self
+            .fingerprint
+            .is_none_or(|pinned| fingerprint_of(end_entity.as_ref()) == pinned)
+        {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(
@@ -169,12 +174,19 @@ pub fn client_config(
     identity: &NodeIdentity,
     pinned: [u8; 32],
 ) -> anyhow::Result<Arc<ClientConfig>> {
+    client_config_with(identity, Some(pinned))
+}
+
+fn client_config_with(
+    identity: &NodeIdentity,
+    pinned: Option<[u8; 32]>,
+) -> anyhow::Result<Arc<ClientConfig>> {
     let provider = provider();
     let config = ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("TLS 1.3 unavailable")?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Pinned {
+        .with_custom_certificate_verifier(Arc::new(ServerIdentity {
             fingerprint: pinned,
             provider,
         }))
@@ -211,6 +223,32 @@ pub async fn connect(
         .map_err(|_| anyhow!("TLS handshake with {endpoint} timed out"))?
         .with_context(|| format!("TLS handshake with {endpoint}"))?;
     Ok((stream, addr))
+}
+
+/// First contact with a master selected by address or local discovery. The
+/// returned fingerprint must be checked against the master's declared node
+/// id and persisted before this connection's result is trusted on a retry.
+pub async fn connect_first(
+    identity: &NodeIdentity,
+    endpoint: &str,
+    timeout: Duration,
+) -> anyhow::Result<(ClientStream, SocketAddr, [u8; 32])> {
+    let config = client_config_with(identity, None)?;
+    let connector = TlsConnector::from(config);
+    let tcp = tokio::time::timeout(timeout, TcpStream::connect(endpoint))
+        .await
+        .map_err(|_| anyhow!("connecting to {endpoint} timed out"))?
+        .with_context(|| format!("connecting to {endpoint}"))?;
+    tcp.set_nodelay(true).ok();
+    let addr = tcp.peer_addr()?;
+    let name = ServerName::try_from(TLS_SERVER_NAME.to_string()).expect("static name");
+    let stream = tokio::time::timeout(timeout, connector.connect(name, tcp))
+        .await
+        .map_err(|_| anyhow!("TLS handshake with {endpoint} timed out"))?
+        .with_context(|| format!("TLS handshake with {endpoint}"))?;
+    let fingerprint = peer_fingerprint(stream.get_ref().1)
+        .ok_or_else(|| anyhow!("master presented no certificate"))?;
+    Ok((stream, addr, fingerprint))
 }
 
 /// Complete the server side of a handshake on an accepted socket.

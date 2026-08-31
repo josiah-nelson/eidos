@@ -3,6 +3,7 @@
 //! freshness, last error, and any fence or repair state (sprint section
 //! 11, "operability").
 
+use crate::config::PendingJoinTarget;
 use crate::metrics::FleetCountersView;
 use eidos_catalog::fleet::NodeId;
 use eidos_domain::{SourceId, UnixNanos};
@@ -148,6 +149,32 @@ pub struct ReplicaSourceSync {
     pub connected: bool,
 }
 
+/// Master found through local DNS service discovery. Discovery is a
+/// convenience only; the join handshake proves and pins the certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct DiscoveredMaster {
+    pub node_id: NodeId,
+    pub name: String,
+    pub fingerprint: String,
+    pub endpoints: Vec<String>,
+    pub last_seen_at: UnixNanos,
+}
+
+/// Unknown node waiting for an operator decision on this master.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct JoinRequestView {
+    pub request_id: String,
+    pub node_id: NodeId,
+    pub name: String,
+    pub platform: String,
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub remote_addr: Option<String>,
+    pub requested_at: UnixNanos,
+    pub last_seen_at: UnixNanos,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct FleetStatus {
     pub node_id: NodeId,
@@ -172,8 +199,14 @@ pub struct FleetStatus {
     /// Conditions an operator should see: backlog over its ceiling, a
     /// fenced source, a listener that failed to bind.
     pub degraded: Vec<String>,
-    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
-    pub pending_invites: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pending_join: Option<PendingJoinTarget>,
+    pub join_requests: Vec<JoinRequestView>,
+    pub discovered_masters: Vec<DiscoveredMaster>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub discovery_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -268,7 +301,32 @@ mod tests {
                 ..Default::default()
             },
             degraded: vec![],
-            pending_invites: 25,
+            pending_join: Some(PendingJoinTarget {
+                request_id: "01010101010101010101010101010101".into(),
+                endpoint: "127.0.0.1:7710".into(),
+                master_name: "master".into(),
+                master_fingerprint: "fingerprint".into(),
+                requested_at: UnixNanos(791),
+                rejected_reason: None,
+            }),
+            join_requests: vec![JoinRequestView {
+                request_id: "02020202020202020202020202020202".into(),
+                node_id: node,
+                name: "joining".into(),
+                platform: "windows".into(),
+                fingerprint: "joining-fingerprint".into(),
+                remote_addr: Some("127.0.0.1:1234".into()),
+                requested_at: UnixNanos(792),
+                last_seen_at: UnixNanos(793),
+            }],
+            discovered_masters: vec![DiscoveredMaster {
+                node_id: node,
+                name: "master".into(),
+                fingerprint: "fingerprint".into(),
+                endpoints: vec!["127.0.0.1:7710".into()],
+                last_seen_at: UnixNanos(794),
+            }],
+            discovery_error: None,
         };
         let mut wire = serde_json::to_value(&status).unwrap();
         stringify_numbers(&mut wire);

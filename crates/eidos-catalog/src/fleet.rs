@@ -1,10 +1,10 @@
-//! Fleet roster: the peers this installation trusts and the single-use
-//! invitations a central mints for enrollment (ADR-0023).
+//! Fleet roster and approval queue (ADR-0023).
 //!
 //! Identity lives outside the catalog (the node's key pair and certificate
 //! are files in the data directory); the catalog records which peer
-//! fingerprints are admitted and what they may do. Only the hash of an
-//! invitation secret is stored.
+//! fingerprints are admitted and what they may do. Unknown nodes may leave a
+//! durable join request, but cannot replicate until the designated master
+//! approves that exact certificate identity.
 
 use crate::{Catalog, CatalogError, Result};
 use eidos_domain::{HostId, SourceId, SourceState, SyncPolicy, UnixNanos};
@@ -129,14 +129,48 @@ pub struct FleetPeer {
     pub connected: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl JoinRequestStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FleetInvite {
-    pub token_hash: [u8; 32],
-    pub name_hint: Option<String>,
-    pub created_at: UnixNanos,
-    pub expires_at: UnixNanos,
-    pub used_at: Option<UnixNanos>,
-    pub used_by: Option<NodeId>,
+pub struct FleetJoinRequest {
+    /// Random 128-bit attempt identity encoded as lowercase hex. A rejected
+    /// attempt stays rejected; retrying creates a fresh id and a new explicit
+    /// approval decision.
+    pub request_id: String,
+    pub node_id: NodeId,
+    pub name: String,
+    pub platform: String,
+    pub fingerprint: [u8; 32],
+    pub remote_addr: Option<String>,
+    pub requested_at: UnixNanos,
+    pub last_seen_at: UnixNanos,
+    pub status: JoinRequestStatus,
+    pub decided_at: Option<UnixNanos>,
 }
 
 fn blob32(blob: Vec<u8>, what: &str) -> Result<[u8; 32]> {
@@ -196,6 +230,68 @@ fn peer_build(row: PeerRow) -> Result<FleetPeer> {
 }
 
 const PEER_COLUMNS: &str = "node_id, name, role, fingerprint, endpoint, enabled, enrolled_at, last_seen_at, last_error, connected";
+const JOIN_REQUEST_COLUMNS: &str = "request_id, node_id, name, platform, fingerprint, remote_addr, requested_at, last_seen_at, status, decided_at";
+
+type JoinRequestRow = (
+    String,
+    Vec<u8>,
+    String,
+    String,
+    Vec<u8>,
+    Option<String>,
+    i64,
+    i64,
+    String,
+    Option<i64>,
+);
+
+fn canonical_request_id(value: &str) -> Result<String> {
+    NodeId::parse_hex(value).map(NodeId::to_hex).ok_or_else(|| {
+        CatalogError::InvalidState("join request id is not 32 hex characters".into())
+    })
+}
+
+fn join_request_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JoinRequestRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn join_request_build(row: JoinRequestRow) -> Result<FleetJoinRequest> {
+    Ok(FleetJoinRequest {
+        request_id: canonical_request_id(&row.0)?,
+        node_id: NodeId(blob16(row.1, "join request node id")?),
+        name: row.2,
+        platform: row.3,
+        fingerprint: blob32(row.4, "join request fingerprint")?,
+        remote_addr: row.5,
+        requested_at: UnixNanos(row.6),
+        last_seen_at: UnixNanos(row.7),
+        status: JoinRequestStatus::parse(&row.8).ok_or_else(|| {
+            CatalogError::InvalidState(format!("unknown join request status {}", row.8))
+        })?,
+        decided_at: row.9.map(UnixNanos),
+    })
+}
+
+fn join_request_conn(conn: &Connection, request_id: &str) -> Result<Option<FleetJoinRequest>> {
+    conn.prepare_cached(&format!(
+        "SELECT {JOIN_REQUEST_COLUMNS} FROM fleet_join_requests WHERE request_id = ?1"
+    ))?
+    .query_row(params![request_id], join_request_from_row)
+    .optional()?
+    .map(join_request_build)
+    .transpose()
+}
 
 pub(crate) fn peer_conn(conn: &Connection, node: NodeId) -> Result<Option<FleetPeer>> {
     conn.prepare_cached(&format!(
@@ -391,177 +487,139 @@ impl Catalog {
         })
     }
 
-    /// Record a minted invitation by the hash of its secret.
-    pub fn fleet_add_invite(
+    /// Record or refresh a join request from the same proved certificate.
+    /// Decisions are never reset by a replay; a retry after rejection uses a
+    /// fresh request id and therefore requires a fresh operator decision.
+    pub fn fleet_record_join_request(
         &self,
-        token_hash: [u8; 32],
-        name_hint: Option<&str>,
-        expires_at: UnixNanos,
-    ) -> Result<()> {
+        request: &FleetJoinRequest,
+    ) -> Result<FleetJoinRequest> {
+        let request_id = canonical_request_id(&request.request_id)?;
         self.with_writer(|conn| {
-            conn.execute(
-                "INSERT INTO fleet_invites (token_hash, name_hint, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    token_hash.as_slice(),
-                    name_hint,
-                    UnixNanos::now().0,
-                    expires_at.0
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Consume an invitation: valid exactly once, before it expires. Returns
-    /// the invite when it was redeemed now.
-    pub fn fleet_redeem_invite(
-        &self,
-        token_hash: [u8; 32],
-        node: NodeId,
-    ) -> Result<Option<FleetInvite>> {
-        self.with_writer(|conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let now = UnixNanos::now().0;
-            let n = tx.execute(
-                "UPDATE fleet_invites SET used_at = ?2, used_by = ?3
-                 WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
-                params![token_hash.as_slice(), now, node.0.as_slice()],
-            )?;
-            let invite = if n == 0 {
-                None
-            } else {
-                tx.query_row(
-                    "SELECT token_hash, name_hint, created_at, expires_at, used_at, used_by
-                     FROM fleet_invites WHERE token_hash = ?1",
-                    params![token_hash.as_slice()],
-                    |r| {
-                        Ok((
-                            r.get::<_, Vec<u8>>(0)?,
-                            r.get::<_, Option<String>>(1)?,
-                            r.get::<_, i64>(2)?,
-                            r.get::<_, i64>(3)?,
-                            r.get::<_, Option<i64>>(4)?,
-                            r.get::<_, Option<Vec<u8>>>(5)?,
-                        ))
-                    },
-                )
-                .optional()?
-                .map(|(hash, hint, created, expires, used, by)| {
-                    Ok::<_, CatalogError>(FleetInvite {
-                        token_hash: blob32(hash, "invite hash")?,
-                        name_hint: hint,
-                        created_at: UnixNanos(created),
-                        expires_at: UnixNanos(expires),
-                        used_at: used.map(UnixNanos),
-                        used_by: by
-                            .map(|b| blob16(b, "invite node id").map(NodeId))
-                            .transpose()?,
-                    })
-                })
-                .transpose()?
-            };
-            tx.commit()?;
-            Ok(invite)
-        })
-    }
-
-    /// Consume an invitation and admit its peer in the same transaction.
-    /// A crash or roster write failure cannot burn a single-use invitation
-    /// without creating the corresponding roster entry.
-    pub fn fleet_redeem_invite_and_upsert_peer(
-        &self,
-        token_hash: [u8; 32],
-        peer: &FleetPeer,
-    ) -> Result<Option<FleetInvite>> {
-        self.with_writer(|conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let now = UnixNanos::now().0;
-            let n = tx.execute(
-                "UPDATE fleet_invites SET used_at = ?2, used_by = ?3
-                 WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
-                params![token_hash.as_slice(), now, peer.node_id.0.as_slice()],
-            )?;
-            let invite = tx
-                .query_row(
-                    "SELECT token_hash, name_hint, created_at, expires_at, used_at, used_by
-                     FROM fleet_invites WHERE token_hash = ?1",
-                    params![token_hash.as_slice()],
-                    |r| {
-                        Ok((
-                            r.get::<_, Vec<u8>>(0)?,
-                            r.get::<_, Option<String>>(1)?,
-                            r.get::<_, i64>(2)?,
-                            r.get::<_, i64>(3)?,
-                            r.get::<_, Option<i64>>(4)?,
-                            r.get::<_, Option<Vec<u8>>>(5)?,
-                        ))
-                    },
-                )
-                .optional()?
-                .map(|invite| {
-                    Ok::<_, CatalogError>(FleetInvite {
-                        token_hash: blob32(invite.0, "invite hash")?,
-                        name_hint: invite.1,
-                        created_at: UnixNanos(invite.2),
-                        expires_at: UnixNanos(invite.3),
-                        used_at: invite.4.map(UnixNanos),
-                        used_by: invite
-                            .5
-                            .map(|b| blob16(b, "invite node id").map(NodeId))
-                            .transpose()?,
-                    })
-                })
-                .transpose()?;
-            let retry_of_committed_enrollment = if n == 0 {
-                invite
-                    .as_ref()
-                    .is_some_and(|invite| invite.used_by == Some(peer.node_id))
-                    && peer_conn(&tx, peer.node_id)?.is_some_and(|enrolled| {
-                        enrolled.enabled
-                            && enrolled.role == PeerRole::Node
-                            && enrolled.fingerprint == peer.fingerprint
-                    })
-            } else {
-                false
-            };
-            let invite = if n > 0 {
-                let invite = invite.expect("an updated invitation row still exists");
-                let mut enrolled = peer.clone();
-                if let Some(hint) = invite.name_hint.as_deref().filter(|hint| !hint.is_empty()) {
-                    enrolled.name = hint.to_string();
+            if let Some(existing) = join_request_conn(conn, &request_id)? {
+                if existing.node_id != request.node_id
+                    || existing.fingerprint != request.fingerprint
+                {
+                    return Err(CatalogError::InvalidState(
+                        "join request id was replayed by a different certificate".into(),
+                    ));
                 }
-                upsert_peer_conn(&tx, &enrolled)?;
-                Some(invite)
-            } else if retry_of_committed_enrollment {
-                // The response to the first redemption may have been lost.
-                // Replaying the same secret is safe only while the exact,
-                // enabled roster entry created by that transaction remains.
-                invite
+                conn.execute(
+                    "UPDATE fleet_join_requests SET name = ?2, platform = ?3,
+                         remote_addr = ?4, last_seen_at = ?5 WHERE request_id = ?1",
+                    params![
+                        request_id,
+                        request.name,
+                        request.platform,
+                        request.remote_addr,
+                        UnixNanos::now().0
+                    ],
+                )?;
             } else {
-                None
-            };
-            tx.commit()?;
-            Ok(invite)
+                conn.execute(
+                    "INSERT INTO fleet_join_requests
+                         (request_id, node_id, name, platform, fingerprint, remote_addr,
+                          requested_at, last_seen_at, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
+                    params![
+                        request_id,
+                        request.node_id.0.as_slice(),
+                        request.name,
+                        request.platform,
+                        request.fingerprint.as_slice(),
+                        request.remote_addr,
+                        request.requested_at.0,
+                        request.last_seen_at.0,
+                    ],
+                )?;
+            }
+            join_request_conn(conn, &request_id)?.ok_or_else(|| {
+                CatalogError::InvalidState("recorded join request disappeared".into())
+            })
         })
     }
 
-    /// Drop expired and redeemed invitations.
-    pub fn fleet_prune_invites(&self) -> Result<u64> {
+    pub fn fleet_join_request(&self, request_id: &str) -> Result<Option<FleetJoinRequest>> {
+        let request_id = canonical_request_id(request_id)?;
+        self.with_reader(|conn| join_request_conn(conn, &request_id))
+    }
+
+    pub fn fleet_pending_join_requests(&self) -> Result<Vec<FleetJoinRequest>> {
+        self.with_reader(|conn| {
+            conn.prepare_cached(&format!(
+                "SELECT {JOIN_REQUEST_COLUMNS} FROM fleet_join_requests
+                 WHERE status = 'pending' ORDER BY requested_at"
+            ))?
+            .query_map([], join_request_from_row)?
+            .map(|row| join_request_build(row?))
+            .collect()
+        })
+    }
+
+    /// Approve or reject a pending attempt. Approval and roster admission
+    /// commit atomically, so a lost response is completed by the node's next
+    /// poll without requiring another click.
+    pub fn fleet_decide_join_request(
+        &self,
+        request_id: &str,
+        approve: bool,
+    ) -> Result<Option<FleetJoinRequest>> {
+        let request_id = canonical_request_id(request_id)?;
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let Some(mut request) = join_request_conn(&tx, &request_id)? else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let wanted = if approve {
+                JoinRequestStatus::Approved
+            } else {
+                JoinRequestStatus::Rejected
+            };
+            if request.status != JoinRequestStatus::Pending && request.status != wanted {
+                return Err(CatalogError::InvalidState(format!(
+                    "join request is already {}",
+                    request.status.as_str()
+                )));
+            }
+            if approve {
+                upsert_peer_conn(
+                    &tx,
+                    &FleetPeer {
+                        node_id: request.node_id,
+                        name: request.name.clone(),
+                        role: PeerRole::Node,
+                        fingerprint: request.fingerprint,
+                        endpoint: None,
+                        enabled: true,
+                        enrolled_at: UnixNanos::now(),
+                        last_seen_at: Some(request.last_seen_at),
+                        last_error: None,
+                        connected: false,
+                    },
+                )?;
+            }
+            let now = UnixNanos::now();
+            tx.execute(
+                "UPDATE fleet_join_requests SET status = ?2, decided_at = COALESCE(decided_at, ?3)
+                 WHERE request_id = ?1",
+                params![request_id, wanted.as_str(), now.0],
+            )?;
+            tx.commit()?;
+            request.status = wanted;
+            request.decided_at.get_or_insert(now);
+            Ok(Some(request))
+        })
+    }
+
+    /// Bound abandoned approval attempts. Active nodes refresh `last_seen_at`
+    /// on every poll, so only requests silent for thirty days are removed.
+    pub fn fleet_prune_join_requests(&self) -> Result<u64> {
+        const RETENTION_NANOS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
         self.with_writer(|conn| {
             Ok(conn.execute(
-                "DELETE FROM fleet_invites WHERE used_at IS NOT NULL OR expires_at <= ?1",
-                params![UnixNanos::now().0],
-            )? as u64)
-        })
-    }
-
-    pub fn fleet_pending_invites(&self) -> Result<u64> {
-        self.with_reader(|conn| {
-            Ok(conn.query_row(
-                "SELECT COUNT(*) FROM fleet_invites WHERE used_at IS NULL AND expires_at > ?1",
-                params![UnixNanos::now().0],
-                |r| r.get::<_, i64>(0),
+                "DELETE FROM fleet_join_requests WHERE last_seen_at <= ?1",
+                params![UnixNanos::now().0.saturating_sub(RETENTION_NANOS)],
             )? as u64)
         })
     }

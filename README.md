@@ -204,7 +204,7 @@ The v0.5 release is Windows-first (a signed installer; macOS builds from source)
 | Interfaces | Web UI, CLI, and HTTP API using the same typed query model |
 | Archives | ZIP member inventories searchable by name, path, and size |
 | Packaging | Signed Windows setup (per-user or service), in-place upgrades; macOS LaunchAgent from source |
-| Fleet (experimental) | Explicitly enrolled nodes replicate catalog metadata to one central over mutual TLS; central search over the union |
+| Fleet (experimental) | Master-approved nodes replicate catalog metadata over mutual TLS; the master searches the union |
 
 Everything Eidos does to a source is read-only.
 
@@ -213,7 +213,7 @@ Everything Eidos does to a source is read-only.
 The detailed sequence and acceptance gates live in the [release roadmap](docs/roadmap.md), but the larger direction includes:
 
 - Windows and macOS agents feeding a durable central search service;
-- one-command enrollment and resumable catch-up after long periods offline;
+- discoverable, operator-approved fleet joining and resumable catch-up after long periods offline;
 - direct indexing of supported virtual-disk filesystems;
 - recursive ZIP, RAR, 7z, and tar discovery;
 - text extraction from common Office documents and PDFs;
@@ -333,7 +333,7 @@ The name also deliberately evokes eidetic memory: not just recalling that someth
 | [Architecture](docs/architecture.md) | Invariants, identity model, catalog, search architecture, scheduler, and fleet evolution |
 | [Roadmap](docs/roadmap.md) | Releases, milestones, acceptance gates, and sequencing |
 | [v0.5 dogfood-fleet sprint](docs/v0.5-dogfood-fleet-sprint.md) | Unified installer, measured multi-node slice, chunking bakeoff, and release gates |
-| [Private fleet](docs/fleet.md) | Enrolling nodes with a central, what replicates, status, bounds, and the failure matrix (experimental) |
+| [Private fleet](docs/fleet.md) | Joining nodes to a master, what replicates, status, bounds, and the failure matrix (experimental) |
 | [Query syntax](docs/query-syntax.md) | Query language used by the UI, CLI, and API |
 | [Development](docs/development.md) | Toolchain, project layout, tests, linting, and benchmarks |
 | [Benchmarks](docs/benchmarks.md) | Reference corpus, methodology, measurements, and known limitations |

@@ -3,8 +3,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   api,
   ApiError,
+  type DiscoveredMaster,
   type FleetStatus,
-  type InviteView,
+  type JoinRequestView,
   type LocalSourceSync,
   type PeerView,
   type ReplicaSourceSync,
@@ -13,19 +14,19 @@ import {
 import { ErrorBox, Spinner } from '../components'
 import { ago, bytes, count, duration, integerNumber, when } from '../format'
 
-// Everything the fleet API offers, in one place: this node's role, the
-// enrollment handshake (invite on the central, code entry on the node),
-// the peer roster, live sessions, and per-source sync state. The service
+// Everything the fleet API offers, in one place: this node's role, local
+// master discovery and approval-based joining, the peer roster, live
+// sessions, and per-source sync state. The service
 // answers 503 while the fleet runtime is not running, which the page
 // reports as a state rather than an error.
 export default function FleetPage() {
   const q = useQuery({ queryKey: ['fleet'], queryFn: api.fleetStatus, refetchInterval: 2000, retry: false })
-  if (q.isPending) return <Spinner label="Loading fleet…" />
+  if (q.isPending) return <Spinner label="Loading nodes…" />
   if (q.isError)
     return (
       <>
         <div className="toolbar">
-          <h1 style={{ margin: 0 }}>Fleet</h1>
+          <h1 style={{ margin: 0 }}>Nodes</h1>
         </div>
         <ErrorBox error={q.error} />
         {q.error instanceof ApiError && q.error.status === 503 && (
@@ -41,7 +42,7 @@ export default function FleetPage() {
   return (
     <>
       <div className="toolbar">
-        <h1 style={{ margin: 0 }}>Fleet</h1>
+        <h1 style={{ margin: 0 }}>Nodes</h1>
         <div className="spacer" style={{ flex: 1 }} />
         <span className="muted small" title={`node id ${f.node_id}`}>
           {f.name} · {f.fingerprint}
@@ -56,10 +57,11 @@ export default function FleetPage() {
           ))}
         </div>
       )}
+      {f.central && f.join_requests.length > 0 && <JoinRequests requests={f.join_requests} />}
       <div className="stats">
         <div className="stat">
           <div className="label">Role</div>
-          <div className="value">{f.central ? 'central' : f.enrolled ? 'enrolled' : 'standalone'}</div>
+          <div className="value">{f.central ? 'master' : f.enrolled ? 'joined' : 'standalone'}</div>
           <div className="sub">
             {f.central
               ? f.listening
@@ -69,7 +71,11 @@ export default function FleetPage() {
                 ? f.sync_enabled
                   ? 'sync enabled'
                   : 'sync paused'
-                : 'not part of a fleet yet'}
+                : f.pending_join
+                  ? f.pending_join.rejected_reason
+                    ? 'join rejected'
+                    : 'waiting for approval'
+                  : 'not part of a fleet yet'}
           </div>
         </div>
         <div className="stat">
@@ -80,7 +86,7 @@ export default function FleetPage() {
         <div className="stat">
           <div className="label">Sessions</div>
           <div className="value">{f.sessions.length}</div>
-          <div className="sub">{count(f.pending_invites)} open invites</div>
+          <div className="sub">{f.join_requests.length} awaiting approval</div>
         </div>
         <div className="stat">
           <div className="label">Sources shipping</div>
@@ -96,7 +102,7 @@ export default function FleetPage() {
 
       {f.peers.length > 0 && (
         <>
-          <h2>Peers</h2>
+          <h2>Fleet members</h2>
           <table className="grid">
             <thead>
               <tr>
@@ -190,7 +196,63 @@ export default function FleetPage() {
   )
 }
 
-// Role, listener, enrollment, and invites for the node this UI talks to.
+function JoinRequests({ requests }: { requests: JoinRequestView[] }) {
+  return (
+    <div className="empty" style={{ marginBottom: 12, borderColor: 'var(--warn, #c98b22)' }}>
+      <div className="head" style={{ marginBottom: 8 }}>
+        <div className="grow">
+          <div className="name">
+            {requests.length} node{requests.length === 1 ? '' : 's'} waiting for approval
+          </div>
+          <div className="path">Confirm only machines you recognize. Unapproved nodes cannot sync any data.</div>
+        </div>
+        <span className="badge warn">action required</span>
+      </div>
+      {requests.map((request) => (
+        <JoinRequestRow key={request.request_id} request={request} />
+      ))}
+    </div>
+  )
+}
+
+function JoinRequestRow({ request }: { request: JoinRequestView }) {
+  const qc = useQueryClient()
+  const decide = useMutation({
+    mutationFn: (approve: boolean) => api.decideFleetJoin(request.request_id, approve),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['fleet'] }),
+  })
+  return (
+    <div className="card" style={{ marginTop: 8 }}>
+      <div className="head">
+        <div className="grow">
+          <div className="name">{request.name}</div>
+          <div className="path">
+            {request.platform} · {request.remote_addr ?? 'network address unavailable'} · requested {ago(request.requested_at)}
+          </div>
+          <div className="muted small" title={request.fingerprint}>
+            node {request.node_id} · certificate {request.fingerprint}
+          </div>
+        </div>
+        <div className="actions">
+          <button type="button" className="btn small" disabled={decide.isPending} onClick={() => decide.mutate(false)}>
+            Reject
+          </button>
+          <button
+            type="button"
+            className="btn small primary"
+            disabled={decide.isPending}
+            onClick={() => decide.mutate(true)}
+          >
+            {decide.isPending ? 'confirming…' : 'Approve & join'}
+          </button>
+        </div>
+      </div>
+      {decide.isError && <div className="error-text">{decide.error.message}</div>}
+    </div>
+  )
+}
+
+// Role, listener, and join controls for the node this UI talks to.
 function ThisNode({ f }: { f: FleetStatus }) {
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['fleet'] })
@@ -209,8 +271,8 @@ function ThisNode({ f }: { f: FleetStatus }) {
             <div className="name">This node</div>
             <div className="path">
               {f.central
-                ? 'accepts enrollments and replicates enrolled sources here'
-                : 'a central accepts enrollments; a node ships its sources to one'}
+                ? 'advertises on the local network, approves nodes, and holds their replicas'
+                : 'join a master to make this node’s sources available across the fleet'}
             </div>
           </div>
         </div>
@@ -222,7 +284,7 @@ function ThisNode({ f }: { f: FleetStatus }) {
               disabled={central.isPending}
               onChange={(e) => central.mutate({ central: e.target.checked })}
             />{' '}
-            act as central
+            act as fleet master
           </label>
           <label>
             Sync listener (host:port; empty stops listening)
@@ -257,14 +319,14 @@ function ThisNode({ f }: { f: FleetStatus }) {
                 disabled={sync.isPending}
                 onChange={(e) => sync.mutate(e.target.checked)}
               />{' '}
-              sync to central
+              sync to master
             </label>
             <button
               type="button"
               className="btn small"
               disabled={leave.isPending}
               onClick={() => {
-                if (window.confirm('Leave the fleet? The central keeps this node’s replicas; rejoining is a new epoch.'))
+                if (window.confirm('Leave the fleet? The master keeps this node’s replicas; joining again is a new epoch.'))
                   leave.mutate()
               }}
             >
@@ -275,78 +337,119 @@ function ThisNode({ f }: { f: FleetStatus }) {
           </div>
         )}
       </div>
-      {f.central ? <InviteCard /> : !f.enrolled ? <EnrollCard onEnrolled={invalidate} /> : null}
+      {f.central ? (
+        <div className="card">
+          <div className="head">
+            <div className="grow">
+              <div className="name">Master discovery</div>
+              <div className="path">
+                {f.listening
+                  ? `advertising ${f.name} on the local network; nodes may also enter this host’s IP with port ${f.listening.split(':').at(-1)}`
+                  : 'set a sync listener to advertise this master and accept join requests'}
+              </div>
+            </div>
+            {f.listening ? <span className="badge ok">advertising</span> : <span className="badge warn">offline</span>}
+          </div>
+          {f.discovery_error && <div className="error-text">{f.discovery_error}</div>}
+        </div>
+      ) : !f.enrolled ? (
+        <JoinCard f={f} onChanged={invalidate} />
+      ) : null}
     </div>
   )
 }
 
-// Central side of the handshake: mint a one-time code for a new node.
-function InviteCard() {
-  const [invite, setInvite] = useState<InviteView | null>(null)
-  const mint = useMutation({ mutationFn: () => api.fleetInvite(), onSuccess: setInvite })
+function JoinCard({ f, onChanged }: { f: FleetStatus; onChanged: () => void }) {
+  const firstDiscovered = f.discovered_masters[0]
+  const [master, setMaster] = useState(firstDiscovered?.endpoints[0] ?? '')
+  const join = useMutation({ mutationFn: () => api.requestFleetJoin(master.trim()), onSuccess: onChanged })
+  const cancel = useMutation({ mutationFn: api.cancelFleetJoin, onSuccess: onChanged })
+  if (f.pending_join) {
+    const pending = f.pending_join
+    return (
+      <div className="card">
+        <div className="head">
+          <div className="grow">
+            <div className="name">{pending.rejected_reason ? 'Join rejected' : 'Waiting for master approval'}</div>
+            <div className="path">
+              {pending.master_name} at {pending.endpoint} · requested {ago(pending.requested_at)}
+            </div>
+            <div className="muted small" title={pending.master_fingerprint}>
+              master certificate {pending.master_fingerprint}
+            </div>
+          </div>
+          <span className={`badge ${pending.rejected_reason ? 'bad' : 'info'}`}>
+            {pending.rejected_reason ? 'rejected' : 'pending'}
+          </span>
+        </div>
+        {pending.rejected_reason && <div className="error-text">{pending.rejected_reason}</div>}
+        <div className="actions" style={{ marginTop: 8 }}>
+          <button type="button" className="btn small" disabled={cancel.isPending} onClick={() => cancel.mutate()}>
+            {pending.rejected_reason ? 'Clear & try again' : 'Cancel request'}
+          </button>
+        </div>
+        {cancel.isError && <div className="error-text">{cancel.error.message}</div>}
+      </div>
+    )
+  }
   return (
     <div className="card">
       <div className="head">
         <div className="grow">
-          <div className="name">Invite a node</div>
-          <div className="path">one-time code; paste it into the other node’s Fleet page</div>
+          <div className="name">Join a fleet</div>
+          <div className="path">Choose a discovered master or enter its IP address. The master must approve this node.</div>
         </div>
-        <button type="button" className="btn small primary" disabled={mint.isPending} onClick={() => mint.mutate()}>
-          {mint.isPending ? 'creating…' : 'New invite'}
-        </button>
       </div>
-      {mint.isError && <div className="error-text">{mint.error.message}</div>}
-      {invite && (
-        <div className="form">
-          <label>
-            Code
-            <input type="text" readOnly value={invite.code} onFocus={(e) => e.target.select()} />
-          </label>
-          <div className="muted small">
-            endpoint {invite.endpoint} · expires {when(invite.expires_at)}
-          </div>
+      {f.discovered_masters.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div className="muted small" style={{ marginBottom: 6 }}>Found on this network</div>
+          {f.discovered_masters.map((found) => (
+            <DiscoveredMasterButton key={found.node_id} master={found} onSelect={setMaster} selected={master} />
+          ))}
         </div>
       )}
-    </div>
-  )
-}
-
-// Node side of the handshake: redeem a code from a central.
-function EnrollCard({ onEnrolled }: { onEnrolled: () => void }) {
-  const [code, setCode] = useState('')
-  const enroll = useMutation({ mutationFn: () => api.fleetEnroll(code.trim()), onSuccess: onEnrolled })
-  return (
-    <div className="card">
-      <div className="head">
-        <div className="grow">
-          <div className="name">Enroll with a central</div>
-          <div className="path">paste an invite code minted on the central’s Fleet page</div>
-        </div>
-      </div>
       <form
         className="form"
         onSubmit={(e) => {
           e.preventDefault()
-          enroll.mutate()
+          join.mutate()
         }}
       >
         <label>
-          Invite code
-          <input type="text" value={code} onChange={(e) => setCode(e.target.value)} placeholder="eidos-…" />
+          Master IP or host
+          <input type="text" value={master} onChange={(e) => setMaster(e.target.value)} placeholder="192.168.1.20" />
         </label>
-        {enroll.isError && <div className="error-text">{enroll.error.message}</div>}
-        {enroll.data && (
-          <div className="muted small">
-            enrolled with {enroll.data.central_name} at {enroll.data.endpoint}
-          </div>
-        )}
+        {join.isError && <div className="error-text">{join.error.message}</div>}
         <div className="actions">
-          <button type="submit" className="btn primary" disabled={enroll.isPending || !code.trim()}>
-            {enroll.isPending ? 'enrolling…' : 'Enroll'}
+          <button type="submit" className="btn primary" disabled={join.isPending || !master.trim()}>
+            {join.isPending ? 'contacting master…' : 'Request to join'}
           </button>
         </div>
       </form>
     </div>
+  )
+}
+
+function DiscoveredMasterButton({
+  master,
+  selected,
+  onSelect,
+}: {
+  master: DiscoveredMaster
+  selected: string
+  onSelect: (endpoint: string) => void
+}) {
+  const endpoint = master.endpoints[0]
+  return (
+    <button
+      type="button"
+      className={`btn small${selected === endpoint ? ' primary' : ''}`}
+      style={{ marginRight: 6, marginBottom: 6 }}
+      title={`${master.node_id}\n${master.fingerprint}`}
+      onClick={() => onSelect(endpoint)}
+    >
+      {master.name} · {endpoint}
+    </button>
   )
 }
 

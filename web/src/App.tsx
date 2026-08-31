@@ -47,8 +47,8 @@ export default function App() {
         <NavLink to="/activity" className={({ isActive }) => (isActive ? 'active' : '')}>
           Activity
         </NavLink>
-        <NavLink to="/fleet" className={({ isActive }) => (isActive ? 'active' : '')}>
-          Fleet
+        <NavLink to="/nodes" className={({ isActive }) => (isActive ? 'active' : '')}>
+          Nodes
         </NavLink>
         <a className="disabled" title="Milestone 5">
           Policies
