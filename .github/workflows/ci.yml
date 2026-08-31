@@ -26,11 +26,10 @@ jobs:
   # Windows keeps the lint lane and not the test lane. `--all-targets` type
   # checks and lints every cfg(windows) file, tests included, so Windows
   # compile breakage still fails here in about a minute. What it cannot catch
-  # is Windows runtime behaviour, and that is covered three other ways:
-  # scripts/check.ps1 runs the whole suite on Windows before a commit,
-  # nightly.yml runs it again every night, and release.yml gates the tag on
-  # it. Paying three minutes of Windows build per commit to run fourteen
-  # seconds of Windows-specific tests was not worth it at this commit rate.
+  # is Windows runtime behaviour; nightly.yml runs it every night and
+  # release.yml gates the tag on it. Paying three minutes of Windows build per
+  # commit to run fourteen seconds of Windows-specific tests was not worth it
+  # at this commit rate.
   lint:
     name: lint (windows)
     runs-on: windows-latest
@@ -76,7 +75,7 @@ jobs:
       # in a step of its own avoids a second build of eidos-service and its
       # dependencies, which cost more than two minutes on this runner. The
       # cost is learning about contract drift after the suite instead of
-      # before it, and scripts/check.ps1 already catches it before a commit.
+      # before it; a developer can also catch it with scripts/check.ps1.
       - run: git diff --exit-code -- web/src/generated/api.ts
 
   web:

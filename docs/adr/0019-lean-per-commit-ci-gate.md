@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-08-25
+Amended: 2026-08-31 (remove the full-suite pre-push hook)
 
 ## Context
 
@@ -28,8 +29,7 @@ same 37 test binaries and the same 461 tests in well under half the time.
 
 So the Windows lane was spending roughly three minutes of build to reach
 fourteen seconds of genuinely Windows-specific testing, duplicating a suite
-already covered per-commit elsewhere, and already run on Windows by
-`scripts/check.ps1` before the commit was made.
+already covered per-commit elsewhere.
 
 ## Decision
 
@@ -42,13 +42,15 @@ minute. What it cannot catch is Windows *runtime* behaviour.
 generated API contract check, which is generated from Rust types and is
 identical on every platform.
 
-**Windows runtime behaviour is covered three other ways**, in increasing order
-of how late they catch a problem:
+**Windows runtime behaviour is covered by the scheduled and release gates:**
 
-- `scripts/check.ps1` runs the whole suite on Windows before a commit.
 - `nightly.yml` runs it every night and files a task when it fails, because a
   nightly nobody reads is not a gate.
 - `release.yml` runs it on a tag before anything is built or signed.
+
+Developers may run `scripts/check.ps1` when useful, but the repository does not
+install or carry a hook that runs the suite on every push. Repeated pushes are
+not worth repeated full Windows runs.
 
 ## Consequences
 
@@ -57,10 +59,6 @@ reserved names — is now caught within a day rather than within a commit. That
 class of bug is real for this codebase, and the trade is deliberate: the cost
 of finding one at nightly or release time is bounded and rare, while the cost
 of the slow gate was paid on every commit.
-
-The risk concentrates on `scripts/check.ps1` actually being run. It is the
-only Windows check that happens before code lands, so skipping it moves the
-whole burden onto the nightly.
 
 If the nightly starts failing for Windows-specific reasons more than
 occasionally, the answer is to move the offending tests back onto the
