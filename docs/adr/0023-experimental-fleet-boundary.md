@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-08-29
+Amended: 2026-08-31 (operator-approved joining and LAN discovery replace invitation codes)
 Milestone: v0.5 dogfood-fleet sprint (tracks A-C)
 
 ## Context
@@ -11,14 +12,13 @@ and the catalog's source ledger ([ADR-0015](0015-source-sync-ledger-in-the-catal
 were built and verified without a socket. The
 [v0.5 dogfood-fleet sprint](../v0.5-dogfood-fleet-sprint.md) puts them
 behind real catalog, storage, identity, and transport adapters so a small,
-explicitly enrolled private fleet can test the architecture before the v1
+explicitly joined private fleet can test the architecture before the v1
 control plane exists. This record fixes the contract those adapters
 implement: what a node is, how peers authenticate, where sync lives, how
 concurrent connections are resolved, how versions negotiate, and what
-enrollment, pausing, leaving, and retirement mean. Everything here is
+joining, pausing, leaving, and retirement mean. Everything here is
 **experimental**: the wire protocol is stable only within its explicit
-version negotiation, and the roster, enrollment UI, discovery, relay, and
-multi-central topologies remain non-goals.
+version negotiation. Relay and multi-master topologies remain non-goals.
 
 ## Decisions
 
@@ -30,10 +30,10 @@ multi-central topologies remain non-goals.
   `fleet/config.json`. It indexes and searches its own local sources
   alongside replicated ones and never becomes a prerequisite for a node's
   local readiness, publication, content work, or shutdown.
-- A **node** is an installation enrolled with exactly one central. All of
+- A **node** is an installation joined to exactly one master. All of
   its eligible local sources (published, not retired, `sync_policy =
   inherit`) replicate; `local_only` is the per-source exclusion; newly added
-  eligible sources inherit the enrolled default.
+  eligible sources inherit the joined default.
 - One central, no failover, no peer-to-peer search, no content transfer
   (see [ADR-0024](0024-content-transfer-bakeoff.md)).
 
@@ -95,13 +95,15 @@ node by construction. There is no certificate authority.
 
 Sync uses a dedicated TLS 1.3 endpoint (default port 7710), never the
 loopback web API. Both sides present certificates. A dialing peer pins the
-fingerprint it expects (from the roster, or from an invitation) and the
-handshake fails on any other certificate. An accepting peer lets the
+fingerprint it expects from the roster and the handshake fails on any other
+certificate. During first contact only, a joining node observes and retains
+the master's certificate fingerprint before sending its identity; all retries
+are pinned to it. An accepting peer lets the
 handshake complete for any well-formed client certificate and then admits
 the peer from its roster **before processing any payload**: a roster
-fingerprint may sync, an unknown one may only enroll (and only at a
-central), anything else is told `unknown peer` and closed with no
-inventory disclosed. Failed admissions are counted and logged by
+fingerprint may sync, an unknown one may only submit a join request to a
+master, and anything else is told `unknown peer` and closed with no inventory
+disclosed. Failed admissions are counted and logged by
 fingerprint only. Credentials and row images never reach ordinary logs.
 
 Frames are length-prefixed JSON with the length checked against the
@@ -111,15 +113,20 @@ ends that connection only. The first message in each direction is `Hello`
 credit); a peer sharing no protocol version is refused before anything
 else.
 
-### 6. Enrollment, pausing, leaving, retiring
+### 6. Joining, pausing, leaving, retiring
 
-- `eidos fleet invite` on a central mints a single-use invitation
-  (`eidos-fleet-v1:<central fingerprint>:<secret>:<endpoint>`, 24 h); only
-  the hash of the secret is stored.
-- `eidos fleet enroll <code>` on a node connects pinned to that
-  fingerprint, presents the secret, and records the central (role,
-  fingerprint, endpoint) in its roster; the central records the node. Sync
-  starts at the service's next tick, with no restart.
+- A designated master advertises `_eidos-fleet._tcp.local` on its LAN. A
+  joining host may select that advertisement or enter the master's IP address
+  or host name directly.
+- The joining host sends a random request id and its certificate-backed node
+  identity. The master quarantines the request; it cannot sync or inspect any
+  catalog data while pending.
+- A master operator approves or rejects the notification on the Nodes page (or
+  with `eidos fleet approve|reject`). Approval and roster admission commit in
+  one catalog transaction. The joining host polls its pinned master and starts
+  sync after approval without a restart.
+- Request replay is idempotent for the same certificate and rejected for a
+  different certificate. Pending and rejected states survive process restarts.
 - **Pause** disables the central peer: transfer stops, the ledger and
   cursors stay, resume needs no resync.
 - **Leave** forgets the central: the maintenance loop removes the ledgers;
@@ -169,10 +176,10 @@ retries after the operator upgrades one side.
 
 - Real-SQLite adapter tests reproduce the simulator's duplicate, crash,
   rewind, epoch, compaction, and repair cases; live loopback-TLS tests cover
-  enrollment, convergence, both initiation directions with a preserved
+  join approval, convergence, both initiation directions with a preserved
   cursor, simultaneous dials, and the fail-closed paths.
 - The unified installer must preserve `fleet/` across upgrade and repair,
   which it does by treating it as data.
-- Everything the v1 control plane adds (leases, discovery, rotation,
-  reassignment, relay, several centrals) builds on these identities and
+- Everything the v1 control plane adds (leases, cross-network discovery,
+  rotation, reassignment, relay, several masters) builds on these identities and
   cursors rather than replacing them.

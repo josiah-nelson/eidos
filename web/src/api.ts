@@ -3,6 +3,7 @@
 
 import type {
   ActivityView,
+  CentralBody,
   AddSourceBody,
   ApiErrorBody,
   ApiInt,
@@ -11,6 +12,9 @@ import type {
   ContentPolicyBody,
   ContentPreview,
   ContentStatusView,
+  FleetConfig,
+  FleetStatus,
+  ForgetView,
   ErrorRecord,
   ExportFormat,
   ExtensionCount,
@@ -19,6 +23,8 @@ import type {
   IndexStatus,
   ObjectDetail,
   ParseView,
+  PeerBody,
+  PeerView,
   ResolveView,
   ResultMode,
   RetryBody,
@@ -149,6 +155,24 @@ export const api = {
   /** Stop or start claiming content jobs; answers with the resulting state. */
   setContentPaused: (paused: boolean) =>
     request<ContentStatusView>(`/api/content/${paused ? 'pause' : 'resume'}`, { method: 'POST' }),
+  fleetStatus: () => request<FleetStatus>('/api/fleet'),
+  setFleetCentral: (body: CentralBody) =>
+    request<FleetConfig>('/api/fleet/central', { method: 'POST', body: JSON.stringify(body) }),
+  requestFleetJoin: (master: string) =>
+    request<FleetStatus>('/api/fleet/join', { method: 'POST', body: JSON.stringify({ master }) }),
+  cancelFleetJoin: () => request<FleetStatus>('/api/fleet/join', { method: 'DELETE' }),
+  decideFleetJoin: (requestId: string, approve: boolean) =>
+    request<FleetStatus>(`/api/fleet/join-requests/${requestId}`, {
+      method: 'POST',
+      body: JSON.stringify({ approve }),
+    }),
+  setFleetSync: (enabled: boolean) =>
+    request<FleetStatus>('/api/fleet/sync', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  fleetLeave: () => request<FleetStatus>('/api/fleet/leave', { method: 'POST' }),
+  updateFleetPeer: (id: string, body: PeerBody) =>
+    request<PeerView>(`/api/fleet/peers/${id}`, { method: 'POST', body: JSON.stringify(body) }),
+  forgetFleetPeer: (id: string) =>
+    request<ForgetView>(`/api/fleet/peers/${id}`, { method: 'DELETE' }),
   contentWorkers: () => request<WorkersView>('/api/content/workers'),
   /** Resize the global extraction pool; durable across restarts. */
   setContentWorkers: (workers: number) =>

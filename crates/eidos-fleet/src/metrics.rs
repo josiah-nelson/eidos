@@ -41,7 +41,7 @@ counters!(
         connections_refused_version,
         duplicate_sessions_closed,
         disconnects,
-        enrollments,
+        join_approvals,
         offers_sent,
         offers_received,
         batches_sent,

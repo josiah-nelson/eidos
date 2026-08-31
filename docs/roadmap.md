@@ -29,7 +29,7 @@ Product statement:
 
 The standalone product remains the release floor. The targeted
 [v0.5 dogfood-fleet sprint](v0.5-dogfood-fleet-sprint.md) adds one manually
-configured central, explicit enrollment, bidirectional connection initiation,
+configured master, approved joining, bidirectional connection initiation,
 real metadata replication, and an optional profiling collector before the
 signed release. It is a measured private-fleet vertical slice, not the full v1
 control plane.
@@ -174,15 +174,15 @@ boundary, chunking bakeoff, failure matrix, unified installer, and release
 gates are defined in
 [v0.5-dogfood-fleet-sprint.md](v0.5-dogfood-fleet-sprint.md).
 
-The scope brought forward from v1 is limited to a manual central, explicitly
-enrolled Windows nodes with complete local fallback, authenticated sessions
+The scope brought forward from v1 is limited to a designated master,
+operator-approved Windows nodes with complete local fallback, authenticated sessions
 that either peer may initiate, durable metadata replication, central search,
 and an experimental content-transfer bakeoff. The rest of the v1 fleet product
 remains below.
 
 ### 2.8 v0.5 non-goals
 
-- automatic fleet discovery and polished enrollment or policy UI
+- discovery beyond the local network and polished policy UI
 - multiple centrals, central HA, failover, and peer-to-peer search
 - remote file open/download routing
 - macOS/Linux

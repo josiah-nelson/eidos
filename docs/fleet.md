@@ -1,18 +1,18 @@
 # Private fleet (experimental, v0.5)
 
-v0.5 can run as a small, explicitly enrolled dogfood fleet: several
-standalone Windows installations replicate their catalog metadata into one
-manually configured central, and the central searches the union. Every
-node keeps working on its own when the central is absent; the central is
-never a prerequisite for local readiness. The boundary, identity, and
+v0.5 can run as a small, operator-approved dogfood fleet: several standalone
+Windows installations replicate their catalog metadata into one designated
+master, and the master searches the union. Every node keeps working on its
+own when the master is absent; the master is never a prerequisite for local
+readiness. The boundary, identity, and
 protocol contract are in [ADR-0023](adr/0023-experimental-fleet-boundary.md);
 content is not replicated ([ADR-0024](adr/0024-content-transfer-bakeoff.md)).
 
 ## What replicates
 
-Every eligible local source of an enrolled node - published, not retired,
+Every eligible local source of a joined node - published, not retired,
 not marked `local_only` - ships its metadata (objects, entries, timestamps,
-sizes, attributes, archive membership) continuously. On the central each
+sizes, attributes, archive membership) continuously. On the master each
 one appears as a source named `<node>/<source>` of kind `remote`, owned by
 a host row for the node, and is searchable like any other source:
 
@@ -27,42 +27,53 @@ a host row for the node, and is searchable like any other source:
   queries report `ContentNotReplicated` with a pointer at the origin node;
 - `host:<name>` (or `host:<id>`) narrows a query to one node's sources.
 
-## Setting up a central
+## Setting up a master
 
 On the installation that will hold the fleet's replicas:
 
 ```powershell
-eidos fleet central --listen 0.0.0.0:7710     # accept sync sessions on port 7710
-eidos fleet invite                             # prints a single-use invitation
+eidos fleet master                             # listen on 0.0.0.0:7710
+eidos fleet status
 ```
+
+The same setup is available from the web UI's **Nodes** page. Enabling the
+master role binds the default listener and advertises the master on the local
+network with mDNS. Discovery is a convenience, not a dependency: a joining
+host can always use the master's IP address or host name.
 
 The sync listener is a dedicated TLS endpoint; keep the separate web API on
-loopback. Open port 7710 on the private network the nodes share (the
-installer does not open it). The invitation embeds the central's certificate
-fingerprint, its endpoint (the host name and the listener port; pass
-`--endpoint host:port` to choose), and a single-use secret that expires
-after 24 hours.
+loopback. Open port 7710 on the private network the nodes share (the installer
+does not open it). Use `eidos fleet master --listen <address>:<port>` when the
+default listener is not appropriate.
 
-## Enrolling a node
+## Joining a node
 
-On each node, with the service running:
+On the new host, select an advertised master from the **Nodes** page or enter
+the master's IP address. The equivalent CLI command is:
 
 ```powershell
-eidos fleet enroll eidos-fleet-v1:...          # paste the invitation
-eidos fleet status                             # sessions, cursors, backlog
+eidos fleet join 192.168.1.20                  # port 7710 is implied
+eidos fleet status                             # shows the pending request
 ```
 
-Enrollment connects to the central pinned to the fingerprint in the code,
-redeems the invitation, and records the central in the node's roster. The
-service picks it up at its next tick: it enables the ledger for every
-eligible source, backfills, dials the central, and streams. Nothing needs
-a restart.
+The host sends its certificate-backed identity to the master and waits. On
+the master's **Nodes** page, a notification shows the node name, platform,
+node id, certificate fingerprint, and remote address. Approve or reject it
+there. The CLI equivalents are `eidos fleet approve <request-id>` and
+`eidos fleet reject <request-id>`.
+
+The node polls the same master automatically. Approval atomically admits its
+certificate to the roster; the next poll records the master locally, enables
+the ledger for every eligible source, backfills, and starts streaming. The
+master certificate observed on first contact is pinned for every retry. No
+restart or join code is required. A rejection remains visible on the joining
+host until it is cancelled or retried.
 
 Exclusions and pausing:
 
 ```powershell
 eidos fleet policy <source name> --local-only  # never leave this host
-eidos fleet policy <source name> --inherit     # follow enrollment again
+eidos fleet policy <source name> --inherit     # follow fleet membership again
 eidos fleet pause                              # stop transfer, keep cursors
 eidos fleet resume
 eidos fleet leave                              # forget the central, drop the ledgers
@@ -72,15 +83,15 @@ Pausing keeps the ledger and cursors, so resuming needs no resync; leaving
 removes the ledgers, and rejoining is a new epoch (a full stream of the
 source, applied while the previous copy stays searchable).
 
-## Central-initiated sessions
+## Master-initiated sessions
 
-Either side may dial. A node dials its central by default; a central dials
+Either side may dial. A node dials its master by default; a master dials
 a node once it knows where to reach it:
 
 ```powershell
-# on the node: listen without enabling the central role
-eidos fleet central --disable --listen 0.0.0.0:7710
-# on the central: tell it where the node is
+# on the node: listen without enabling the master role
+eidos fleet master --disable --listen 0.0.0.0:7710
+# on the master: tell it where the node is
 eidos fleet peer <node id> --endpoint node-host:7710
 ```
 
@@ -95,6 +106,9 @@ When both sides dial at once, both keep the connection with the smaller
 `eidos fleet status` (or `GET /api/fleet`) shows:
 
 - identity: node id, name, certificate fingerprint, role;
+- on a standalone node: discovered masters and any pending or rejected join;
+- on a master: requests waiting for approval, including the requesting
+  identity and observed address;
 - peers: role, fingerprint, endpoint, enabled, connected, last error, next
   dial;
 - sessions: direction, peer, credit remaining, and per source the phase
@@ -121,7 +135,7 @@ central`, editable by hand; re-read every two seconds):
 
 | key | default | meaning |
 |---|---|---|
-| `central` | `false` | accept enrollments and replicas |
+| `central` | `false` | act as the master: approve joins and accept replicas |
 | `listen` | `null` | sync listener address |
 | `max_frame_bytes` | 16 MiB | largest frame accepted or sent |
 | `credit_bytes` | 16 MiB | bytes a peer may have in flight towards this side |
@@ -153,7 +167,7 @@ private fleet with the release candidate and recorded in the release notes.
 | Same-epoch rewind/restore | automated: `a_same_epoch_rewind_is_fenced_and_a_rewritten_history_is_a_fork` |
 | Retained suffix no longer covers central | automated: `a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves` |
 | Central unavailable during heavy local churn | automated: local search and scans never wait on the fleet (separate tasks, bounded blocking calls); soak: churn with the central stopped, backlog within its ceiling |
-| Old/new protocol versions meet | automated: `unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_any_payload` |
+| Unknown peers and old/new protocol versions meet | automated: unknown peers may only submit a quarantined join request; malformed requests and foreign versions fail closed before any catalog payload |
 | Core or collector upgraded while busy | installer workflow: busy upgrade of the collector, repair and reinstall keep the fleet identity and the study key |
 
 ## Soak checklist (release candidate)
@@ -163,9 +177,10 @@ private fleet with the release candidate and recorded in the release notes.
    the collector selected on each.
 2. Record the sync-off baseline on every host (`observe status`, the
    product's `/api/activity`, and search p95 from `eidos bench search`).
-3. `eidos fleet central --listen`, `eidos fleet invite`, `eidos fleet
-   enroll` on both nodes; give the central the workstation's endpoint so
-   one session is central-initiated.
+3. Run `eidos fleet master` on the designated master. Join both nodes by
+   discovery or master IP and approve their notifications from the master's
+   Nodes page. Give the master the workstation's endpoint so one session is
+   master-initiated.
 4. Run normal work for the soak window; keep `eidos fleet status` output
    and the collector bundles.
 5. Exercise the matrix rows marked *soak*: stop the central during churn,

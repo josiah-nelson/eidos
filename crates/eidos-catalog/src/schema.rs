@@ -594,6 +594,36 @@ CREATE TABLE sync_replica_repairs (
 DELETE FROM sync_replica_repairs;
 "#,
     ),
+    (
+        "fleet: replace invitation codes with operator-approved join requests",
+        r#"
+-- Joining is initiated by a node that knows or discovers the master's
+-- address. Its mutual-TLS certificate proves a stable identity; that
+-- identity remains quarantined here until an operator explicitly approves
+-- it. The random request id makes rejection durable without permanently
+-- banning the node from making a later, visibly distinct attempt.
+CREATE TABLE fleet_join_requests (
+    request_id   TEXT PRIMARY KEY,
+    node_id      BLOB NOT NULL,
+    name         TEXT NOT NULL,
+    platform     TEXT NOT NULL,
+    fingerprint  BLOB NOT NULL,
+    remote_addr  TEXT,
+    requested_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    decided_at   INTEGER,
+    CHECK (status IN ('pending', 'approved', 'rejected'))
+) WITHOUT ROWID;
+CREATE INDEX fleet_join_requests_status
+    ON fleet_join_requests (status, requested_at);
+
+-- Invitation codes were never released as a supported enrollment path.
+-- Drop the dormant credential table so upgrades cannot keep accepting an
+-- accidentally retained code after this protocol change.
+DROP TABLE fleet_invites;
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.

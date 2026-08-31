@@ -1,5 +1,5 @@
-//! Live fleet sessions over loopback TLS (sprint track C gate): enrollment
-//! by invitation, replication that converges, sessions initiated from
+//! Live fleet sessions over loopback TLS (sprint track C gate): approved
+//! joining, replication that converges, sessions initiated from
 //! either side that resume the same cursor, simultaneous dials that leave
 //! exactly one session, and peers that fail closed before any payload.
 
@@ -9,7 +9,7 @@ use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::sync::{record_digest, SyncRow, SYNC_ROW_IMAGE_VERSION};
 use eidos_catalog::{Catalog, NewSource};
 use eidos_domain::{ObjectId, SourceId, SourceKind, UnixNanos};
-use eidos_fleet::enroll::{create_invite, enroll};
+use eidos_fleet::enroll::JoinOutcome;
 use eidos_fleet::status::Direction;
 use eidos_fleet::wire::{self, Message};
 use eidos_fleet::{Fleet, FleetConfig, NodeIdentity};
@@ -162,25 +162,27 @@ async fn converged(node: &Host, central: &Host) -> SourceId {
     })
 }
 
-async fn enroll_node(node: &Host, central: &Host) {
+async fn join_node(node: &Host, central: &Host) {
     let endpoint = central.listening().await;
-    let invite = create_invite(
-        &central.catalog,
-        central.fleet().identity(),
-        &central.fleet().config(),
-        &endpoint,
-        None,
-    )
-    .unwrap();
-    let outcome = enroll(
-        &node.catalog,
-        node.fleet().identity(),
-        &invite,
-        Duration::from_secs(10),
-    )
+    let outcome = node.fleet().request_join(&endpoint).await.unwrap();
+    let JoinOutcome::Pending(target) = outcome else {
+        panic!("new join should wait for approval: {outcome:?}");
+    };
+    assert_eq!(central.fleet().status().join_requests.len(), 1);
+    central
+        .catalog
+        .fleet_decide_join_request(&target.request_id, true)
+        .unwrap()
+        .expect("join request exists");
+    wait_for(SETTLE, || {
+        node.catalog
+            .fleet_peers()
+            .ok()?
+            .into_iter()
+            .find(|peer| peer.role == PeerRole::Central)
+    })
     .await
-    .unwrap();
-    assert_eq!(outcome.central, central.fleet().identity().node_id);
+    .expect("node completed its approved join");
 }
 
 fn admit_peer(catalog: &Catalog, identity: &NodeIdentity, role: PeerRole) {
@@ -201,14 +203,14 @@ fn admit_peer(catalog: &Catalog, identity: &NodeIdentity, role: PeerRole) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn enrollment_by_invitation_then_replication_converges_and_follows_changes() {
+async fn approval_then_replication_converges_and_follows_changes() {
     let mut central = Host::new("central", true, true, false);
     let mut node = Host::new("node-a", false, false, true);
     central.start();
     node.start();
-    enroll_node(&node, &central).await;
+    join_node(&node, &central).await;
 
-    // The invitation is single use.
+    // Approval admitted exactly the certificate that requested it.
     let peers = central.catalog.fleet_peers().unwrap();
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0].role, PeerRole::Node);
@@ -264,7 +266,7 @@ async fn either_side_may_initiate_and_the_cursor_survives_a_direction_change() {
     let mut node = Host::new("node-b", false, true, true);
     central.start();
     node.start();
-    enroll_node(&node, &central).await;
+    join_node(&node, &central).await;
     let replica = converged(&node, &central).await;
     let batches_before = central.fleet().status().counters.batches_applied;
     let full_resyncs_before = central.fleet().status().counters.full_resyncs;
@@ -323,7 +325,7 @@ async fn simultaneous_initiation_leaves_exactly_one_session_on_both_sides() {
     let mut node = Host::new("node-c", false, true, true);
     central.start();
     node.start();
-    enroll_node(&node, &central).await;
+    join_node(&node, &central).await;
     let node_endpoint = node.listening().await;
     let node_id = node.fleet().identity().node_id;
     let central_id = central.fleet().identity().node_id;
@@ -778,7 +780,7 @@ async fn multipart_repair_commits_once_before_its_ack() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_any_payload() {
+async fn unknown_peers_join_quarantine_and_foreign_versions_fail_closed_before_any_payload() {
     let mut central = Host::new("central", true, true, false);
     central.start();
     let stranger_dir = tempfile::tempdir().unwrap();
@@ -837,12 +839,13 @@ async fn unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_a
     }
     central.catalog.fleet_remove_peer(forged_id).unwrap();
 
-    // A bad invitation secret is refused and nothing is enrolled.
+    // A malformed request id is refused and cannot create either a roster
+    // entry or a notification.
     let mut s = raw_connect(&stranger, &central).await;
     send(
         &mut s,
-        &Message::Enroll {
-            secret: "00".repeat(32).into(),
+        &Message::JoinRequest {
+            request_id: "not-an-id".into(),
             name: "stranger".into(),
             platform: "windows".into(),
         },
@@ -850,14 +853,58 @@ async fn unknown_peers_bad_invitations_and_foreign_versions_fail_closed_before_a
     .await;
     assert!(matches!(
         recv(&mut s).await.unwrap(),
-        Message::EnrollRejected { .. }
+        Message::JoinRejected { .. }
+    ));
+    assert!(central.catalog.fleet_peers().unwrap().is_empty());
+    assert!(central
+        .catalog
+        .fleet_pending_join_requests()
+        .unwrap()
+        .is_empty());
+
+    // A valid unknown identity is quarantined until the master decides. A
+    // rejection is durable and replaying the same attempt cannot bypass it.
+    let request_id = "abababababababababababababababab";
+    let mut s = raw_connect(&stranger, &central).await;
+    send(
+        &mut s,
+        &Message::JoinRequest {
+            request_id: request_id.into(),
+            name: "stranger".into(),
+            platform: "windows".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut s).await.unwrap(),
+        Message::JoinPending { .. }
+    ));
+    assert!(central.catalog.fleet_peers().unwrap().is_empty());
+    central
+        .catalog
+        .fleet_decide_join_request(request_id, false)
+        .unwrap()
+        .unwrap();
+    let mut s = raw_connect(&stranger, &central).await;
+    send(
+        &mut s,
+        &Message::JoinRequest {
+            request_id: request_id.into(),
+            name: "stranger".into(),
+            platform: "windows".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut s).await.unwrap(),
+        Message::JoinRejected { .. }
     ));
     assert!(central.catalog.fleet_peers().unwrap().is_empty());
 
-    // An enrolled node speaking a version we do not have fails closed.
+    // A joined node speaking a version we do not have fails closed.
     let mut node = Host::new("node-d", false, false, false);
     node.start();
-    enroll_node(&node, &central).await;
+    join_node(&node, &central).await;
     let mut s = raw_connect(node.fleet().identity(), &central).await;
     send(
         &mut s,

@@ -78,9 +78,7 @@ export type DirectoryAggregate = { object_id: ObjectId, file_count: ApiInt, dir_
 
 export type DirectorySummary = { file_count: ApiInt, directory_count: ApiInt, logical_bytes: ApiInt, allocated_bytes: ApiInt, newest_modified?: UnixNanos, oldest_modified?: UnixNanos, extension_counts?: { [key in string]: ApiInt }, complete: boolean, };
 
-export type EnrollBody = { code: string, };
-
-export type EnrollView = { central: NodeId, central_name: string, endpoint: string, };
+export type DiscoveredMaster = { node_id: NodeId, name: string, fingerprint: string, endpoints: Array<string>, last_seen_at: UnixNanos, };
 
 export type EntryId = ApiInt;
 
@@ -124,11 +122,11 @@ export type FailureClass = "transient" | "unsupported" | "deterministic" | "reso
 
 export type FileAttributes = number;
 
-export type FleetConfig = { central: boolean, listen: string | null, max_frame_bytes: ApiInt, credit_bytes: ApiInt, batch_rows: number, batch_bytes: ApiInt, reconnect_max_secs: ApiInt, backlog_ceiling_rows: ApiInt, backlog_ceiling_tombstones: ApiInt, repair_leaf_bits: number | null, };
+export type FleetConfig = { central: boolean, listen: string | null, pending_join?: PendingJoinTarget, max_frame_bytes: ApiInt, credit_bytes: ApiInt, batch_rows: number, batch_bytes: ApiInt, reconnect_max_secs: ApiInt, backlog_ceiling_rows: ApiInt, backlog_ceiling_tombstones: ApiInt, repair_leaf_bits: number | null, };
 
-export type FleetCountersView = { connections_attempted: ApiInt, connections_established_outbound: ApiInt, connections_established_inbound: ApiInt, connections_refused_unknown_peer: ApiInt, connections_refused_version: ApiInt, duplicate_sessions_closed: ApiInt, disconnects: ApiInt, enrollments: ApiInt, offers_sent: ApiInt, offers_received: ApiInt, batches_sent: ApiInt, batches_applied: ApiInt, rows_shipped: ApiInt, rows_applied: ApiInt, acks_sent: ApiInt, acks_received: ApiInt, duplicates_acknowledged: ApiInt, stale_batches: ApiInt, rejections_received: ApiInt, rejections_sent: ApiInt, fences: ApiInt, full_resyncs: ApiInt, repairs_offered: ApiInt, repairs_applied: ApiInt, repair_rows_applied: ApiInt, frames_refused_oversize: ApiInt, frames_malformed: ApiInt, bytes_control_sent: ApiInt, bytes_control_received: ApiInt, bytes_catalog_sent: ApiInt, bytes_catalog_received: ApiInt, bytes_repair_sent: ApiInt, bytes_repair_received: ApiInt, materialize_ms_total: ApiInt, apply_ms_total: ApiInt, backfill_steps: ApiInt, collections: ApiInt, tombstones_collected: ApiInt, };
+export type FleetCountersView = { connections_attempted: ApiInt, connections_established_outbound: ApiInt, connections_established_inbound: ApiInt, connections_refused_unknown_peer: ApiInt, connections_refused_version: ApiInt, duplicate_sessions_closed: ApiInt, disconnects: ApiInt, join_approvals: ApiInt, offers_sent: ApiInt, offers_received: ApiInt, batches_sent: ApiInt, batches_applied: ApiInt, rows_shipped: ApiInt, rows_applied: ApiInt, acks_sent: ApiInt, acks_received: ApiInt, duplicates_acknowledged: ApiInt, stale_batches: ApiInt, rejections_received: ApiInt, rejections_sent: ApiInt, fences: ApiInt, full_resyncs: ApiInt, repairs_offered: ApiInt, repairs_applied: ApiInt, repair_rows_applied: ApiInt, frames_refused_oversize: ApiInt, frames_malformed: ApiInt, bytes_control_sent: ApiInt, bytes_control_received: ApiInt, bytes_catalog_sent: ApiInt, bytes_catalog_received: ApiInt, bytes_repair_sent: ApiInt, bytes_repair_received: ApiInt, materialize_ms_total: ApiInt, apply_ms_total: ApiInt, backfill_steps: ApiInt, collections: ApiInt, tombstones_collected: ApiInt, };
 
-export type FleetStatus = { node_id: NodeId, name: string, fingerprint: string, central: boolean, enrolled: boolean, sync_enabled: boolean, listen?: string, listening?: string, peers: Array<PeerView>, sessions: Array<SessionView>, local_sources: Array<LocalSourceSync>, replica_sources: Array<ReplicaSourceSync>, counters: FleetCountersView, degraded: Array<string>, pending_invites: ApiInt, };
+export type FleetStatus = { node_id: NodeId, name: string, fingerprint: string, central: boolean, enrolled: boolean, sync_enabled: boolean, listen?: string, listening?: string, peers: Array<PeerView>, sessions: Array<SessionView>, local_sources: Array<LocalSourceSync>, replica_sources: Array<ReplicaSourceSync>, counters: FleetCountersView, degraded: Array<string>, pending_join?: PendingJoinTarget, join_requests: Array<JoinRequestView>, discovered_masters: Array<DiscoveredMaster>, discovery_error?: string, };
 
 export type FollowerView = { iterations: ApiInt, rebuilds: ApiInt, rows_applied: ApiInt, documents_added: ApiInt, last_seq: ApiInt, last_rebuild_ms: ApiInt, last_error: string | null, last_activity_ms_ago: ApiInt | null, rebuilding_source: ApiInt | null, index_documents: ApiInt, outbox_pending: ApiInt, };
 
@@ -154,10 +152,6 @@ export type InteractionBatch = { events: Array<InteractionEventBody>, };
 
 export type InteractionEventBody = { session_id: string, action: string, q?: string | null, object_id?: ObjectId | null, source_id?: SourceId | null, presented_rank?: number | null, };
 
-export type InviteBody = { endpoint?: string, name_hint?: string, };
-
-export type InviteView = { code: string, endpoint: string, expires_at: UnixNanos, };
-
 export type JobCounts = { by_stage: { [key in string]: { [key in string]: ApiInt } }, queued: ApiInt, running: ApiInt, failed: ApiInt, oldest_queued_age_ms: ApiInt | null, };
 
 export type JobId = ApiInt;
@@ -167,6 +161,12 @@ export type JobRecord = { id: JobId, source_id: SourceId, object_id: ObjectId | 
 export type JobStage = "catalog_change" | "metadata_projection" | "content_text" | "archive_manifest" | "aggregate_rebuild" | "reconcile";
 
 export type JobState = "queued" | "running" | "done" | "failed" | "superseded";
+
+export type JoinBody = { master: string, };
+
+export type JoinDecisionBody = { approve: boolean, };
+
+export type JoinRequestView = { request_id: string, node_id: NodeId, name: string, platform: string, fingerprint: string, remote_addr?: string, requested_at: UnixNanos, last_seen_at: UnixNanos, };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
@@ -197,6 +197,8 @@ export type PathMode = "exact" | "prefix" | "glob" | "regex";
 export type PeerBody = { endpoint?: string, enabled?: boolean, };
 
 export type PeerView = { node_id: NodeId, name: string, role: string, fingerprint: string, endpoint?: string, enabled: boolean, connected: boolean, last_seen_at?: UnixNanos, last_error?: string, next_dial_in_ms?: ApiInt, };
+
+export type PendingJoinTarget = { request_id: string, endpoint: string, master_name: string, master_fingerprint: string, requested_at: UnixNanos, rejected_reason?: string, };
 
 export type PlanStep = { stage: string, description: string, candidates?: ApiInt, verified?: ApiInt, elapsed_ms?: number, };
 
