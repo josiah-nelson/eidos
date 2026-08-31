@@ -29,7 +29,7 @@ export default function FleetPage() {
           <h1 style={{ margin: 0 }}>Nodes</h1>
         </div>
         <ErrorBox error={q.error} />
-        {q.error instanceof ApiError && q.error.status === 503 && (
+        {q.error instanceof ApiError && q.error.status === 503 && q.error.kind === 'unavailable' && (
           <p className="muted">
             The fleet runtime is not available. It starts with the service when the catalog opens cleanly; check the
             service log if this persists.
@@ -95,10 +95,13 @@ export default function FleetPage() {
         </div>
       </div>
 
-      {/* Remounts when the polled listener changes: the input's draft state
-          is re-seeded from the authoritative value instead of surviving a
-          concurrent administrative change and writing it back stale. */}
-      <ThisNode key={f.listen ?? ''} f={f} />
+      <div className="cards">
+        {/* Only the listener controls remount when the authoritative value
+            changes. Join selection and request feedback live outside this
+            keyed boundary and survive an unrelated listener refresh. */}
+        <ThisNode key={f.listen ?? ''} f={f} />
+        {f.central ? <MasterDiscovery f={f} /> : !f.enrolled ? <JoinCard f={f} /> : null}
+      </div>
 
       {f.peers.length > 0 && (
         <>
@@ -252,7 +255,9 @@ function JoinRequestRow({ request }: { request: JoinRequestView }) {
   )
 }
 
-// Role, listener, and join controls for the node this UI talks to.
+// Role and listener controls for the node this UI talks to. This component is
+// keyed by the server's listener value so its draft cannot overwrite a newer
+// CLI or browser update; unrelated join state lives outside this boundary.
 function ThisNode({ f }: { f: FleetStatus }) {
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['fleet'] })
@@ -264,102 +269,101 @@ function ThisNode({ f }: { f: FleetStatus }) {
   const sync = useMutation({ mutationFn: (enabled: boolean) => api.setFleetSync(enabled), onSuccess: invalidate })
   const leave = useMutation({ mutationFn: () => api.fleetLeave(), onSuccess: invalidate })
   return (
-    <div className="cards">
-      <div className="card">
-        <div className="head">
-          <div className="grow">
-            <div className="name">This node</div>
-            <div className="path">
-              {f.central
-                ? 'advertises on the local network, approves nodes, and holds their replicas'
-                : 'join a master to make this node’s sources available across the fleet'}
-            </div>
+    <div className="card">
+      <div className="head">
+        <div className="grow">
+          <div className="name">This node</div>
+          <div className="path">
+            {f.central
+              ? 'advertises on the local network, approves nodes, and holds their replicas'
+              : 'join a master to make this node’s sources available across the fleet'}
           </div>
         </div>
-        <div className="form">
-          <label className="toggle">
+      </div>
+      <div className="form">
+        <label className="toggle">
+          <input
+            type="checkbox"
+            checked={f.central}
+            disabled={central.isPending}
+            onChange={(e) => central.mutate({ central: e.target.checked })}
+          />{' '}
+          act as fleet master
+        </label>
+        <label>
+          Sync listener (host:port; empty stops listening)
+          <span style={{ display: 'flex', gap: 6 }}>
             <input
-              type="checkbox"
-              checked={f.central}
-              disabled={central.isPending}
-              onChange={(e) => central.mutate({ central: e.target.checked })}
-            />{' '}
-            act as fleet master
-          </label>
-          <label>
-            Sync listener (host:port; empty stops listening)
-            <span style={{ display: 'flex', gap: 6 }}>
-              <input
-                type="text"
-                value={listen}
-                placeholder="0.0.0.0:7710"
-                onChange={(e) => setListen(e.target.value)}
-              />
-              <button
-                type="button"
-                className="btn small"
-                disabled={central.isPending || listen === (f.listen ?? '')}
-                onClick={() => central.mutate({ listen })}
-              >
-                Apply
-              </button>
-            </span>
-          </label>
-          {f.listening && f.listening !== f.listen && (
-            <div className="muted small">bound to {f.listening}</div>
-          )}
-          {central.isError && <div className="error-text">{central.error.message}</div>}
-        </div>
-        {f.enrolled && (
-          <div className="actions" style={{ marginTop: 8 }}>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={f.sync_enabled}
-                disabled={sync.isPending}
-                onChange={(e) => sync.mutate(e.target.checked)}
-              />{' '}
-              sync to master
-            </label>
+              type="text"
+              value={listen}
+              placeholder="0.0.0.0:7710"
+              onChange={(e) => setListen(e.target.value)}
+            />
             <button
               type="button"
               className="btn small"
-              disabled={leave.isPending}
-              onClick={() => {
-                if (window.confirm('Leave the fleet? The master keeps this node’s replicas; joining again is a new epoch.'))
-                  leave.mutate()
-              }}
+              disabled={central.isPending || listen === (f.listen ?? '')}
+              onClick={() => central.mutate({ listen })}
             >
-              Leave fleet
+              Apply
             </button>
-            {sync.isError && <div className="error-text">{sync.error.message}</div>}
-            {leave.isError && <div className="error-text">{leave.error.message}</div>}
-          </div>
-        )}
+          </span>
+        </label>
+        {f.listening && f.listening !== f.listen && <div className="muted small">bound to {f.listening}</div>}
+        {central.isError && <div className="error-text">{central.error.message}</div>}
       </div>
-      {f.central ? (
-        <div className="card">
-          <div className="head">
-            <div className="grow">
-              <div className="name">Master discovery</div>
-              <div className="path">
-                {f.listening
-                  ? `advertising ${f.name} on the local network; nodes may also enter this host’s IP with port ${f.listening.split(':').at(-1)}`
-                  : 'set a sync listener to advertise this master and accept join requests'}
-              </div>
-            </div>
-            {f.listening ? <span className="badge ok">advertising</span> : <span className="badge warn">offline</span>}
-          </div>
-          {f.discovery_error && <div className="error-text">{f.discovery_error}</div>}
+      {f.enrolled && (
+        <div className="actions" style={{ marginTop: 8 }}>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={f.sync_enabled}
+              disabled={sync.isPending}
+              onChange={(e) => sync.mutate(e.target.checked)}
+            />{' '}
+            sync to master
+          </label>
+          <button
+            type="button"
+            className="btn small"
+            disabled={leave.isPending}
+            onClick={() => {
+              if (window.confirm('Leave the fleet? The master keeps this node’s replicas; joining again is a new epoch.'))
+                leave.mutate()
+            }}
+          >
+            Leave fleet
+          </button>
+          {sync.isError && <div className="error-text">{sync.error.message}</div>}
+          {leave.isError && <div className="error-text">{leave.error.message}</div>}
         </div>
-      ) : !f.enrolled ? (
-        <JoinCard f={f} onChanged={invalidate} />
-      ) : null}
+      )}
     </div>
   )
 }
 
-function JoinCard({ f, onChanged }: { f: FleetStatus; onChanged: () => void }) {
+function MasterDiscovery({ f }: { f: FleetStatus }) {
+  return (
+    <div className="card">
+      <div className="head">
+        <div className="grow">
+          <div className="name">Master discovery</div>
+          <div className="path">
+            {f.listening
+              ? `advertising ${f.name} on the local network; nodes may also enter this host’s IP with port ${f.listening.split(':').at(-1)}`
+              : 'set a sync listener to advertise this master and accept join requests'}
+          </div>
+        </div>
+        {f.listening ? <span className="badge ok">advertising</span> : <span className="badge warn">offline</span>}
+      </div>
+      {f.discovery_error && <div className="error-text">{f.discovery_error}</div>}
+    </div>
+  )
+}
+
+function JoinCard({ f }: { f: FleetStatus }) {
+  const qc = useQueryClient()
+  const onChanged = () => qc.invalidateQueries({ queryKey: ['fleet'] })
   const firstDiscovered = f.discovered_masters[0]
   const [master, setMaster] = useState(firstDiscovered?.endpoints[0] ?? '')
   const join = useMutation({ mutationFn: () => api.requestFleetJoin(master.trim()), onSuccess: onChanged })
