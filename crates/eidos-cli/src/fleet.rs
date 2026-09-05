@@ -1,16 +1,17 @@
-//! `eidos fleet ...`: identity, central role, invitations, enrollment, and
+//! `eidos fleet ...`: identity, master role, approval-based joining, and
 //! sync status.
 //!
 //! Commands talk to the running service over the loopback API so the
 //! service's own runtime picks changes up at once. The ones that make sense
-//! without a running service (`identity`, `central`, `enroll`) fall back to
+//! without a running service (`identity`, `master`, `join`) fall back to
 //! working on the data directory directly when the service does not answer.
 
 use anyhow::{anyhow, Context};
 use clap::{Args, Subcommand};
 use eidos_catalog::Catalog;
 use eidos_domain::SyncPolicy;
-use eidos_fleet::{FleetConfig, FleetStatus, InviteCode, NodeIdentity};
+use eidos_fleet::enroll::JoinOutcome;
+use eidos_fleet::{FleetConfig, FleetStatus, NodeIdentity};
 use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,35 +43,32 @@ pub enum FleetCommand {
     Status,
     /// This installation's node id, name, and certificate fingerprint.
     Identity,
-    /// Enable or disable the central role and set the sync listener.
-    Central {
+    /// Make this node the master, or disable its master role.
+    #[command(alias = "central")]
+    Master {
         /// Listen address for the dedicated sync endpoint, e.g. 0.0.0.0:7710.
         #[arg(long, conflicts_with = "no_listen")]
         listen: Option<String>,
-        /// Stop accepting enrollments and replicas (the listener stays).
+        /// Stop accepting joins and replicas (the listener stays).
         #[arg(long)]
         disable: bool,
         /// Stop listening.
         #[arg(long)]
         no_listen: bool,
     },
-    /// Mint a single-use invitation for one node (central only).
-    Invite {
-        /// How the node reaches this central (host:port); defaults to this
-        /// host's name and the listener port.
-        #[arg(long)]
-        endpoint: Option<String>,
-        /// Name to record for the node instead of the one it reports.
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Redeem an invitation: this node replicates into the central from now on.
-    Enroll { code: String },
-    /// Stop transferring without forgetting the central (resume later without a resync).
+    /// Ask a master, by IP address or discovered host, to approve this node.
+    Join { master: String },
+    /// Cancel the local pending or rejected join attempt.
+    CancelJoin,
+    /// Approve a pending node request (master only).
+    Approve { request: String },
+    /// Reject a pending node request (master only).
+    Reject { request: String },
+    /// Stop transferring without forgetting the master (resume later without a resync).
     Pause,
     /// Resume transfer after `pause`.
     Resume,
-    /// Leave the fleet: forget the central and drop the ledgers.
+    /// Leave the fleet: forget the master and drop the ledgers.
     Leave,
     /// Maintain a peer: set the endpoint this side dials, enable/disable, or forget it.
     Peer {
@@ -82,14 +80,14 @@ pub enum FleetCommand {
         enable: bool,
         #[arg(long)]
         disable: bool,
-        /// Forget the node and retire its replicated sources (central only).
+        /// Forget the node and retire its replicated sources (master only).
         #[arg(
             long,
             conflicts_with_all = ["endpoint", "enable", "disable"]
         )]
         forget: bool,
     },
-    /// Keep a source on this host only, or let it follow enrollment again.
+    /// Keep a source on this host only, or let it follow fleet membership again.
     Policy {
         /// Source name.
         source: String,
@@ -186,7 +184,7 @@ pub fn run(args: FleetArgs) -> anyhow::Result<()> {
                 println!("fingerprint:  {}", status.fingerprint);
                 println!(
                     "role:         {}",
-                    if status.central { "central" } else { "node" }
+                    if status.central { "master" } else { "node" }
                 );
             } else {
                 let identity =
@@ -200,19 +198,19 @@ pub fn run(args: FleetArgs) -> anyhow::Result<()> {
                 );
             }
         }
-        FleetCommand::Central {
+        FleetCommand::Master {
             listen,
             disable,
             no_listen,
         } => {
             if service_reachable(&url) {
                 let body = serde_json::json!({
-                    "central": if disable { Some(false) } else if listen.is_some() { Some(true) } else { None },
+                    "central": !disable,
                     "listen": if no_listen { Some(String::new()) } else { listen.clone() },
                 });
                 let config: FleetConfig = send(&url, "POST", "/api/fleet/central", &body)?;
                 println!(
-                    "central: {}  listen: {}",
+                    "master: {}  listen: {}",
                     config.central,
                     config.listen.as_deref().unwrap_or("(none)")
                 );
@@ -224,8 +222,19 @@ pub fn run(args: FleetArgs) -> anyhow::Result<()> {
                 let config = FleetConfig::edit_locked(&args.data_dir, move |config| {
                     if disable {
                         config.central = false;
-                    } else if listen.is_some() {
+                    } else {
+                        if config.pending_join.is_some() {
+                            return Err(anyhow!(
+                                "cancel the pending join before making this node the master"
+                            ));
+                        }
                         config.central = true;
+                        if listen.is_none() && config.listen.is_none() && !no_listen {
+                            config.listen = Some(format!(
+                                "0.0.0.0:{}",
+                                eidos_fleet::config::DEFAULT_SYNC_PORT
+                            ));
+                        }
                     }
                     if no_listen {
                         config.listen = None;
@@ -235,78 +244,106 @@ pub fn run(args: FleetArgs) -> anyhow::Result<()> {
                     Ok(())
                 })?;
                 println!(
-                    "central: {}  listen: {}  (written to {}; takes effect when the service starts or on its next tick)",
+                    "master: {}  listen: {}  (written to {}; takes effect when the service starts or on its next tick)",
                     config.central,
                     config.listen.as_deref().unwrap_or("(none)"),
                     FleetConfig::path(&args.data_dir).display()
                 );
             }
         }
-        FleetCommand::Invite { endpoint, name } => {
+        FleetCommand::Join { master } => {
             if service_reachable(&url) {
-                let body = serde_json::json!({ "endpoint": endpoint, "name_hint": name });
-                let view: serde_json::Value = send(&url, "POST", "/api/fleet/invite", &body)?;
+                let status: FleetStatus = send(
+                    &url,
+                    "POST",
+                    "/api/fleet/join",
+                    &serde_json::json!({ "master": master }),
+                )?;
                 if args.json {
-                    println!("{}", serde_json::to_string_pretty(&view)?);
+                    println!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
-                    println!("{}", view["code"].as_str().unwrap_or_default());
-                    eprintln!(
-                        "single use, valid 24 hours; run on the node: eidos fleet enroll <code>  (endpoint {})",
-                        view["endpoint"].as_str().unwrap_or_default()
+                    let pending = status
+                        .pending_join
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("join completed without a pending target"))?;
+                    println!(
+                        "waiting for {} to approve this node (request {})",
+                        pending.master_name, pending.request_id
                     );
                 }
             } else {
-                let endpoint = endpoint.ok_or_else(|| {
-                    anyhow!("the service is not running; pass --endpoint host:port explicitly")
-                })?;
-                let catalog = Arc::new(Catalog::open(args.data_dir.join("catalog.db"))?);
-                let identity =
-                    NodeIdentity::load_or_create(&args.data_dir, &eidos_domain::bench::hostname())?;
-                let config = FleetConfig::load(&args.data_dir)?;
-                let code = eidos_fleet::enroll::create_invite(
-                    &catalog,
-                    &identity,
-                    &config,
-                    &endpoint,
-                    name.as_deref(),
-                )?;
-                println!("{}", code.encode());
-                eprintln!("single use, valid 24 hours; the central service must be listening on {endpoint} for the node to redeem it");
-            }
-        }
-        FleetCommand::Enroll { code } => {
-            let invite = InviteCode::parse(&code)?;
-            if service_reachable(&url) {
-                let view: serde_json::Value = send(
-                    &url,
-                    "POST",
-                    "/api/fleet/enroll",
-                    &serde_json::json!({ "code": code }),
-                )?;
-                println!(
-                    "enrolled with central {} ({}) at {}",
-                    view["central_name"].as_str().unwrap_or_default(),
-                    view["central"].as_str().unwrap_or_default(),
-                    view["endpoint"].as_str().unwrap_or_default()
-                );
-            } else {
+                if FleetConfig::load(&args.data_dir)?.central {
+                    return Err(anyhow!("a fleet master cannot join another master"));
+                }
                 let catalog = Arc::new(Catalog::open(args.data_dir.join("catalog.db"))?);
                 let identity =
                     NodeIdentity::load_or_create(&args.data_dir, &eidos_domain::bench::hostname())?;
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                let outcome = rt.block_on(eidos_fleet::enroll::enroll(
+                let outcome = rt.block_on(eidos_fleet::enroll::request_join(
                     &catalog,
                     &identity,
-                    &invite,
+                    &master,
                     Duration::from_secs(15),
                 ))?;
-                println!(
-                    "enrolled with central {} ({}) at {}; sync starts when the service runs",
-                    outcome.central_name, outcome.central, outcome.endpoint
-                );
+                match outcome {
+                    JoinOutcome::Pending(target) => {
+                        let shown = target.clone();
+                        FleetConfig::edit_locked(&args.data_dir, move |config| {
+                            config.pending_join = Some(target);
+                            Ok(())
+                        })?;
+                        println!(
+                            "waiting for {} to approve this node (request {}); the service will complete the join",
+                            shown.master_name, shown.request_id
+                        );
+                    }
+                    JoinOutcome::Joined(joined) => println!(
+                        "joined master {} ({}) at {}",
+                        joined.master_name, joined.master, joined.endpoint
+                    ),
+                    JoinOutcome::Rejected(reason) => {
+                        return Err(anyhow!("the master rejected the join request: {reason}"))
+                    }
+                }
             }
+        }
+        FleetCommand::CancelJoin => {
+            if service_reachable(&url) {
+                let _: FleetStatus =
+                    send(&url, "DELETE", "/api/fleet/join", &serde_json::json!({}))?;
+            } else {
+                FleetConfig::edit_locked(&args.data_dir, |config| {
+                    config.pending_join = None;
+                    Ok(())
+                })?;
+            }
+            println!("pending join cleared");
+        }
+        FleetCommand::Approve { request } => {
+            let status: FleetStatus = send(
+                &url,
+                "POST",
+                &format!("/api/fleet/join-requests/{request}"),
+                &serde_json::json!({ "approve": true }),
+            )?;
+            println!(
+                "approved request {request}; {} request(s) still waiting",
+                status.join_requests.len()
+            );
+        }
+        FleetCommand::Reject { request } => {
+            let status: FleetStatus = send(
+                &url,
+                "POST",
+                &format!("/api/fleet/join-requests/{request}"),
+                &serde_json::json!({ "approve": false }),
+            )?;
+            println!(
+                "rejected request {request}; {} request(s) still waiting",
+                status.join_requests.len()
+            );
         }
         FleetCommand::Pause => {
             let status: FleetStatus = send(
@@ -396,17 +433,50 @@ fn print_status(s: &FleetStatus) {
         "{} ({}) {} fingerprint {}",
         s.name,
         s.node_id,
-        if s.central { "central" } else { "node" },
+        if s.central { "master" } else { "node" },
         s.fingerprint
     );
     println!(
-        "enrolled: {}  sync: {}  listening: {}",
+        "joined: {}  sync: {}  listening: {}",
         s.enrolled,
         if s.sync_enabled { "on" } else { "off" },
         s.listening.as_deref().unwrap_or("no")
     );
-    if s.pending_invites > 0 {
-        println!("pending invitations: {}", s.pending_invites);
+    if let Some(join) = &s.pending_join {
+        println!(
+            "join request {} -> {} at {}{}",
+            join.request_id,
+            join.master_name,
+            join.endpoint,
+            join.rejected_reason
+                .as_deref()
+                .map(|reason| format!(" (rejected: {reason})"))
+                .unwrap_or_default()
+        );
+    }
+    if !s.join_requests.is_empty() {
+        println!("join requests waiting for approval:");
+        for request in &s.join_requests {
+            println!(
+                "  {} {} ({}, {}) from {}",
+                request.request_id,
+                request.name,
+                request.platform,
+                request.node_id,
+                request.remote_addr.as_deref().unwrap_or("unknown address")
+            );
+        }
+    }
+    if !s.discovered_masters.is_empty() {
+        println!("masters discovered on this network:");
+        for master in &s.discovered_masters {
+            println!(
+                "  {} ({}) {}",
+                master.name,
+                master.node_id,
+                master.endpoints.join(", ")
+            );
+        }
     }
     for d in &s.degraded {
         println!("DEGRADED: {d}");

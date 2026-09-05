@@ -9,6 +9,7 @@
 use crate::wire::{
     DEFAULT_BATCH_BYTES, DEFAULT_BATCH_ROWS, DEFAULT_CREDIT_BYTES, DEFAULT_MAX_FRAME_BYTES,
 };
+use eidos_domain::UnixNanos;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,14 +23,33 @@ static CONFIG_EDIT_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 pub const DEFAULT_SYNC_PORT: u16 = 7710;
 pub const MAX_BATCH_ROWS: u32 = 10_000;
 
+/// A node's durable, certificate-pinned request to join a master. The
+/// service retries pending attempts after restarts; a rejection remains
+/// visible until the operator cancels it or starts a new attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct PendingJoinTarget {
+    pub request_id: String,
+    pub endpoint: String,
+    pub master_name: String,
+    pub master_fingerprint: String,
+    pub requested_at: UnixNanos,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rejected_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct FleetConfig {
-    /// Accept enrollments and replicate enrolled nodes' sources here.
+    /// Approve join requests and replicate joined nodes' sources here.
     pub central: bool,
     /// Address of the dedicated sync listener; `null` accepts no inbound
     /// sessions (a node that only dials out).
     pub listen: Option<String>,
+    /// Join attempt waiting for the named master's approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pending_join: Option<PendingJoinTarget>,
     /// Largest frame accepted or sent.
     pub max_frame_bytes: u64,
     /// Bytes a peer may have in flight towards this side.
@@ -55,6 +75,7 @@ impl Default for FleetConfig {
         Self {
             central: false,
             listen: None,
+            pending_join: None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES as u64,
             credit_bytes: DEFAULT_CREDIT_BYTES,
             batch_rows: DEFAULT_BATCH_ROWS,

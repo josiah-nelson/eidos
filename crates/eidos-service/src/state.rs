@@ -96,6 +96,10 @@ pub struct AppState {
     pub update_available: Mutex<Option<String>>,
     /// Whether the daily release check runs at all.
     pub update_check: bool,
+    /// Serializes expired cache refreshes. Callers double-check the cache
+    /// after acquiring this lock so a health-check burst performs one disk
+    /// traversal and every waiter reuses its result.
+    storage_refresh: Mutex<()>,
     pub exec_opts: eidos_search::exec::ExecOptions,
     /// Bounds and counters for `/api/search/export`.
     pub export: crate::export::ExportLimits,
@@ -151,6 +155,13 @@ impl AppState {
             tracing::warn!(
                 requeued = requeued_unfinished_content,
                 "re-queued content records left `indexing` by a previous process"
+            );
+        }
+        let refreshed_source_states = catalog.refresh_source_content_states()?;
+        if refreshed_source_states > 0 {
+            tracing::info!(
+                sources = refreshed_source_states,
+                "reconciled source lifecycle states from durable content rows"
             );
         }
         // Interaction capture bounds itself from its own insert path, but a
@@ -224,6 +235,7 @@ impl AppState {
             storage_cache: Mutex::new(None),
             update_available: Mutex::new(None),
             update_check: config.update_check,
+            storage_refresh: Mutex::new(()),
             exec_opts: eidos_search::exec::ExecOptions::default(),
             export: export_limits,
             export_stats: Arc::new(crate::export::ExportStats::default()),
@@ -252,30 +264,45 @@ impl AppState {
     /// the UI's 2-second activity poll does not walk index directories on
     /// every call.
     pub fn storage(&self) -> crate::api::StorageView {
-        const REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
-        {
-            let cache = self.storage_cache.lock();
-            if let Some((at, view)) = *cache {
-                if at.elapsed() < REFRESH {
-                    return view;
-                }
+        self.storage_with(|| {
+            let db = self.catalog.path();
+            let catalog_db_bytes = [
+                db.to_path_buf(),
+                with_suffix(db, "-wal"),
+                with_suffix(db, "-shm"),
+            ]
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+            crate::api::StorageView {
+                catalog_db_bytes,
+                catalog_index_bytes: dir_bytes(&self.data_dir.join("index").join("catalog")),
+                content_index_bytes: dir_bytes(&self.data_dir.join("index").join("content")),
             }
-        }
-        let db = self.catalog.path();
-        let catalog_db_bytes = [
-            db.to_path_buf(),
-            with_suffix(db, "-wal"),
-            with_suffix(db, "-shm"),
-        ]
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum();
-        let view = crate::api::StorageView {
-            catalog_db_bytes,
-            catalog_index_bytes: dir_bytes(&self.data_dir.join("index").join("catalog")),
-            content_index_bytes: dir_bytes(&self.data_dir.join("index").join("content")),
+        })
+    }
+
+    fn storage_with(
+        &self,
+        compute: impl FnOnce() -> crate::api::StorageView,
+    ) -> crate::api::StorageView {
+        const REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+        let fresh = || {
+            self.storage_cache
+                .lock()
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < REFRESH)
+                .map(|(_, view)| *view)
         };
+        if let Some(view) = fresh() {
+            return view;
+        }
+        let _refresh = self.storage_refresh.lock();
+        if let Some(view) = fresh() {
+            return view;
+        }
+        let view = compute();
         *self.storage_cache.lock() = Some((Instant::now(), view));
         view
     }
@@ -389,5 +416,54 @@ impl AppState {
         for p in self.scans.lock().values() {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    #[test]
+    fn concurrent_storage_reads_share_one_expensive_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            AppState::open(&ServiceConfig {
+                data_dir: dir.path().join("data"),
+                content: false,
+                fleet: false,
+                ..ServiceConfig::default()
+            })
+            .unwrap(),
+        );
+        let callers = 8;
+        let barrier = Arc::new(Barrier::new(callers));
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..callers {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            let refreshes = refreshes.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                state.storage_with(|| {
+                    refreshes.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(25));
+                    crate::api::StorageView {
+                        catalog_db_bytes: 7,
+                        catalog_index_bytes: 11,
+                        content_index_bytes: 13,
+                    }
+                })
+            }));
+        }
+        let views: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+        assert!(views.iter().all(|view| view.catalog_db_bytes == 7));
     }
 }

@@ -20,10 +20,8 @@ with no change feed.
 
 ## Commands
 
-CI lints Windows but does not run the Windows test suite per commit (see
-`docs/adr/0019`). Windows runtime behavior is covered by the nightly and
-release gates. Run the complete local gate explicitly when a change warrants
-it; pushes do not invoke it automatically.
+Pushes do not run a local test hook. Run the relevant checks while developing;
+the complete Windows suite runs in the nightly and release gates.
 
 ```powershell
 # Windows. One-shot: format check, clippy (deny warnings), all tests,
@@ -46,10 +44,10 @@ scripts/check.sh               # --skip-web / --skip-release to shorten
 `scripts/macos/build-agent.sh` builds the `Eidos.app` bundle the macOS agent
 is installed from; see [installing-macos.md](installing-macos.md).
 
-CI runs the Rust gate on both Windows and macOS, because the enumeration and
-change-feed adapters differ per platform and the contracts they share are only
-proven when both run them. The Windows lane also checks formatting and that
-the generated API contract in `web/src/generated/api.ts` is not stale.
+Pull-request CI lints all Windows targets and runs the functional Rust gate on
+macOS, where the native adapters differ. The nightly and release workflows run
+the complete Windows suite. CI also checks formatting and that the generated
+API contract in `web/src/generated/api.ts` is not stale.
 
 Tests never touch user data: every integration test builds its own fixture
 under a `tempfile::tempdir()`. USN-journal tests need an elevated session
@@ -328,16 +326,6 @@ virtual paths, queued/running jobs, an unfinished content publication, and an
 open scan. It asserts a healthy catalog projection and content index reopen
 without rebuild, then checks the exact recovery counters and Activity JSON.
 
-### Onboarding, volumes, and the update check
-
-`GET /api/volumes` enumerates local drive roots (type, filesystem,
-capacity, USN eligibility) for the first-run picker the web UI shows while
-no sources exist; the same flow offers fleet enrollment. The service also
-checks GitHub releases once a day (read-only; `--no-update-check` disables
-it) and reports a newer tag through `/api/health` and a badge in the UI.
-`GET /api/collector` / `POST /api/collector/upload` surface and configure
-the local collector daemon's bundle forwarding over its control pipe.
-
 ### Extraction worker pool
 
 `eidos content workers` shows the global extraction pool;
@@ -583,7 +571,7 @@ crates/
   eidos-cli       the `eidos` binary
 web/              Vite + React + TypeScript UI
 docs/             public documentation and ADRs
-scripts/          check.ps1, check.sh, packaging and benchmark helpers
+scripts/          check.ps1, check.sh, hooks/
 ```
 
 ## Conventions

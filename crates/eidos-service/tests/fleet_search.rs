@@ -9,7 +9,6 @@ use axum::http::{Request, StatusCode};
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::NewSource;
 use eidos_domain::{CoverageKind, SearchRequest, SourceId, SourceKind, SourceState, SyncPolicy};
-use eidos_fleet::enroll::{create_invite, enroll};
 use eidos_fleet::{Fleet, FleetConfig, NodeIdentity};
 use eidos_search::exec::{search_with_content, ExecOptions};
 use eidos_service::state::AppState;
@@ -142,22 +141,44 @@ async fn central_search_returns_the_replicated_union_with_truthful_origin_and_co
     })
     .await
     .expect("listener");
-    let invite = create_invite(
-        &central.state.catalog,
-        central.fleet().identity(),
-        &central.fleet().config(),
-        &endpoint,
-        None,
-    )
-    .unwrap();
-    enroll(
-        &node.state.catalog,
-        node.fleet().identity(),
-        &invite,
-        Duration::from_secs(10),
-    )
+    let response = eidos_service::api::router(node.state.clone(), None)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet/join")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "master": endpoint }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let request_id = status["pending_join"]["request_id"]
+        .as_str()
+        .expect("pending join request id");
+    let response = eidos_service::api::router(central.state.clone(), None)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/fleet/join-requests/{request_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"approve":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for(Duration::from_secs(30), || {
+        node.fleet().status().enrolled.then_some(())
+    })
     .await
-    .unwrap();
+    .expect("approved join completed");
 
     // Converge: the central's replica cursor reaches the node's head.
     let node_head = node

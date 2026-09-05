@@ -3,8 +3,8 @@ name: nightly
 # The per-commit gate (ci.yml) lints Windows but does not test it: the whole
 # suite is portable apart from ten cfg(windows) source files and macOS runs it
 # in half the time. Windows *runtime* behaviour — path separators, case
-# folding, file locking, reserved names — is therefore checked here every
-# night and again on a release tag.
+# folding, file locking, reserved names — runs here every night and again on a
+# release tag.
 on:
   schedule:
     - cron: "23 5 * * *"

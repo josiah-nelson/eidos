@@ -4,8 +4,6 @@
 import type {
   ActivityView,
   CentralBody,
-  CollectorUploadBody,
-  CollectorView,
   AddSourceBody,
   ApiErrorBody,
   ApiInt,
@@ -14,11 +12,9 @@ import type {
   ContentPolicyBody,
   ContentPreview,
   ContentStatusView,
-  EnrollView,
   FleetConfig,
   FleetStatus,
   ForgetView,
-  InviteView,
   ErrorRecord,
   ExportFormat,
   ExtensionCount,
@@ -38,7 +34,6 @@ import type {
   SortField,
   SourceDetail,
   SourceView,
-  VolumeCandidateView,
   WorkersView,
 } from './generated/api'
 import type { PreviewWindow } from './preview-window'
@@ -163,13 +158,14 @@ export const api = {
   fleetStatus: () => request<FleetStatus>('/api/fleet'),
   setFleetCentral: (body: CentralBody) =>
     request<FleetConfig>('/api/fleet/central', { method: 'POST', body: JSON.stringify(body) }),
-  fleetInvite: (endpoint?: string, nameHint?: string) =>
-    request<InviteView>('/api/fleet/invite', {
+  requestFleetJoin: (master: string) =>
+    request<FleetStatus>('/api/fleet/join', { method: 'POST', body: JSON.stringify({ master }) }),
+  cancelFleetJoin: () => request<FleetStatus>('/api/fleet/join', { method: 'DELETE' }),
+  decideFleetJoin: (requestId: string, approve: boolean) =>
+    request<FleetStatus>(`/api/fleet/join-requests/${requestId}`, {
       method: 'POST',
-      body: JSON.stringify({ endpoint: endpoint || undefined, name_hint: nameHint || undefined }),
+      body: JSON.stringify({ approve }),
     }),
-  fleetEnroll: (code: string) =>
-    request<EnrollView>('/api/fleet/enroll', { method: 'POST', body: JSON.stringify({ code }) }),
   setFleetSync: (enabled: boolean) =>
     request<FleetStatus>('/api/fleet/sync', { method: 'POST', body: JSON.stringify({ enabled }) }),
   fleetLeave: () => request<FleetStatus>('/api/fleet/leave', { method: 'POST' }),
@@ -177,11 +173,6 @@ export const api = {
     request<PeerView>(`/api/fleet/peers/${id}`, { method: 'POST', body: JSON.stringify(body) }),
   forgetFleetPeer: (id: string) =>
     request<ForgetView>(`/api/fleet/peers/${id}`, { method: 'DELETE' }),
-  volumes: () => request<VolumeCandidateView[]>('/api/volumes'),
-  collector: () => request<CollectorView>('/api/collector'),
-  /** Configure collector bundle forwarding; absent fields keep their value. */
-  setCollectorUpload: (body: CollectorUploadBody) =>
-    request<CollectorView>('/api/collector/upload', { method: 'POST', body: JSON.stringify(body) }),
   contentWorkers: () => request<WorkersView>('/api/content/workers'),
   /** Resize the global extraction pool; durable across restarts. */
   setContentWorkers: (workers: number) =>

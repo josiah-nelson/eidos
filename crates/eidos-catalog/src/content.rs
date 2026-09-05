@@ -11,11 +11,11 @@ use crate::{Catalog, CatalogError, Result};
 use eidos_content::Chunk;
 use eidos_domain::{
     ContentId, ContentState, Coverage, FailureClass, JobId, JobStage, ObjectId, Priority, SourceId,
-    SourceKind, UnixNanos,
+    SourceKind, SourceState, UnixNanos,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
 
 pub const ZSTD_LEVEL: i32 = 1;
@@ -268,6 +268,7 @@ impl Catalog {
             )?;
             if publish {
                 flip_state(&tx, rec.object_id, rec.state, rec.content_id)?;
+                refresh_source_content_state_conn(&tx, rec.source_id)?;
             }
             if let Some(job) = complete_job {
                 tx.execute(
@@ -288,15 +289,16 @@ impl Catalog {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let mut n = 0;
+            let mut sources = BTreeSet::new();
             for o in objects {
-                let row: Option<(String, Option<Vec<u8>>, i64)> = tx
+                let row: Option<(String, Option<Vec<u8>>, i64, i64)> = tx
                     .query_row(
-                        "SELECT coverage, content_id, generation FROM content_records WHERE object_id = ?1 AND state = 'indexing'",
+                        "SELECT coverage, content_id, generation, source_id FROM content_records WHERE object_id = ?1 AND state = 'indexing'",
                         params![o.0],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .optional()?;
-                let (coverage, cid, gen) = match row {
+                let (coverage, cid, gen, source_id) = match row {
                     Some(r) => r,
                     None => continue,
                 };
@@ -331,10 +333,35 @@ impl Catalog {
                     }
                 });
                 flip_state(&tx, *o, state, content_id)?;
+                sources.insert(SourceId(source_id));
                 n += 1;
+            }
+            for source in sources {
+                refresh_source_content_state_conn(&tx, source)?;
             }
             tx.commit()?;
             Ok(n)
+        })
+    }
+
+    /// Reconcile steady-state source labels with their durable content rows.
+    /// This repairs older catalogs that drained successfully but remained
+    /// `content_pending`, and catches pending work restored at startup.
+    pub fn refresh_source_content_states(&self) -> Result<u64> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let sources: Vec<SourceId> = tx
+                .prepare_cached(
+                    "SELECT source_id FROM sources WHERE published_generation IS NOT NULL",
+                )?
+                .query_map([], |row| row.get::<_, i64>(0).map(SourceId))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut changed = 0;
+            for source in sources {
+                changed += u64::from(refresh_source_content_state_conn(&tx, source)?);
+            }
+            tx.commit()?;
+            Ok(changed)
         })
     }
 
@@ -810,6 +837,55 @@ pub(crate) fn flip_state(
     )?;
     outbox_append_conn(conn, SourceId(source_id), object, "upsert", generation)?;
     Ok(())
+}
+
+/// Move only steady metadata/content states. Feed and reachability states are
+/// stronger claims and must not be erased merely because extraction changed.
+fn refresh_source_content_state_conn(conn: &Connection, source: SourceId) -> Result<bool> {
+    let (state, published, content_enabled): (String, Option<i64>, bool) = conn.query_row(
+        "SELECT state, published_generation, content_enabled FROM sources WHERE source_id = ?1",
+        params![source.0],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let Some(current) = SourceState::parse(&state) else {
+        return Ok(false);
+    };
+    if published.is_none()
+        || !matches!(
+            current,
+            SourceState::MetadataComplete | SourceState::ContentPending | SourceState::Complete
+        )
+    {
+        return Ok(false);
+    }
+    let (pending, failed): (i64, i64) = conn.query_row(
+        "SELECT
+            SUM(CASE WHEN content_state IN ('pending','stale') THEN 1 ELSE 0 END),
+            SUM(CASE WHEN content_state = 'failed' THEN 1 ELSE 0 END)
+         FROM objects WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file'",
+        params![source.0],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            ))
+        },
+    )?;
+    let next = if !content_enabled {
+        SourceState::MetadataComplete
+    } else if pending > 0 || failed > 0 {
+        SourceState::ContentPending
+    } else {
+        SourceState::Complete
+    };
+    if next == current {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE sources SET state = ?2, updated_at = ?3 WHERE source_id = ?1",
+        params![source.0, next.as_str(), UnixNanos::now().0],
+    )?;
+    Ok(true)
 }
 
 pub(crate) fn enqueue_pending_content_conn(

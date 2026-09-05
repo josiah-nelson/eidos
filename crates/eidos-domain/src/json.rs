@@ -68,6 +68,32 @@ pub mod option_u64_string {
     }
 }
 
+pub mod option_i64_string {
+    use super::*;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<i64>, D::Error> {
+        Option::<Decimal<i64>>::deserialize(deserializer)?
+            .map(Decimal::value)
+            .transpose()
+    }
+}
+
+pub mod u64_string_map {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, u64>, D::Error> {
+        BTreeMap::<String, Decimal<u64>>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(key, value)| value.value().map(|value| (key, value)))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +107,10 @@ mod tests {
         unsigned: u64,
         #[serde(default, with = "option_u64_string")]
         optional: Option<u64>,
+        #[serde(default, deserialize_with = "option_i64_string::deserialize")]
+        optional_signed: Option<i64>,
+        #[serde(default, deserialize_with = "u64_string_map::deserialize")]
+        counts: std::collections::BTreeMap<String, u64>,
     }
 
     #[test]
@@ -89,17 +119,26 @@ mod tests {
             signed: i64::MIN,
             unsigned: u64::MAX,
             optional: Some(9_007_199_254_740_993),
+            optional_signed: None,
+            counts: std::collections::BTreeMap::new(),
         };
         assert_eq!(
             serde_json::to_string(&values).unwrap(),
-            r#"{"signed":"-9223372036854775808","unsigned":"18446744073709551615","optional":"9007199254740993"}"#
+            r#"{"signed":"-9223372036854775808","unsigned":"18446744073709551615","optional":"9007199254740993","optional_signed":null,"counts":{}}"#
         );
         assert_eq!(
-            serde_json::from_str::<Values>(r#"{"signed":-7,"unsigned":8}"#).unwrap(),
+            serde_json::from_str::<Values>(
+                r#"{"signed":-7,"unsigned":8,"optional_signed":"-9","counts":{"a":"10","b":11}}"#
+            )
+            .unwrap(),
             Values {
                 signed: -7,
                 unsigned: 8,
                 optional: None,
+                optional_signed: Some(-9),
+                counts: [("a".to_string(), 10), ("b".to_string(), 11)]
+                    .into_iter()
+                    .collect(),
             }
         );
     }

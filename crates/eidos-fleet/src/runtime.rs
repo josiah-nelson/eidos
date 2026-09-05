@@ -3,17 +3,21 @@
 //! stopped through the shutdown channel.
 //!
 //! Every loop re-reads `fleet/config.json` and the roster on its own tick,
-//! so `eidos fleet ...` commands and enrollments take effect without a
+//! so `eidos fleet ...` commands and join approvals take effect without a
 //! restart. Nothing here is on the path of local search, scanning, or
 //! shutdown: sessions and maintenance run on their own tasks and bounded
 //! blocking calls, and a central that is unreachable only ever costs the
 //! node a reconnect timer.
 
 use crate::config::FleetConfig;
+use crate::discovery::{self, DiscoveryState};
+use crate::enroll::{self, JoinOutcome};
 use crate::identity::{hex, NodeIdentity};
 use crate::metrics::FleetCounters;
 use crate::session::{run_session, Registry, SessionContext, SessionEnd};
-use crate::status::{Direction, FleetStatus, LocalSourceSync, PeerView, ReplicaSourceSync};
+use crate::status::{
+    Direction, FleetStatus, JoinRequestView, LocalSourceSync, PeerView, ReplicaSourceSync,
+};
 use crate::tls;
 use anyhow::Context;
 use eidos_catalog::fleet::{NodeId, PeerRole};
@@ -63,6 +67,8 @@ pub struct Fleet {
     listener_error: Arc<Mutex<Option<String>>>,
     dials: Arc<Mutex<HashMap<NodeId, Dial>>>,
     session_permits: Arc<Semaphore>,
+    discovery: Arc<DiscoveryState>,
+    join_error: Arc<Mutex<Option<String>>>,
     /// Sources whose ledger looks over its ceiling, by name.
     degraded: Arc<Mutex<Vec<String>>>,
 }
@@ -100,11 +106,21 @@ impl Fleet {
             listener_error: Arc::new(Mutex::new(None)),
             dials: Arc::new(Mutex::new(HashMap::new())),
             session_permits: Arc::new(Semaphore::new(MAX_FLEET_SESSIONS)),
+            discovery: Arc::new(DiscoveryState::default()),
+            join_error: Arc::new(Mutex::new(None)),
             degraded: Arc::new(Mutex::new(Vec::new())),
         });
         let mut tasks = fleet.tasks.lock();
         tasks.push(tokio::spawn(config_loop(fleet.clone())));
         tasks.push(tokio::spawn(listener_loop(fleet.clone())));
+        tasks.push(tokio::spawn(discovery::run(
+            fleet.discovery.clone(),
+            fleet.ctx.identity.clone(),
+            fleet.ctx.config.clone(),
+            fleet.listening.clone(),
+            fleet.shutdown.subscribe(),
+        )));
+        tasks.push(tokio::spawn(join_loop(fleet.clone())));
         tasks.push(tokio::spawn(dial_loop(fleet.clone())));
         tasks.push(tokio::spawn(maintenance_loop(fleet.clone())));
         drop(tasks);
@@ -163,6 +179,57 @@ impl Fleet {
         Ok(config)
     }
 
+    /// Contact a master and durably retain the resulting pending request.
+    /// Completion is automatic after the master approves it.
+    pub async fn request_join(&self, endpoint: &str) -> anyhow::Result<JoinOutcome> {
+        if self.config().central {
+            return Err(anyhow::anyhow!("a fleet master cannot join another master"));
+        }
+        let outcome = enroll::request_join(
+            &self.ctx.catalog,
+            &self.ctx.identity,
+            endpoint,
+            CONNECT_TIMEOUT,
+        )
+        .await?;
+        match &outcome {
+            JoinOutcome::Pending(target) => {
+                let target = target.clone();
+                self.update_config(move |config| {
+                    if config.central {
+                        return Err(anyhow::anyhow!(
+                            "a master cannot also wait to join another master"
+                        ));
+                    }
+                    config.pending_join = Some(target);
+                    Ok(())
+                })?;
+                *self.join_error.lock() = None;
+            }
+            JoinOutcome::Joined(_) => {
+                self.update_config(|config| {
+                    config.pending_join = None;
+                    Ok(())
+                })?;
+            }
+            JoinOutcome::Rejected(reason) => {
+                return Err(anyhow::anyhow!(
+                    "the master rejected the join request: {reason}"
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub fn cancel_join(&self) -> anyhow::Result<()> {
+        self.update_config(|config| {
+            config.pending_join = None;
+            Ok(())
+        })?;
+        *self.join_error.lock() = None;
+        Ok(())
+    }
+
     pub fn status(&self) -> FleetStatus {
         let catalog = &self.ctx.catalog;
         let config = self.config();
@@ -193,6 +260,13 @@ impl Fleet {
         let mut degraded = self.degraded.lock().clone();
         if let Some(e) = self.listener_error.lock().clone() {
             degraded.push(format!("sync listener: {e}"));
+        }
+        if let Some(error) = self.join_error.lock().clone() {
+            degraded.push(format!("join request: {error}"));
+        }
+        let discovery_error = self.discovery.error();
+        if let Some(error) = &discovery_error {
+            degraded.push(error.clone());
         }
         let mut local_sources = Vec::new();
         let mut replica_sources = Vec::new();
@@ -247,6 +321,21 @@ impl Fleet {
                 s.name, s.backlog_rows, s.backlog_tombstones
             ));
         }
+        let join_requests = catalog
+            .fleet_pending_join_requests()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|request| JoinRequestView {
+                request_id: request.request_id,
+                node_id: request.node_id,
+                name: request.name,
+                platform: request.platform,
+                fingerprint: hex(&request.fingerprint),
+                remote_addr: request.remote_addr,
+                requested_at: request.requested_at,
+                last_seen_at: request.last_seen_at,
+            })
+            .collect();
         FleetStatus {
             node_id: self.ctx.identity.node_id,
             name: self.ctx.identity.name.clone(),
@@ -262,7 +351,109 @@ impl Fleet {
             replica_sources,
             counters: self.ctx.counters.view(),
             degraded,
-            pending_invites: catalog.fleet_pending_invites().unwrap_or(0),
+            pending_join: config.pending_join,
+            join_requests,
+            discovered_masters: self.discovery.masters(),
+            discovery_error,
+        }
+    }
+}
+
+async fn join_loop(fleet: Arc<Fleet>) {
+    let mut shutdown = fleet.shutdown.subscribe();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(DIAL_POLL) => {}
+            _ = shutdown.changed() => return,
+        }
+        let Some(target) = fleet
+            .config()
+            .pending_join
+            .filter(|target| target.rejected_reason.is_none())
+        else {
+            continue;
+        };
+        // A roster entry is authoritative. This also closes the small window
+        // after a successful response but before the pending config edit.
+        if fleet
+            .ctx
+            .catalog
+            .fleet_peers()
+            .unwrap_or_default()
+            .iter()
+            .any(|peer| peer.role == PeerRole::Central)
+        {
+            let request_id = target.request_id.clone();
+            if let Err(error) = fleet.update_config(move |config| {
+                if config
+                    .pending_join
+                    .as_ref()
+                    .is_some_and(|current| current.request_id == request_id)
+                {
+                    config.pending_join = None;
+                }
+                Ok(())
+            }) {
+                *fleet.join_error.lock() = Some(error.to_string());
+            }
+            continue;
+        }
+        match enroll::poll_join(
+            &fleet.ctx.catalog,
+            &fleet.ctx.identity,
+            &target,
+            CONNECT_TIMEOUT,
+        )
+        .await
+        {
+            Ok(JoinOutcome::Pending(_)) => {
+                *fleet.join_error.lock() = None;
+            }
+            Ok(JoinOutcome::Joined(joined)) => {
+                let request_id = target.request_id.clone();
+                match fleet.update_config(move |config| {
+                    if config
+                        .pending_join
+                        .as_ref()
+                        .is_some_and(|current| current.request_id == request_id)
+                    {
+                        config.pending_join = None;
+                    }
+                    Ok(())
+                }) {
+                    Ok(_) => {
+                        *fleet.join_error.lock() = None;
+                        tracing::info!(master = %joined.master, "fleet join completed after approval");
+                    }
+                    Err(error) => *fleet.join_error.lock() = Some(error.to_string()),
+                }
+            }
+            Ok(JoinOutcome::Rejected(reason)) => {
+                let request_id = target.request_id.clone();
+                let persisted_reason = reason.clone();
+                if let Err(error) = fleet.update_config(move |config| {
+                    if let Some(current) = config
+                        .pending_join
+                        .as_mut()
+                        .filter(|current| current.request_id == request_id)
+                    {
+                        current.rejected_reason = Some(persisted_reason);
+                    }
+                    Ok(())
+                }) {
+                    *fleet.join_error.lock() = Some(error.to_string());
+                } else {
+                    *fleet.join_error.lock() = None;
+                    tracing::warn!(request = %target.request_id, %reason, "fleet join was rejected");
+                }
+            }
+            Err(error) => {
+                let error = format!("{}: {error:#}", target.endpoint);
+                if fleet.join_error.lock().as_deref() != Some(error.as_str()) {
+                    tracing::warn!(%error, "pending fleet join could not reach its master");
+                }
+                *fleet.join_error.lock() = Some(error);
+            }
         }
     }
 }
@@ -510,7 +701,7 @@ async fn dial_loop(fleet: Arc<Fleet>) {
                 dial.in_progress = false;
                 match outcome {
                     // A session that ran for a while restarts the backoff.
-                    SessionEnd::Closed | SessionEnd::Enrolled(_) => {
+                    SessionEnd::Closed | SessionEnd::Joined(_) => {
                         dial.delay = RECONNECT_MIN;
                     }
                     // The other direction won; wait a little before trying
@@ -777,6 +968,6 @@ fn maintain(
                 }
             }
         }
-        let _ = catalog.fleet_prune_invites();
+        let _ = catalog.fleet_prune_join_requests();
     }
 }

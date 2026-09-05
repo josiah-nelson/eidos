@@ -1,6 +1,6 @@
 [package]
 name = "eidos-fleet"
-description = "Authenticated duplex sync transport, node identity, and enrollment for the eidos fleet"
+description = "Authenticated duplex sync transport, node identity, and approved joining for the eidos fleet"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -30,6 +30,7 @@ base64 = { workspace = true }
 getrandom = { workspace = true }
 ts-rs = { workspace = true }
 zeroize = { workspace = true }
+mdns-sd = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]

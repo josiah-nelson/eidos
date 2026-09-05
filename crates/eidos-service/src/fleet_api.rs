@@ -1,5 +1,5 @@
-//! Fleet endpoints: status, role and listener configuration, invitations,
-//! enrollment, peer maintenance, and per-source sync policy.
+//! Fleet endpoints: status, master role, approval-based joining, peer
+//! maintenance, and per-source sync policy.
 //!
 //! These are operator actions on the loopback API, the same trust level as
 //! adding a source. The fleet's own trust boundary is the dedicated TLS
@@ -12,21 +12,19 @@ use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use eidos_catalog::fleet::{NodeId, PeerRole};
-use eidos_domain::{SourceId, SourceKind, SyncPolicy, UnixNanos};
-use eidos_fleet::enroll::{create_invite, enroll};
+use eidos_domain::{SourceId, SourceKind, SyncPolicy};
 use eidos_fleet::status::PeerView;
-use eidos_fleet::{Fleet, FleetConfig, FleetStatus, InviteCode};
+use eidos_fleet::{Fleet, FleetConfig, FleetStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
 use ts_rs::TS;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/fleet", get(status))
         .route("/fleet/central", post(set_central))
-        .route("/fleet/invite", post(invite))
-        .route("/fleet/enroll", post(enroll_node))
+        .route("/fleet/join", post(request_join).delete(cancel_join))
+        .route("/fleet/join-requests/{id}", post(decide_join))
         .route("/fleet/sync", post(set_sync))
         .route("/fleet/leave", post(leave))
         .route("/fleet/peers/{id}", post(update_peer).delete(forget_peer))
@@ -55,7 +53,7 @@ async fn read_status(fleet: Arc<Fleet>) -> Result<FleetStatus, ApiError> {
 
 #[derive(Debug, Deserialize, TS)]
 pub struct CentralBody {
-    /// Accept enrollments and replicate enrolled nodes' sources here.
+    /// Act as the master that approves nodes and holds their replicas.
     #[ts(optional)]
     pub central: Option<bool>,
     /// Sync listener address (`host:port`); `""` stops listening.
@@ -69,6 +67,19 @@ async fn set_central(
 ) -> ApiResult<FleetConfig> {
     let fleet = fleet(&st)?;
     let central = body.central;
+    if central == Some(true) {
+        let current = read_status(fleet.clone()).await?;
+        if current.enrolled {
+            return Err(ApiError::bad_request(
+                "leave the current fleet before making this node the master",
+            ));
+        }
+        if current.pending_join.is_some() {
+            return Err(ApiError::bad_request(
+                "cancel the pending join before making this node the master",
+            ));
+        }
+    }
     let listen = body
         .listen
         .map(|listen| listen.trim().to_string())
@@ -87,7 +98,18 @@ async fn set_central(
         fleet
             .update_config(move |config| {
                 if let Some(central) = central {
+                    if central && config.pending_join.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "cancel the pending join before making this node the master"
+                        ));
+                    }
                     config.central = central;
+                    if central && config.listen.is_none() && listen.is_none() {
+                        config.listen = Some(format!(
+                            "0.0.0.0:{}",
+                            eidos_fleet::config::DEFAULT_SYNC_PORT
+                        ));
+                    }
                 }
                 if let Some(listen) = listen {
                     config.listen = listen;
@@ -101,109 +123,65 @@ async fn set_central(
 }
 
 #[derive(Debug, Deserialize, TS)]
-pub struct InviteBody {
-    /// How nodes reach this central (`host:port`); defaults to this host's
-    /// name and the listener's port.
-    #[ts(optional)]
-    pub endpoint: Option<String>,
-    #[ts(optional)]
-    pub name_hint: Option<String>,
+pub struct JoinBody {
+    /// Master IP address or host name, with an optional sync port.
+    pub master: String,
 }
 
-#[derive(Debug, Serialize, TS)]
-pub struct InviteView {
-    pub code: String,
-    pub endpoint: String,
-    pub expires_at: UnixNanos,
-}
-
-fn default_endpoint(st: &AppState, config: &FleetConfig) -> Result<String, ApiError> {
-    let listen = config.listen.as_deref().ok_or_else(|| {
-        ApiError::bad_request(
-            "no sync listener is configured; set one with POST /api/fleet/central",
-        )
-    })?;
-    let addr: std::net::SocketAddr = listen
-        .parse()
-        .map_err(|e| ApiError::bad_request(format!("listen address: {e}")))?;
-    Ok(advertised_endpoint(&st.host_name, addr))
-}
-
-fn advertised_endpoint(host_name: &str, addr: std::net::SocketAddr) -> String {
-    if addr.ip().is_unspecified() {
-        format!("{host_name}:{}", addr.port())
-    } else {
-        // SocketAddr formatting preserves the brackets required by IPv6.
-        std::net::SocketAddr::new(addr.ip(), addr.port()).to_string()
-    }
-}
-
-async fn invite(
+async fn request_join(
     State(st): State<Arc<AppState>>,
-    Json(body): Json<InviteBody>,
-) -> ApiResult<InviteView> {
+    Json(body): Json<JoinBody>,
+) -> ApiResult<FleetStatus> {
     let fleet = fleet(&st)?;
-    let config = fleet.config();
-    let endpoint = match body
-        .endpoint
-        .map(|e| e.trim().to_string())
-        .filter(|e| !e.is_empty())
-    {
-        Some(e) => e,
-        None => default_endpoint(&st, &config)?,
-    };
-    let invite_endpoint = endpoint.clone();
-    let code = blocking(move || {
-        create_invite(
-            &st.catalog,
-            fleet.identity(),
-            &config,
-            &invite_endpoint,
-            body.name_hint.as_deref(),
-        )
-        .map_err(|e| ApiError::bad_request(e.to_string()))
+    fleet
+        .request_join(&body.master)
+        .await
+        .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+    Ok(ApiJson(read_status(fleet).await?))
+}
+
+async fn cancel_join(State(st): State<Arc<AppState>>) -> ApiResult<FleetStatus> {
+    let fleet = fleet(&st)?;
+    let runtime = fleet.clone();
+    blocking(move || {
+        runtime
+            .cancel_join()
+            .map_err(|error| ApiError::internal(error.to_string()))
     })
     .await?;
-    Ok(ApiJson(InviteView {
-        code: code.encode(),
-        endpoint,
-        expires_at: UnixNanos(
-            UnixNanos::now().0 + eidos_fleet::enroll::INVITE_TTL.as_nanos() as i64,
-        ),
-    }))
+    Ok(ApiJson(read_status(fleet).await?))
 }
 
 #[derive(Debug, Deserialize, TS)]
-pub struct EnrollBody {
-    pub code: String,
+pub struct JoinDecisionBody {
+    pub approve: bool,
 }
 
-#[derive(Debug, Serialize, TS)]
-pub struct EnrollView {
-    pub central: NodeId,
-    pub central_name: String,
-    pub endpoint: String,
-}
-
-async fn enroll_node(
+async fn decide_join(
     State(st): State<Arc<AppState>>,
-    Json(body): Json<EnrollBody>,
-) -> ApiResult<EnrollView> {
+    Path(request_id): Path<String>,
+    Json(body): Json<JoinDecisionBody>,
+) -> ApiResult<FleetStatus> {
     let fleet = fleet(&st)?;
-    let code = InviteCode::parse(&body.code).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let outcome = enroll(
-        &st.catalog,
-        fleet.identity(),
-        &code,
-        Duration::from_secs(15),
-    )
-    .await
-    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    Ok(ApiJson(EnrollView {
-        central: outcome.central,
-        central_name: outcome.central_name,
-        endpoint: outcome.endpoint,
-    }))
+    if !fleet.config().central {
+        return Err(ApiError::bad_request(
+            "only the designated master can approve join requests",
+        ));
+    }
+    let approve = body.approve;
+    let catalog_state = st.clone();
+    blocking(move || {
+        catalog_state
+            .catalog
+            .fleet_decide_join_request(&request_id, approve)?
+            .ok_or_else(|| ApiError::not_found(format!("join request {request_id}")))?;
+        Ok(())
+    })
+    .await?;
+    if approve {
+        fleet.counters().add(&fleet.counters().join_approvals, 1);
+    }
+    Ok(ApiJson(read_status(fleet).await?))
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -216,7 +194,7 @@ fn central_peer(st: &AppState) -> Result<eidos_catalog::fleet::FleetPeer, ApiErr
         .fleet_peers()?
         .into_iter()
         .find(|p| p.role == PeerRole::Central)
-        .ok_or_else(|| ApiError::bad_request("this node is not enrolled with a central"))
+        .ok_or_else(|| ApiError::bad_request("this node has not joined a master"))
 }
 
 /// Pause or resume transfer without forgetting anything: the ledger and
@@ -244,8 +222,8 @@ async fn set_sync(
     Ok(ApiJson(read_status(runtime).await?))
 }
 
-/// Leave the fleet: forget the central. The maintenance loop then removes
-/// the ledgers; local indexes are untouched. Rejoining is a new epoch.
+/// Leave the fleet: forget the master. The maintenance loop then removes
+/// the ledgers; local indexes are untouched. Joining again is a new epoch.
 async fn leave(State(st): State<Arc<AppState>>) -> ApiResult<FleetStatus> {
     let runtime = fleet(&st)?;
     let catalog_state = st.clone();
@@ -375,20 +353,4 @@ async fn set_sync_policy(
     })
     .await?;
     Ok(ApiJson(view))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::advertised_endpoint;
-
-    #[test]
-    fn advertised_ipv6_endpoints_keep_their_brackets() {
-        let addr = "[::1]:7710".parse().unwrap();
-        assert_eq!(advertised_endpoint("ignored", addr), "[::1]:7710");
-        let unspecified = "[::]:7710".parse().unwrap();
-        assert_eq!(
-            advertised_endpoint("central-host", unspecified),
-            "central-host:7710"
-        );
-    }
 }

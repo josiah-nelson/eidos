@@ -6,7 +6,7 @@
 
 use eidos_catalog::scan::{run_scan, RunScanOptions};
 use eidos_catalog::NewSource;
-use eidos_domain::{ContentState, SearchRequest, SourceId, SourceKind};
+use eidos_domain::{ContentState, SearchRequest, SourceId, SourceKind, SourceState};
 use eidos_search::content::object_ids;
 use eidos_search::exec::{search_with_content, ExecOptions};
 use eidos_service::content_workers::spawn_content_workers;
@@ -135,6 +135,10 @@ fn workers_drain_publish_and_survive_restart() {
     assert_eq!(view.files_failed, 0);
     assert!(view.commits >= 1);
     assert_eq!(view.published, 41);
+    assert_eq!(
+        state.catalog.get_source(sid).unwrap().unwrap().state,
+        SourceState::Complete
+    );
 
     refresh_index(&state);
     let r = search(&state, "content:omega7");

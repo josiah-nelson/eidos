@@ -114,6 +114,8 @@ pub enum StartScanError {
     RemoteSource,
     #[error("{0}")]
     Catalog(#[from] eidos_catalog::CatalogError),
+    #[error("the scan worker thread could not be started: {0}")]
+    Spawn(#[source] std::io::Error),
 }
 
 fn ensure_scannable(state: &AppState, source_id: SourceId) -> Result<(), StartScanError> {
@@ -147,7 +149,11 @@ fn deferral(now: UnixNanos, reason: String) -> ReconciliationDeferral {
     }
 }
 
-fn spawn_scan(state: &Arc<AppState>, source_id: SourceId, progress: Arc<ScanProgress>) {
+fn spawn_scan(
+    state: &Arc<AppState>,
+    source_id: SourceId,
+    progress: Arc<ScanProgress>,
+) -> std::io::Result<()> {
     let st = state.clone();
     let p = progress.clone();
     std::thread::Builder::new()
@@ -158,8 +164,8 @@ fn spawn_scan(state: &Arc<AppState>, source_id: SourceId, progress: Arc<ScanProg
                 tracing::error!(source = source_id.0, error = %e, "scan failed");
             }
             p.finish(r);
-        })
-        .expect("spawn scan thread");
+        })?;
+    Ok(())
 }
 
 /// Start a scan on a dedicated thread. Native sources run the full
@@ -188,7 +194,10 @@ pub fn start_scan(
         state.clear_reconciliation_deferral(source_id);
         progress
     };
-    spawn_scan(state, source_id, progress.clone());
+    if let Err(error) = spawn_scan(state, source_id, progress.clone()) {
+        state.scans.lock().remove(&source_id);
+        return Err(StartScanError::Spawn(error));
+    }
     Ok(progress)
 }
 
@@ -278,7 +287,10 @@ fn start_automatic_scan_with(
         state.clear_reconciliation_deferral(source_id);
         progress
     };
-    spawn_scan(state, source_id, progress.clone());
+    if let Err(error) = spawn_scan(state, source_id, progress.clone()) {
+        state.scans.lock().remove(&source_id);
+        return Err(StartScanError::Spawn(error));
+    }
     Ok(AutomaticScanOutcome::Started(progress))
 }
 

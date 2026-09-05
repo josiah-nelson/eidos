@@ -1,7 +1,7 @@
 //! One authenticated connection running the duplex protocol.
 //!
 //! After the TLS handshake each side sends a [`Hello`]; the peer is admitted
-//! from the roster (or diverted to enrollment) before any other frame is
+//! from the roster (or diverted to a quarantined join request) before any other frame is
 //! processed. Both sides then run the same loop: the *shipper* role offers
 //! this side's sync-enabled sources and streams materialized batches, the
 //! *consumer* role applies the peer's. Which sources exist decides what
@@ -16,12 +16,10 @@
 use crate::identity::NodeIdentity;
 use crate::metrics::FleetCounters;
 use crate::status::{Direction, SessionSourceView, SessionView, SyncRole};
-use crate::wire::{
-    self, EnrollmentSecret, Family, Hello, Message, Role, MAX_REPAIR_LEAF_BITS, PROTOCOL_VERSION,
-};
+use crate::wire::{self, Family, Hello, Message, Role, MAX_REPAIR_LEAF_BITS, PROTOCOL_VERSION};
 use crate::FleetConfig;
 use anyhow::{anyhow, Context};
-use eidos_catalog::fleet::{FleetPeer, NodeId, PeerRole};
+use eidos_catalog::fleet::{FleetJoinRequest, FleetPeer, JoinRequestStatus, NodeId, PeerRole};
 use eidos_catalog::replica::{
     BatchOutcome, HelloOutcome, RemoteNode, RemoteSourceDescriptor, RepairOfferOutcome,
     RepairOutcome,
@@ -38,7 +36,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch, Notify};
-use zeroize::{Zeroize, Zeroizing};
 
 /// Interval of the shipper/keepalive tick.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -47,7 +44,7 @@ pub const TICK: Duration = Duration::from_secs(1);
 pub const IDLE_PING: Duration = Duration::from_secs(30);
 /// Deadline for the hello exchange.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
-/// Hello and enrollment are deliberately tiny; unknown certificates never
+/// Hello and join requests are deliberately tiny; unknown certificates never
 /// get the full data-frame allocation budget before roster admission.
 const ADMISSION_MAX_FRAME_BYTES: usize = 64 * 1024;
 /// A peer that stops reading cannot hold a session (or shutdown) forever.
@@ -246,15 +243,14 @@ mod registry_tests {
 /// How a session ended, for the dialer's backoff and the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEnd {
-    /// The peer is not in the roster (and this side is not a central that
-    /// could enroll it).
+    /// The peer is not in the roster (and did not leave a valid join request).
     UnknownPeer,
     /// No common protocol version.
     Version,
     /// Another session to the same peer won the tie-break.
     Duplicate,
-    /// The peer enrolled; the connection served only that.
-    Enrolled(NodeId),
+    /// The peer joined; the connection served only that handshake.
+    Joined(NodeId),
     /// Orderly close or shutdown.
     Closed,
     /// The connection failed.
@@ -382,8 +378,8 @@ where
         credit_bytes: ctx.config.read().credit_bytes(),
     });
 
-    // The dialing side speaks first so an accepting central can tell an
-    // enrollment from a session before it says anything about itself.
+    // The dialing side speaks first so an accepting master can tell a join
+    // request from a session before it says anything about itself.
     if direction == Direction::Outbound {
         if let Err(e) = send(&mut wr, &my_hello, max_frame, &ctx.counters).await {
             return SessionEnd::Failed(format!("sending hello: {e}"));
@@ -422,25 +418,46 @@ where
     };
     let peer_hello = match (first, peer) {
         (
-            Message::Enroll {
-                secret,
+            Message::JoinRequest {
+                request_id,
                 name,
                 platform,
             },
             None,
         ) if direction == Direction::Inbound => {
-            return enroll_peer(
+            return request_join(
                 &ctx,
                 &mut wr,
                 max_frame,
-                peer_fingerprint,
-                secret,
-                name,
-                platform,
+                IncomingJoin {
+                    fingerprint: peer_fingerprint,
+                    request_id,
+                    name,
+                    platform,
+                    remote_addr: remote_addr.clone(),
+                },
             )
             .await;
         }
-        (Message::Hello(_), None) | (Message::Enroll { .. }, None) => {
+        (Message::JoinRequest { .. }, Some(peer))
+            if direction == Direction::Inbound
+                && peer.role == PeerRole::Node
+                && peer.node_id == crate::identity::node_id_of(&peer_fingerprint)
+                && ctx.config.read().central =>
+        {
+            let _ = send(
+                &mut wr,
+                &Message::Joined {
+                    node_id: ctx.identity.node_id,
+                    name: ctx.identity.name.clone(),
+                },
+                max_frame,
+                &ctx.counters,
+            )
+            .await;
+            return SessionEnd::Joined(peer.node_id);
+        }
+        (Message::Hello(_), None) | (Message::JoinRequest { .. }, _) => {
             ctx.counters
                 .add(&ctx.counters.connections_refused_unknown_peer, 1);
             let _ = send(
@@ -728,16 +745,21 @@ where
     end
 }
 
-async fn enroll_peer<W: AsyncWrite + Unpin>(
+struct IncomingJoin {
+    fingerprint: [u8; 32],
+    request_id: String,
+    name: String,
+    platform: String,
+    remote_addr: Option<String>,
+}
+
+async fn request_join<W: AsyncWrite + Unpin>(
     ctx: &SessionContext,
     wr: &mut W,
     max_frame: usize,
-    fingerprint: [u8; 32],
-    secret: EnrollmentSecret,
-    name: String,
-    _platform: String,
+    join: IncomingJoin,
 ) -> SessionEnd {
-    let reject = |reason: &str| Message::EnrollRejected {
+    let reject = |reason: &str| Message::JoinRejected {
         reason: reason.into(),
     };
     if !ctx.config.read().central {
@@ -752,37 +774,23 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
         .await;
         return SessionEnd::UnknownPeer;
     }
-    let Some(secret) = crate::identity::unhex::<32>(secret.as_str()) else {
-        ctx.counters
-            .add(&ctx.counters.connections_refused_unknown_peer, 1);
-        let _ = send(
-            wr,
-            &reject("malformed invitation"),
-            max_frame,
-            &ctx.counters,
-        )
-        .await;
-        return SessionEnd::UnknownPeer;
-    };
-    let secret = Zeroizing::new(secret);
-    let node_id = crate::identity::node_id_of(&fingerprint);
-    let hash = crate::InviteCode::token_hash(&secret);
-    let fallback_name = sanitize_name(&name);
-    let peer = FleetPeer {
+    let node_id = crate::identity::node_id_of(&join.fingerprint);
+    let now = UnixNanos::now();
+    let request = FleetJoinRequest {
+        request_id: join.request_id,
         node_id,
-        name: fallback_name,
-        role: PeerRole::Node,
-        fingerprint,
-        endpoint: None,
-        enabled: true,
-        enrolled_at: UnixNanos::now(),
-        last_seen_at: Some(UnixNanos::now()),
-        last_error: None,
-        connected: false,
+        name: sanitize_name(&join.name),
+        platform: sanitize_name(&join.platform),
+        fingerprint: join.fingerprint,
+        remote_addr: join.remote_addr,
+        requested_at: now,
+        last_seen_at: now,
+        status: JoinRequestStatus::Pending,
+        decided_at: None,
     };
     let catalog = ctx.catalog.clone();
-    let redeemed = match tokio::task::spawn_blocking(move || {
-        catalog.fleet_redeem_invite_and_upsert_peer(hash, &peer)
+    let recorded = match tokio::task::spawn_blocking(move || {
+        catalog.fleet_record_join_request(&request)
     })
     .await
     {
@@ -790,21 +798,20 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
         Err(e) => {
             let _ = send(
                 wr,
-                &reject("enrollment unavailable"),
+                &reject("join approval is unavailable"),
                 max_frame,
                 &ctx.counters,
             )
             .await;
-            return SessionEnd::Failed(format!("enrollment task: {e}"));
+            return SessionEnd::Failed(format!("join request task: {e}"));
         }
     };
-    match redeemed {
-        Ok(Some(_)) => {
-            ctx.counters.add(&ctx.counters.enrollments, 1);
-            tracing::info!(node = %node_id, "enrolled a fleet node");
+    match recorded {
+        Ok(request) if request.status == JoinRequestStatus::Pending => {
+            tracing::info!(node = %node_id, request = %request.request_id, "fleet join is waiting for approval");
             let _ = send(
                 wr,
-                &Message::Enrolled {
+                &Message::JoinPending {
                     node_id: ctx.identity.node_id,
                     name: ctx.identity.name.clone(),
                 },
@@ -812,17 +819,27 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
                 &ctx.counters,
             )
             .await;
-            SessionEnd::Enrolled(node_id)
+            SessionEnd::UnknownPeer
         }
-        Ok(None) => {
-            // Bounded and auditable: the attempt is counted and logged with
-            // the fingerprint only, and nothing about the roster is said.
-            ctx.counters
-                .add(&ctx.counters.connections_refused_unknown_peer, 1);
-            tracing::warn!(fingerprint = %crate::identity::hex(&fingerprint), "enrollment refused: invitation unknown, used, or expired");
+        Ok(request) if request.status == JoinRequestStatus::Approved => {
             let _ = send(
                 wr,
-                &reject("invitation is not valid"),
+                &Message::Joined {
+                    node_id: ctx.identity.node_id,
+                    name: ctx.identity.name.clone(),
+                },
+                max_frame,
+                &ctx.counters,
+            )
+            .await;
+            SessionEnd::Joined(node_id)
+        }
+        Ok(_) => {
+            ctx.counters
+                .add(&ctx.counters.connections_refused_unknown_peer, 1);
+            let _ = send(
+                wr,
+                &reject("the master rejected this join request"),
                 max_frame,
                 &ctx.counters,
             )
@@ -832,12 +849,12 @@ async fn enroll_peer<W: AsyncWrite + Unpin>(
         Err(e) => {
             let _ = send(
                 wr,
-                &reject("enrollment unavailable"),
+                &reject("join approval is unavailable"),
                 max_frame,
                 &ctx.counters,
             )
             .await;
-            SessionEnd::Failed(format!("enrollment: {e}"))
+            SessionEnd::Failed(format!("join request: {e}"))
         }
     }
 }
@@ -885,11 +902,8 @@ async fn send<W: AsyncWrite + Unpin>(
     max_frame: usize,
     counters: &FleetCounters,
 ) -> anyhow::Result<usize> {
-    let mut bytes = wire::encode(msg)?;
+    let bytes = wire::encode(msg)?;
     let result = write_encoded(wr, &bytes, max_frame, msg.kind()).await;
-    if matches!(msg, Message::Enroll { .. }) {
-        bytes.zeroize();
-    }
     let n = result?;
     counters.bytes_sent(msg.family(), n as u64);
     Ok(n)
@@ -938,8 +952,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 }
                 Ok(true)
             }
-            Message::Enroll { .. } | Message::Enrolled { .. } | Message::EnrollRejected { .. } => {
-                Err(anyhow!("enrollment message inside an established session"))
+            Message::JoinRequest { .. }
+            | Message::JoinPending { .. }
+            | Message::Joined { .. }
+            | Message::JoinRejected { .. } => {
+                Err(anyhow!("join message inside an established session"))
             }
             // ----- consumer role ---------------------------------------
             Message::Offer {

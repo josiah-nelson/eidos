@@ -1,6 +1,6 @@
-//! Node identity: a self-signed certificate whose fingerprint is the trust
-//! anchor, and the invitation code that carries a central's fingerprint to
-//! a node about to enroll.
+//! Node identity: a self-signed certificate whose fingerprint is the fleet
+//! trust anchor. A node observes the master's certificate on first contact,
+//! then pins it while its request waits for approval.
 //!
 //! There is no certificate authority. Each installation generates one
 //! ECDSA P-256 key pair and a long-lived self-signed certificate the first
@@ -370,92 +370,6 @@ fn run_icacls(path: &Path, args: &[String]) -> anyhow::Result<()> {
     }
 }
 
-/// What a central hands an operator to enroll one node: its own
-/// fingerprint (so the node can pin it before trusting anything it says),
-/// where to reach it, and a single-use secret.
-#[derive(Clone, PartialEq, Eq)]
-pub struct InviteCode {
-    pub central_fingerprint: [u8; 32],
-    pub secret: [u8; 32],
-    pub endpoint: String,
-}
-
-impl std::fmt::Debug for InviteCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InviteCode")
-            .field("central_fingerprint", &hex(&self.central_fingerprint))
-            .field("secret", &"[REDACTED]")
-            .field("endpoint", &self.endpoint)
-            .finish()
-    }
-}
-
-impl Drop for InviteCode {
-    fn drop(&mut self) {
-        self.secret.fill(0);
-    }
-}
-
-const INVITE_PREFIX: &str = "eidos-fleet-v1";
-
-impl InviteCode {
-    pub fn generate(central_fingerprint: [u8; 32], endpoint: &str) -> anyhow::Result<Self> {
-        let mut secret = [0u8; 32];
-        getrandom::fill(&mut secret).map_err(|e| anyhow!("entropy unavailable: {e}"))?;
-        Ok(Self {
-            central_fingerprint,
-            secret,
-            endpoint: endpoint.to_string(),
-        })
-    }
-
-    /// The value stored by the central: only ever the hash of the secret.
-    pub fn token_hash(secret: &[u8; 32]) -> [u8; 32] {
-        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-        ctx.update(b"eidos-fleet-invite/1");
-        ctx.update(secret);
-        ctx.finish().as_ref().try_into().expect("32 bytes")
-    }
-
-    pub fn encode(&self) -> String {
-        format!(
-            "{INVITE_PREFIX}:{}:{}:{}",
-            hex(&self.central_fingerprint),
-            hex(&self.secret),
-            self.endpoint
-        )
-    }
-
-    pub fn parse(code: &str) -> anyhow::Result<Self> {
-        let mut parts = code.trim().splitn(4, ':');
-        let prefix = parts.next().unwrap_or_default();
-        if prefix != INVITE_PREFIX {
-            return Err(anyhow!(
-                "not an eidos fleet invitation (expected `{INVITE_PREFIX}:...`)"
-            ));
-        }
-        let central_fingerprint = parts
-            .next()
-            .and_then(unhex::<32>)
-            .ok_or_else(|| anyhow!("invitation has a malformed central fingerprint"))?;
-        let secret = parts
-            .next()
-            .and_then(unhex::<32>)
-            .ok_or_else(|| anyhow!("invitation has a malformed secret"))?;
-        let endpoint = parts
-            .next()
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-            .ok_or_else(|| anyhow!("invitation names no central endpoint"))?
-            .to_string();
-        Ok(Self {
-            central_fingerprint,
-            secret,
-            endpoint,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,25 +444,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("do not match"), "{error}");
-    }
-
-    #[test]
-    fn invite_codes_round_trip_and_reject_garbage() {
-        let code = InviteCode::generate([7u8; 32], "192.0.2.10:7710").unwrap();
-        let text = code.encode();
-        assert!(text.starts_with("eidos-fleet-v1:"));
-        assert_eq!(InviteCode::parse(&text).unwrap(), code);
-        assert_eq!(InviteCode::parse(&format!("  {text}\n")).unwrap(), code);
-        assert!(InviteCode::parse("eidos-fleet-v1:zz:yy:host").is_err());
-        assert!(InviteCode::parse("hello").is_err());
-        assert!(InviteCode::parse(&text[..text.len() - "192.0.2.10:7710".len()]).is_err());
-        // The hash never equals the secret and is stable.
-        assert_ne!(InviteCode::token_hash(&code.secret), code.secret);
-        assert_eq!(
-            InviteCode::token_hash(&code.secret),
-            InviteCode::token_hash(&code.secret)
-        );
-        assert!(!format!("{code:?}").contains(&hex(&code.secret)));
-        assert!(format!("{code:?}").contains("REDACTED"));
     }
 }

@@ -76,7 +76,7 @@ enum Command {
     Content(content::ContentArgs),
     /// Manage a bounded, privacy-preserving workload observation study.
     Observe(observe::ObserveArgs),
-    /// Fleet identity, enrollment, central role, and sync status.
+    /// Fleet identity, master role, approved joining, and sync status.
     Fleet(fleet::FleetArgs),
 }
 

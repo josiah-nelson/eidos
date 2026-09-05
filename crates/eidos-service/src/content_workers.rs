@@ -25,6 +25,7 @@ use eidos_domain::{JobStage, ObjectId, SourceId, SourceState};
 use eidos_search::pipeline::{process_object, ProcessResult};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -233,36 +234,58 @@ pub fn load_workers_override(data_dir: &std::path::Path) -> Option<usize> {
 
 /// Resize the global pool at runtime and return the effective size.
 ///
-/// Durable-first, like the pause marker: the new size is written to
-/// [`WORKERS_MARKER`] before it takes effect, so what the operator is told
-/// and what a restart does never diverge (the marker overrides
-/// `--content-workers` at startup). Growing spawns the missing threads;
-/// shrinking parks the surplus after their current batch — nothing in
-/// flight is interrupted, and per-source budgets still apply on top.
+/// Growing first creates the missing threads in a parked state, then writes
+/// [`WORKERS_MARKER`] and exposes the new desired size. A spawn or marker
+/// failure therefore retains the previous effective size, while a retry
+/// continues after any threads already created. Shrinking writes the marker
+/// before parking the surplus after their current batch. Nothing in flight is
+/// interrupted, and per-source budgets still apply on top.
 pub fn resize_workers(state: &Arc<AppState>, workers: usize) -> std::io::Result<usize> {
+    resize_workers_with(state, workers, spawn_worker_thread)
+}
+
+fn spawn_worker_thread(index: usize, state: Arc<AppState>) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name(format!("content-{index}"))
+        .spawn(move || worker_loop(&state, index, &format!("content-{index}")))?;
+    Ok(())
+}
+
+/// Resize with an injectable thread spawner so partial operating-system
+/// failures are testable. Newly spawned workers park behind the old desired
+/// size until every requested thread and the durable marker are ready. A
+/// failed grow can therefore leave extra parked threads, but it cannot claim
+/// work at an uncommitted size or make restart advertise a size that never
+/// came into existence.
+fn resize_workers_with<F>(state: &Arc<AppState>, workers: usize, mut spawn: F) -> io::Result<usize>
+where
+    F: FnMut(usize, Arc<AppState>) -> io::Result<()>,
+{
     // The control/claim admission gate serialises resizes: two overlapping
     // calls would otherwise read the same `spawned` count and spawn the
     // same worker indices twice, exceeding the cap they just agreed on.
     let _admission = state.content_pause.admission_guard();
     let workers = workers.clamp(1, MAX_WORKERS);
+    let status = &state.content_workers;
+    let spawned = status.spawned.load(Ordering::Relaxed);
+
+    // Grow the parked high-water mark first, advancing `spawned` after each
+    // successful thread. If a later spawn fails, retry resumes at the first
+    // missing index instead of duplicating the threads already created.
+    for i in spawned..workers {
+        spawn(i, state.clone())?;
+        status.spawned.store(i + 1, Ordering::Relaxed);
+    }
+
+    // Only a fully realizable size becomes durable and visible. Marker
+    // failure is also safe: any just-created threads remain parked because
+    // `workers` still holds the previous desired size.
     let path = state.data_dir.join(WORKERS_MARKER);
     let tmp = path.with_extension("json.tmp");
-    let body = serde_json::to_vec(&WorkersMarker { workers }).expect("workers marker");
+    let body = serde_json::to_vec(&WorkersMarker { workers }).map_err(io::Error::other)?;
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)?;
-    let status = &state.content_workers;
     status.workers.store(workers, Ordering::Relaxed);
-    let spawned = status.spawned.load(Ordering::Relaxed);
-    for i in spawned..workers {
-        let st = state.clone();
-        std::thread::Builder::new()
-            .name(format!("content-{i}"))
-            .spawn(move || worker_loop(&st, i, &format!("content-{i}")))
-            .expect("spawn content worker");
-    }
-    if workers > spawned {
-        status.spawned.store(workers, Ordering::Relaxed);
-    }
     tracing::info!(workers, "content worker pool resized");
     Ok(workers)
 }
@@ -585,4 +608,61 @@ pub fn refresh_budgets(state: &AppState) -> anyhow::Result<Vec<eidos_catalog::So
         .collect();
     state.content_workers.budgets.set_all(&budgets);
     Ok(sources)
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+    use crate::ServiceConfig;
+
+    #[test]
+    fn partial_grow_failure_keeps_the_old_size_and_retry_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            AppState::open(&ServiceConfig {
+                data_dir: dir.path().join("data"),
+                auto_reconcile: false,
+                content_workers: 2,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        // Establish the same two-thread state startup would have, without
+        // creating real background threads in this focused failure test.
+        resize_workers_with(&state, 2, |_index, _state| Ok(())).unwrap();
+        assert_eq!(state.content_workers.workers.load(Ordering::Relaxed), 2);
+        assert_eq!(state.content_workers.spawned.load(Ordering::Relaxed), 2);
+
+        let mut attempted = Vec::new();
+        let error = resize_workers_with(&state, 6, |index, _state| {
+            attempted.push(index);
+            if index == 4 {
+                Err(io::Error::other("injected spawn failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected spawn failure");
+        assert_eq!(attempted, vec![2, 3, 4]);
+        assert_eq!(state.content_workers.spawned.load(Ordering::Relaxed), 4);
+        assert_eq!(state.content_workers.workers.load(Ordering::Relaxed), 2);
+        assert_eq!(load_workers_override(&state.data_dir), Some(2));
+
+        let mut retried = Vec::new();
+        assert_eq!(
+            resize_workers_with(&state, 6, |index, _state| {
+                retried.push(index);
+                Ok(())
+            })
+            .unwrap(),
+            6
+        );
+        assert_eq!(retried, vec![4, 5]);
+        assert_eq!(state.content_workers.spawned.load(Ordering::Relaxed), 6);
+        assert_eq!(state.content_workers.workers.load(Ordering::Relaxed), 6);
+        assert_eq!(load_workers_override(&state.data_dir), Some(6));
+        state.request_shutdown();
+    }
 }

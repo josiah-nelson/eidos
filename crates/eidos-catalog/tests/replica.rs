@@ -6,7 +6,7 @@
 //! thing under test.
 
 use eidos_catalog::changes::{ChangeEvent, NativeKey, ObjectSnapshot};
-use eidos_catalog::fleet::{FleetPeer, NodeId, PeerRole};
+use eidos_catalog::fleet::{FleetJoinRequest, FleetPeer, JoinRequestStatus, NodeId, PeerRole};
 use eidos_catalog::replica::{
     BatchOutcome, HelloOutcome, RemoteNode, RemoteSourceDescriptor, RepairOutcome,
 };
@@ -4937,58 +4937,60 @@ fn one_certificate_fingerprint_cannot_enroll_as_two_node_ids() {
 }
 
 #[test]
-fn a_lost_enrollment_response_can_retry_only_the_committed_roster_entry() {
+fn an_approved_join_is_atomic_and_a_lost_response_can_retry() {
     let central = Central::new();
-    let token_hash = [0x42; 32];
-    central
-        .catalog
-        .fleet_add_invite(
-            token_hash,
-            Some("enrolled-name"),
-            UnixNanos(UnixNanos::now().0 + 60_000_000_000),
-        )
-        .unwrap();
-    let peer = FleetPeer {
-        // This fixture already has NODE enrolled for replica tests. Use a
-        // distinct identity so the enrollment retry exercises only this
-        // invitation rather than attempting a forbidden key replacement.
+    let now = UnixNanos::now();
+    let request = FleetJoinRequest {
+        request_id: "42424242424242424242424242424242".into(),
         node_id: NodeId([0x0B; 16]),
-        name: "fallback".into(),
-        role: PeerRole::Node,
+        name: "joining-node".into(),
+        platform: "windows".into(),
         fingerprint: [0x24; 32],
-        endpoint: None,
-        enabled: true,
-        enrolled_at: UnixNanos::now(),
-        connected: false,
-        last_seen_at: None,
-        last_error: None,
+        remote_addr: Some("192.0.2.10:54321".into()),
+        requested_at: now,
+        last_seen_at: now,
+        status: JoinRequestStatus::Pending,
+        decided_at: None,
     };
-    assert!(central
-        .catalog
-        .fleet_redeem_invite_and_upsert_peer(token_hash, &peer)
-        .unwrap()
-        .is_some());
     assert_eq!(
         central
             .catalog
-            .fleet_peer(peer.node_id)
+            .fleet_record_join_request(&request)
+            .unwrap()
+            .status,
+        JoinRequestStatus::Pending
+    );
+    let approved = central
+        .catalog
+        .fleet_decide_join_request(&request.request_id, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(approved.status, JoinRequestStatus::Approved);
+    assert_eq!(
+        central
+            .catalog
+            .fleet_peer(request.node_id)
             .unwrap()
             .unwrap()
             .name,
-        "enrolled-name"
+        "joining-node"
     );
-    assert!(central
-        .catalog
-        .fleet_redeem_invite_and_upsert_peer(token_hash, &peer)
-        .unwrap()
-        .is_some());
+    // The response may be lost. Replaying the same certificate-bound attempt
+    // remains approved and never creates a second roster row.
+    let retry = central.catalog.fleet_record_join_request(&request).unwrap();
+    assert_eq!(retry.status, JoinRequestStatus::Approved);
+    assert_eq!(central.catalog.fleet_peers().unwrap().len(), 2);
 
-    central.catalog.fleet_remove_peer(peer.node_id).unwrap();
+    // Reusing the request id from another certificate is refused even after
+    // approval, and removing the peer does not make that replay admissible.
+    central.catalog.fleet_remove_peer(request.node_id).unwrap();
+    let mut impostor = request;
+    impostor.node_id = NodeId([0x0C; 16]);
+    impostor.fingerprint = [0x25; 32];
     assert!(central
         .catalog
-        .fleet_redeem_invite_and_upsert_peer(token_hash, &peer)
-        .unwrap()
-        .is_none());
+        .fleet_record_join_request(&impostor)
+        .is_err());
 }
 
 #[test]

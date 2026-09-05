@@ -110,11 +110,11 @@ for a machine install; without `ALLUSERS=1` it installs per-user).
 ## Fleet
 
 Several installations can replicate their catalog metadata into one
-central and search the union; see [fleet.md](fleet.md). Nothing in the
-setup enrolls a host: enrollment is an explicit `eidos fleet enroll` on a
-running installation, and the sync listener (port 7710 by default) is only
-opened by `eidos fleet central --listen` (add `--disable` in the same command
-when a node should listen without becoming a central).
+master and search the union; see [fleet.md](fleet.md). Setup does not join a
+host automatically. Designate the master with `eidos fleet master`, then
+select the advertised master or enter its IP address on the joining host. The
+master must approve the request from its Nodes page before synchronization
+starts. The dedicated sync listener uses port 7710 by default.
 
 ## Troubleshooting
 

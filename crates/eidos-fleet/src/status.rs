@@ -3,6 +3,7 @@
 //! freshness, last error, and any fence or repair state (sprint section
 //! 11, "operability").
 
+use crate::config::PendingJoinTarget;
 use crate::metrics::FleetCountersView;
 use eidos_catalog::fleet::NodeId;
 use eidos_domain::{SourceId, UnixNanos};
@@ -37,13 +38,18 @@ pub struct SessionSourceView {
     pub phase: String,
     /// Sequence the peer has durably acknowledged (shipping) or that this
     /// side has durably applied (consuming).
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub cursor: u64,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub head: u64,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub in_flight_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub last_error: Option<String>,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub batches: u64,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub rows: u64,
 }
 
@@ -56,8 +62,10 @@ pub struct SessionView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub remote_addr: Option<String>,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub last_activity_ms_ago: u64,
     /// Bytes this side may still put in flight towards the peer.
+    #[serde(deserialize_with = "eidos_domain::json::i64_string::deserialize")]
     pub credit_remaining: i64,
     pub sources: Vec<SessionSourceView>,
 }
@@ -80,7 +88,11 @@ pub struct PeerView {
     #[ts(optional)]
     pub last_error: Option<String>,
     /// Reconnect state when this side dials the peer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "eidos_domain::json::option_u64_string::deserialize"
+    )]
     #[ts(optional)]
     pub next_dial_in_ms: Option<u64>,
 }
@@ -96,11 +108,19 @@ pub struct LocalSourceSync {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub epoch: Option<String>,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub head_seq: u64,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub compacted_through: u64,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub backlog_rows: u64,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub backlog_tombstones: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "eidos_domain::json::option_u64_string::deserialize"
+    )]
     #[ts(optional)]
     pub backlog_oldest_age_ms: Option<u64>,
     pub degraded: bool,
@@ -115,7 +135,9 @@ pub struct ReplicaSourceSync {
     pub node_name: String,
     pub remote_source_id: SourceId,
     pub epoch: String,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub applied_seq: u64,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub reported_head: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -125,6 +147,32 @@ pub struct ReplicaSourceSync {
     pub reported_at: Option<UnixNanos>,
     pub resyncing: bool,
     pub connected: bool,
+}
+
+/// Master found through local DNS service discovery. Discovery is a
+/// convenience only; the join handshake proves and pins the certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct DiscoveredMaster {
+    pub node_id: NodeId,
+    pub name: String,
+    pub fingerprint: String,
+    pub endpoints: Vec<String>,
+    pub last_seen_at: UnixNanos,
+}
+
+/// Unknown node waiting for an operator decision on this master.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct JoinRequestView {
+    pub request_id: String,
+    pub node_id: NodeId,
+    pub name: String,
+    pub platform: String,
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub remote_addr: Option<String>,
+    pub requested_at: UnixNanos,
+    pub last_seen_at: UnixNanos,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -151,5 +199,138 @@ pub struct FleetStatus {
     /// Conditions an operator should see: backlog over its ceiling, a
     /// fenced source, a listener that failed to bind.
     pub degraded: Vec<String>,
-    pub pending_invites: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pending_join: Option<PendingJoinTarget>,
+    pub join_requests: Vec<JoinRequestView>,
+    pub discovered_masters: Vec<DiscoveredMaster>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub discovery_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn stringify_numbers(value: &mut Value) {
+        match value {
+            Value::Number(number) => *value = Value::String(number.to_string()),
+            Value::Array(values) => values.iter_mut().for_each(stringify_numbers),
+            Value::Object(values) => values.values_mut().for_each(stringify_numbers),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn api_decimal_strings_deserialize_through_the_complete_status_shape() {
+        let node = NodeId([1; 16]);
+        let status = FleetStatus {
+            node_id: node,
+            name: "node".into(),
+            fingerprint: "fingerprint".into(),
+            central: true,
+            enrolled: false,
+            sync_enabled: true,
+            listen: Some("0.0.0.0:7701".into()),
+            listening: Some("0.0.0.0:7701".into()),
+            peers: vec![PeerView {
+                node_id: node,
+                name: "peer".into(),
+                role: "node".into(),
+                fingerprint: "peer-fingerprint".into(),
+                endpoint: Some("127.0.0.1:7701".into()),
+                enabled: true,
+                connected: false,
+                last_seen_at: Some(UnixNanos(123)),
+                last_error: None,
+                next_dial_in_ms: Some(4),
+            }],
+            sessions: vec![SessionView {
+                peer: node,
+                peer_name: "peer".into(),
+                direction: Direction::Inbound,
+                since: UnixNanos(456),
+                remote_addr: Some("127.0.0.1:1234".into()),
+                last_activity_ms_ago: 5,
+                credit_remaining: -6,
+                sources: vec![SessionSourceView {
+                    source_id: SourceId(7),
+                    role: SyncRole::Shipping,
+                    phase: "streaming".into(),
+                    cursor: 8,
+                    head: 9,
+                    in_flight_bytes: 10,
+                    last_error: None,
+                    batches: 11,
+                    rows: 12,
+                }],
+            }],
+            local_sources: vec![LocalSourceSync {
+                source_id: SourceId(13),
+                name: "local".into(),
+                policy: "metadata".into(),
+                enabled: true,
+                ready: true,
+                epoch: Some("epoch".into()),
+                head_seq: 14,
+                compacted_through: 15,
+                backlog_rows: 16,
+                backlog_tombstones: 17,
+                backlog_oldest_age_ms: Some(18),
+                degraded: false,
+            }],
+            replica_sources: vec![ReplicaSourceSync {
+                source_id: SourceId(19),
+                name: "replica".into(),
+                node,
+                node_name: "node".into(),
+                remote_source_id: SourceId(20),
+                epoch: "epoch".into(),
+                applied_seq: 21,
+                reported_head: 22,
+                applied_at: Some(UnixNanos(789)),
+                reported_at: Some(UnixNanos(790)),
+                resyncing: false,
+                connected: true,
+            }],
+            counters: FleetCountersView {
+                connections_attempted: 23,
+                bytes_catalog_received: 24,
+                ..Default::default()
+            },
+            degraded: vec![],
+            pending_join: Some(PendingJoinTarget {
+                request_id: "01010101010101010101010101010101".into(),
+                endpoint: "127.0.0.1:7710".into(),
+                master_name: "master".into(),
+                master_fingerprint: "fingerprint".into(),
+                requested_at: UnixNanos(791),
+                rejected_reason: None,
+            }),
+            join_requests: vec![JoinRequestView {
+                request_id: "02020202020202020202020202020202".into(),
+                node_id: node,
+                name: "joining".into(),
+                platform: "windows".into(),
+                fingerprint: "joining-fingerprint".into(),
+                remote_addr: Some("127.0.0.1:1234".into()),
+                requested_at: UnixNanos(792),
+                last_seen_at: UnixNanos(793),
+            }],
+            discovered_masters: vec![DiscoveredMaster {
+                node_id: node,
+                name: "master".into(),
+                fingerprint: "fingerprint".into(),
+                endpoints: vec!["127.0.0.1:7710".into()],
+                last_seen_at: UnixNanos(794),
+            }],
+            discovery_error: None,
+        };
+        let mut wire = serde_json::to_value(&status).unwrap();
+        stringify_numbers(&mut wire);
+        let decoded: FleetStatus = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, status);
+    }
 }
