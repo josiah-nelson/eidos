@@ -10,12 +10,11 @@ pub mod api;
 #[cfg(test)]
 mod api_contract;
 mod api_json;
+pub mod collector_api;
 pub mod content_control;
 pub mod content_preview;
-pub mod collector_api;
 pub mod content_workers;
 pub mod export;
-pub mod update_check;
 pub mod fleet_api;
 pub mod follower;
 #[cfg(target_os = "macos")]
@@ -25,6 +24,7 @@ pub mod retry_api;
 pub mod scanner;
 pub mod source_budget;
 pub mod state;
+pub mod update_check;
 #[cfg(windows)]
 pub mod usn_apply;
 pub mod watcher;

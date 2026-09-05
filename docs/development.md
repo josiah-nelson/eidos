@@ -20,16 +20,10 @@ with no change feed.
 
 ## Commands
 
-Install the pre-push hook once per clone. CI lints Windows but does not test
-it (see `docs/adr/0019`), so on a Windows machine this hook is the only
-automated check that runs the suite on Windows before code lands:
-
-```powershell
-git config core.hooksPath scripts/hooks
-```
-
-It runs `check.ps1 -SkipWeb -SkipRelease` on pushes that touch Rust, skips
-pushes that do not, and is bypassed for one push with `git push --no-verify`.
+CI lints Windows but does not run the Windows test suite per commit (see
+`docs/adr/0019`). Windows runtime behavior is covered by the nightly and
+release gates. Run the complete local gate explicitly when a change warrants
+it; pushes do not invoke it automatically.
 
 ```powershell
 # Windows. One-shot: format check, clippy (deny warnings), all tests,
@@ -334,6 +328,16 @@ virtual paths, queued/running jobs, an unfinished content publication, and an
 open scan. It asserts a healthy catalog projection and content index reopen
 without rebuild, then checks the exact recovery counters and Activity JSON.
 
+### Onboarding, volumes, and the update check
+
+`GET /api/volumes` enumerates local drive roots (type, filesystem,
+capacity, USN eligibility) for the first-run picker the web UI shows while
+no sources exist; the same flow offers fleet enrollment. The service also
+checks GitHub releases once a day (read-only; `--no-update-check` disables
+it) and reports a newer tag through `/api/health` and a badge in the UI.
+`GET /api/collector` / `POST /api/collector/upload` surface and configure
+the local collector daemon's bundle forwarding over its control pipe.
+
 ### Extraction worker pool
 
 `eidos content workers` shows the global extraction pool;
@@ -579,7 +583,7 @@ crates/
   eidos-cli       the `eidos` binary
 web/              Vite + React + TypeScript UI
 docs/             public documentation and ADRs
-scripts/          check.ps1, check.sh, hooks/
+scripts/          check.ps1, check.sh, packaging and benchmark helpers
 ```
 
 ## Conventions

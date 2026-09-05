@@ -40,6 +40,12 @@ export type ChildrenQuery = { sort: ChildSort, desc: boolean, offset: ApiInt, li
 
 export type ChildrenView = { path: string | null, parent_id: ObjectId | null, source: SourceCompleteness, rows: Array<ChildRow>, total: ApiInt, offset: ApiInt, };
 
+export type CollectorUploadBody = { enabled?: boolean, destination?: string, hour?: number, };
+
+export type CollectorUploadView = { enabled: boolean, destination: string, hour: number, last_upload_unix_ns: ApiInt | null, uploaded_total: ApiInt, pending: ApiInt, last_error: string | null, };
+
+export type CollectorView = { available: boolean, detail: string | null, version: string | null, uptime_s: ApiInt, spool_records: ApiInt, capture_gaps: ApiInt, upload: CollectorUploadView | null, };
+
 export type ContentFlow = "disabled" | "stopped" | "draining" | "waiting" | "running";
 
 export type ContentId = string;
@@ -136,7 +142,7 @@ export type ForgetView = { retired_sources: ApiInt, };
 
 export type Freshness = "live" | "periodic" | "unknown";
 
-export type Health = { version: string, schema_version: number, host: string, uptime_s: ApiInt, catalog_path: string, sources: number, running_scans: number, export_max_rows: ApiInt, content_status: ContentStatusView, storage: StorageView, };
+export type Health = { version: string, schema_version: number, host: string, uptime_s: ApiInt, catalog_path: string, sources: number, running_scans: number, export_max_rows: ApiInt, content_status: ContentStatusView, storage: StorageView, update_available: string | null, };
 
 export type Hit = { object_id: ObjectId, entry_id?: EntryId, source_id: SourceId, host_id: HostId, kind: ObjectKind, name: string, path?: string, parent_id?: ObjectId, extension: string, size: ApiInt, allocated_size: ApiInt, modified?: UnixNanos, created?: UnixNanos, changed?: UnixNanos, attributes: FileAttributes, hard_link_count: number, content: ContentSummary, score?: number, snippets?: Array<Snippet>, directory?: DirectorySummary, archive?: ArchiveSummary, source_state: SourceState, };
 
@@ -307,6 +313,8 @@ export type TotalCount = { value: ApiInt, exact: boolean, origin: TotalOrigin, }
 export type TotalOrigin = "counted" | "cursor" | "bound";
 
 export type UnixNanos = ApiInt;
+
+export type VolumeCandidateView = { root: string, drive_type: string, filesystem: string, volume_name: string, total_bytes: ApiInt, free_bytes: ApiInt, supports_usn: boolean, already_indexed: boolean, };
 
 export type VolumeId = ApiInt;
 

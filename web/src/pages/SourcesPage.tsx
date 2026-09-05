@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
-import { api, type ApiInt, type SourceView } from '../api'
+import { api, type ApiInt, type SourceView, type VolumeCandidateView } from '../api'
+import { EnrollCard } from './FleetPage'
 import { ErrorBox, Spinner, StateBadge } from '../components'
 import { ago, bytes, count, duration, integerNumber, rate, when } from '../format'
 
@@ -34,11 +35,7 @@ export default function SourcesPage() {
       {sources.isError && <ErrorBox error={sources.error} />}
       {scan.isError && <ErrorBox error={scan.error} />}
       {sources.isPending && <Spinner />}
-      {sources.data && sources.data.length === 0 && (
-        <div className="empty">
-          No sources yet. Add a drive root such as <code>G:\</code> or a folder to begin.
-        </div>
-      )}
+      {sources.data && sources.data.length === 0 && <Onboarding onManual={() => setAdding(true)} />}
       <div className="cards">
         {sources.data?.map((s) => (
           <SourceCard
@@ -250,6 +247,105 @@ function AddSourceModal({ onClose }: { onClose: () => void }) {
           </div>
         </form>
       </div>
+    </div>
+  )
+}
+
+// First-run flow: no sources exist yet, so enumerate the machine's drives,
+// let the operator pick what to index, and offer the connect-to-master step
+// in the same breath. Falls back to manual path entry where drive
+// enumeration is unavailable (non-Windows) or the drive is not listed.
+function Onboarding({ onManual }: { onManual: () => void }) {
+  const qc = useQueryClient()
+  const vols = useQuery({ queryKey: ['volumes'], queryFn: api.volumes })
+  const [picked, setPicked] = useState<Record<string, boolean>>({})
+  const add = useMutation({
+    mutationFn: async (roots: string[]) => {
+      for (const root of roots) {
+        await api.addSource({ name: root.replace(/[\/]+$/, ''), root_path: root, scan: true })
+      }
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['sources'] }),
+  })
+  if (vols.isPending) return <Spinner label="Looking at this machine's drives…" />
+  const candidates = vols.data ?? []
+  const isPicked = (c: VolumeCandidateView) => picked[c.root] ?? (c.drive_type === 'fixed' && !c.already_indexed)
+  const chosen = candidates.filter((c) => !c.already_indexed && isPicked(c))
+  return (
+    <div className="cards">
+      <div className="card">
+        <div className="head">
+          <div className="grow">
+            <div className="name">Welcome — pick what to index</div>
+            <div className="path">metadata first (fast, read-only); content indexing follows in the background</div>
+          </div>
+        </div>
+        {vols.isError && <ErrorBox error={vols.error} />}
+        {candidates.length === 0 && (
+          <div className="muted">
+            No drives could be enumerated here. Add a drive root such as <code>G:\</code> or a folder manually.
+          </div>
+        )}
+        {candidates.length > 0 && (
+          <table className="grid">
+            <thead>
+              <tr>
+                <th />
+                <th>Drive</th>
+                <th>Type</th>
+                <th>Filesystem</th>
+                <th className="num">Size</th>
+                <th className="num">Free</th>
+                <th>Change feed</th>
+              </tr>
+            </thead>
+            <tbody>
+              {candidates.map((c) => (
+                <tr key={c.root}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={c.already_indexed || isPicked(c)}
+                      disabled={c.already_indexed || add.isPending}
+                      onChange={(e) => setPicked({ ...picked, [c.root]: e.target.checked })}
+                    />
+                  </td>
+                  <td>
+                    <span className="mono">{c.root}</span>
+                    {c.volume_name ? <span className="muted small"> {c.volume_name}</span> : null}
+                    {c.already_indexed && <span className="badge ok"> indexed</span>}
+                  </td>
+                  <td>{c.drive_type}</td>
+                  <td>{c.filesystem}</td>
+                  <td className="num">{c.total_bytes !== '0' ? bytes(c.total_bytes) : '—'}</td>
+                  <td className="num">{c.total_bytes !== '0' ? bytes(c.free_bytes) : '—'}</td>
+                  <td>
+                    {c.supports_usn ? (
+                      <span className="badge ok">live (USN)</span>
+                    ) : (
+                      <span className="badge info">periodic rescan</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {add.isError && <div className="error-text">{add.error.message}</div>}
+        <div className="actions" style={{ marginTop: 8 }}>
+          <button
+            className="btn primary"
+            disabled={chosen.length === 0 || add.isPending}
+            onClick={() => add.mutate(chosen.map((c) => c.root))}
+          >
+            {add.isPending ? 'adding…' : `Index ${chosen.length} drive${chosen.length === 1 ? '' : 's'}`}
+          </button>
+          <button className="btn" onClick={onManual}>
+            Add a folder manually
+          </button>
+        </div>
+      </div>
+      <EnrollCard onEnrolled={() => qc.invalidateQueries({ queryKey: ['fleet'] })} />
     </div>
   )
 }

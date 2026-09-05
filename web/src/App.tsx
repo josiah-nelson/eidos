@@ -25,6 +25,17 @@ export default function App() {
                 {health.data.host} · {health.data.sources} sources
                 {health.data.running_scans > 0 ? ` · ${health.data.running_scans} scanning` : ''}
               </span>
+              {health.data.update_available && (
+                <a
+                  className="badge accent"
+                  href="https://github.com/josiah-nelson/eidos/releases/latest"
+                  target="_blank"
+                  rel="noreferrer"
+                  title="a newer release is available"
+                >
+                  {health.data.update_available} available
+                </a>
+              )}
             </>
           ) : (
             <span className="badge">connecting…</span>

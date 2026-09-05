@@ -11,7 +11,8 @@
 //! runs as SYSTEM in production; a dev instance run unelevated reports the
 //! denial as a state rather than an error.
 
-use crate::api::{ApiError, ApiJson, ApiResult};
+use crate::api::{ApiError, ApiResult};
+use crate::api_json::ApiJson;
 use crate::state::AppState;
 use axum::extract::State;
 use axum::routing::{get, post};
@@ -58,8 +59,11 @@ pub struct CollectorView {
 /// `POST /api/collector/upload`: fields present are changed, absent are kept.
 #[derive(Debug, Clone, serde::Deserialize, TS)]
 pub struct CollectorUploadBody {
+    #[ts(optional)]
     pub enabled: Option<bool>,
+    #[ts(optional)]
     pub destination: Option<String>,
+    #[ts(optional)]
     pub hour: Option<u32>,
 }
 
@@ -125,9 +129,7 @@ fn apply_upload(body: &CollectorUploadBody) -> Result<(), ApiError> {
 /// The distinction operators actually need: not running vs. not allowed.
 #[cfg(windows)]
 fn collector_error(e: &anyhow::Error) -> String {
-    let io = e
-        .chain()
-        .find_map(|c| c.downcast_ref::<std::io::Error>());
+    let io = e.chain().find_map(|c| c.downcast_ref::<std::io::Error>());
     match io.map(|io| io.kind()) {
         Some(std::io::ErrorKind::NotFound) => {
             "the collector service is not installed or not running on this host".into()

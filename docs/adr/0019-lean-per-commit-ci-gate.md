@@ -1,6 +1,6 @@
 # ADR-0019: A lean per-commit CI gate
 
-Status: accepted
+Status: accepted (amended 2026-08-31)
 Date: 2026-08-25
 
 ## Context
@@ -28,8 +28,8 @@ same 37 test binaries and the same 461 tests in well under half the time.
 
 So the Windows lane was spending roughly three minutes of build to reach
 fourteen seconds of genuinely Windows-specific testing, duplicating a suite
-already covered per-commit elsewhere, and already run on Windows by
-`scripts/check.ps1` before the commit was made.
+already covered per-commit elsewhere, and available to run explicitly on
+Windows with `scripts/check.ps1` when a change warrants it.
 
 ## Decision
 
@@ -42,13 +42,15 @@ minute. What it cannot catch is Windows *runtime* behaviour.
 generated API contract check, which is generated from Rust types and is
 identical on every platform.
 
-**Windows runtime behaviour is covered three other ways**, in increasing order
-of how late they catch a problem:
+**Windows runtime behaviour is covered by two automated gates**, in increasing
+order of how late they catch a problem:
 
-- `scripts/check.ps1` runs the whole suite on Windows before a commit.
-- `nightly.yml` runs it every night and files a task when it fails, because a
-  nightly nobody reads is not a gate.
-- `release.yml` runs it on a tag before anything is built or signed.
+- `nightly.yml` runs the whole suite every night and files a task when it
+  fails, because a nightly nobody reads is not a gate.
+- `release.yml` runs it on a tag before anything is published.
+
+The repository still provides `scripts/check.ps1` for deliberate local use,
+but it is not installed as a Git hook and a push does not run it implicitly.
 
 ## Consequences
 
@@ -58,9 +60,9 @@ class of bug is real for this codebase, and the trade is deliberate: the cost
 of finding one at nightly or release time is bounded and rare, while the cost
 of the slow gate was paid on every commit.
 
-The risk concentrates on `scripts/check.ps1` actually being run. It is the
-only Windows check that happens before code lands, so skipping it moves the
-whole burden onto the nightly.
+Windows-specific runtime regressions may land before the nightly reports them.
+The repository intentionally accepts that delay instead of imposing the full
+Windows suite on every push.
 
 If the nightly starts failing for Windows-specific reasons more than
 occasionally, the answer is to move the offending tests back onto the

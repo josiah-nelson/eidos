@@ -312,7 +312,7 @@ function InviteCard() {
 }
 
 // Node side of the handshake: redeem a code from a central.
-function EnrollCard({ onEnrolled }: { onEnrolled: () => void }) {
+export function EnrollCard({ onEnrolled }: { onEnrolled: () => void }) {
   const [code, setCode] = useState('')
   const enroll = useMutation({ mutationFn: () => api.fleetEnroll(code.trim()), onSuccess: onEnrolled })
   return (

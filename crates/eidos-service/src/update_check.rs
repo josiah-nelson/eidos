@@ -22,7 +22,10 @@ const FIRST_DELAY: Duration = Duration::from_secs(60);
 pub fn newer_release(current: &str, tag: &str) -> Option<String> {
     let parse = |v: &str| -> Option<Vec<u64>> {
         let v = v.trim().trim_start_matches('v');
-        let parts: Vec<u64> = v.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+        let parts: Vec<u64> = v
+            .split('.')
+            .map(|p| p.parse().ok())
+            .collect::<Option<_>>()?;
         (!parts.is_empty()).then_some(parts)
     };
     let cur = parse(current)?;
@@ -97,6 +100,10 @@ mod tests {
         assert_eq!(newer_release("0.5.0", "v0.5.0"), None);
         assert_eq!(newer_release("0.5.1", "v0.5.0"), None);
         assert_eq!(newer_release("0.5.0", "v1.0"), Some("v1.0".into()));
-        assert_eq!(newer_release("0.5.0", "nightly"), None, "non-numeric tags never fire");
+        assert_eq!(
+            newer_release("0.5.0", "nightly"),
+            None,
+            "non-numeric tags never fire"
+        );
     }
 }

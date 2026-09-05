@@ -963,6 +963,7 @@ dependencies = [
  "eidos-query",
  "eidos-scanner",
  "eidos-search",
+ "eidos-windows-collector",
  "futures-core",
  "http-body-util",
  "parking_lot",
@@ -976,6 +977,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "ts-rs",
+ "ureq",
 ]
 
 [[package]]

@@ -38,6 +38,7 @@ pub fn router(state: Arc<AppState>, web_dir: Option<&std::path::Path>) -> Router
 pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
     let api = Router::new()
         .route("/health", get(health))
+        .route("/volumes", get(volumes))
         .route("/sources", get(list_sources).post(add_source))
         .route("/sources/{id}", get(get_source))
         .route("/sources/{id}/scan", post(scan_source))
@@ -57,6 +58,7 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
         )
         .route("/sources/{id}/archives", post(requeue_archives))
         .merge(crate::content_control::routes())
+        .merge(crate::collector_api::routes())
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())
         .merge(crate::fleet_api::routes())
@@ -260,6 +262,8 @@ pub(crate) struct Health {
     content_status: crate::content_control::ContentStatusView,
     /// On-disk footprint of the catalog and indexes.
     storage: StorageView,
+    /// Newer release tag from the daily update check, when one exists.
+    update_available: Option<String>,
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
@@ -285,11 +289,59 @@ async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
             export_max_rows: st.export.max_rows,
             content_status: crate::content_control::content_status(&st),
             storage: st.storage(),
+            update_available: st.update_available.lock().clone(),
         })
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))??;
     Ok(ApiJson(view))
+}
+
+/// One local drive the onboarding picker can offer.
+#[derive(Serialize, TS)]
+pub struct VolumeCandidateView {
+    /// Drive root such as `G:\`.
+    pub root: String,
+    /// `fixed`, `removable`, `remote`, `cdrom`, or `ramdisk`.
+    pub drive_type: String,
+    pub filesystem: String,
+    pub volume_name: String,
+    /// Zero when the OS would not say.
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// Eligible for the USN incremental fast path.
+    pub supports_usn: bool,
+    /// A source already covers exactly this root.
+    pub already_indexed: bool,
+}
+
+/// Local volumes for source selection. Empty on platforms without drive
+/// enumeration; the UI falls back to manual path entry.
+async fn volumes(State(st): State<Arc<AppState>>) -> ApiResult<Vec<VolumeCandidateView>> {
+    blocking(move || {
+        let roots: Vec<String> = st
+            .catalog
+            .list_sources()?
+            .iter()
+            .map(|s| eidos_scanner::normalize_root(&s.root_path))
+            .collect();
+        Ok(ApiJson(
+            eidos_scanner::local_volume_candidates()
+                .into_iter()
+                .map(|c| VolumeCandidateView {
+                    already_indexed: roots.contains(&eidos_scanner::normalize_root(&c.root)),
+                    root: c.root,
+                    drive_type: c.drive_type,
+                    filesystem: c.filesystem,
+                    volume_name: c.volume_name,
+                    total_bytes: c.total_bytes,
+                    free_bytes: c.free_bytes,
+                    supports_usn: c.supports_usn,
+                })
+                .collect(),
+        ))
+    })
+    .await
 }
 
 // ----- sources -------------------------------------------------------------

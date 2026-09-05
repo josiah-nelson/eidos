@@ -4,6 +4,8 @@
 import type {
   ActivityView,
   CentralBody,
+  CollectorUploadBody,
+  CollectorView,
   AddSourceBody,
   ApiErrorBody,
   ApiInt,
@@ -36,6 +38,7 @@ import type {
   SortField,
   SourceDetail,
   SourceView,
+  VolumeCandidateView,
   WorkersView,
 } from './generated/api'
 import type { PreviewWindow } from './preview-window'
@@ -174,6 +177,11 @@ export const api = {
     request<PeerView>(`/api/fleet/peers/${id}`, { method: 'POST', body: JSON.stringify(body) }),
   forgetFleetPeer: (id: string) =>
     request<ForgetView>(`/api/fleet/peers/${id}`, { method: 'DELETE' }),
+  volumes: () => request<VolumeCandidateView[]>('/api/volumes'),
+  collector: () => request<CollectorView>('/api/collector'),
+  /** Configure collector bundle forwarding; absent fields keep their value. */
+  setCollectorUpload: (body: CollectorUploadBody) =>
+    request<CollectorView>('/api/collector/upload', { method: 'POST', body: JSON.stringify(body) }),
   contentWorkers: () => request<WorkersView>('/api/content/workers'),
   /** Resize the global extraction pool; durable across restarts. */
   setContentWorkers: (workers: number) =>

@@ -196,8 +196,11 @@ Keychain Access only when prior study tokens no longer need to remain stable.
 The Windows lane set runs as the `eidos-collector` service (LocalSystem,
 delayed automatic start, restart on failure) and is controlled over a local
 named pipe by `eidos observe` from an elevated prompt. It has no listener and
-no remote control; its only outbound path is the optional scheduled upload
-described below, which the collector initiates and which is off by default.
+no remote control; its only outbound path is the scheduled bundle upload
+described below, which the collector initiates. Delivery is enabled by
+default — installing the collector is the opt-in — but stays idle until a
+destination share is configured (from the service's Activity page, the
+installer, or `eidos observe configure`).
 Install and run:
 
 ```powershell
