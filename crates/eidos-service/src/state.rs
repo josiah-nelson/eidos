@@ -94,10 +94,8 @@ pub struct AppState {
     pub data_dir: std::path::PathBuf,
     /// Cached on-disk footprint; recomputed lazily by [`AppState::storage`].
     pub storage_cache: Mutex<Option<(Instant, crate::api::StorageView)>>,
-    /// Newer release tag from the daily update check, if any.
-    pub update_available: Mutex<Option<String>>,
-    /// Whether the daily release check runs at all.
-    pub update_check: bool,
+    /// Durable advisory discovery and verified artifact staging.
+    pub updates: Arc<crate::updates::UpdateManager>,
     pub(crate) volume_candidates:
         Arc<crate::background_probe::BackgroundProbe<Vec<eidos_scanner::VolumeCandidate>>>,
     pub resources: Arc<crate::resource_control::ResourceControl>,
@@ -241,8 +239,10 @@ impl AppState {
                 .unwrap_or(config.content_workers),
             data_dir: config.data_dir.clone(),
             storage_cache: Mutex::new(None),
-            update_available: Mutex::new(None),
-            update_check: config.update_check,
+            updates: Arc::new(crate::updates::UpdateManager::load(
+                &config.data_dir,
+                config.update_check,
+            )?),
             volume_candidates: Arc::new(crate::background_probe::BackgroundProbe::default()),
             resources: Arc::new(crate::resource_control::ResourceControl::load(
                 &config.data_dir,
@@ -403,7 +403,7 @@ impl AppState {
         crate::watcher::spawn_reconciler(self);
         crate::follower::spawn_follower(self);
         crate::content_workers::spawn_content_workers(self, self.content_worker_count);
-        if self.update_check {
+        if self.updates.view().checks_enabled {
             crate::update_check::spawn_update_check(self);
         }
         Ok(())

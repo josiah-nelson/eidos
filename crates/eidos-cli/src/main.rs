@@ -31,6 +31,7 @@ mod service;
 #[cfg(target_os = "macos")]
 #[path = "service_launchd.rs"]
 mod service;
+mod updates;
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -81,6 +82,8 @@ enum Command {
     Exclusions(exclusions::ExclusionArgs),
     /// Fleet identity, master role, approved joining, and sync status.
     Fleet(fleet::FleetArgs),
+    /// Check releases and stage a verified installer without installing it.
+    Updates(updates::UpdateArgs),
 }
 
 /// Everything that configures a running service. Shared by `serve`
@@ -304,6 +307,7 @@ fn main() -> anyhow::Result<()> {
         Command::Resources(args) => resources::run(args),
         Command::Exclusions(args) => exclusions::run(args),
         Command::Fleet(args) => fleet::run(args),
+        Command::Updates(args) => updates::run(args),
         #[cfg(any(windows, target_os = "macos"))]
         Command::Service(args) => service::run(args, cli.log, cli.log_json),
         Command::Search(args) => {

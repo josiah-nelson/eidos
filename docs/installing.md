@@ -1,5 +1,17 @@
 # Installing eidos on Windows
 
+## Preparing a newer release
+
+`eidos updates check` records a compatible newer canonical release.
+`eidos updates configure --expected-publisher '<certificate subject>'` pins the
+required Authenticode publisher, and `eidos updates stage` downloads and
+verifies the setup without running it. The Nodes page offers the same check,
+configuration, and staging controls. Staged files remain under the Eidos data
+directory and interrupted or failed verification is reported after restart.
+
+This is not an upgrade command. Install and fleet rollout remain disabled
+until the drain/install/restart/health lifecycle is implemented and qualified.
+
 These instructions describe the collector-free recovery build. v0.5.0 does
 not contain the recovery fixes; do not treat a source build or a passing CI
 run as a qualified replacement release. See [recovery.md](recovery.md).

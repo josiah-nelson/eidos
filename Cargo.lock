@@ -916,6 +916,7 @@ dependencies = [
  "http-body-util",
  "libc",
  "parking_lot",
+ "ring",
  "rust-embed",
  "serde",
  "serde_json",

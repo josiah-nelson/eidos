@@ -10,6 +10,8 @@ import {
   type PeerView,
   type ReplicaSourceSync,
   type SessionView,
+  type UpdateState,
+  type UpdateSettings,
 } from '../api'
 import { ErrorBox, Spinner } from '../components'
 import { ago, bytes, count, duration, integerNumber, when } from '../format'
@@ -97,6 +99,7 @@ export default function FleetPage() {
 
       <div className="cards">
         <ThisNode f={f} />
+        <UpdatePreparation />
         {f.central ? <MasterDiscovery f={f} /> : !f.enrolled ? <JoinCard f={f} /> : null}
       </div>
 
@@ -193,6 +196,65 @@ export default function FleetPage() {
         </>
       )}
     </>
+  )
+}
+
+function UpdatePreparation() {
+  const qc = useQueryClient()
+  const q = useQuery({ queryKey: ['updates'], queryFn: api.updateStatus, refetchInterval: 5000, retry: false })
+  const settings = useQuery({ queryKey: ['update-settings'], queryFn: api.updateSettings, retry: false })
+  const refresh = useMutation({ mutationFn: api.checkForUpdates, onSuccess: (data) => qc.setQueryData(['updates'], data) })
+  const stage = useMutation({ mutationFn: api.stageUpdate, onSuccess: (data) => qc.setQueryData(['updates'], data) })
+  if (q.isPending) return <div className="card"><div className="name">Update preparation</div><div className="muted small">Loading release status…</div></div>
+  if (q.isError) return <div className="card"><div className="name">Update preparation</div><div className="error-text">{q.error.message}</div></div>
+  const u: UpdateState = q.data
+  return (
+    <div className="card">
+      <div className="head">
+        <div className="grow">
+          <div className="name">Update preparation</div>
+          <div className="path">Checks and stages the canonical signed setup. Installation and fleet rollout are not enabled yet.</div>
+        </div>
+        <span className={`badge ${u.stage_phase === 'staged' ? 'ok' : u.stage_phase === 'failed' ? 'bad' : 'info'}`}>{u.stage_phase}</span>
+      </div>
+      <div className="muted small">
+        Running {u.current_version}. {u.available ? `Release ${u.available.version} is available (${bytes(integerNumber(u.available.size))}).` : 'No compatible newer release is recorded.'}
+      </div>
+      {u.check_error && <div className="error-text">Check failed: {u.check_error}</div>}
+      {u.stage_error && <div className="error-text">Staging failed: {u.stage_error}</div>}
+      {u.staged && <div className="muted small">Verified {u.staged.product} {u.staged.version} from {u.staged.publisher}.</div>}
+      <div className="actions" style={{ marginTop: 8 }}>
+        <button type="button" className="btn small" disabled={refresh.isPending || stage.isPending} onClick={() => refresh.mutate()}>Check now</button>
+        <button type="button" className="btn small" disabled={!u.available || refresh.isPending || stage.isPending} onClick={() => stage.mutate()}>{stage.isPending ? 'Staging…' : 'Verify & stage'}</button>
+      </div>
+      {settings.data && <UpdateSettingsForm key={JSON.stringify(settings.data)} initial={settings.data} />}
+      {refresh.isError && <div className="error-text">{refresh.error.message}</div>}
+      {stage.isError && <div className="error-text">{stage.error.message}</div>}
+    </div>
+  )
+}
+
+function UpdateSettingsForm({ initial }: { initial: UpdateSettings }) {
+  const qc = useQueryClient()
+  const [publisher, setPublisher] = useState(initial.expected_publisher ?? '')
+  const [automatic, setAutomatic] = useState(initial.automatic_checks)
+  const save = useMutation({
+    mutationFn: () => api.saveUpdateSettings({ ...initial, automatic_checks: automatic, expected_publisher: publisher.trim() || null }),
+    onSuccess: (state) => {
+      qc.setQueryData(['updates'], state)
+      qc.invalidateQueries({ queryKey: ['update-settings'] })
+    },
+  })
+  return (
+    <div className="form" style={{ marginTop: 10 }}>
+      <label>
+        Expected publisher certificate subject
+        <input type="text" value={publisher} onChange={(e) => setPublisher(e.target.value)} placeholder="Required before staging" />
+      </label>
+      <label className="toggle"><input type="checkbox" checked={automatic} onChange={(e) => setAutomatic(e.target.checked)} /> automatic daily checks</label>
+      <button type="button" className="btn small" disabled={save.isPending} onClick={() => save.mutate()}>Save update settings</button>
+      {save.isError && <div className="error-text">{save.error.message}</div>}
+    </div>
   )
 }
 

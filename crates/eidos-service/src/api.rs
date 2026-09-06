@@ -65,6 +65,7 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())
         .merge(crate::fleet_api::routes())
+        .merge(crate::updates::routes())
         .route("/resolve", get(resolve))
         .route("/search", post(search).get(search_get))
         .route(
@@ -292,7 +293,11 @@ async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
             export_max_rows: st.export.max_rows,
             content_status: crate::content_control::content_status(&st),
             storage: st.storage(),
-            update_available: st.update_available.lock().clone(),
+            update_available: st
+                .updates
+                .view()
+                .available
+                .map(|a| format!("v{}", a.version)),
         })
     })
     .await

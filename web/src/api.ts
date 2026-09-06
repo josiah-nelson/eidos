@@ -46,6 +46,8 @@ import type {
   SourceView,
   VolumeCandidateView,
   WorkersView,
+  UpdateSettings,
+  UpdateState,
 } from './generated/api'
 import type { PreviewWindow } from './preview-window'
 
@@ -178,6 +180,11 @@ export const api = {
   setContentPaused: (paused: boolean) =>
     request<ContentStatusView>(`/api/content/${paused ? 'pause' : 'resume'}`, { method: 'POST' }),
   fleetStatus: () => request<FleetStatus>('/api/fleet'),
+  updateStatus: () => request<UpdateState>('/api/updates'),
+  checkForUpdates: () => request<UpdateState>('/api/updates/check', { method: 'POST' }),
+  stageUpdate: () => request<UpdateState>('/api/updates/stage', { method: 'POST' }),
+  updateSettings: () => request<UpdateSettings>('/api/updates/settings'),
+  saveUpdateSettings: (body: UpdateSettings) => request<UpdateState>('/api/updates/settings', { method: 'POST', body: JSON.stringify(body) }),
   setFleetCentral: (body: CentralBody) =>
     request<FleetConfig>('/api/fleet/central', { method: 'POST', body: JSON.stringify(body) }),
   requestFleetJoin: (master: string) =>

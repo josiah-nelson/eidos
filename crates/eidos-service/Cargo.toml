@@ -27,6 +27,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 ts-rs = { workspace = true }
 parking_lot = { workspace = true }
+ring = { workspace = true }
 rust-embed = { workspace = true }
 # Release update check (read-only GitHub API poll).
 ureq = { version = "3.4", features = ["json"] }

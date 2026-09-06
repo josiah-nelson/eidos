@@ -139,6 +139,8 @@ fn typescript_contract() -> String {
     types.add::<crate::fleet_api::PeerBody>();
     types.add::<crate::fleet_api::ForgetView>();
     types.add::<crate::fleet_api::SyncPolicyBody>();
+    types.add::<crate::updates::UpdateState>();
+    types.add::<crate::updates::UpdateSettings>();
 
     types.finish()
 }
