@@ -126,9 +126,15 @@ jobs:
             $pause = Invoke-RestMethod "$url/api/content/status" -TimeoutSec 10
             Assert-Retained 'content pause' $pause.paused $true
             Assert-Retained 'in-flight batches' $pause.in_flight 0
-            # `ready` means the content index still reflects every stored
-            # chunk: an installer operation that lost it would rebuild.
             Assert-Retained 'content search state' $pause.search 'ready'
+            # `ready` on its own would also describe an index that was lost and
+            # rebuilt from stored chunks before this ran: startup schedules that
+            # whenever the index is empty and the catalog still holds chunks,
+            # and four files rebuild far too fast to observe. A service that
+            # never rebuilt reports an idle phase and zero rebuilt documents,
+            # which is what separates a retained index from a reconstructed one.
+            Assert-Retained 'content index rebuild phase' $pause.rebuild.phase 'idle'
+            Assert-Retained 'rebuilt content documents' $pause.rebuild.docs 0
             $search = Invoke-RestMethod "$url/api/search?q=content%3A%3Drecoveryinstallneedle&limit=10&count=exact" -TimeoutSec 15
             Assert-Retained 'content match total' ([long]$search.total.value) 4
             Assert-Retained 'content total exactness' $search.total.exact $true
