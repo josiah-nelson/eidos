@@ -56,10 +56,21 @@ that source's application and is shown with **Retry application**. Resolve the
 store error first; a retry does not replace the rules or increment the revision.
 Application also runs when content extraction is paused or globally disabled.
 
-Path changes that affect inherited decisions schedule the same catalog-only
-pass. A directory move may therefore temporarily hold content claims for that
-source. These are bounded object pages, not a hard byte/time limit on deleting
-one very large object's cached chunks or archive manifest.
+Path changes that affect inherited decisions schedule a separate durable
+subtree repair. The move, native checkpoint and deduplicated repair root commit
+together. The coordinator expands indexed direct-child entries and checks at
+most 128 objects or child edges per turn; it does not crawl the source or build
+the whole subtree in memory. Unaffected content claims continue while the UI
+shows checked, changed and pending-frontier counts. Coverage remains incomplete
+until affected content deletions commit and are acknowledged. Repair resumes
+after restart, and a recorded repair error uses the same Retry action.
+An outstanding delete fences only that object from new content work. Its
+generation-bound acknowledgement cannot clear cleanup advanced by a later
+in-flight publication.
+
+The bound is catalog work rather than a hard byte/time limit on deleting one
+very large object's cached chunks or archive manifest. Current-path evaluation
+also depends on path depth, capped at 512 catalog components.
 
 ## Eidos's own directories
 

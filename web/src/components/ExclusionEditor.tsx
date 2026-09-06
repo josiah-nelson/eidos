@@ -35,6 +35,7 @@ function Editor({ sourceId, saved }: { sourceId: string; saved: ExclusionPolicy 
   })
   const retry = useMutation({ mutationFn: () => api.retryExclusions(sourceId), onSuccess: refresh })
   const busy = saved.phase !== 'applied'
+  const repairing = saved.repair_phase !== 'applied'
   const disabled = apply.isPending || preview.isPending || busy
   const edit = (value: ExclusionRule[]) => { setRules(value); apply.reset(); preview.reset() }
   // IDs are labels, not credentials. This also works on plain-HTTP LAN URLs
@@ -54,8 +55,13 @@ function Editor({ sourceId, saved }: { sourceId: string; saved: ExclusionPolicy 
     <p role="status">Policy revision {saved.revision} · {humanState(saved.phase)} · {count(saved.processed)} objects checked · {count(saved.changed)} changed</p>
     {busy && <p className="banner warn">New scans and content claims for this source are waiting. Current files drain first;
       catalog updates and old content cleanup then run in batches. Application resumes after restart. Check errors below if progress stops.</p>}
+    {repairing && <p className="banner warn" role="status">Changed paths are being checked in bounded subtree pages: {count(saved.repair_processed)} objects checked,
+      {' '}{count(saved.repair_changed)} changed, {count(saved.repair_pending)} frontier items pending. Content work outside affected paths continues.
+      Repair and cleanup resume after restart.</p>}
     {saved.error && <div className="banner bad" role="alert">Application stopped: {saved.error}{' '}
       <button disabled={retry.isPending} onClick={() => retry.mutate()}>Retry application</button></div>}
+    {saved.repair_error && <div className="banner bad" role="alert">Path repair stopped: {saved.repair_error}{' '}
+      <button disabled={retry.isPending} onClick={() => retry.mutate()}>Retry path repair</button></div>}
     {retry.isError && <ErrorBox error={retry.error} />}
     {saved.protected_directories.length > 0 && <div className="banner warn">
       Eidos storage is automatically protected from enumeration and content reads:

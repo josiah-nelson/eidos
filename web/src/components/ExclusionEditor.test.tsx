@@ -5,7 +5,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { api, type ExclusionPolicy } from '../api'
 import ExclusionEditor from './ExclusionEditor'
 
-const initial: ExclusionPolicy = { revision: 0, engine_version: 3, rules: [], phase: 'applied', processed: '0', changed: '0', error: null, protected_directories: ['.eidos'], case_sensitive: false }
+const initial: ExclusionPolicy = {
+  revision: 0, engine_version: 3, rules: [], phase: 'applied', processed: '0', changed: '0', error: null,
+  repair_phase: 'applied', repair_processed: '0', repair_changed: '0', repair_pending: '0', repair_error: null,
+  protected_directories: ['.eidos'], case_sensitive: false,
+}
 let client: QueryClient
 beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
@@ -88,6 +92,22 @@ test('durable application errors and protected coverage are visible with retry',
   await userEvent.click(screen.getByRole('button', { name: 'Retry application' }))
   await waitFor(() => expect(api.retryExclusions).toHaveBeenCalledWith('1'))
   await waitFor(() => expect(screen.queryByText(/Application stopped/)).toBeNull())
+})
+
+test('subtree repair reports bounded progress while unrelated policy work stays available', async () => {
+  vi.mocked(api.exclusionPolicy).mockResolvedValue({
+    ...initial,
+    repair_phase: 'applying', repair_processed: '128', repair_changed: '3', repair_pending: '7',
+    repair_error: 'cleanup unavailable',
+  })
+  mount()
+  await screen.findByText(/Changed paths are being checked in bounded subtree pages/)
+  expect(screen.getByText(/128 objects checked/).textContent).toContain('3 changed')
+  expect(screen.getByText(/Content work outside affected paths continues/)).not.toBeNull()
+  await addFolder()
+  expect((screen.getByRole('button', { name: 'Apply to existing and future files' }) as HTMLButtonElement).disabled).toBe(false)
+  await userEvent.click(screen.getByRole('button', { name: 'Retry path repair' }))
+  await waitFor(() => expect(api.retryExclusions).toHaveBeenCalledWith('1'))
 })
 
 test('replica editor directs changes to origin without fetching local policy', async () => {

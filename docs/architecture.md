@@ -172,6 +172,8 @@ Minimum logical tables:
 - `policy_decisions`
 - `source_policy`, `protected_paths`, `policy_cleanup` (versioned rules and
   resumable cross-index application; [ADR-0028](adr/0028-versioned-content-exclusions.md))
+- `policy_repair_state`, `policy_repair_frontier` (bounded path-change repair;
+  [ADR-0033](adr/0033-bounded-subtree-policy-repair.md))
 - `errors`
 - later `entities`, `edges`, `symbols`, and `occurrences`
 

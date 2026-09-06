@@ -103,7 +103,8 @@ impl Fx {
             apply_policies_once(&self.state).unwrap();
             let status = self.state.catalog.exclusion_policy(self.source).unwrap();
             assert!(status.error.is_none(), "{status:?}");
-            if status.phase == "applied" {
+            assert!(status.repair_error.is_none(), "{status:?}");
+            if status.phase == "applied" && status.repair_phase == "applied" {
                 return;
             }
         }
@@ -497,7 +498,7 @@ fn nested_store_boundaries_stay_relative_and_never_protect_the_whole_source() {
 }
 
 #[test]
-fn a_file_rename_does_not_restart_a_whole_source_pass_unless_its_decision_changes() {
+fn a_file_rename_repairs_only_the_changed_object_without_closing_source_admission() {
     use eidos_catalog::changes::ChangeEvent;
     let f = Fx::new(1, false);
     f.index("docs/n0.txt");
@@ -546,16 +547,109 @@ fn a_file_rename_does_not_restart_a_whole_source_pass_unless_its_decision_change
             .unwrap()
             .content_enabled
     );
-    // A rename that does change the decision still schedules the pass.
+    // A rename that changes the decision schedules only that object's repair.
     f.apply(vec![folder("docs/quarantine.txt")]);
     f.settle();
     rename("n1.txt", "quarantine.txt");
-    assert!(f.state.catalog.policy_applying(f.source).unwrap());
+    assert!(!f.state.catalog.policy_applying(f.source).unwrap());
+    let repairing = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(repairing.repair_phase, "applying");
+    assert_eq!(repairing.repair_pending, 1);
+    assert!(
+        f.state
+            .catalog
+            .content_target(f.id("docs/quarantine.txt"))
+            .unwrap()
+            .unwrap()
+            .content_enabled,
+        "subtree repair must not close admission for the source"
+    );
     f.settle();
     assert_eq!(
         f.state
             .catalog
             .get_object(f.id("docs/quarantine.txt"))
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Excluded
+    );
+    assert_eq!(f.state.content_index.num_docs(), 0);
+}
+
+#[test]
+fn hard_links_keep_canonical_path_policy_until_the_canonical_link_is_removed() {
+    use eidos_catalog::changes::ChangeEvent;
+    let f = Fx::new(1, false);
+    f.apply(vec![folder("quarantine.txt")]);
+    f.settle();
+    f.index("docs/n0.txt");
+    let id = f.id("docs/n0.txt");
+    let before_generation = f.state.catalog.get_object(id).unwrap().unwrap().generation;
+    let (_, mut snapshot) = native(&f, "docs/n0.txt");
+    snapshot.link_count = 2;
+    let root = f
+        .state
+        .catalog
+        .get_source(f.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let parent = f
+        .state
+        .catalog
+        .get_object(root)
+        .unwrap()
+        .unwrap()
+        .native
+        .unwrap()
+        .into();
+    f.state
+        .catalog
+        .apply_changes(
+            f.source,
+            &[ChangeEvent::Link {
+                parent,
+                name: "quarantine.txt".into(),
+                snapshot,
+            }],
+            None,
+        )
+        .unwrap();
+    assert_eq!(f.id("quarantine.txt"), id);
+    assert_eq!(
+        f.state.catalog.get_object(id).unwrap().unwrap().generation,
+        before_generation,
+        "adding a noncanonical hard link must not force re-extraction"
+    );
+    assert_eq!(
+        f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase,
+        "applied"
+    );
+
+    f.state
+        .catalog
+        .apply_changes(
+            f.source,
+            &[ChangeEvent::Unlink {
+                parent: native(&f, "docs").0,
+                name: "n0.txt".into(),
+            }],
+            None,
+        )
+        .unwrap();
+    let repairing = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(repairing.repair_phase, "applying");
+    f.settle();
+    assert_eq!(
+        f.state
+            .catalog
+            .get_object(id)
             .unwrap()
             .unwrap()
             .content_state,
@@ -579,7 +673,13 @@ fn only_objects_that_stored_content_queue_a_derived_index_deletion() {
     // 299 of them never produced chunks or a content record, so queuing them
     // would commit a page of no-op index deletions for each 128 objects.
     assert_eq!(
-        f.state.catalog.policy_cleanup_batch(f.source).unwrap(),
+        f.state
+            .catalog
+            .policy_cleanup_batch(f.source)
+            .unwrap()
+            .iter()
+            .map(|cleanup| cleanup.object_id)
+            .collect::<Vec<_>>(),
         vec![indexed]
     );
     f.settle();
@@ -595,7 +695,7 @@ fn only_objects_that_stored_content_queue_a_derived_index_deletion() {
 }
 
 #[test]
-fn a_move_during_application_queues_one_more_pass_instead_of_discarding_progress() {
+fn a_move_during_full_application_keeps_its_cursor_and_queues_subtree_repair() {
     use eidos_catalog::changes::ChangeEvent;
     let f = Fx::new(300, false);
     f.apply(vec![folder("hidden")]);
@@ -643,8 +743,8 @@ fn a_move_during_application_queues_one_more_pass_instead_of_discarding_progress
             None,
         )
         .unwrap();
-    // The running pass keeps its cursor: repeated moves must not be able to
-    // rewind it forever and hold this source's content claims closed.
+    // The running full revision keeps its cursor. The move is recorded in the
+    // independent repair frontier instead of rewinding this source-wide pass.
     assert_eq!(
         f.state
             .catalog
@@ -653,7 +753,15 @@ fn a_move_during_application_queues_one_more_pass_instead_of_discarding_progress
             .processed,
         progressed
     );
-    // It still converges, and the queued pass observes the moved subtree.
+    assert_eq!(
+        f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase,
+        "applying"
+    );
+    // Both operations converge and the repair observes the moved subtree.
     f.settle();
     assert_eq!(
         f.state
@@ -756,6 +864,46 @@ fn native(
     )
 }
 
+fn move_root_directory(f: &Fx, from: &str, to: &str) {
+    use eidos_catalog::changes::ChangeEvent;
+    let (_, snapshot) = native(f, from);
+    let root = f
+        .state
+        .catalog
+        .get_source(f.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let parent = f
+        .state
+        .catalog
+        .get_object(root)
+        .unwrap()
+        .unwrap()
+        .native
+        .unwrap()
+        .into();
+    f.state
+        .catalog
+        .apply_changes(
+            f.source,
+            &[
+                ChangeEvent::Unlink {
+                    parent,
+                    name: from.into(),
+                },
+                ChangeEvent::Link {
+                    parent,
+                    name: to.into(),
+                    snapshot,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+}
+
 #[test]
 fn native_changes_cannot_reinsert_internal_children_and_advance_the_checkpoint() {
     use eidos_catalog::changes::{ChangeEvent, Checkpoint};
@@ -790,6 +938,83 @@ fn native_changes_cannot_reinsert_internal_children_and_advance_the_checkpoint()
         .unwrap()
         .is_none());
     assert_eq!(f.state.catalog.checkpoint(f.source).unwrap().unwrap().0, cp);
+}
+
+#[test]
+fn moving_a_catalogued_subtree_across_an_internal_store_boundary_cannot_recreate_it() {
+    use eidos_catalog::changes::{ChangeEvent, Checkpoint};
+    let f = Fx::new(1, true);
+    f.index("docs/n0.txt");
+    let id = f.id("docs/n0.txt");
+    let (_, snapshot) = native(&f, "docs");
+    let (protected_parent, _) = native(&f, ".eidos");
+    let root = f
+        .state
+        .catalog
+        .get_source(f.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let root_parent = f
+        .state
+        .catalog
+        .get_object(root)
+        .unwrap()
+        .unwrap()
+        .native
+        .unwrap()
+        .into();
+    let checkpoint = Checkpoint {
+        kind: "fixture".into(),
+        value: serde_json::json!({ "offset": 321 }),
+    };
+    f.state
+        .catalog
+        .apply_changes(
+            f.source,
+            &[
+                ChangeEvent::Unlink {
+                    parent: root_parent,
+                    name: "docs".into(),
+                },
+                ChangeEvent::Link {
+                    parent: protected_parent,
+                    name: "moved".into(),
+                    snapshot,
+                },
+            ],
+            Some(&checkpoint),
+        )
+        .unwrap();
+    assert!(f
+        .state
+        .catalog
+        .resolve_relative(f.source, ".eidos/moved/n0.txt")
+        .unwrap()
+        .is_none());
+    assert!(f
+        .state
+        .catalog
+        .get_object(id)
+        .unwrap()
+        .unwrap()
+        .deleted_at
+        .is_some());
+    assert!(f.state.catalog.content_target(id).unwrap().is_none());
+    assert_eq!(
+        f.state.catalog.checkpoint(f.source).unwrap().unwrap().0,
+        checkpoint
+    );
+    assert_eq!(
+        f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase,
+        "applied",
+        "immutable protection is enforced before a repair can admit the path"
+    );
 }
 
 #[test]
@@ -836,7 +1061,15 @@ fn directory_move_reapplies_descendant_rules_without_a_byte_change_or_rescan() {
             None,
         )
         .unwrap();
-    assert!(f.state.catalog.policy_applying(f.source).unwrap());
+    assert!(!f.state.catalog.policy_applying(f.source).unwrap());
+    assert_eq!(
+        f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase,
+        "applying"
+    );
     f.settle();
     assert_eq!(f.id("hidden/n0.txt"), id);
     assert_eq!(
@@ -849,6 +1082,549 @@ fn directory_move_reapplies_descendant_rules_without_a_byte_change_or_rescan() {
         ContentState::Excluded
     );
     assert_eq!(f.state.content_index.num_docs(), 0);
+}
+
+#[test]
+fn an_in_flight_move_is_fenced_at_publication_and_a_second_move_cannot_ack_stale_cleanup() {
+    let f = Fx::new(1, false);
+    f.apply(vec![folder("hidden")]);
+    f.settle();
+    let id = f.id("docs/n0.txt");
+    let generation = f.state.catalog.get_object(id).unwrap().unwrap().generation;
+    let result = eidos_search::pipeline::process_object(
+        &f.state.catalog,
+        &f.state.content_index,
+        id,
+        generation,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        result,
+        eidos_search::pipeline::ProcessResult::Indexed(_)
+    ));
+
+    // The path changes after extraction stored its `indexing` record but
+    // before the derived index is committed and acknowledged.
+    move_root_directory(&f, "docs", "hidden");
+    assert!(
+        f.state
+            .catalog
+            .write_chunks(
+                id,
+                generation,
+                &[eidos_content::Chunk {
+                    ordinal: 99,
+                    byte_start: 0,
+                    byte_end: 1,
+                    line_start: 0,
+                    line_end: 0,
+                    text: "x".into(),
+                    split_line: false,
+                }],
+            )
+            .is_err(),
+        "a moved-into-exclusion generation must reject later chunk writes"
+    );
+    f.state.content_workers.pending_publish.lock().push(id);
+    assert_eq!(commit_and_publish(&f.state).unwrap(), 0);
+    let status = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_ne!(status.repair_phase, "applied");
+    assert!(f
+        .state
+        .catalog
+        .policy_cleanup_batch(f.source)
+        .unwrap()
+        .iter()
+        .any(|cleanup| cleanup.object_id == id));
+    assert_ne!(
+        f.state
+            .catalog
+            .get_object(id)
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Indexed
+    );
+
+    // Move back while the first derived-index delete is still pending. The
+    // cleanup row must survive, and the reset repair frontier must observe the
+    // newest path before coverage can become complete.
+    move_root_directory(&f, "hidden", "docs");
+    assert!(f
+        .state
+        .catalog
+        .policy_cleanup_batch(f.source)
+        .unwrap()
+        .iter()
+        .any(|cleanup| cleanup.object_id == id));
+    f.settle();
+    assert_eq!(f.state.content_index.num_docs(), 0);
+    assert_eq!(
+        f.state
+            .catalog
+            .get_object(id)
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Pending
+    );
+    let status = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(status.repair_phase, "applied");
+    assert!(status.repair_processed >= 2);
+}
+
+#[test]
+fn an_old_cleanup_fences_only_its_object_and_cannot_delete_the_reincluded_generation() {
+    use eidos_domain::JobStage;
+    let f = Fx::new(1, false);
+    f.index("docs/n0.txt");
+    f.apply(vec![folder("hidden")]);
+    f.settle();
+    let id = f.id("docs/n0.txt");
+
+    move_root_directory(&f, "docs", "hidden");
+    for _ in 0..10 {
+        f.state.catalog.apply_policy_repair_batch(f.source).unwrap();
+        if f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase
+            == "purging"
+        {
+            break;
+        }
+    }
+    let old_cleanup = f.state.catalog.policy_cleanup_batch(f.source).unwrap();
+    assert_eq!(old_cleanup.len(), 1);
+
+    // Re-inclusion can finish its frontier while the prior object-wide index
+    // delete is still pending. That object must remain inadmissible even though
+    // the rest of the source stays open.
+    move_root_directory(&f, "hidden", "docs");
+    for _ in 0..10 {
+        f.state.catalog.apply_policy_repair_batch(f.source).unwrap();
+        if f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase
+            == "purging"
+        {
+            break;
+        }
+    }
+    assert!(!f.state.catalog.policy_applying(f.source).unwrap());
+    assert_eq!(
+        f.state
+            .catalog
+            .get_object(id)
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Pending
+    );
+    top_up_queue(&f.state).unwrap();
+    assert!(f
+        .state
+        .catalog
+        .claim_job(&[JobStage::ContentText], "cleanup-fenced")
+        .unwrap()
+        .is_none());
+    assert!(
+        !f.state
+            .catalog
+            .content_target(id)
+            .unwrap()
+            .unwrap()
+            .content_enabled
+    );
+
+    // Model a worker that crossed its admission check just before cleanup was
+    // recorded: let it store the current generation, then restore the older
+    // token before its staged index write is committed and acknowledged.
+    f.state
+        .catalog
+        .with_writer(|conn| {
+            conn.execute("DELETE FROM policy_cleanup WHERE object_id = ?1", [id.0])?;
+            Ok(())
+        })
+        .unwrap();
+    let in_flight_generation = f.state.catalog.get_object(id).unwrap().unwrap().generation;
+    let result = eidos_search::pipeline::process_object(
+        &f.state.catalog,
+        &f.state.content_index,
+        id,
+        in_flight_generation,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        result,
+        eidos_search::pipeline::ProcessResult::Indexed(_)
+    ));
+    f.state
+        .catalog
+        .with_writer(|conn| {
+            conn.execute(
+                "INSERT INTO policy_cleanup(object_id, source_id, generation)
+                 VALUES (?1, ?2, ?3)",
+                [id.0, f.source.0, i64::from(old_cleanup[0].generation)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    f.state.content_workers.pending_publish.lock().push(id);
+    assert_eq!(commit_and_publish(&f.state).unwrap(), 0);
+    assert_eq!(
+        f.state
+            .catalog
+            .get_object(id)
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Pending
+    );
+    assert!(f.state.catalog.get_object(id).unwrap().unwrap().generation > in_flight_generation);
+
+    // The final publication fence advanced cleanup, so an acknowledgement for
+    // the older selected token cannot erase the newer request.
+    f.state
+        .catalog
+        .acknowledge_policy_cleanup(f.source, &old_cleanup)
+        .unwrap();
+    let current_cleanup = f.state.catalog.policy_cleanup_batch(f.source).unwrap();
+    assert_eq!(current_cleanup.len(), 1);
+    assert!(current_cleanup[0].generation > old_cleanup[0].generation);
+
+    f.state.content_index.delete_object(id);
+    f.state.content_index.commit().unwrap();
+    assert!(f
+        .state
+        .catalog
+        .claim_job(&[JobStage::ContentText], "between-delete-and-ack")
+        .unwrap()
+        .is_none());
+    f.state
+        .catalog
+        .acknowledge_policy_cleanup(f.source, &current_cleanup)
+        .unwrap();
+
+    // Only the exact cleanup acknowledgement opens this object. The current
+    // generation can then publish and a later repair turn cannot wipe it.
+    f.index("docs/n0.txt");
+    apply_policies_once(&f.state).unwrap();
+    assert_eq!(f.state.content_index.num_docs(), 1);
+    assert_eq!(f.hits("content:constellation"), 1);
+}
+
+#[test]
+fn sustained_tiny_subtree_moves_still_admit_and_process_unaffected_queued_content() {
+    use eidos_domain::JobStage;
+    let f = Fx::new(1, false);
+    std::fs::write(
+        f.root.join("stable.txt"),
+        "policyfixture unaffected progress\n",
+    )
+    .unwrap();
+    run_full_scan(&f.state, f.source, &ScanProgress::new(f.source)).unwrap();
+    f.apply(vec![folder("hidden")]);
+    f.settle();
+
+    move_root_directory(&f, "docs", "hidden");
+    move_root_directory(&f, "hidden", "docs");
+    move_root_directory(&f, "docs", "hidden");
+    let status = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(status.phase, "applied");
+    assert_eq!(status.repair_phase, "applying");
+    assert_eq!(status.repair_pending, 1, "repeated root moves deduplicate");
+
+    top_up_queue(&f.state).unwrap();
+    let stable = f.id("stable.txt");
+    let mut progressed = false;
+    for attempt in 0..10 {
+        let Some((_permit, jobs)) = f
+            .state
+            .catalog
+            .claim_jobs_admitted(
+                &[JobStage::ContentText],
+                &format!("repair-fixture-{attempt}"),
+                1,
+                &mut |_| Some(()),
+            )
+            .unwrap()
+        else {
+            break;
+        };
+        let job = &jobs[0];
+        let object = job.object_id.unwrap();
+        let result = eidos_search::pipeline::process_object(
+            &f.state.catalog,
+            &f.state.content_index,
+            object,
+            job.object_generation,
+            &Default::default(),
+            Some(job.id),
+        )
+        .unwrap();
+        if object == stable && matches!(result, eidos_search::pipeline::ProcessResult::Indexed(_)) {
+            progressed = true;
+            break;
+        }
+        if matches!(result, eidos_search::pipeline::ProcessResult::Skipped(_)) {
+            f.state.catalog.complete_job(job.id).unwrap();
+        }
+    }
+    assert!(
+        progressed,
+        "an unaffected queued file must actually be extracted"
+    );
+    assert_eq!(
+        f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase,
+        "applying",
+        "unaffected progress must not require repair completion"
+    );
+}
+
+#[test]
+fn repair_completion_cannot_apply_or_erase_a_coexisting_full_revision() {
+    let f = Fx::new(300, false);
+    f.apply(vec![folder("hidden")]);
+    f.state.catalog.apply_policy_batch(f.source).unwrap();
+    let full_progress = f
+        .state
+        .catalog
+        .exclusion_policy(f.source)
+        .unwrap()
+        .processed;
+    move_root_directory(&f, "docs", "hidden");
+    f.state
+        .catalog
+        .with_writer(|conn| {
+            conn.execute(
+                "UPDATE source_policy SET error = 'fixture full revision error' WHERE source_id = ?1",
+                [f.source.0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    for _ in 0..10 {
+        f.state.catalog.apply_policy_repair_batch(f.source).unwrap();
+        let repair = f.state.catalog.exclusion_policy(f.source).unwrap();
+        if repair.repair_phase == "purging" {
+            break;
+        }
+    }
+    f.state
+        .catalog
+        .acknowledge_policy_cleanup(f.source, &[])
+        .unwrap();
+    let status = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(status.repair_phase, "applied");
+    assert_eq!(status.phase, "applying");
+    assert_eq!(status.processed, full_progress);
+    assert_eq!(status.error.as_deref(), Some("fixture full revision error"));
+}
+
+#[test]
+fn repair_frontier_and_checkpoint_roll_back_with_a_failed_native_move() {
+    use eidos_catalog::changes::Checkpoint;
+    let f = Fx::new(1, false);
+    f.apply(vec![folder("hidden")]);
+    f.settle();
+    let old = Checkpoint {
+        kind: "fixture".into(),
+        value: serde_json::json!({ "offset": 10 }),
+    };
+    let next = Checkpoint {
+        kind: "fixture".into(),
+        value: serde_json::json!({ "offset": 20 }),
+    };
+    f.state.catalog.set_checkpoint(f.source, &old).unwrap();
+    f.state
+        .catalog
+        .with_writer(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_repair_frontier BEFORE INSERT ON policy_repair_frontier
+                 BEGIN SELECT RAISE(ABORT, 'fixture repair frontier failed'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let (_, snapshot) = native(&f, "docs");
+    let root = f
+        .state
+        .catalog
+        .get_source(f.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let parent = f
+        .state
+        .catalog
+        .get_object(root)
+        .unwrap()
+        .unwrap()
+        .native
+        .unwrap()
+        .into();
+    let result = f.state.catalog.apply_changes(
+        f.source,
+        &[
+            eidos_catalog::changes::ChangeEvent::Unlink {
+                parent,
+                name: "docs".into(),
+            },
+            eidos_catalog::changes::ChangeEvent::Link {
+                parent,
+                name: "hidden".into(),
+                snapshot,
+            },
+        ],
+        Some(&next),
+    );
+    assert!(result.is_err());
+    f.state
+        .catalog
+        .with_writer(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_repair_frontier;")?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(f
+        .state
+        .catalog
+        .resolve_relative(f.source, "docs/n0.txt")
+        .unwrap()
+        .is_some());
+    assert!(f
+        .state
+        .catalog
+        .resolve_relative(f.source, "hidden/n0.txt")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        f.state.catalog.checkpoint(f.source).unwrap().unwrap().0,
+        old
+    );
+    assert_eq!(
+        f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase,
+        "applied"
+    );
+}
+
+#[test]
+fn restart_resumes_the_exact_subtree_frontier_cursor() {
+    let mut f = Fx::new(300, false);
+    f.apply(vec![folder("hidden")]);
+    f.settle();
+    move_root_directory(&f, "docs", "hidden");
+    f.state.catalog.apply_policy_repair_batch(f.source).unwrap();
+    let before = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(before.repair_phase, "applying");
+    assert!(before.repair_processed > 0);
+    assert!(before.repair_pending > 0);
+    let source = f.source;
+    f.state.request_shutdown();
+    drop(f.state);
+    f.state = Arc::new(AppState::open(&f.config).unwrap());
+    let reopened = f.state.catalog.exclusion_policy(source).unwrap();
+    assert_eq!(reopened.repair_processed, before.repair_processed);
+    assert_eq!(reopened.repair_pending, before.repair_pending);
+    assert_eq!(reopened.repair_phase, "applying");
+    f.settle();
+    assert_eq!(
+        f.state
+            .catalog
+            .source_counts(source)
+            .unwrap()
+            .content_excluded,
+        300
+    );
+}
+
+#[test]
+fn tombstoned_repair_roots_are_discarded_without_sticking_coverage() {
+    let f = Fx::new(1, false);
+    f.apply(vec![folder("hidden")]);
+    f.settle();
+    move_root_directory(&f, "docs", "hidden");
+    let (directory, _) = native(&f, "hidden");
+    f.state
+        .catalog
+        .apply_changes(
+            f.source,
+            &[eidos_catalog::changes::ChangeEvent::Delete { object: directory }],
+            None,
+        )
+        .unwrap();
+    f.settle();
+    let status = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(status.repair_phase, "applied");
+    assert_eq!(status.repair_pending, 0);
+}
+
+#[test]
+fn subtree_purge_ack_failure_is_durable_and_retryable_without_blocking_full_policy() {
+    let f = Fx::new(1, false);
+    f.index("docs/n0.txt");
+    f.apply(vec![folder("hidden")]);
+    f.settle();
+    move_root_directory(&f, "docs", "hidden");
+    f.state
+        .catalog
+        .with_writer(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_repair_ack BEFORE DELETE ON policy_cleanup
+                 BEGIN SELECT RAISE(ABORT, 'fixture repair acknowledgement failed'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    apply_policies_once(&f.state).unwrap();
+    let failed = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(failed.phase, "applied");
+    assert!(failed.error.is_none());
+    assert_eq!(failed.repair_phase, "purging");
+    assert!(failed
+        .repair_error
+        .as_deref()
+        .is_some_and(|e| e.contains("fixture repair acknowledgement failed")));
+    assert_eq!(
+        f.state.content_index.num_docs(),
+        0,
+        "derived delete commits before its failed acknowledgement"
+    );
+    f.state
+        .catalog
+        .with_writer(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_repair_ack;")?;
+            Ok(())
+        })
+        .unwrap();
+    f.state.catalog.set_policy_error(f.source, None).unwrap();
+    f.settle();
+    assert_eq!(
+        f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase,
+        "applied"
+    );
 }
 
 #[test]

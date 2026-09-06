@@ -470,7 +470,7 @@ impl ScanSession {
                         || ex.modified != e.modified.map(|t| t.0)
                         || policy_changed);
                 if policy_changed {
-                    crate::exclusions::reapply_conn(&self.conn, self.source.id)?;
+                    crate::exclusions::enqueue_repair_conn(&self.conn, self.source.id, ex.id)?;
                 }
                 // Any shipped column moving marks the row for sync. Access
                 // time is deliberately excluded: where last-access updates

@@ -723,10 +723,11 @@ pub fn apply_policies_once(state: &AppState) -> anyhow::Result<()> {
                 return Ok(());
             }
             state.catalog.apply_policy_batch(source)?;
+            state.catalog.apply_policy_repair_batch(source)?;
             let deletes = state.catalog.policy_cleanup_batch(source)?;
             if !deletes.is_empty() {
-                for id in &deletes {
-                    state.content_index.delete_object(*id);
+                for cleanup in &deletes {
+                    state.content_index.delete_object(cleanup.object_id);
                 }
                 commit_and_publish(state)?;
             }
