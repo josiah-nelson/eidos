@@ -37,6 +37,11 @@ impl InputBudget {
 
     /// Reserve before allocating the three text fields. The fixed extra space
     /// avoids geometric Vec growth and accounts conservatively for metadata.
+    ///
+    /// `TantivyDocument` is `CompactDoc`, whose `with_capacity` reserves that
+    /// many *bytes* of serialized value data (its field-value list is sized
+    /// separately), so the preallocation and the reservation describe the same
+    /// quantity. `document_capacity_is_a_byte_reservation` pins that meaning.
     pub(crate) fn document(self: &Arc<Self>, text_bytes: usize) -> Result<InputDocument> {
         let capacity = text_bytes
             .checked_mul(3)
@@ -116,6 +121,39 @@ impl Document for InputDocument {
 mod tests {
     use super::*;
 
+    /// A field count would preallocate one entry per byte of text here; a byte
+    /// capacity holds the three copies the reservation paid for. Pin the
+    /// meaning so a Tantivy upgrade cannot silently change what is reserved.
+    #[test]
+    fn document_capacity_is_a_byte_reservation() {
+        let mut schema = tantivy::schema::Schema::builder();
+        let number = schema.add_u64_field("n", tantivy::schema::FAST);
+        let text_field = schema.add_text_field("t", tantivy::schema::TEXT);
+        let budget = InputBudget::new(CONTENT_INPUT_MEMORY_BYTES);
+        let text = "queued content input needle ".repeat(600);
+        let mut input = budget.document(text.len()).unwrap();
+        let reserved = input.document.node_data.capacity();
+        assert!(
+            reserved >= 3 * text.len(),
+            "{reserved} bytes reserved for {} bytes of text",
+            3 * text.len()
+        );
+        // The same four counters and three text copies `add_chunks` writes.
+        for _ in 0..4 {
+            input.document.add_u64(number, u64::MAX);
+        }
+        for _ in 0..3 {
+            input.document.add_text(text_field, &text);
+        }
+        assert_eq!(
+            input.document.node_data.capacity(),
+            reserved,
+            "a filled document must not outgrow the bytes reserved for it"
+        );
+        assert!(input.document.node_data.len() <= reserved);
+        drop(input);
+        assert_eq!(budget.usage().0, 0);
+    }
     #[test]
     fn capacity_waits_for_owned_document_release_and_rejects_oversize() {
         let budget = InputBudget::new(4096);
