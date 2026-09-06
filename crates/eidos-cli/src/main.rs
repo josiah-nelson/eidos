@@ -341,6 +341,36 @@ mod tests {
     #[test]
     fn resource_replacement_requires_all_limits_and_enforces_ranges() {
         assert!(Cli::try_parse_from(["eidos", "resources", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["eidos", "resources", "coordinated"]).is_ok());
+        assert!(Cli::try_parse_from(["eidos", "resources", "--json", "coordinated"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "eidos",
+            "resources",
+            "coordinated",
+            "apply",
+            "--content-workers",
+            "2",
+            "--scan-threads",
+            "2",
+            "--concurrent-scans",
+            "1",
+            "--minimum-free-mib",
+            "1024",
+            "--device-readers",
+            "2"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "eidos",
+            "resources",
+            "coordinated",
+            "apply",
+            "--content-workers",
+            "2",
+            "--scan-threads",
+            "2"
+        ])
+        .is_err());
         assert!(Cli::try_parse_from(["eidos", "resources", "--scan-threads", "2"]).is_err());
         for (threads, expected) in [("0", false), ("2", true), ("65", false)] {
             assert_eq!(

@@ -24,6 +24,13 @@ and publishes normally; it no longer drains a sixteen-file preclaimed batch.
 A large file or a stalled filesystem read can still take time. This is not
 mid-file cancellation or a hard I/O deadline. Pause remains durable.
 
+Activity also offers a [coordinated custom tuple](coordinated-resource-settings.md)
+covering this pool, the three metadata settings and the shared-device ceiling.
+It journals the target before changing the existing component files, reports
+partial outcomes explicitly and repairs them after a persistence failure or
+restart. It does not change source-specific caps or claim that a custom tuple
+is a measured preset.
+
 Source caps are per source, **not per physical disk**. The additional
 [shared-device reader ceiling](device-budgets.md) combines scan/content readers
 across roots on known backing OS disks, with a conservative shared fallback for
@@ -72,6 +79,7 @@ eidos resources --memory            # process RAM and configured budgets
 eidos content workers 4
 eidos content pause
 eidos content resume
+eidos resources coordinated
 ```
 
 `GET /api/memory` and `eidos resources --memory` report observed process memory

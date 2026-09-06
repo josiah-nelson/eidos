@@ -73,6 +73,7 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
 }
 
 pub struct AppState {
+    pub resource_profiles: crate::resource_profiles::ResourceProfileControl,
     pub devices: crate::device_control::DeviceControl,
     pub memory: crate::memory::MemoryTelemetry,
     /// Bounded gate in front of expensive HTTP operations.
@@ -136,6 +137,10 @@ pub struct AppState {
 impl AppState {
     pub fn open(config: &ServiceConfig) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
+        // Finish any coordinated resource operation before the three
+        // component controls read their standalone files and before a pool,
+        // scanner or topology worker can start with a mixed configuration.
+        crate::resource_profiles::recover_before_open(&config.data_dir)?;
         let catalog = Catalog::open(config.data_dir.join("catalog.db"))?;
         let report = catalog.recover()?;
         let mut protected = vec![config.data_dir.clone()];
@@ -226,6 +231,9 @@ impl AppState {
             .min(config.admission.concurrency.saturating_sub(1))
             .max(1);
         let state = Self {
+            resource_profiles: crate::resource_profiles::ResourceProfileControl::new(
+                &config.data_dir,
+            ),
             memory: crate::memory::MemoryTelemetry::default(),
             admission: Arc::new(crate::admission::Admission::new(config.admission.clone())),
             catalog,

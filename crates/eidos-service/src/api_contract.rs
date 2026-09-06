@@ -116,6 +116,8 @@ fn typescript_contract() -> String {
     types.add::<crate::content_control::WorkersView>();
     types.add::<crate::api::VolumeCandidateView>();
     types.add::<crate::resource_control::ResourceView>();
+    types.add::<crate::resource_profiles::ApplyResourceSettings>();
+    types.add::<crate::resource_profiles::ResourceSettingsView>();
     types.add::<crate::memory::MemoryView>();
     types.add::<crate::api::ActivityView>();
     types.add::<crate::api::IndexStatus>();

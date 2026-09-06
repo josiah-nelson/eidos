@@ -413,8 +413,9 @@ async fn set_workers(
 ) -> ApiResult<WorkersView> {
     // Durable filesystem mutation, off the async runtime like the pause.
     crate::api::blocking(move || {
-        crate::content_workers::resize_workers(&st, body.workers as usize).map_err(|e| {
-            ApiError::internal(format!("the worker pool could not be resized: {e}"))
+        st.resource_profiles.manual_update(|| {
+            crate::content_workers::resize_workers(&st, body.workers as usize)
+                .map_err(|e| anyhow::anyhow!("the worker pool could not be resized: {e}"))
         })?;
         Ok(ApiJson(pool_view(&st)))
     })

@@ -107,22 +107,9 @@ impl DeviceControl {
         data_dir: &std::path::Path,
         limits: DeviceLimits,
     ) -> anyhow::Result<()> {
-        use std::io::Write;
         limits.validate().map_err(anyhow::Error::msg)?;
         let _write = self.settings_write.lock();
-        let tmp = data_dir.join(format!("{SETTINGS_FILE}.tmp"));
-        let replace = || -> anyhow::Result<()> {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(&serde_json::to_vec(&limits)?)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp, data_dir.join(SETTINGS_FILE))?;
-            Ok(())
-        };
-        if let Err(error) = replace() {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error);
-        }
+        persist_limits(data_dir, limits)?;
         self.set_limit(limits.readers_per_device)
             .map_err(anyhow::Error::msg)
     }
@@ -277,6 +264,17 @@ impl DeviceControl {
                 .collect(),
         }
     }
+}
+
+/// Write the standalone device file using the same durable replacement used
+/// by both the ordinary endpoint and coordinated recovery.
+pub(crate) fn persist_limits(
+    data_dir: &std::path::Path,
+    limits: DeviceLimits,
+) -> anyhow::Result<()> {
+    limits.validate().map_err(anyhow::Error::msg)?;
+    crate::durable_file::replace(&data_dir.join(SETTINGS_FILE), &serde_json::to_vec(&limits)?)?;
+    Ok(())
 }
 
 fn unknown(roots: &SourceRoots) -> Topology {

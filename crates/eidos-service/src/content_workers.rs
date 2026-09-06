@@ -239,6 +239,20 @@ pub fn load_workers_override(data_dir: &std::path::Path) -> Option<usize> {
     Some(marker.workers.clamp(1, MAX_WORKERS))
 }
 
+pub(crate) fn persist_workers_override(
+    data_dir: &std::path::Path,
+    workers: usize,
+) -> io::Result<()> {
+    if !(1..=MAX_WORKERS).contains(&workers) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("content workers must be 1..={MAX_WORKERS}"),
+        ));
+    }
+    let body = serde_json::to_vec(&WorkersMarker { workers }).map_err(io::Error::other)?;
+    crate::durable_file::replace(&data_dir.join(WORKERS_MARKER), &body)
+}
+
 /// Resize the global pool at runtime and return the effective size.
 ///
 /// Growing first creates the missing threads in a parked state, then writes
@@ -287,11 +301,7 @@ where
     // Only a fully realizable size becomes durable and visible. Marker
     // failure is also safe: any just-created threads remain parked because
     // `workers` still holds the previous desired size.
-    let path = state.data_dir.join(WORKERS_MARKER);
-    let tmp = path.with_extension("json.tmp");
-    let body = serde_json::to_vec(&WorkersMarker { workers }).map_err(io::Error::other)?;
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    persist_workers_override(&state.data_dir, workers)?;
     status.workers.store(workers, Ordering::Relaxed);
     state.content_pause.work.notify_all();
     tracing::info!(workers, "content worker pool resized");

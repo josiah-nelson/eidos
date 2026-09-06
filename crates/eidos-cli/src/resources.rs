@@ -1,7 +1,7 @@
 //! Runtime admission ceilings; all values are explicit on replacement.
 
 use anyhow::Context;
-use clap::Args;
+use clap::{Args, Subcommand};
 
 #[derive(Args, Debug)]
 pub struct ResourceArgs {
@@ -27,6 +27,37 @@ pub struct ResourceArgs {
     device_readers: Option<u32>,
     #[arg(long)]
     json: bool,
+    /// Inspect, apply, or repair the coordinated resource tuple.
+    #[command(subcommand)]
+    command: Option<ResourceCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ResourceCommand {
+    /// Coordinate worker, scan, reserve, and device settings durably.
+    Coordinated {
+        #[command(subcommand)]
+        action: Option<CoordinatedAction>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CoordinatedAction {
+    /// Apply a complete custom tuple; source-specific caps are unchanged.
+    Apply {
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+        content_workers: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+        scan_threads: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=16))]
+        concurrent_scans: u32,
+        #[arg(long)]
+        minimum_free_mib: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+        device_readers: u32,
+    },
+    /// Retry an incomplete coordinated operation from its durable target.
+    Repair,
 }
 
 pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
@@ -35,6 +66,18 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
         .http_status_as_error(false)
         .build()
         .into();
+    if let Some(ResourceCommand::Coordinated { action }) = args.command {
+        anyhow::ensure!(
+            !args.memory
+                && !args.devices
+                && args.scan_threads.is_none()
+                && args.concurrent_scans.is_none()
+                && args.minimum_free_mib.is_none()
+                && args.device_readers.is_none(),
+            "coordinated commands cannot be combined with individual resource options"
+        );
+        return run_coordinated(&agent, &args.url, args.json, action);
+    }
     let devices = args.devices || args.device_readers.is_some();
     let url = format!(
         "{}/api/{}",
@@ -183,5 +226,101 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
             println!("waiting: {reason}");
         }
     }
+    Ok(())
+}
+
+fn run_coordinated(
+    agent: &ureq::Agent,
+    base_url: &str,
+    json: bool,
+    action: Option<CoordinatedAction>,
+) -> anyhow::Result<()> {
+    let base = format!("{}/api/resource-settings", base_url.trim_end_matches('/'));
+    let (url, mut response) = match action {
+        Some(CoordinatedAction::Apply {
+            content_workers,
+            scan_threads,
+            concurrent_scans,
+            minimum_free_mib,
+            device_readers,
+        }) => {
+            let response = agent.post(&base).send_json(serde_json::json!({
+                "settings": {
+                    "content_workers": content_workers,
+                    "scan_threads": scan_threads,
+                    "concurrent_scans": concurrent_scans,
+                    "minimum_free_mib": minimum_free_mib,
+                    "readers_per_device": device_readers
+                }
+            }))?;
+            (base, response)
+        }
+        Some(CoordinatedAction::Repair) => {
+            let url = format!("{base}/repair");
+            let response = agent.post(&url).send_empty()?;
+            (url, response)
+        }
+        None => {
+            let response = agent.get(&base).call()?;
+            (base, response)
+        }
+    };
+    let status = response.status();
+    // Report the status even when the body is not the JSON API error shape
+    // (a wrong URL, a proxy, or a build without this route).
+    let body = response.body_mut().read_json::<serde_json::Value>();
+    anyhow::ensure!(
+        status.is_success(),
+        "{}: {}",
+        status,
+        body.as_ref()
+            .ok()
+            .and_then(|body| body["error"].as_str())
+            .unwrap_or("coordinated resource request failed")
+    );
+    let body = body.context("read coordinated resource settings")?;
+    let outcome = body["outcome"].as_str().unwrap_or("unknown");
+    // A live failure reports its reason at the top level; after a restart only
+    // the retained journal still carries it. Print whichever the service gave.
+    let failure = body["error"]
+        .as_str()
+        .or_else(|| body["pending"]["error"].as_str());
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else {
+        let current = &body["current"];
+        println!(
+            "current custom tuple: content workers {}  metadata threads {}  concurrent scans {}  data-volume reserve {} MiB  device readers {}",
+            current["content_workers"],
+            current["scan_threads"],
+            current["concurrent_scans"],
+            current["minimum_free_mib"],
+            current["readers_per_device"]
+        );
+        println!("outcome: {outcome}");
+        if let Some(pending) = body["pending"].as_object() {
+            println!(
+                "repair required: completed {}  next {}  cleanup pending {}",
+                pending["completed_components"],
+                pending["next_component"],
+                pending["cleanup_pending"]
+            );
+        }
+        if let Some(error) = failure {
+            println!("failure: {error}");
+        }
+        println!("Source-specific reader caps are independent and unchanged.");
+    }
+    // `failed` means the journal never reached disk and nothing changed, so
+    // there is no durable target for repair to replay: the apply is re-run.
+    anyhow::ensure!(
+        body["pending"].is_null() && outcome != "failed",
+        "coordinated resource operation is incomplete ({url}); {}",
+        if body["pending"].is_null() {
+            "no component changed, so re-run the apply after correcting the persistence failure"
+        } else {
+            "run `eidos resources coordinated repair` after correcting the persistence failure"
+        }
+    );
     Ok(())
 }

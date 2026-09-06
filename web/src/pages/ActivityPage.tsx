@@ -13,6 +13,7 @@ import { bytes, count, duration, integerNumber, when } from '../format'
 import ResourceControls from '../components/ResourceControls'
 import MemoryResources from '../components/MemoryResources'
 import DeviceResources from '../components/DeviceResources'
+import CoordinatedResources from '../components/CoordinatedResources'
 
 const STATE_ORDER = ['indexed', 'partial', 'pending', 'stale', 'failed', 'unsupported', 'excluded']
 
@@ -44,9 +45,8 @@ const SEARCH_BADGE: Record<ContentStatusView['search'], string> = {
   disabled: 'warn',
 }
 
-// The global extraction pool. Per-source caps below bound each source;
-// overlapping roots or partitions on one disk do not yet share a device cap.
-// The server clamps and persists the choice across restarts.
+// The global extraction pool. Per-source caps and the shared-device control
+// apply on top. The server clamps and persists this manual choice.
 function WorkerPoolControl({ workers }: { workers: number }) {
   const qc = useQueryClient()
   const resize = useMutation({
@@ -54,7 +54,7 @@ function WorkerPoolControl({ workers }: { workers: number }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['activity'] }),
   })
   return (
-    <span title="global extraction worker pool, shared across all sources; source caps apply on top">
+    <span title="global extraction worker pool, shared across all sources; source and shared-device caps apply on top">
       pool{' '}
       <input
         type="number"
@@ -296,6 +296,7 @@ export default function ActivityPage() {
         {a.content_status.detail}
       </p>
 
+      <CoordinatedResources />
       <ResourceControls />
       <MemoryResources />
       <DeviceResources />
