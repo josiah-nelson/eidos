@@ -377,6 +377,14 @@ pub fn reserve_and_claim(
         if active_scans.contains(&source) {
             return None;
         }
+        // Check the shared-device gate before charging the source budget. A
+        // device refusal holds every source at once, and a source unit taken
+        // and immediately dropped here would still raise that source's peak
+        // reservation for work the device gate is what actually held.
+        state
+            .devices
+            .would_admit(source.0, crate::device_budget::WorkKind::Content, 1)
+            .ok()?;
         let source_reservation = budgets.try_reserve(source)?;
         let device = state
             .devices
@@ -387,9 +395,18 @@ pub fn reserve_and_claim(
             _device: device,
         })
     };
-    state
-        .catalog
-        .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)
+    let mut claimed =
+        state
+            .catalog
+            .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)?;
+    // Count the units only once the claim is durable. `admit` runs inside the
+    // claiming transaction: a losing racer for the last device slot, and a
+    // transaction that then fails, both release without ever reading a file,
+    // and neither should leave a peak behind describing work nobody did.
+    if let Some((reservation, _)) = claimed.as_mut() {
+        reservation.confirm();
+    }
+    Ok(claimed)
 }
 
 pub struct ContentReservation {
@@ -398,6 +415,12 @@ pub struct ContentReservation {
 }
 
 impl ContentReservation {
+    /// Count these units towards the reported high-water marks. The caller
+    /// does this once the claim has committed, never from inside `admit`.
+    fn confirm(&mut self) {
+        self._source.confirm();
+    }
+
     pub fn source(&self) -> SourceId {
         self._source.source()
     }

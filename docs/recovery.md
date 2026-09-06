@@ -76,24 +76,32 @@ See
 Process RAM and configured cache/index budgets are implemented in the Activity
 page, memory API and resource CLI. The values distinguish resident RAM, Windows
 private commit, baseline/scan page-cache targets and effective mapped-file
-limits. See [memory diagnostics](memory.md). The full Windows local gate passed,
-including four memory unit tests, a read-only API regression, 43 web utility
-tests, 25 rendered UI tests and the production web build. The required-web
-development binary passed a 256-file synthetic crawl, CLI round trip and
-15-second unpolled idle observation; see [the recorded smoke limits](benchmarks.md).
+limits. A request that starts a refresh waits briefly for it, so a one-shot CLI
+call reports memory as it is now rather than a superseded reading, and is never
+told to retry. See [memory diagnostics](memory.md). The full Windows local gate
+passed, including eight memory unit tests, a read-only API regression, 45 web utility
+tests, 29 rendered UI tests and the production web build. The required-web
+development binary passed a 256-file synthetic crawl, single-call CLI round
+trip and 15-second unpolled idle observation; see
+[the recorded smoke limits](benchmarks.md).
 Cross-platform review remains pending. This does not introduce a hard memory
 limit or measured presets.
 
 Shared-device reader admission is implemented with Windows backing-disk
 discovery, an explicit unknown-topology fallback, combined scan/content
-reservations, durable limits and Activity/API/CLI controls. The full Windows
-local gate passed, including 43 web utility and 32 rendered UI tests. Follow-up
-service unit tests (67 passed), 20 integration/export regressions, all-target
-service/CLI clippy and the device page tests/build/lint passed after the smoke
-caught a populated-map JSON serialization bug. A rebuilt required-web CLI
-passed the 256-file device-limit/diagnostics smoke, but its short idle window
-still recorded process I/O requiring investigation. Cross-platform review is
-pending; see [scope and fallback semantics](device-budgets.md) and the
+reservations, durable limits and Activity/API/CLI controls. A device refusal is
+checked before the per-source budget is charged, so a shared ceiling holding the
+work no longer inflates another source's peak reservation. The full Windows
+local gate passed on the merged head: format, all-target clippy, generated API
+contract, all Rust tests and doc-tests (74 service unit tests, six device
+admission regressions), 45 web utility tests, 33 rendered UI tests and the
+production web build. An earlier smoke caught a populated-map JSON
+serialization bug, now covered by an exact-integer map regression. A rebuilt
+required-web CLI passed the 256-file device-limit/diagnostics smoke, observing a
+resolved backing disk and reservations that never exceeded the saved ceiling,
+but its short idle window still recorded process I/O requiring investigation.
+Cross-platform review is pending; see
+[scope and fallback semantics](device-budgets.md) and the
 [measured limits](benchmarks.md).
 
 Chunk B is **not complete**. Device qualification, measured profiles,

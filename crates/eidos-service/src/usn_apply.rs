@@ -14,6 +14,7 @@ use eidos_scanner::usn::{
     USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_HARD_LINK_CHANGE,
     USN_REASON_RENAME_OLD_NAME,
 };
+use eidos_scanner::{ScanError, ScanErrorKind};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -24,10 +25,43 @@ pub struct TranslateStats {
     pub vanished: u64,
     pub out_of_scope: u64,
     pub link_resyncs: u64,
+    /// Snapshots that failed transiently. The batch is retried from the same
+    /// position rather than acknowledged.
     pub io_errors: u64,
+    /// Snapshots that cannot succeed by replaying the record (denied,
+    /// unsupported). Skipped like an unlistable file in a scan.
+    pub unreadable: u64,
 }
 
 impl TranslateStats {
+    /// Record one failed `snapshot_by_id`. Only a failure that replaying the
+    /// same record cannot fix may be skipped: a single protected file inside
+    /// an indexed root would otherwise stall the live feed until the journal
+    /// wrapped and abort every overlap replay. Everything else keeps the
+    /// checkpoint, because acknowledging it would drop a change that a retry
+    /// could still have read.
+    fn record_snapshot_failure(&mut self, frn: u128, error: &ScanError) {
+        // Exhaustive on purpose: a new ScanErrorKind has to make this choice
+        // deliberately rather than default into dropping an update.
+        let permanent = match error.kind {
+            ScanErrorKind::AccessDenied
+            | ScanErrorKind::NotFound
+            | ScanErrorKind::Unsupported
+            | ScanErrorKind::InvalidName => true,
+            // Transient is retryable by definition. Other is every code the
+            // classifier does not know, which on Windows includes recoverable
+            // ones such as ERROR_IO_DEVICE and ERROR_OPERATION_ABORTED, so it
+            // is retried rather than acknowledged.
+            ScanErrorKind::Transient | ScanErrorKind::Other => false,
+        };
+        if permanent {
+            self.unreadable += 1;
+        } else {
+            self.io_errors += 1;
+        }
+        tracing::debug!(frn, error = %error, permanent, "snapshot by id failed");
+    }
+
     fn ensure_complete(&self) -> eidos_catalog::Result<()> {
         if self.io_errors > 0 {
             return Err(eidos_catalog::CatalogError::InvalidState(format!(
@@ -150,15 +184,20 @@ impl<'a> Translator<'a> {
             let snap = match snapshot_by_id(self.vol, frn) {
                 Ok(Some(s)) => s,
                 Ok(None) => {
+                    // Gone between the record and the snapshot. As on the
+                    // deleted arm, only an identity the source knows is a
+                    // change event; anything else is temporary-file churn
+                    // whose event would force a checkpoint write.
                     stats.vanished += 1;
-                    events.push(ChangeEvent::Delete {
-                        object: self.key(frn),
-                    });
+                    if let Some(event) =
+                        known_deletion(self.catalog, self.source_id, self.key(frn))?
+                    {
+                        events.push(event);
+                    }
                     continue;
                 }
                 Err(e) => {
-                    stats.io_errors += 1;
-                    tracing::debug!(frn, error = %e, "snapshot by id failed");
+                    stats.record_snapshot_failure(frn, &e);
                     continue;
                 }
             };
@@ -307,6 +346,75 @@ mod deletion_tests {
         }
         .ensure_complete()
         .is_err());
+    }
+
+    #[test]
+    fn only_unfixable_snapshot_failures_may_be_skipped() {
+        let error = |kind, code| ScanError::new(kind, code, "fixture", std::path::Path::new("V"));
+        let mut stats = TranslateStats::default();
+        // ACCESS_DENIED, PRIVILEGE_NOT_HELD, NOT_SUPPORTED, unrepresentable
+        // name: replaying the record produces the same failure forever.
+        for (kind, code) in [
+            (ScanErrorKind::AccessDenied, 5),
+            (ScanErrorKind::AccessDenied, 1314),
+            (ScanErrorKind::Unsupported, 50),
+            (ScanErrorKind::NotFound, 2),
+            (ScanErrorKind::InvalidName, 0),
+        ] {
+            stats.record_snapshot_failure(1, &error(kind, code));
+        }
+        assert_eq!(stats.unreadable, 5);
+        assert_eq!(stats.io_errors, 0);
+        assert!(
+            stats.ensure_complete().is_ok(),
+            "a permanently unreadable object must not stall the feed or abort replay"
+        );
+        // SHARING_VIOLATION is retryable by classification, and an
+        // unclassified code must not be assumed permanent: ERROR_IO_DEVICE and
+        // ERROR_OPERATION_ABORTED reach Other and can succeed on retry.
+        for (kind, code) in [
+            (ScanErrorKind::Transient, 32),
+            (ScanErrorKind::Other, 1117),
+            (ScanErrorKind::Other, 995),
+        ] {
+            let mut retryable = TranslateStats::default();
+            retryable.record_snapshot_failure(2, &error(kind, code));
+            assert_eq!(retryable.io_errors, 1, "os {code} must retain the position");
+            assert_eq!(retryable.unreadable, 0);
+            assert!(retryable.ensure_complete().is_err());
+        }
+    }
+
+    #[test]
+    fn unclassified_windows_codes_land_in_the_retryable_bucket() {
+        // The choice above is only safe if these codes really do classify as
+        // Other rather than as something the permanent arm would swallow.
+        use eidos_scanner::classify_os_error;
+        for code in [1117i32, 995, 23, 1392] {
+            assert_eq!(
+                classify_os_error(code, std::io::ErrorKind::Other),
+                ScanErrorKind::Other,
+                "os {code} is unclassified and must stay retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_denied_snapshot_is_classified_from_the_real_open_failure() {
+        // The classification must follow snapshot_by_id's own mapping, not a
+        // guess: only NOT_FOUND-like codes reach the vanished arm.
+        use eidos_scanner::classify_os_error;
+        for code in [5i32, 1314, 1920] {
+            assert_eq!(
+                classify_os_error(code, std::io::ErrorKind::Other),
+                ScanErrorKind::AccessDenied,
+                "os {code} must be permanent"
+            );
+        }
+        assert_eq!(
+            classify_os_error(32, std::io::ErrorKind::Other),
+            ScanErrorKind::Transient
+        );
     }
 
     #[test]

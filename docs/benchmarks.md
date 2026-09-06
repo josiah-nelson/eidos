@@ -41,6 +41,12 @@ bounded checkpoint flushes, real changes and normal maintenance remain. Writer
 acquisitions alone are not disk-write counts. The after build preceded the
 small initial-position display/offline-recovery follow-up.
 
+All the binaries above predate the review fixes for permanently unreadable
+snapshots and empty-batch Offline recovery. Neither path is exercised by this
+fixture — it has no protected file and no offline source — so the recorded idle
+and throughput numbers still describe the merged behaviour, but they are not
+evidence about those two paths.
+
 These are non-isolated Windows build-26100 development observations, not a
 controlled physical-media benchmark. The sample count is too small for a useful
 tail-latency qualification. Repeated/longer observations, measured profiles and
@@ -109,23 +115,24 @@ required; the previously chosen acceptance thresholds have not been relaxed.
 
 `scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15 -DeviceReaders 2`,
 Windows build 26100, two content workers/two requested enumeration threads.
-Required-web development binary SHA-256:
-`5CBB09456C175C53A3460AFB99D43FCD1718005D5381D04355214B29E94EB5AB`.
-Raw record: `bench-results/device-admission-2026-09-06-01.json` (private).
+Re-measured on the review head after merging the memory work, so these numbers
+describe the branch as it stands. Required-web development binary SHA-256:
+`E5A32C5E280175F279896478E24E7AA7E2BAB061AB930803E95B6FAACC356554`.
+Raw record: `bench-results/device-admission-2026-09-06-02.json` (private).
 
-The 256-file / 1,084,562-byte fixture drained in 6.700 seconds; 25 HTTP queries
-had p95 15.8 ms and maximum 17.6 ms. The observed combined device reservations
+The 256-file / 1,084,562-byte fixture drained in 6.872 seconds; 26 HTTP queries
+had p95 9.4 ms and maximum 11.3 ms. The observed combined device reservations
 peaked at two, never above the saved ceiling; a resolved Windows backing device
-was observed. Both the device-limit write and populated diagnostics CLI passed.
-An earlier smoke caught double-quoted numeric map keys; the shared JSON
-formatter now has an exact-integer map regression and the device API test
-exercises populated source membership.
+was observed rather than the unknown fallback. Both the device-limit write and
+the populated diagnostics CLI passed. An earlier smoke caught double-quoted
+numeric map keys; the shared JSON formatter now has an exact-integer map
+regression and the device API test exercises populated source membership.
 
-The 15.102-second unpolled idle used 0.15625 CPU seconds (1.035% of one core),
-4,804,608 process read bytes and 509,784 write bytes. This remains unexplained
+The 15.099-second unpolled idle used 0.125 CPU seconds (0.828% of one core),
+2,019,328 process read bytes and 78,280 write bytes. This remains unexplained
 idle I/O, not a quiet-idle qualification. After idle, resident memory was
-52,871,168 bytes, peak resident 138,215,424 bytes and private commit 60,432,384
-bytes. Catalog writer maximum wait/hold at drain was 18.94/18.56 ms.
+54,435,840 bytes, peak resident 116,363,264 bytes and private commit 63,610,880
+bytes. Catalog writer maximum wait/hold at drain was 18.86/19.74 ms.
 
 Only one temporary root was crawled. Separate integration tests cover shared
 roots, multi-disk accounting, topology changes and an eight-thread scan using
@@ -138,19 +145,23 @@ Process I/O is not physical-disk I/O. See [device scope](device-budgets.md).
 
 `scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15`, Windows build 26100,
 two content workers and two enumeration threads. Binary SHA-256:
-`552FC6367739AE52CE6F13D1F3096F48D2E8021E1956D5F1751D89CA87C25FF9`.
-Raw record: `bench-results/memory-visibility-2026-09-06-01.json` (private).
+`DCB1A2B3A32D3134EFE0AE3A018484D9C3B2D5149697924E4716B377C22941CE`.
+Raw record: `bench-results/memory-visibility-2026-09-06-02.json` (private).
 
-The 256-file / 1,084,562-byte temporary fixture drained in 7.246 seconds;
-28 concurrent HTTP queries had p95 10.7 ms and maximum 15.5 ms. The 15.083-second
-unpolled idle window used 0.0625 CPU seconds, 155,648 process read bytes and
-4,120 process write bytes. It was not I/O-free.
+The 256-file / 1,084,562-byte temporary fixture drained in 7.038 seconds;
+27 concurrent HTTP queries had p95 9.3 ms and maximum 25.5 ms. The 15.087-second
+unpolled idle window used 0.031 CPU seconds, 147,456 process read bytes and
+8,240 process write bytes. It was not I/O-free.
 
-After idle, the actual `resources --memory --json` CLI returned the candidate's
-PID and a fresh sample: resident 54,267,904 bytes, peak resident 122,712,064
-bytes and Windows private commit 64,630,784 bytes. Configured budgets remained
-distinct: 872,415,232 baseline page-cache target bytes and a 1 TiB effective
-mapped-file ceiling per connection, neither an allocated-RAM total.
+A cold `GET /api/memory` before the crawl returned the candidate's own PID in
+one call. After idle, one `resources --memory --json` CLI call returned that
+same PID and a sample of age 0 s: resident 52,985,856 bytes, peak resident
+125,321,216 bytes and Windows private commit 62,558,208 bytes. The reading
+tracks the run — the idle window ended at a 52,580,352-byte working set and the
+crawl peaked at 124,862,464 — because a request that starts a refresh waits for
+it instead of returning the pre-crawl reading it supersedes. Configured budgets
+remained distinct: 872,415,232 baseline page-cache target bytes and a 1 TiB
+effective mapped-file ceiling per connection, neither an allocated-RAM total.
 
 Only disposable synthetic data was indexed. The host was not isolated, the
 build was a development binary, process I/O is not physical-disk I/O, and the

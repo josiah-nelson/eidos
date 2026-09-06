@@ -543,12 +543,13 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
 
 #[cfg(windows)]
 fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStatus>) {
-    use crate::usn_checkpoint::{CheckpointPlan, ReadAhead};
+    use crate::usn_checkpoint::{BatchRetry, CheckpointPlan, FailedBatch, ReadAhead};
     use eidos_scanner::usn::{read_journal_wait, ReadOutcome, UsnError, VolumeHandle};
 
     let mut buf = vec![0u8; 1024 * 1024];
     let mut vol: Option<VolumeHandle> = None;
     let mut io_failures = 0u32;
+    let mut batch_retry = BatchRetry::new();
     let mut read_ahead = ReadAhead::new(Instant::now());
     let stop = |status: &WatcherStatus, reason: String| {
         tracing::info!(source = source_id.0, reason, "watcher stopped");
@@ -649,6 +650,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             }
         };
         if read_ahead.synchronize(&cp, Instant::now()) {
+            // A scan, recovery or journal/volume replacement moved the
+            // position, so the next batch is a different one: it must not
+            // inherit the old position's failure window and reconcile early.
+            batch_retry.reset();
             vol = None;
             status.last_position.store(cp.next_usn, Ordering::Relaxed);
         }
@@ -697,7 +702,13 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 }
                 io_failures = 0;
                 if records.is_empty() {
-                    match read_ahead.plan(next_usn, false, Instant::now()) {
+                    // An empty batch is still proof that the volume opened and
+                    // the journal is valid, so an Offline source recovers here
+                    // as it does on the non-empty path. Deferring that turn
+                    // would leave health stale until unrelated volume activity
+                    // happened to produce records.
+                    let offline = source.state == SourceState::Offline;
+                    match read_ahead.plan(next_usn, offline, Instant::now()) {
                         CheckpointPlan::Unchanged | CheckpointPlan::Deferred => {
                             status.set(WatcherState::Live, None);
                             continue;
@@ -749,6 +760,15 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                             }
                         }
                     }
+                    // Reached only when the position needed no advance or the
+                    // fenced advance committed.
+                    if offline {
+                        let Some(_mutation) = status.mutation_guard(&state) else {
+                            stop(&status, "cancelled".into());
+                            return;
+                        };
+                        let _ = restore_state(&state, source_id);
+                    }
                     status.set(WatcherState::Live, None);
                     // No sleep: the next read blocks until records arrive.
                     continue;
@@ -787,14 +807,57 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                     source_id,
                 };
                 let (events, tstats) = match translator.translate(&records) {
-                    Ok(batch) => batch,
+                    Ok(batch) => {
+                        batch_retry.reset();
+                        batch
+                    }
                     Err(error) => {
-                        tracing::error!(error = %error, "USN translation failed; retaining checkpoint for retry");
-                        status.set(
-                            WatcherState::Starting,
-                            Some("retrying an incomplete change-feed batch".into()),
+                        let failing_for = match batch_retry.failed(Instant::now()) {
+                            FailedBatch::Retry => {
+                                tracing::error!(error = %error, "USN translation failed; retaining checkpoint for retry");
+                                status.set(
+                                    WatcherState::Starting,
+                                    Some("retrying an incomplete change-feed batch".into()),
+                                );
+                                std::thread::sleep(Duration::from_secs(2));
+                                continue;
+                            }
+                            // The position is not going to become readable.
+                            // Take the same reconciliation an invalid journal
+                            // takes rather than retry it forever against a
+                            // volume that is already answering badly.
+                            FailedBatch::Reconcile { failing_for } => failing_for,
+                        };
+                        let reason = format!(
+                            "a change-feed batch failed to translate for {}s; reconciling: {error}",
+                            failing_for.as_secs()
                         );
-                        std::thread::sleep(Duration::from_secs(2));
+                        tracing::warn!(source = source_id.0, reason, "change feed stuck");
+                        let recovery = {
+                            let Some(_mutation) = status.mutation_guard(&state) else {
+                                stop(&status, "cancelled".into());
+                                return;
+                            };
+                            let _ = state.catalog.set_source_state(
+                                source_id,
+                                SourceState::Degraded,
+                                Some(&reason),
+                            );
+                            let _ = state.catalog.clear_checkpoint(source_id);
+                            scanner::start_feed_recovery_scan(&state, source_id, UnixNanos::now())
+                        };
+                        status.set(WatcherState::Reconciling, Some(reason));
+                        vol = None;
+                        match recovery {
+                            Ok(scanner::AutomaticScanOutcome::Started(_)) => {
+                                status.reconciles.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(scanner::AutomaticScanOutcome::Deferred(d)) => {
+                                status.set(WatcherState::Reconciling, Some(d.reason));
+                            }
+                            Err(e) => tracing::error!(error = %e, "reconcile start failed"),
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
                         continue;
                     }
                 };
@@ -871,6 +934,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                             created = astats.objects_created,
                             tombstoned = astats.objects_tombstoned,
                             out_of_scope = tstats.out_of_scope,
+                            unreadable = tstats.unreadable,
                             ms = started.elapsed().as_millis() as u64,
                             "applied change batch"
                         );

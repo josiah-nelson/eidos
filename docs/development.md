@@ -42,7 +42,10 @@ exercise real rendered setup controls in jsdom: role changes, joining,
 partial drive results, scan retry and state surviving query refreshes.
 Resource-control tests also exercise explicit saves, persistence errors and
 disk-pressure visibility; [resource-controls.md](resource-controls.md) has the
-bounded synthetic measurement procedure.
+bounded synthetic measurement procedure. Memory-diagnostics tests cover the
+cold/stale sampling contract, per-platform counter availability and the
+rendered pending, stale, probe-failure and refetch-failure states; see
+[memory.md](memory.md).
 
 Exclusion tests cover rendered drafts/preview/apply, optimistic conflicts,
 catalog-only application while a source is unavailable, native path changes,
