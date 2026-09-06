@@ -66,16 +66,21 @@ try {
         })
         [IO.File]::WriteAllText((Join-Path $recordDir 'results.json'), (ConvertTo-Json -InputObject $results.ToArray() -Depth 8), $utf8)
         Write-Host "Run $($run + 1): synthetic thresholds pass=$($evaluation.passed_synthetic_thresholds); failed=$($evaluation.failed_checks -join ', ')"
+        if ($evaluation.rejected_because) { Write-Host "Run $($run + 1) report rejected: $($evaluation.rejected_because)" }
     }
     $failedRuns = @($results | Where-Object { -not $_.evaluation.passed_synthetic_thresholds })
     $summary = @{ status = 'complete'; completed_runs = $results.Count; failed_runs = $failedRuns.Count
         passed_synthetic_thresholds = $failedRuns.Count -eq 0; binary_sha256 = $candidateHash }
     [IO.File]::WriteAllText((Join-Path $recordDir 'summary.json'), ($summary | ConvertTo-Json), $utf8)
 } catch {
-    $failure = @{ status = 'incomplete'; error = $_.Exception.Message; completed_runs = $results.Count; binary_sha256 = $candidateHash
-        fixture_directory = $_.Exception.Data['recovery_fixture_directory'] }
+    $failed = $_
+    # An abort that carries no fixture annotation still has to leave a record.
+    $fixtureLink = $null
+    try { $fixtureLink = $failed.Exception.Data['recovery_fixture_directory'] } catch { }
+    $failure = @{ status = 'incomplete'; error = $failed.Exception.Message; completed_runs = $results.Count
+        binary_sha256 = $candidateHash; fixture_directory = $fixtureLink }
     [IO.File]::WriteAllText((Join-Path $recordDir 'failure.json'), ($failure | ConvertTo-Json), $utf8)
-    throw
+    throw $failed
 } finally {
     Write-Host "Matrix plan, raw reports and outcomes retained: $recordDir"
 }

@@ -23,6 +23,7 @@ function Test-RecoveryMeasurement {
     Set-StrictMode -Version Latest
     $limits = Get-RecoveryThresholds
     $checks = [ordered]@{}
+    $rejection = $null
     # Fail closed on missing fields, NaN, infinity, malformed numeric strings
     # or booleans disguised as numbers. Wire u64 fields are decimal strings.
     function Number($Value) {
@@ -107,12 +108,15 @@ function Test-RecoveryMeasurement {
             (TrueBoolean $restart.retained_search_total.exact) -and (Count $restart.retained_search_total.value) -eq 772
         $checks.valid_report = $true
     } catch {
+        # A closed gate must say what it could not read, not only that it closed.
         $checks.valid_report = $false
+        $rejection = $_.Exception.Message
     }
     $failed = @($checks.Keys | Where-Object { -not $checks[$_] })
     [pscustomobject]@{
         passed_synthetic_thresholds = $failed.Count -eq 0
         failed_checks = $failed
+        rejected_because = $rejection
         checks = $checks
         qualification = 'synthetic evidence only; no recommended profile or deployment qualification'
     }

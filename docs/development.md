@@ -77,6 +77,8 @@ then keeps the executable, raw reports and all pass/fail outcomes in a new ignor
 `failure.json` records an incomplete matrix and links a failed smoke's fixture.
 Temporary stores/logs remain available through the raw reports' fixture paths.
 A startup, correctness or reader-cap failure aborts with an incomplete record.
+The failed run keeps its own `failure.json` beside its retained fixture, including
+a failure while generating that fixture or launching the candidate.
 Evaluated performance failures remain in the six-run comparison and give a
 nonzero exit at the end.
 
@@ -88,8 +90,9 @@ controls/results retained across restart and successful explicit resume. Exact
 search totals must match all 772 files both after drain and after restart;
 these correctness queries are outside the crawl latency sample. Sample counts
 and percentiles must agree with the recorded crawl latencies.
-Missing, nonfinite or malformed gate measurements fail closed. Do not add idle
-queries to inflate the crawl sample count or relax criteria after a failure.
+Missing, nonfinite or malformed gate measurements fail closed, and the retained
+outcome records what could not be read. Do not add idle queries to inflate the
+crawl sample count or relax criteria after a failure.
 
 These are development evidence gates, not recommended performance presets.
 Host activity and reviewer builds may overlap; process transfers are not

@@ -34,6 +34,12 @@ function Check([scriptblock]$Mutate, [string]$ExpectedFailure = '') {
             throw "Expected failure '$ExpectedFailure': $($result | ConvertTo-Json -Depth 5 -Compress)"
         }
     } elseif (-not $result.passed_synthetic_thresholds) { throw 'Boundary fixture must pass' }
+    # An unreadable report must record what stopped it; a measured threshold
+    # failure must not claim the report itself was rejected.
+    $expectsReason = $ExpectedFailure -eq 'valid_report'
+    if ($expectsReason -ne [bool]$result.rejected_because) {
+        throw "Rejection reason mismatch for '$ExpectedFailure': [$($result.rejected_because)]"
+    }
     $script:caseCount++
 }
 Check { param($r) }
