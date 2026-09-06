@@ -32,6 +32,7 @@ pub mod scanner;
 pub mod source_budget;
 pub mod state;
 pub mod update_check;
+pub mod updates;
 #[cfg(windows)]
 pub mod usn_apply;
 #[cfg(any(windows, test))]

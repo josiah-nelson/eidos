@@ -19,6 +19,11 @@ signature and timestamp is verified before asset upload. Signing
 infrastructure already exists; it must also be used by the planned pushed
 update path, which is not implemented by the advisory version badge.
 
+Release assets intended for update staging must retain the canonical
+`eidos-v<version>-setup.exe` name. GitHub's release-asset SHA-256 digest is part
+of the staging trust decision, in addition to Authenticode and embedded product
+metadata. Staging is preparation only and does not run the installer.
+
 Run the unsigned lifecycle gate once for an installer change:
 
 ```powershell

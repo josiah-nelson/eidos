@@ -80,6 +80,21 @@ satisfy the checks by falling back to a default or being reconstructed.
 It also checks stable fleet identity. These checks use unsigned development
 packages; they do not establish signed release or real-machine qualification.
 
+### Preparing a newer release
+
+`eidos updates check` records a compatible newer canonical release.
+`eidos updates configure --expected-publisher '<certificate subject>'` pins the
+required Authenticode publisher, and `eidos updates stage` downloads and
+verifies the setup without running it. The Nodes page offers the same check,
+configuration, and staging controls. Staged files remain under the Eidos data
+directory and interrupted or failed verification is reported after restart.
+
+This is not an upgrade command. Install and fleet rollout remain disabled
+until the drain/install/restart/health lifecycle is implemented and qualified.
+
+A release newer than this build but not a compatible upgrade for it is
+reported as information; it is never staged.
+
 ### Retiring an existing collector
 
 The recovery installer does not carry or adopt the profiling collector.

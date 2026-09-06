@@ -1,5 +1,22 @@
 # Private fleet (experimental, v0.5)
 
+## Update preparation
+
+The Nodes page can check the canonical Eidos GitHub release and download a
+newer compatible setup into verified staging. Configure the exact expected
+Authenticode publisher certificate subject before staging. The service also
+checks the release asset's fixed name and URL, declared size, GitHub SHA-256
+digest, Windows trust result, product name, and version. State and failures
+survive restart, turning automatic checks on or off takes effect without one,
+and staging keeps only the artifact the page still reports.
+
+A release that is newer but not a compatible upgrade for the running build is
+reported as available information; it is never staged.
+
+This prepares an artifact only. Master-initiated installation, node draining,
+restart health checks, retries, and canary scheduling are not enabled yet. No
+API accepts an arbitrary download URL or command.
+
 v0.5 can run as a small, operator-approved dogfood fleet: several standalone
 Windows installations replicate their catalog metadata into one designated
 master, and the master searches the union. Every node keeps working on its

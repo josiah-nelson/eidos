@@ -248,6 +248,8 @@ export type RebuildStatus = { phase: RebuildPhase, chunks: ApiInt, docs: ApiInt,
 
 export type ReconciliationDeferral = { reason: string, next_eligible_at: UnixNanos, };
 
+export type ReleaseArtifact = { version: string, name: string, download_url: string, size: ApiInt, sha256: string, };
+
 export type RemoteCompleteness = { node_id: string, node_name: string, remote_source_id: SourceId, epoch: string, applied_seq: ApiInt, reported_head: ApiInt, applied_at?: UnixNanos, reported_at?: UnixNanos, resyncing: boolean, connected: boolean, };
 
 export type ReplicaSourceSync = { source_id: SourceId, name: string, node: NodeId, node_name: string, remote_source_id: SourceId, epoch: string, applied_seq: ApiInt, reported_head: ApiInt, applied_at?: UnixNanos, reported_at?: UnixNanos, resyncing: boolean, connected: boolean, };
@@ -316,6 +318,10 @@ export type SourceState = "new" | "enumerating" | "metadata_complete" | "content
 
 export type SourceView = { source: SourceRecord, counts: SourceCounts, completeness: SourceCompleteness, scan?: ScanProgress, watcher?: WatcherView, reconciliation_deferred?: ReconciliationDeferral, };
 
+export type StagePhase = "idle" | "downloading" | "verifying" | "staged" | "failed";
+
+export type StagedArtifact = { version: string, path: string, size: ApiInt, sha256: string, publisher: string, product: string, };
+
 export type StartupRecovery = { aborted_scan_generations: ApiInt, requeued_running_jobs: ApiInt, requeued_unfinished_content: ApiInt, };
 
 export type StorageView = { catalog_db_bytes: ApiInt, catalog_index_bytes: ApiInt, content_index_bytes: ApiInt, };
@@ -341,6 +347,10 @@ export type TotalCount = { value: ApiInt, exact: boolean, origin: TotalOrigin, }
 export type TotalOrigin = "counted" | "cursor" | "bound";
 
 export type UnixNanos = ApiInt;
+
+export type UpdateSettings = { automatic_checks: boolean, expected_publisher: string | null, expected_product: string, max_artifact_bytes: ApiInt, };
+
+export type UpdateState = { checks_enabled: boolean, current_version: string, checked_at: UnixNanos | null, check_error: string | null, latest_version: string | null, available: ReleaseArtifact | null, stage_phase: StagePhase, stage_error: string | null, staged: StagedArtifact | null, };
 
 export type VolumeCandidateView = { root: string, drive_type: string, filesystem: string, volume_name: string, total_bytes: ApiInt, free_bytes: ApiInt, supports_usn: boolean, already_indexed: boolean, };
 
