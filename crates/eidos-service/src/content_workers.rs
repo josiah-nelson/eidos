@@ -375,6 +375,14 @@ pub fn reserve_and_claim(
         if active_scans.contains(&source) {
             return None;
         }
+        // Check the shared-device gate before charging the source budget. A
+        // device refusal holds every source at once, and a source unit taken
+        // and immediately dropped here would still raise that source's peak
+        // reservation for work the device gate is what actually held.
+        state
+            .devices
+            .would_admit(source.0, crate::device_budget::WorkKind::Content, 1)
+            .ok()?;
         let source_reservation = budgets.try_reserve(source)?;
         let device = state
             .devices

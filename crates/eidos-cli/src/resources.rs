@@ -105,7 +105,7 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
         if let Some(errors) = body["source_errors"].as_object() {
             for (source, error) in errors {
                 println!(
-                    "source {source}: {}",
+                    "source {source} topology error: {}",
                     error.as_str().unwrap_or("topology unavailable")
                 );
             }
@@ -113,7 +113,7 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
         if let Some(roots) = body["source_roots"].as_object() {
             for (source, root) in roots {
                 println!(
-                    "source {source}: {}",
+                    "source {source} root: {}",
                     root.as_str().unwrap_or("unknown root")
                 );
             }

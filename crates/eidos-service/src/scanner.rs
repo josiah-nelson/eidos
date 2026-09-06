@@ -482,13 +482,18 @@ pub(crate) fn wait_for_capacity(
                 ) {
                     Ok(device) => device,
                     Err(reason) => {
+                        let width = reservation.threads;
+                        drop(reservation);
                         progress.set_phase(match reason {
                             crate::device_budget::WaitReason::TopologyDraining => "waiting for old device reservations to drain after topology changed",
                             crate::device_budget::WaitReason::DeviceAtCapacity => "waiting for shared-device reader capacity",
                             crate::device_budget::WaitReason::UnknownSource => "waiting for local-source topology registration",
-                            crate::device_budget::WaitReason::InvalidWidth => "invalid device reader request",
+                            // Waiting can never satisfy a malformed width: fail
+                            // the scan instead of spinning on it forever.
+                            crate::device_budget::WaitReason::InvalidWidth => anyhow::bail!(
+                                "scan enumeration width {width} is outside the shared-device reader range 1..=64"
+                            ),
                         });
-                        drop(reservation);
                         std::thread::sleep(Duration::from_millis(100));
                         continue;
                     }
