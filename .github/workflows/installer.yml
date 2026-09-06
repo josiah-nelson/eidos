@@ -101,30 +101,41 @@ jobs:
             if ($null -eq $s) { throw "service $name is not registered" }
             if ($s.Status -ne $state) { throw "service $name is $($s.Status), expected $state" }
           }
+          function Assert-Retained([string]$what, $actual, $expected) {
+            # Report the observed value: the runner is disposable, so the log
+            # is the only evidence left of why a retention check failed.
+            if ($actual -ne $expected) { throw "$what is '$actual', expected '$expected'" }
+          }
           function Assert-RecoveryFixture([int]$port, [string]$recordPath) {
             $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
             $url = "http://127.0.0.1:$port"
             $health = Invoke-RestMethod "$url/api/health" -TimeoutSec 10
-            if ([IO.Path]::GetFullPath($health.catalog_path) -ne $record.catalog_path) { throw 'Unexpected installed catalog' }
+            Assert-Retained 'installed catalog' ([IO.Path]::GetFullPath($health.catalog_path)) $record.catalog_path
             $source = Invoke-RestMethod "$url/api/sources/$($record.source_id)" -TimeoutSec 10
-            if ($source.source.root_path -ne $record.source_root -or $source.source.content_concurrency -ne 1 -or
-                -not $source.source.content_enabled) { throw 'Installed source or its settings were not retained' }
+            Assert-Retained 'source root' $source.source.root_path $record.source_root
+            Assert-Retained 'source content concurrency' $source.source.content_concurrency 1
+            Assert-Retained 'source content extraction' $source.source.content_enabled $true
             $resources = Invoke-RestMethod "$url/api/resources" -TimeoutSec 10
+            Assert-Retained 'scan threads' $resources.limits.scan_threads 3
+            Assert-Retained 'concurrent scans' $resources.limits.concurrent_scans 2
+            Assert-Retained 'minimum free MiB' $resources.limits.minimum_free_mib 512
             $devices = Invoke-RestMethod "$url/api/devices" -TimeoutSec 10
+            Assert-Retained 'readers per device' $devices.budget.readers_per_device 3
             $workers = Invoke-RestMethod "$url/api/content/workers" -TimeoutSec 10
+            Assert-Retained 'content workers' $workers.workers 3
             $pause = Invoke-RestMethod "$url/api/content/status" -TimeoutSec 10
-            if ($resources.limits.scan_threads -ne 2 -or $resources.limits.concurrent_scans -ne 1 -or
-                $resources.limits.minimum_free_mib -ne 1024 -or $devices.budget.readers_per_device -ne 2 -or
-                $workers.workers -ne 2 -or -not $pause.paused -or $pause.in_flight -ne 0) {
-              throw 'Installed pause or resource settings were not retained'
-            }
+            Assert-Retained 'content pause' $pause.paused $true
+            Assert-Retained 'in-flight batches' $pause.in_flight 0
+            # `ready` means the content index still reflects every stored
+            # chunk: an installer operation that lost it would rebuild.
+            Assert-Retained 'content search state' $pause.search 'ready'
             $search = Invoke-RestMethod "$url/api/search?q=content%3A%3Drecoveryinstallneedle&limit=10&count=exact" -TimeoutSec 15
-            if (-not $search.total.exact -or [long]$search.total.value -ne 4 -or $search.hits.Count -ne 4 -or
-                @($search.hits | Where-Object { $_.source_id -ne $record.source_id }).Count) {
-              throw 'Installed catalog lost searchable fixture content'
-            }
+            Assert-Retained 'content match total' ([long]$search.total.value) 4
+            Assert-Retained 'content total exactness' $search.total.exact $true
+            Assert-Retained 'returned content hits' $search.hits.Count 4
+            Assert-Retained 'hits outside the fixture source' (@($search.hits | Where-Object { $_.source_id -ne $record.source_id }).Count) 0
             foreach ($file in $record.files) {
-              if ((Get-FileHash -LiteralPath $file.path -Algorithm SHA256).Hash -cne $file.sha256) { throw 'Source fixture changed' }
+              Assert-Retained "hash of $($file.path)" (Get-FileHash -LiteralPath $file.path -Algorithm SHA256).Hash $file.sha256
             }
             Write-Host 'Retained four searchable files, source hashes, pause and resource settings.'
           }
@@ -141,9 +152,13 @@ jobs:
               [IO.File]::WriteAllText($path, "recoveryinstallneedle synthetic document $i", [Text.UTF8Encoding]::new($false))
               @{ path = $path; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
             })
-            $null = Invoke-RestMethod "$url/api/resources" -Method Post -ContentType 'application/json' -TimeoutSec 10 -Body '{"scan_threads":2,"concurrent_scans":1,"minimum_free_mib":1024}'
-            $null = Invoke-RestMethod "$url/api/devices" -Method Post -ContentType 'application/json' -TimeoutSec 10 -Body '{"readers_per_device":2}'
-            $null = Invoke-RestMethod "$url/api/content/workers" -Method Post -ContentType 'application/json' -TimeoutSec 10 -Body '{"workers":2}'
+            # Every seeded value differs from the service default (scan threads
+            # 8, concurrent scans 1, 1024 MiB, 2 readers, 4 workers, source
+            # concurrency 2), so a settings file an installer step dropped
+            # cannot satisfy the checks by falling back.
+            $null = Invoke-RestMethod "$url/api/resources" -Method Post -ContentType 'application/json' -TimeoutSec 10 -Body '{"scan_threads":3,"concurrent_scans":2,"minimum_free_mib":512}'
+            $null = Invoke-RestMethod "$url/api/devices" -Method Post -ContentType 'application/json' -TimeoutSec 10 -Body '{"readers_per_device":3}'
+            $null = Invoke-RestMethod "$url/api/content/workers" -Method Post -ContentType 'application/json' -TimeoutSec 10 -Body '{"workers":3}'
             $source = Invoke-RestMethod "$url/api/sources" -Method Post -ContentType 'application/json' -TimeoutSec 10 -Body (
               @{ name = 'installed-recovery-fixture'; root_path = $sourceRoot; scan = $false } | ConvertTo-Json)
             $sourceId = $source.source.id
@@ -156,7 +171,15 @@ jobs:
               if ([DateTime]::UtcNow -gt $deadline) { throw 'Installed fixture did not complete' }
               Start-Sleep -Milliseconds 100
             } while ($true)
-            $null = Invoke-RestMethod "$url/api/content/pause" -Method Post -TimeoutSec 10
+            # Pausing stops new claims only; a batch already claimed still runs
+            # to completion, so wait for the drain the assertions expect.
+            $flow = Invoke-RestMethod "$url/api/content/pause" -Method Post -TimeoutSec 10
+            $deadline = [DateTime]::UtcNow.AddSeconds(60)
+            while ($flow.in_flight -ne 0) {
+              if ([DateTime]::UtcNow -gt $deadline) { throw "content is still draining: $($flow.flow_reason)" }
+              Start-Sleep -Milliseconds 100
+              $flow = Invoke-RestMethod "$url/api/content/status" -TimeoutSec 10
+            }
             @{ catalog_path = $expectedCatalog; source_id = $sourceId; source_root = $sourceRoot; files = $files } |
               ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $recordPath
             Assert-RecoveryFixture $port $recordPath
