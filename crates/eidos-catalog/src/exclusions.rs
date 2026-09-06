@@ -205,11 +205,15 @@ pub(crate) fn engine_conn(conn: &Connection, source: SourceId) -> Result<PolicyE
             if within(&root, p, sensitive) {
                 Some(String::new())
             } else if within(p, &root, sensitive) {
+                // Case-insensitive matching can fold to a different byte
+                // length, so drop whole components instead of slicing at
+                // `root.len()`: a non-boundary slice would silently yield ""
+                // and protect the entire source.
                 Some(
-                    p.get(root.len()..)
-                        .unwrap_or("")
-                        .trim_start_matches('/')
-                        .to_owned(),
+                    p.split('/')
+                        .skip(root.split('/').count())
+                        .collect::<Vec<_>>()
+                        .join("/"),
                 )
             } else {
                 None
@@ -236,9 +240,22 @@ pub(crate) fn applying_conn(conn: &Connection, source: SourceId) -> Result<bool>
 
 /// A path change can alter inherited decisions without changing file bytes.
 /// Restart the bounded catalog pass, retaining the operator's revision/rules.
+///
+/// A pass that is already running is *not* rewound: repeated moves on an
+/// actively reorganized source would otherwise discard progress indefinitely
+/// and hold its content claims closed. One more full pass is queued instead,
+/// which `acknowledge_policy_cleanup` starts once this one has committed.
 pub(crate) fn reapply_conn(conn: &Connection, source: SourceId) -> Result<()> {
-    conn.execute("INSERT INTO source_policy (source_id, revision, rules) VALUES (?1, 0, '[]')
-        ON CONFLICT(source_id) DO UPDATE SET phase = 'applying', cursor = 0, processed = 0, changed = 0", [source.0])?;
+    conn.execute(
+        "INSERT INTO source_policy (source_id, revision, rules) VALUES (?1, 0, '[]')
+        ON CONFLICT(source_id) DO UPDATE SET
+            restart_requested = (phase != 'applied'),
+            phase = 'applying',
+            cursor = CASE WHEN phase = 'applied' THEN 0 ELSE cursor END,
+            processed = CASE WHEN phase = 'applied' THEN 0 ELSE processed END,
+            changed = CASE WHEN phase = 'applied' THEN 0 ELSE changed END",
+        [source.0],
+    )?;
     Ok(())
 }
 
@@ -495,7 +512,7 @@ impl Catalog {
             if applying_conn(&tx, source)? { return Err(invalid("policy application is already in progress; retry its error or wait for completion")); }
             if tx.query_row("SELECT EXISTS(SELECT 1 FROM scan_generations WHERE source_id = ?1 AND state = 'open')", [source.0], |r| r.get::<_, bool>(0))? { return Err(invalid("a scan is open; finish or cancel it before applying exclusions")); }
             tx.execute("INSERT INTO source_policy (source_id, revision, rules) VALUES (?1, ?2, ?3)
-                ON CONFLICT(source_id) DO UPDATE SET revision = excluded.revision, rules = excluded.rules, phase = 'applying', cursor = 0, processed = 0, changed = 0, error = NULL",
+                ON CONFLICT(source_id) DO UPDATE SET revision = excluded.revision, rules = excluded.rules, phase = 'applying', cursor = 0, processed = 0, changed = 0, restart_requested = 0, error = NULL",
                 params![source.0, request.expected_revision + 1, serde_json::to_string(&request.rules)?])?;
             tx.execute("UPDATE sources SET policy_version = ?2 WHERE source_id = ?1", params![source.0, engine.version])?;
             tx.commit()?;
@@ -530,7 +547,7 @@ impl Catalog {
             for (source, previous) in before {
                 if previous == engine_conn(&tx, source)?.protected { continue; }
                 tx.execute("INSERT INTO source_policy (source_id, revision, rules) VALUES (?1, 1, '[]')
-                    ON CONFLICT(source_id) DO UPDATE SET revision = revision + 1, phase = 'applying', cursor = 0, processed = 0, changed = 0, error = NULL", [source.0])?;
+                    ON CONFLICT(source_id) DO UPDATE SET revision = revision + 1, phase = 'applying', cursor = 0, processed = 0, changed = 0, restart_requested = 0, error = NULL", [source.0])?;
                 tx.execute("UPDATE sources SET policy_version = ?2 WHERE source_id = ?1", params![source.0, POLICY_VERSION])?;
             }
             tx.commit()?;
@@ -602,15 +619,22 @@ impl Catalog {
                 tx.execute("UPDATE objects SET generation = generation + 1, content_id = NULL WHERE object_id = ?1", [id.0])?;
                 crate::content::flip_state(&tx, *id, next, None)?;
                 crate::sync::touch_conn(&tx, source, *id)?;
-                tx.execute("DELETE FROM chunks WHERE object_id = ?1", [id.0])?;
-                tx.execute("DELETE FROM content_records WHERE object_id = ?1", [id.0])?;
+                let stored = tx.execute("DELETE FROM chunks WHERE object_id = ?1", [id.0])?
+                    + tx.execute("DELETE FROM content_records WHERE object_id = ?1", [id.0])?;
                 crate::archive::retire_virtual_tree(&tx, *id, eidos_domain::UnixNanos::now().0)?;
                 tx.execute("DELETE FROM archive_members WHERE object_id = ?1", [id.0])?;
                 tx.execute("DELETE FROM archive_records WHERE object_id = ?1", [id.0])?;
                 let generation: i64 = tx.query_row("SELECT generation FROM objects WHERE object_id = ?1", [id.0], |r| r.get(0))?;
                 crate::jobs::outbox_append_conn(&tx, source, *id, "subtree", generation)?;
                 tx.execute("UPDATE jobs SET state = 'superseded' WHERE object_id = ?1 AND stage = 'content_text' AND state = 'queued'", [id.0])?;
-                tx.execute("INSERT OR IGNORE INTO policy_cleanup (object_id, source_id) VALUES (?1, ?2)", params![id.0, source.0])?;
+                // Chunk rows are written to the catalog before their documents
+                // reach the derived index, so an object that stored neither
+                // chunks nor a content record cannot have documents there.
+                // Queuing the rest would commit a durable no-op delete page for
+                // every 128 objects of a never-indexed corpus.
+                if stored > 0 {
+                    tx.execute("INSERT OR IGNORE INTO policy_cleanup (object_id, source_id) VALUES (?1, ?2)", params![id.0, source.0])?;
+                }
             }
             tx.execute("UPDATE source_policy SET cursor = ?2, processed = processed + ?3, changed = changed + ?4, phase = ?5 WHERE source_id = ?1",
                 params![source.0, ids.last().map(|id| id.0).unwrap_or(cursor), ids.len() as i64, changed, if ids.len() < 128 { "purging" } else { "applying" }])?;
@@ -628,8 +652,21 @@ impl Catalog {
         self.with_writer(|conn| {
             let tx = conn.transaction()?;
             for object in objects { tx.execute("DELETE FROM policy_cleanup WHERE object_id = ?1 AND source_id = ?2", params![object.0, source.0])?; }
-            let finished = tx.execute("UPDATE source_policy SET phase = 'applied', error = NULL WHERE source_id = ?1 AND phase = 'purging' AND NOT EXISTS(SELECT 1 FROM policy_cleanup WHERE source_id = ?1)", [source.0])?;
-            if finished > 0 { crate::content::refresh_source_content_state_conn(&tx, source)?; }
+            let ready: Option<bool> = tx.query_row(
+                "SELECT restart_requested != 0 FROM source_policy
+                 WHERE source_id = ?1 AND phase = 'purging' AND NOT EXISTS(SELECT 1 FROM policy_cleanup WHERE source_id = ?1)",
+                [source.0], |r| r.get(0)).optional()?;
+            match ready {
+                // A path change arrived while this pass ran, so objects it
+                // already walked may hold stale decisions. Run the queued pass
+                // rather than reporting a transition that never observed them.
+                Some(true) => { tx.execute("UPDATE source_policy SET phase = 'applying', cursor = 0, processed = 0, changed = 0, restart_requested = 0, error = NULL WHERE source_id = ?1", [source.0])?; }
+                Some(false) => {
+                    tx.execute("UPDATE source_policy SET phase = 'applied', error = NULL WHERE source_id = ?1", [source.0])?;
+                    crate::content::refresh_source_content_state_conn(&tx, source)?;
+                }
+                None => {}
+            }
             tx.commit()?;
             Ok(())
         })
@@ -770,6 +807,21 @@ mod tests {
         assert_eq!(
             engine
                 .path_decision("work2/drop.txt", FileAttributes(0), 0)
+                .initial_state(),
+            ContentState::Pending
+        );
+        // `file` builds the relative path lazily; nested paths must still be
+        // matched by folder rules, and the default engine must still classify
+        // a deep path by extension without one.
+        assert_eq!(
+            engine
+                .path_decision("work/a/b/deep.txt", FileAttributes(0), 0)
+                .initial_state(),
+            ContentState::Excluded
+        );
+        assert_eq!(
+            PolicyEngine::new()
+                .path_decision("work/a/b/deep.txt", FileAttributes(0), 0)
                 .initial_state(),
             ContentState::Pending
         );

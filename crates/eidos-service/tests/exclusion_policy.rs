@@ -449,6 +449,231 @@ fn newly_configured_store_purges_old_content_without_reenumeration() {
     );
 }
 
+#[test]
+fn nested_store_boundaries_stay_relative_and_never_protect_the_whole_source() {
+    let f = Fx::new(1, false);
+    let nested = f.root.join("docs").join("store");
+    std::fs::create_dir_all(&nested).unwrap();
+    f.state
+        .catalog
+        .configure_protected_paths(std::slice::from_ref(&nested))
+        .unwrap();
+    let policy = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(policy.protected_directories, vec!["docs/store".to_owned()]);
+    // A boundary two components deep must not swallow its siblings.
+    assert!(!f
+        .state
+        .catalog
+        .path_is_protected(f.source, &f.root.join("docs").display().to_string())
+        .unwrap());
+    assert!(f
+        .state
+        .catalog
+        .path_is_protected(f.source, &nested.join("catalog.db").display().to_string())
+        .unwrap());
+    f.settle();
+    assert_eq!(
+        f.state
+            .catalog
+            .get_object(f.id("docs/n0.txt"))
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Pending,
+    );
+    // Protecting the source root itself is still the whole-root boundary.
+    f.state
+        .catalog
+        .configure_protected_paths(std::slice::from_ref(&f.root))
+        .unwrap();
+    assert_eq!(
+        f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .protected_directories,
+        vec![String::new()]
+    );
+}
+
+#[test]
+fn a_file_rename_does_not_restart_a_whole_source_pass_unless_its_decision_changes() {
+    use eidos_catalog::changes::ChangeEvent;
+    let f = Fx::new(1, false);
+    f.index("docs/n0.txt");
+    f.apply(vec![folder("hidden")]);
+    f.settle();
+    let (_, snapshot) = native(&f, "docs/n0.txt");
+    let parent = f
+        .state
+        .catalog
+        .get_object(f.id("docs"))
+        .unwrap()
+        .unwrap()
+        .native
+        .unwrap()
+        .into();
+    let rename = |from: &str, to: &str| {
+        f.state
+            .catalog
+            .apply_changes(
+                f.source,
+                &[
+                    ChangeEvent::Unlink {
+                        parent,
+                        name: from.into(),
+                    },
+                    ChangeEvent::Link {
+                        parent,
+                        name: to.into(),
+                        snapshot: snapshot.clone(),
+                    },
+                ],
+                None,
+            )
+            .unwrap();
+    };
+    // Still outside every rule: nothing to reapply, so content claims and
+    // scans for this source must stay open.
+    rename("n0.txt", "n1.txt");
+    assert!(!f.state.catalog.policy_applying(f.source).unwrap());
+    assert_eq!(f.state.content_index.num_docs(), 1);
+    assert!(
+        f.state
+            .catalog
+            .content_target(f.id("docs/n1.txt"))
+            .unwrap()
+            .unwrap()
+            .content_enabled
+    );
+    // A rename that does change the decision still schedules the pass.
+    f.apply(vec![folder("docs/quarantine.txt")]);
+    f.settle();
+    rename("n1.txt", "quarantine.txt");
+    assert!(f.state.catalog.policy_applying(f.source).unwrap());
+    f.settle();
+    assert_eq!(
+        f.state
+            .catalog
+            .get_object(f.id("docs/quarantine.txt"))
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Excluded
+    );
+    assert_eq!(f.state.content_index.num_docs(), 0);
+}
+
+#[test]
+fn only_objects_that_stored_content_queue_a_derived_index_deletion() {
+    let f = Fx::new(300, false);
+    f.index("docs/n0.txt");
+    let indexed = f.id("docs/n0.txt");
+    f.apply(vec![folder("docs")]);
+    for _ in 0..10 {
+        f.state.catalog.apply_policy_batch(f.source).unwrap();
+    }
+    let status = f.state.catalog.exclusion_policy(f.source).unwrap();
+    assert_eq!(status.phase, "purging");
+    assert_eq!(status.changed, 300);
+    // 299 of them never produced chunks or a content record, so queuing them
+    // would commit a page of no-op index deletions for each 128 objects.
+    assert_eq!(
+        f.state.catalog.policy_cleanup_batch(f.source).unwrap(),
+        vec![indexed]
+    );
+    f.settle();
+    assert_eq!(f.state.content_index.num_docs(), 0);
+    assert_eq!(
+        f.state
+            .catalog
+            .source_counts(f.source)
+            .unwrap()
+            .content_excluded,
+        300
+    );
+}
+
+#[test]
+fn a_move_during_application_queues_one_more_pass_instead_of_discarding_progress() {
+    use eidos_catalog::changes::ChangeEvent;
+    let f = Fx::new(300, false);
+    f.apply(vec![folder("hidden")]);
+    f.state.catalog.apply_policy_batch(f.source).unwrap();
+    let progressed = f
+        .state
+        .catalog
+        .exclusion_policy(f.source)
+        .unwrap()
+        .processed;
+    assert_eq!(progressed, 128);
+    let (_, snapshot) = native(&f, "docs");
+    let root = f
+        .state
+        .catalog
+        .get_source(f.source)
+        .unwrap()
+        .unwrap()
+        .root_object_id
+        .unwrap();
+    let parent = f
+        .state
+        .catalog
+        .get_object(root)
+        .unwrap()
+        .unwrap()
+        .native
+        .unwrap()
+        .into();
+    f.state
+        .catalog
+        .apply_changes(
+            f.source,
+            &[
+                ChangeEvent::Unlink {
+                    parent,
+                    name: "docs".into(),
+                },
+                ChangeEvent::Link {
+                    parent,
+                    name: "hidden".into(),
+                    snapshot,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    // The running pass keeps its cursor: repeated moves must not be able to
+    // rewind it forever and hold this source's content claims closed.
+    assert_eq!(
+        f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .processed,
+        progressed
+    );
+    // It still converges, and the queued pass observes the moved subtree.
+    f.settle();
+    assert_eq!(
+        f.state
+            .catalog
+            .get_object(f.id("hidden/n0.txt"))
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Excluded
+    );
+    assert_eq!(
+        f.state
+            .catalog
+            .source_counts(f.source)
+            .unwrap()
+            .content_excluded,
+        300
+    );
+}
+
 async fn request(
     f: &Fx,
     method: &str,
