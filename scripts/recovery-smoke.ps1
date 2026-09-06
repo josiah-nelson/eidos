@@ -41,6 +41,10 @@ $activePauseLargeFileBytes = 1MB
 $activePauseDrainSeconds = 5
 $activePauseHoldSeconds = 3
 $activePauseMaximumAttempts = 8
+# Schema 1 recorded the large file only as it was seen before the pause request.
+# Schema 2 also records what was still extracting once the pause was
+# acknowledged, which is what an active-pause claim actually rests on.
+$activePauseSchema = 2
 # Everything that can still fail runs inside the protected lifecycle below,
 # so a fixture-generation, hashing or launch failure also records failure.json
 # beside its retained fixture and names that fixture to the caller.
@@ -102,12 +106,13 @@ function Measure-ActivePause($activityBefore) {
     # would then measure a small file's drain while the report named a large
     # one, so read the held set back and require the large file to still be
     # extracting. An attempt that raced completion is recorded and retried,
-    # never reclassified as active-pause evidence.
+    # never reclassified as active-pause evidence. That read-back is part of
+    # the acknowledged pause, so the drain clock starts at the acknowledgement
+    # and not after it: a slow /api/activity lengthens the reported drain
+    # rather than disappearing from it.
     $pauseClock = [Diagnostics.Stopwatch]::StartNew()
     $paused = Invoke-RestMethod "$baseUrl/api/content/pause" -Method Post -TimeoutSec 10
     $pauseMs = $pauseClock.Elapsed.TotalMilliseconds
-    # Include the post-acknowledgement identity read in extraction drain time.
-    # A slow Activity response must not disappear from the five-second gate.
     $drainClock = [Diagnostics.Stopwatch]::StartNew()
     if (-not $paused.paused) { throw 'Active pause was not acknowledged.' }
     if ([int]$paused.in_flight -eq 0) {
@@ -149,8 +154,14 @@ function Measure-ActivePause($activityBefore) {
     $holdSeconds = $holdClock.Elapsed.TotalSeconds
     $resumed = Invoke-RestMethod "$baseUrl/api/content/resume" -Method Post -TimeoutSec 10
     if ($resumed.paused) { throw 'Active workload did not resume explicitly.' }
-    @{ performed = $true; pause_response_ms = $pauseMs; in_flight_at_pause = $paused.in_flight
-        observed_files = $heldFiles; observed_files_before_pause = $activityBefore.workers.current
+    # observed_files keeps its original meaning -- the snapshot that triggered
+    # the attempt, taken before the pause request. in_flight_files_at_pause is
+    # the new evidence and the reason for the schema number: a schema-1 record
+    # has only the earlier snapshot and cannot show what was still extracting
+    # once the pause was acknowledged.
+    @{ schema = $activePauseSchema; performed = $true; pause_response_ms = $pauseMs
+        in_flight_at_pause = $paused.in_flight; in_flight_files_at_pause = $heldFiles
+        observed_files = $activityBefore.workers.current
         queued_before_pause = $activityBefore.jobs.queued
         extraction_drain_seconds = $drainSeconds; queued_after_drain = $drained.jobs.queued
         hold_seconds = $holdSeconds; extraction_stayed_stopped = $true; resumed = $true

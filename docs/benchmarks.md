@@ -62,7 +62,7 @@ The Windows host was not isolated, and sibling builds overlapped.
 | 4 | 4/4/2/4 | 9.366 | 172 | 38.70 | 600.45 | 0.363 | Memory failed |
 | 5 | 2/2/1/2 | 10.222 | 184 | 33.15 | 371.46 | 0.727 | Pass |
 | 6 | 1/1/1/1 | 9.466 | 178 | 24.00 | 346.48 | 0.623 | Pass |
-| 7, active pause | 2/2/1/2 | 12.353 | 142 | 23.98 | 351.00 | 0.623 | Pass |
+| 7, active pause | 2/2/1/2 | 12.353 | 142 | 23.98 | 351.00 | 0.623 | Pass (schema-1 pause) |
 
 All seven retained exactly 2,056 searchable files and saved controls through
 restart, and respected the resolved shared-device ceiling. Writer hold stayed
@@ -71,16 +71,23 @@ four-worker runs exceeded the unchanged 512-MiB resident-peak limit. One
 two-worker run exceeded the unchanged 1%-of-one-core idle limit. Those failures
 remain unresolved by this evidence; no run was discarded or reclassified.
 
-The active-pause run observed two 8-MiB files in flight with six queued jobs.
-Pause acknowledged in 4.077 ms, extraction drained in 1.207 seconds, and the
-backlog remained stopped for 3.013 seconds before explicit resume. Its crawl
-includes the 4.234-second controlled pause and is not an uninterrupted
-throughput result. This establishes bounded extraction drain for this fixture,
-not cancellation inside an OS read or recovery of a paused backlog on restart.
-Both files had been reading for about 30 ms when they were observed, immediately
-before the pause request; the harness now re-reads the still-extracting set after
-the pause is acknowledged, and this retained run predates that check. Its drain
-is far longer than a 64-KiB file takes, so the measured window is a large file's.
+The active-pause run recorded two 8-MiB files in flight with six queued jobs,
+a pause acknowledged in 4.077 ms, extraction drained in 1.207 seconds, and the
+backlog stopped for 3.013 seconds before explicit resume. Its crawl includes the
+4.234-second controlled pause and is not an uninterrupted throughput result.
+
+Read that run as a **pre-acknowledgement observation**. Its harness sampled the
+two large files immediately before sending the pause and then relied on a
+nonzero in-flight count, so the record cannot show which file was still being
+extracted once the pause was acknowledged; its drain is also measured from after
+a subsequent diagnostic request rather than from the acknowledgement. The
+counters above are unchanged and the run keeps its recorded outcome, but they do
+not establish that a large-file extraction was the one that drained. The harness
+now reads the extracting set back after the acknowledgement and records it as
+active-pause schema 2; this run is schema 1, and the gate names it as historical
+rather than accepting it. A corrected measurement needs a new run, which no
+evidence here supplies. Nothing about cancellation inside an OS read or recovery
+of a paused backlog on restart is established either.
 
 An initial attempt stopped at the completeness check because the harness used
 a ranked query whose 5,000 matching-chunk cap made the total inexact. The

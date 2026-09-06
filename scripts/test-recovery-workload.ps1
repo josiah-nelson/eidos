@@ -60,9 +60,12 @@ CheckFixture {
 }
 # The boundary report sits exactly on every published active-pause threshold.
 $pauseLimits = Get-RecoveryActivePauseThresholds
+$largeFile = @{ size = "$($pauseLimits.large_file_bytes)" }
 $pauseJson = @{
+    schema = Get-RecoveryActivePauseSchema
     performed = $true; in_flight_at_pause = 2; queued_before_pause = '3'; queued_after_drain = '1'
-    observed_files = @(@{ size = "$($pauseLimits.large_file_bytes)" }); pause_response_ms = $pauseLimits.response_ms
+    observed_files = @($largeFile); in_flight_files_at_pause = @($largeFile)
+    pause_response_ms = $pauseLimits.response_ms
     extraction_drain_seconds = $pauseLimits.extraction_drain_seconds
     hold_seconds = $pauseLimits.hold_seconds_minimum; total_seconds = 8.15
     extraction_stayed_stopped = $true; resumed = $true
@@ -93,8 +96,13 @@ CheckPause { param($p) $p.in_flight_at_pause = 3 } 'active_backlog'
 CheckPause { param($p) $p.in_flight_at_pause = 0.5 } 'valid_report'
 CheckPause { param($p) $p.queued_before_pause = '2' } 'active_backlog'
 CheckPause { param($p) $p.queued_after_drain = '0' } 'active_backlog'
-CheckPause { param($p) $p.observed_files[0].size = "$($pauseLimits.large_file_bytes - 1)" } 'active_backlog'
+CheckPause { param($p) $p.observed_files[0].size = "$($pauseLimits.large_file_bytes - 1)" } 'large_file_before_pause'
 CheckPause { param($p) $p.observed_files = 'one file' } 'valid_report'
+# The evidence the whole claim rests on: what was still extracting once the
+# pause was acknowledged, not what was seen before the request was sent.
+CheckPause { param($p) $p.in_flight_files_at_pause[0].size = "$($pauseLimits.large_file_bytes - 1)" } 'large_file_at_pause'
+CheckPause { param($p) $p.in_flight_files_at_pause = @() } 'valid_report'
+CheckPause { param($p) $p.in_flight_files_at_pause = @($largeFile, $largeFile, $largeFile) } 'large_file_at_pause'
 CheckPause { param($p) $p.pause_response_ms = $pauseLimits.response_ms + 0.1 } 'response'
 CheckPause { param($p) $p.extraction_drain_seconds = $pauseLimits.extraction_drain_seconds + 0.1 } 'drain'
 CheckPause { param($p) $p.hold_seconds = $pauseLimits.hold_seconds_minimum - 0.1 } 'held'
@@ -103,4 +111,9 @@ CheckPause { param($p) $p.resumed = $false } 'resumed'
 CheckPause { param($p) $p.pause_response_ms = 'NaN' } 'valid_report'
 CheckPause { param($p) $p.hold_seconds = @(3) } 'valid_report'
 CheckPause { param($p) $p.total_seconds = 3 } 'timing'
+# A schema-1 record keeps its counters but is named as historical, never
+# waived through this gate to keep an older measurement passing.
+CheckPause { param($p) $p.PSObject.Properties.Remove('schema') } 'valid_report'
+CheckPause { param($p) $p.schema = 1 } 'schema'
+CheckPause { param($p) $p.PSObject.Properties.Remove('in_flight_files_at_pause') } 'valid_report'
 Write-Output "Recovery workload: $script:fixtureCases fixture/query and $script:pauseCases active-pause cases passed."

@@ -18,6 +18,20 @@ function ConvertTo-RecoveryNumber {
     $parsed
 }
 
+# Schema 1 active-pause records observed the large file only before the pause
+# request, so they cannot show which file was still extracting once the pause
+# was acknowledged. Schema 2 records that read-back. Schema 1 records keep
+# their counters and stay readable, but this gate does not accept them as
+# active-pause evidence; it names them instead of silently passing them.
+function Get-RecoveryActivePauseSchema { 2 }
+
+function Test-RecoveryHasField {
+    param($Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [Collections.IDictionary]) { return $Object.Contains($Name) }
+    $null -ne $Object.PSObject.Properties[$Name]
+}
+
 function Get-RecoveryActivePauseThresholds {
     [ordered]@{
         response_ms = 150
@@ -144,6 +158,16 @@ function Test-RecoveryMeasurement {
     }
 }
 
+function Test-RecoveryLargeFile {
+    param($Files, [Parameter(Mandatory)][double]$MinimumBytes)
+    if ($Files -isnot [Array] -or $Files.Count -eq 0) { throw 'missing extracting-file list' }
+    $large = $false
+    foreach ($file in $Files) {
+        if ((ConvertTo-RecoveryNumber $file.size -Count) -ge $MinimumBytes) { $large = $true }
+    }
+    $large
+}
+
 function Test-RecoveryActivePause {
     param([Parameter(Mandatory)]$Pause, [Parameter(Mandatory)]$Tuple)
     Set-StrictMode -Version Latest
@@ -151,17 +175,26 @@ function Test-RecoveryActivePause {
     $checks = [ordered]@{}
     $rejection = $null
     try {
+        if (-not (Test-RecoveryHasField $Pause 'schema')) {
+            throw 'active-pause record predates post-acknowledgement identity (schema 1)'
+        }
+        $checks.schema = (ConvertTo-RecoveryNumber $Pause.schema -Count) -eq (Get-RecoveryActivePauseSchema)
         $checks.performed = $Pause.performed -is [bool] -and $Pause.performed
         $inFlight = ConvertTo-RecoveryNumber $Pause.in_flight_at_pause -Count
         $queuedBefore = ConvertTo-RecoveryNumber $Pause.queued_before_pause -Count
         $queuedAfter = ConvertTo-RecoveryNumber $Pause.queued_after_drain -Count
-        $largeFile = $false
-        if ($Pause.observed_files -isnot [Array]) { throw 'missing observed files' }
-        foreach ($file in $Pause.observed_files) {
-            if ((ConvertTo-RecoveryNumber $file.size -Count) -ge $limits.large_file_bytes) { $largeFile = $true }
-        }
         $checks.active_backlog = $inFlight -ge 1 -and $inFlight -le $Tuple.workers -and
-            $queuedBefore -gt $Tuple.workers -and $queuedAfter -gt 0 -and $largeFile
+            $queuedBefore -gt $Tuple.workers -and $queuedAfter -gt 0
+        # The observation that triggered the attempt, and then the evidence:
+        # what the service reported still extracting after it acknowledged the
+        # pause. Only the second can support a large-file drain claim.
+        $checks.large_file_before_pause = Test-RecoveryLargeFile $Pause.observed_files $limits.large_file_bytes
+        if (-not (Test-RecoveryHasField $Pause 'in_flight_files_at_pause')) {
+            throw 'missing the files extracting when the pause was acknowledged'
+        }
+        $atPause = $Pause.in_flight_files_at_pause
+        $checks.large_file_at_pause = (Test-RecoveryLargeFile $atPause $limits.large_file_bytes) -and
+            $atPause.Count -le $Tuple.workers
         $response = ConvertTo-RecoveryNumber $Pause.pause_response_ms
         $drain = ConvertTo-RecoveryNumber $Pause.extraction_drain_seconds
         $hold = ConvertTo-RecoveryNumber $Pause.hold_seconds

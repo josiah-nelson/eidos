@@ -35,6 +35,7 @@ $plan = [ordered]@{
     maximum_generated_source_bytes = $runCount * $fixture.bytes
     thresholds = Get-RecoveryThresholds
     active_pause_thresholds = Get-RecoveryActivePauseThresholds
+    active_pause_schema = Get-RecoveryActivePauseSchema
 }
 [IO.File]::WriteAllText((Join-Path $recordDir 'plan.json'), ($plan | ConvertTo-Json -Depth 8), $utf8)
 $results = [Collections.Generic.List[object]]::new()
