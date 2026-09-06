@@ -53,3 +53,16 @@ test('an HTTP error is visible instead of silently blank diagnostics', async () 
   mount()
   await screen.findByText(/memory endpoint unavailable/)
 })
+
+test('a failed background refetch keeps the last successful diagnostics visible', async () => {
+  mount()
+  await screen.findByText(/Process 42/)
+  vi.mocked(api.memory).mockRejectedValue(new Error('service is not answering'))
+  await act(async () => {
+    await client.refetchQueries({ queryKey: ['memory'] })
+  })
+  await screen.findByText('service is not answering')
+  expect(screen.getByText(/Process 42.*last successful response/)).toBeTruthy()
+  expect(screen.getByText('100.0 MiB')).toBeTruthy()
+  expect(screen.getByText('Content-index writer')).toBeTruthy()
+})

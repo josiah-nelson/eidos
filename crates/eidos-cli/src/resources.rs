@@ -35,12 +35,13 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
         .http_status_as_error(false)
         .build()
         .into();
+    let devices = args.devices || args.device_readers.is_some();
     let url = format!(
         "{}/api/{}",
         args.url.trim_end_matches('/'),
         if args.memory {
             "memory"
-        } else if args.devices || args.device_readers.is_some() {
+        } else if devices {
             "devices"
         } else {
             "resources"
@@ -73,12 +74,24 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
         body.as_ref()
             .ok()
             .and_then(|body| body["error"].as_str())
-            .unwrap_or("resource request failed")
+            .unwrap_or(if args.memory {
+                "memory diagnostics request failed"
+            } else if devices {
+                "shared-device request failed"
+            } else {
+                "resource request failed"
+            })
     );
-    let body = body.context("read resource limits")?;
+    let body = body.context(if args.memory {
+        "read memory diagnostics"
+    } else if devices {
+        "read shared-device limits"
+    } else {
+        "read resource limits"
+    })?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&body)?);
-    } else if args.devices || args.device_readers.is_some() {
+    } else if devices {
         println!(
             "reader limit per device: {}  shared unknown fallback: {}  topology draining: {}",
             body["budget"]["readers_per_device"],
@@ -90,8 +103,8 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
             body["sample_age_s"].as_str().unwrap_or("unavailable"),
             body["stale"]
         );
-        if let Some(devices) = body["budget"]["devices"].as_array() {
-            for device in devices {
+        if let Some(rows) = body["budget"]["devices"].as_array() {
+            for device in rows {
                 println!(
                     "{}: content readers {}  scan threads {}  peak {}  sources {}",
                     device["key"].as_str().unwrap_or("unknown"),
@@ -121,6 +134,15 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
         println!("Covers scan enumerators and content readers, not writers, native feeds, query I/O or the single background topology probe. OS disks may hide shared RAID/virtual storage.");
     } else if args.memory {
         let value = |v: &serde_json::Value| v.as_str().unwrap_or("unavailable").to_owned();
+        // Name the process these counters describe: `--url` may address another
+        // machine's service, and only some counters exist on every platform.
+        println!(
+            "sampled process: {}",
+            body["process"]["pid"]
+                .as_u64()
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "no sample yet".to_owned())
+        );
         println!(
             "resident bytes: {}  peak resident bytes: {}  private committed bytes: {}",
             value(&body["process"]["resident_bytes"]),

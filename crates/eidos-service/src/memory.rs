@@ -12,6 +12,11 @@ use ts_rs::TS;
 
 const REFRESH: Duration = Duration::from_secs(5);
 const MAX_AGE: Duration = Duration::from_secs(30);
+/// A one-shot caller such as `eidos resources --memory` cannot poll, so a
+/// request that starts a refresh waits this long for it rather than returning
+/// the reading it just superseded. A sample inside `REFRESH` never waits, and
+/// the wait never starts a second probe.
+const SAMPLE_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, TS)]
 pub struct ProcessMemory {
@@ -48,8 +53,12 @@ impl Default for MemoryTelemetry {
 }
 
 impl MemoryTelemetry {
-    pub fn view(&self, catalog: &eidos_catalog::Catalog) -> MemoryView {
+    pub async fn view(&self, catalog: &eidos_catalog::Catalog) -> MemoryView {
         self.probe.refresh(REFRESH, sample_process);
+        let _ = self
+            .probe
+            .cached_within(Some(REFRESH), SAMPLE_DEADLINE)
+            .await;
         self.cached_view(catalog)
     }
 
@@ -81,7 +90,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> ApiResult<MemoryView> {
-    Ok(ApiJson(state.memory.view(&state.catalog)))
+    Ok(ApiJson(state.memory.view(&state.catalog).await))
 }
 
 #[cfg(windows)]
@@ -235,6 +244,80 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sample_inside_the_refresh_interval_is_served_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = eidos_catalog::Catalog::open(dir.path().join("catalog.db")).unwrap();
+        let cached = ProcessMemory {
+            pid: 0,
+            resident_bytes: 1,
+            peak_resident_bytes: None,
+            private_commit_bytes: None,
+        };
+        let telemetry = MemoryTelemetry {
+            probe: Arc::new(BackgroundProbe::seeded(Ok(cached))),
+        };
+        // No refresh is due, so the cache answers and no probe runs at all.
+        let view = telemetry.view(&catalog).await;
+        let process = view.process.expect("a fresh sample must be served");
+        assert_eq!(process.pid, 0);
+        assert_eq!(process.resident_bytes, 1);
+        assert!(!view.stale);
+    }
+
+    #[tokio::test]
+    async fn a_recent_probe_failure_answers_without_waiting_for_a_new_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = eidos_catalog::Catalog::open(dir.path().join("catalog.db")).unwrap();
+        let telemetry = MemoryTelemetry {
+            probe: Arc::new(BackgroundProbe::seeded(Err("probe failed".into()))),
+        };
+        // A successful sample here would mean the request blocked on a probe it
+        // should not have started: the failure is inside the refresh interval.
+        let view = telemetry.view(&catalog).await;
+        assert!(view.process.is_none());
+        assert!(view.stale);
+        assert_eq!(view.error.as_deref(), Some("probe failed"));
+    }
+
+    #[tokio::test]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    async fn a_cold_cache_answers_a_single_request_instead_of_asking_it_to_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = eidos_catalog::Catalog::open(dir.path().join("catalog.db")).unwrap();
+        let view = MemoryTelemetry::default().view(&catalog).await;
+        let process = view.process.expect("a cold cache must wait for its sample");
+        assert_eq!(process.pid, std::process::id());
+        assert!(!view.stale);
+        assert_eq!(view.sample_age_s, Some(0));
+    }
+
+    #[tokio::test]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    async fn a_sample_the_request_supersedes_is_replaced_before_answering() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = eidos_catalog::Catalog::open(dir.path().join("catalog.db")).unwrap();
+        let telemetry = MemoryTelemetry {
+            probe: Arc::new(BackgroundProbe::seeded_at(
+                Ok(ProcessMemory {
+                    pid: 0,
+                    resident_bytes: 1,
+                    peak_resident_bytes: None,
+                    private_commit_bytes: None,
+                }),
+                // Old enough that this request starts a refresh: answering
+                // with the superseded reading would report pre-idle memory.
+                REFRESH + Duration::from_secs(1),
+            )),
+        };
+        let view = telemetry.view(&catalog).await;
+        let process = view.process.expect("a superseded sample must be replaced");
+        assert_eq!(process.pid, std::process::id());
+        assert!(process.resident_bytes > 1);
+        assert!(!view.stale);
+        assert_eq!(view.sample_age_s, Some(0));
     }
 
     #[test]
