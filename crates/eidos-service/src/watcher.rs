@@ -697,7 +697,13 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 }
                 io_failures = 0;
                 if records.is_empty() {
-                    match read_ahead.plan(next_usn, false, Instant::now()) {
+                    // An empty batch is still proof that the volume opened and
+                    // the journal is valid, so an Offline source recovers here
+                    // as it does on the non-empty path. Deferring that turn
+                    // would leave health stale until unrelated volume activity
+                    // happened to produce records.
+                    let offline = source.state == SourceState::Offline;
+                    match read_ahead.plan(next_usn, offline, Instant::now()) {
                         CheckpointPlan::Unchanged | CheckpointPlan::Deferred => {
                             status.set(WatcherState::Live, None);
                             continue;
@@ -748,6 +754,15 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                                 continue;
                             }
                         }
+                    }
+                    // Reached only when the position needed no advance or the
+                    // fenced advance committed.
+                    if offline {
+                        let Some(_mutation) = status.mutation_guard(&state) else {
+                            stop(&status, "cancelled".into());
+                            return;
+                        };
+                        let _ = restore_state(&state, source_id);
                     }
                     status.set(WatcherState::Live, None);
                     // No sleep: the next read blocks until records arrive.
@@ -871,6 +886,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                             created = astats.objects_created,
                             tombstoned = astats.objects_tombstoned,
                             out_of_scope = tstats.out_of_scope,
+                            unreadable = tstats.unreadable,
                             ms = started.elapsed().as_millis() as u64,
                             "applied change batch"
                         );

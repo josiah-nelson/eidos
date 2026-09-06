@@ -26,10 +26,22 @@ if the journal stops producing records, the remaining ignored tail can stay
 volatile. One read batch may cross the byte threshold before it is persisted.
 Do not log each irrelevant batch, since logging can itself create journal work.
 
+Only a *transient* snapshot failure retains the position. An access-denied,
+privilege-not-held or unsupported object returns the same failure on every
+replay, so it is counted as unreadable and skipped exactly as an unlistable
+file is during a scan. Blocking on it instead would stall the live feed until
+the journal wrapped and would abort every overlap replay, so one protected file
+inside an indexed root could stop the source indefinitely.
+
 The durable checkpoint remains the compare-and-swap fence. A scan/recovery or
 journal/volume replacement discards old read-ahead and reopens the proper handle.
 Restart replays the ignored tail; a wrapped/replaced journal still follows the
 existing reconciliation path. Never skip unapplied source events to reduce I/O.
+
+An empty batch proves the volume and journal are readable, so an Offline source
+takes the same fenced durable turn and state restoration there as on a batch
+carrying events. Because the reader parks on journal activity rather than a
+timer, that recovery still waits for the volume's next record.
 
 ## Limits and qualification
 

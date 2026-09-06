@@ -41,6 +41,12 @@ bounded checkpoint flushes, real changes and normal maintenance remain. Writer
 acquisitions alone are not disk-write counts. The after build preceded the
 small initial-position display/offline-recovery follow-up.
 
+All the binaries above predate the review fixes for permanently unreadable
+snapshots and empty-batch Offline recovery. Neither path is exercised by this
+fixture — it has no protected file and no offline source — so the recorded idle
+and throughput numbers still describe the merged behaviour, but they are not
+evidence about those two paths.
+
 These are non-isolated Windows build-26100 development observations, not a
 controlled physical-media benchmark. The sample count is too small for a useful
 tail-latency qualification. Repeated/longer observations, measured profiles and
