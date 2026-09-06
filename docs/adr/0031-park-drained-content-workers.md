@@ -12,10 +12,18 @@ the configured pool despite no queued work or relevant source changes.
 
 ## Decision
 
-Idle and surplus workers park on a content-specific epoch/condition variable.
-Capture the epoch before checking shutdown, pool size and admission, so a
-notification between the work check and parking cannot be lost. Retain a
+Idle and surplus workers park on a content-specific epoch and condition
+variable. Capture the epoch before checking shutdown, pool size and admission,
+so a notification between the work check and parking cannot be lost. Retain a
 30-second fallback and the existing bounded error backoff.
+
+One epoch, but two wait sets. A worker parked above the pool size cannot claim
+however much work is due, so a single-worker hint spent on it does nothing and
+the due job waits for the next one — sixty-three wasted hints for a pool cut
+from sixty-four to one. Surplus workers therefore park where no work hint
+reaches them; only control transitions, which they do have to re-evaluate,
+wake them. Both wait sets share the epoch, so a resize racing a capture still
+cannot strand either of them.
 
 The existing coordinator checks for due jobs every 500 ms, off the writer
 path. Seven exact priority-range seeks use the existing jobs_queue index;
@@ -61,8 +69,9 @@ and removes a duplicate blocked-reason check; the recorded hash identifies the
 preceding measured executable, not a subsequently rebuilt binary.
 
 Review then replaced the pool-wide readiness broadcast with the one-worker
-baton above, and added the surplus-resize and refused-backlog regressions that
-pin both halves of it. The recorded idle comparison is unaffected: an idle
+baton above, split the surplus waiters out of the hint's wait set, and added
+the refused-backlog, surplus-resize and surplus-queue regressions that pin all
+three. Each was confirmed to fail against the code it guards. The recorded idle comparison is unaffected: an idle
 queue produces no readiness hints at all, so that path is identical in both
 binaries. The scan and query rows were measured before that change and were
 not re-measured for it.

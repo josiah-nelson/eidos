@@ -414,7 +414,12 @@ fn worker_loop(state: &AppState, index: usize, name: &str) {
         // A worker at or past the desired pool size parks: shrinking never
         // interrupts a claimed batch, and growth reuses the parked thread.
         if index >= status.workers.load(Ordering::Relaxed) {
-            state.content_pause.work.wait(observed, IDLE_FALLBACK);
+            // Only a control change can make this thread eligible again, so
+            // it parks where no work hint can be spent on it.
+            state
+                .content_pause
+                .work
+                .wait_for_control(observed, IDLE_FALLBACK);
             continue;
         }
         let (reservation, jobs) = match reserve_and_claim(state, name, CLAIM_BATCH) {
@@ -1102,5 +1107,70 @@ mod idle_tests {
             claims <= 12,
             "{claims} empty writer claims in {window:?} for a refused backlog"
         );
+    }
+
+    /// A shrink can leave far more parked threads than the pool admits. A
+    /// single-worker hint spent on one of those does nothing, and the due job
+    /// then waits for the next hint — sixty-three times over for a pool cut
+    /// from sixty-four to one.
+    #[test]
+    fn a_work_hint_reaches_the_eligible_worker_behind_a_queue_of_surplus_ones() {
+        use eidos_catalog::{jobs::NewJob, NewSource};
+        use eidos_domain::{JobState, Priority, SourceKind};
+        let f = Fixture::new();
+        let source = f
+            .state
+            .catalog
+            .add_source(&NewSource {
+                host_id: f.state.host_id,
+                name: "hint fixture".into(),
+                kind: SourceKind::WindowsGeneric,
+                root_path: "synthetic-hint-root".into(),
+                aliases: vec![],
+            })
+            .unwrap();
+        refresh_budgets(&f.state).unwrap();
+
+        // A pool of one with eight threads alive: indices 1..8 are surplus.
+        f.state.content_workers.workers.store(1, Ordering::Relaxed);
+        f.state.content_workers.spawned.store(8, Ordering::Relaxed);
+        let spawn = |index: usize| {
+            let st = f.state.clone();
+            std::thread::Builder::new()
+                .name(format!("content-{index}"))
+                .spawn(move || worker_loop(&st, index, &format!("content-{index}")))
+                .unwrap();
+        };
+        // Park the surplus threads first so they sit ahead of the one worker
+        // that can claim: a shared wait set would hand the hint to them.
+        for index in 1..8 {
+            spawn(index);
+        }
+        await_condition(|| f.state.content_pause.work.waiting() == 7);
+        spawn(0);
+        await_condition(|| f.state.content_pause.work.waiting() == 8);
+
+        let job = f
+            .state
+            .catalog
+            .enqueue(&NewJob {
+                source_id: source,
+                object_id: None,
+                object_generation: 1,
+                stage: JobStage::ContentText,
+                priority: Priority::NormalText,
+                idempotency_key: "behind the surplus".into(),
+                payload: None,
+                estimated_cost: 0,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            f.state.catalog.get_job(job).unwrap().unwrap().state,
+            JobState::Queued
+        );
+        // No coordinator runs here, so this is the only hint the pool gets.
+        wake_due_workers(&f.state);
+        await_condition(|| f.state.catalog.get_job(job).unwrap().unwrap().state == JobState::Done);
     }
 }
