@@ -36,6 +36,13 @@ cargo build --release
 cd web; npm ci; npm run lint; npm test; npm run build
 ```
 
+The web gate includes both Node utility tests (`npm run test:unit`) and
+Vitest/React Testing Library page tests (`npm run test:pages`). The latter
+exercise real rendered setup controls in jsdom: role changes, joining,
+partial drive results, scan retry and state surviving query refreshes.
+They do not replace installed-browser or real two-host acceptance; see
+[recovery.md](recovery.md).
+
 ```bash
 # macOS or another Unix host: the same steps in the same order.
 scripts/check.sh               # --skip-web / --skip-release to shorten

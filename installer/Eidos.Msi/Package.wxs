@@ -43,6 +43,14 @@
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <Launch Condition="VersionNT64" Message="eidos requires 64-bit Windows 10 or later." />
+    <!-- Direct MSI installs enforce retirement too; uninstall stays available. -->
+    <Property Id="EIDOS_RETIRED_COLLECTOR_SERVICE">
+      <RegistrySearch Id="RetiredCollectorService" Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\eidos-collector" Name="ImagePath" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="EIDOS_RETIRED_COLLECTOR_PACKAGE">
+      <RegistrySearch Id="RetiredCollectorPackage" Root="HKLM" Key="Software\eidos-collector" Name="Version" Type="raw" Bitness="always64" />
+    </Property>
+    <Launch Condition="REMOVE = &quot;ALL&quot; OR (NOT EIDOS_RETIRED_COLLECTOR_SERVICE AND NOT EIDOS_RETIRED_COLLECTOR_PACKAGE)" Message="The profiling collector is retired. Uninstall 'eidos observatory collector' from Settings > Apps (keep study data), then retry. If its app entry is missing, use the original collector installer to uninstall it." />
 
     <Icon Id="eidos.ico" SourceFile="eidos.ico" />
     <Property Id="ARPPRODUCTICON" Value="eidos.ico" />

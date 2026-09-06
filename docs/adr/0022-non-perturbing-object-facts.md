@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-08-26).
+Historical; collector scope superseded by [ADR-0026](0026-retire-profiling-collector.md) on 2026-09-05.
 
 ## Context
 

@@ -375,7 +375,7 @@ function MasterDiscovery({ f }: { f: FleetStatus }) {
   )
 }
 
-function JoinCard({ f }: { f: FleetStatus }) {
+export function JoinCard({ f }: { f: FleetStatus }) {
   const qc = useQueryClient()
   const onChanged = () => qc.invalidateQueries({ queryKey: ['fleet'] })
   const firstDiscovered = f.discovered_masters[0]

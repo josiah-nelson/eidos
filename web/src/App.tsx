@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { NavLink, Outlet } from 'react-router'
+import { Link, NavLink, Outlet } from 'react-router'
 import { api } from './api'
 import { installInteractionFlush } from './interactions'
 
@@ -12,7 +12,7 @@ export default function App() {
     <div className="shell">
       <header className="topbar">
         <div className="brand">
-          eidos<small>filesystem indexer · v0.5 dev</small>
+          eidos<small>filesystem indexer{health.data ? ' · v' + health.data.version : ''}</small>
         </div>
         <div className="spacer" />
         <div className="health">
@@ -66,6 +66,7 @@ export default function App() {
         </a>
       </nav>
       <main className="main">
+        {health.data?.sources === 0 && <p className="card">No sources yet. <Link to="/sources">Set up this node and choose what to index</Link>.</p>}
         <Outlet />
       </main>
     </div>

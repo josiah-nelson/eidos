@@ -10,7 +10,6 @@ pub mod api;
 #[cfg(test)]
 mod api_contract;
 mod api_json;
-pub mod collector_api;
 pub mod content_control;
 pub mod content_preview;
 pub mod content_workers;

@@ -10,6 +10,8 @@ export type ActivityView = { content_enabled: boolean, content_status: ContentSt
 
 export type AddSourceBody = { name: string, root_path: string, kind?: SourceKind | null, aliases: Array<string>, scan: boolean, };
 
+export type AddedSource = { scan_error?: string, warning?: string, source: SourceRecord, counts: SourceCounts, completeness: SourceCompleteness, scan?: ScanProgress, watcher?: WatcherView, reconciliation_deferred?: ReconciliationDeferral, };
+
 export type AdmissionView = { limit: number, queue_depth: number, in_flight: ApiInt, queued: ApiInt, detached: ApiInt, admitted: ApiInt, completed: ApiInt, rejected_busy: ApiInt, timed_out: ApiInt, queue_wait_ms: ApiInt, search_timeout_ms: ApiInt, operation_timeout_ms: ApiInt, max_body_bytes: number, };
 
 export type AggStats = { directories: ApiInt, extension_rows: ApiInt, unreachable_directories: ApiInt, };
@@ -39,12 +41,6 @@ export type ChildSort = "name" | "size" | "allocated_size" | "modified" | "kind"
 export type ChildrenQuery = { sort: ChildSort, desc: boolean, offset: ApiInt, limit: number, hidden: boolean, };
 
 export type ChildrenView = { path: string | null, parent_id: ObjectId | null, source: SourceCompleteness, rows: Array<ChildRow>, total: ApiInt, offset: ApiInt, };
-
-export type CollectorUploadBody = { enabled?: boolean, destination?: string, hour?: number, };
-
-export type CollectorUploadView = { enabled: boolean, destination: string, hour: number, last_upload_unix_ns: ApiInt | null, uploaded_total: ApiInt, pending: ApiInt, last_error: string | null, };
-
-export type CollectorView = { available: boolean, detail: string | null, version: string | null, uptime_s: ApiInt, spool_records: ApiInt, capture_gaps: ApiInt, upload: CollectorUploadView | null, };
 
 export type ContentFlow = "disabled" | "stopped" | "draining" | "waiting" | "running";
 

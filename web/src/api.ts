@@ -5,6 +5,7 @@ import type {
   ActivityView,
   CentralBody,
   AddSourceBody,
+  AddedSource,
   ApiErrorBody,
   ApiInt,
   ChildrenQuery,
@@ -34,6 +35,7 @@ import type {
   SortField,
   SourceDetail,
   SourceView,
+  VolumeCandidateView,
   WorkersView,
 } from './generated/api'
 import type { PreviewWindow } from './preview-window'
@@ -109,9 +111,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<Health>('/api/health'),
   sources: () => request<SourceView[]>('/api/sources'),
+  volumes: () => request<VolumeCandidateView[]>('/api/volumes'),
   source: (id: ApiRouteId) => request<SourceDetail>(`/api/sources/${id}`),
   addSource: (body: AddSourceParams) =>
-    request<SourceView>('/api/sources', { method: 'POST', body: JSON.stringify(body) }),
+    request<AddedSource>('/api/sources', { method: 'POST', body: JSON.stringify(body) }),
   scanSource: (id: ApiRouteId) => request<ScanProgress>(`/api/sources/${id}/scan`, { method: 'POST' }),
   cancelScan: (id: ApiRouteId) =>
     request<ScanProgress>(`/api/sources/${id}/scan/cancel`, { method: 'POST' }),

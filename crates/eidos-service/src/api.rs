@@ -58,7 +58,6 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
         )
         .route("/sources/{id}/archives", post(requeue_archives))
         .merge(crate::content_control::routes())
-        .merge(crate::collector_api::routes())
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())
         .merge(crate::fleet_api::routes())
@@ -421,10 +420,39 @@ pub(crate) struct AddSourceBody {
     scan: bool,
 }
 
+/// Creation and scan startup are distinct outcomes: never make a successful
+/// creation look retryable just because the initial scan could not start.
+#[derive(Serialize, TS)]
+#[ts(optional_fields)]
+pub(crate) struct AddedSource {
+    #[serde(flatten)]
+    view: SourceView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
 async fn add_source(
     State(st): State<Arc<AppState>>,
     Json(body): Json<AddSourceBody>,
-) -> Result<(StatusCode, ApiJson<SourceView>), ApiError> {
+) -> Result<(StatusCode, ApiJson<AddedSource>), ApiError> {
+    // Directory/volume access can block, particularly on network shares.
+    // Like the other mutation handlers, wait for the blocking operation's
+    // result instead of timing out after it has committed a source.
+    let added = blocking(move || create_source(&st, body)).await?;
+    Ok((StatusCode::CREATED, ApiJson(added)))
+}
+
+fn create_source(st: &Arc<AppState>, body: AddSourceBody) -> Result<AddedSource, ApiError> {
+    create_source_with_scan(st, body, |st, id| start_scan(st, id).map(|_| ()))
+}
+
+fn create_source_with_scan(
+    st: &Arc<AppState>,
+    body: AddSourceBody,
+    scan: impl FnOnce(&Arc<AppState>, SourceId) -> Result<(), StartScanError>,
+) -> Result<AddedSource, ApiError> {
     if body.name.trim().is_empty() || body.root_path.trim().is_empty() {
         return Err(ApiError::bad_request("name and root_path are required"));
     }
@@ -435,6 +463,7 @@ async fn add_source(
             "root_path is not an accessible directory: {root_path}"
         )));
     }
+    let volume = st.lister.volume_info(root).ok();
     let kind = match body.kind {
         Some(SourceKind::Remote) => {
             return Err(ApiError::bad_request(
@@ -442,12 +471,13 @@ async fn add_source(
             ))
         }
         Some(k) => k,
-        None => match st.lister.volume_info(root) {
-            Ok(v) => v.source_kind(),
-            Err(_) => eidos_scanner::GENERIC_SOURCE_KIND,
-        },
+        None => volume
+            .as_ref()
+            .map(|v| v.source_kind())
+            .unwrap_or(eidos_scanner::GENERIC_SOURCE_KIND),
     };
-    if st.catalog.find_source_by_name(&body.name)?.is_some() {
+    let name = body.name.trim();
+    if st.catalog.find_source_by_name(name)?.is_some() {
         return Err(ApiError::conflict(format!(
             "source '{}' already exists",
             body.name
@@ -455,22 +485,31 @@ async fn add_source(
     }
     let id = st.catalog.add_source(&NewSource {
         host_id: st.host_id,
-        name: body.name.clone(),
+        name: name.to_owned(),
         kind,
         root_path: root_path.clone(),
         aliases: body.aliases.clone(),
     })?;
-    if let Ok(v) = st.lister.volume_info(root) {
-        st.catalog.upsert_volume(st.host_id, id, &v)?;
-    }
-    if body.scan {
-        start_scan(&st, id).map_err(start_scan_api_error)?;
-    }
+    let warning = volume.and_then(|v| {
+        st.catalog
+            .upsert_volume(st.host_id, id, &v)
+            .err()
+            .map(|error| format!("Source created, but volume metadata could not be saved: {error}"))
+    });
+    let scan_error = if body.scan {
+        scan(st, id).err().map(|error| error.to_string())
+    } else {
+        None
+    };
     let s = st
         .catalog
         .get_source(id)?
         .ok_or_else(|| ApiError::not_found("source vanished"))?;
-    Ok((StatusCode::CREATED, ApiJson(source_view(&st, s)?)))
+    Ok(AddedSource {
+        view: source_view(st, s)?,
+        scan_error,
+        warning,
+    })
 }
 
 #[derive(Serialize, TS)]
@@ -1280,4 +1319,114 @@ async fn resolve(
         object_id: id,
         path: st.catalog.render_path(id)?,
     }))
+}
+
+#[cfg(test)]
+mod source_creation_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn fixture() -> (tempfile::TempDir, Arc<AppState>, AddSourceBody) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        let state = Arc::new(
+            AppState::open(&crate::ServiceConfig {
+                data_dir: dir.path().join("data"),
+                content: false,
+                auto_reconcile: false,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let body = AddSourceBody {
+            name: " documents ".into(),
+            root_path: root.display().to_string(),
+            kind: None,
+            aliases: vec![],
+            scan: true,
+        };
+        (dir, state, body)
+    }
+
+    #[test]
+    fn scan_spawn_failure_returns_the_created_source_and_explicit_error() {
+        let (_dir, state, body) = fixture();
+        let added = create_source_with_scan(&state, body, |_, _| {
+            Err(StartScanError::Spawn(std::io::Error::other(
+                "synthetic spawn failure",
+            )))
+        })
+        .unwrap();
+        assert_eq!(added.view.source.name, "documents");
+        assert!(added
+            .scan_error
+            .as_deref()
+            .unwrap()
+            .contains("synthetic spawn failure"));
+        let sources = state.catalog.list_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, added.view.source.id);
+        assert!(sources[0].published_generation.is_none());
+        assert!(!added.view.completeness.metadata_complete);
+    }
+
+    #[test]
+    fn scan_false_never_starts_work() {
+        let (_dir, state, mut body) = fixture();
+        body.scan = false;
+        let added =
+            create_source_with_scan(&state, body, |_, _| panic!("scan not requested")).unwrap();
+        assert!(added.scan_error.is_none());
+        assert!(added.view.scan.is_none());
+    }
+
+    #[test]
+    fn inaccessible_root_does_not_create_a_source() {
+        let (_dir, state, mut body) = fixture();
+        body.root_path.push_str("/missing");
+        assert!(create_source_with_scan(&state, body, |_, _| panic!("invalid root")).is_err());
+        assert!(state.catalog.list_sources().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn creation_keeps_the_wire_shape_and_retired_routes_are_absent() {
+        let (_dir, state, body) = fixture();
+        let app = router(state.clone(), None);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sources")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": body.name, "root_path": body.root_path, "scan": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(created["source"]["id"].is_string(), "API v2 decimal IDs");
+        assert!(created["counts"]["files"].is_string());
+        assert_eq!(created["completeness"]["metadata_complete"], false);
+        assert!(created.get("scan_error").is_none());
+        for path in ["/api/collector", "/api/collector/upload"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
 }

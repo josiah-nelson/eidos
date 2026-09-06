@@ -17,7 +17,6 @@ eidos-service = { workspace = true }
 eidos-search = { workspace = true }
 eidos-query = { workspace = true }
 eidos-content = { workspace = true }
-eidos-observe = { workspace = true }
 eidos-fleet = { workspace = true }
 windows-sys = { workspace = true }
 regex = { workspace = true }
@@ -33,13 +32,9 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-eidos-windows-collector = { workspace = true }
 windows-service = { workspace = true }
 # Interactive password prompt for `eidos service install --account user`.
 rpassword = "7"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-eidos-macos-collector = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

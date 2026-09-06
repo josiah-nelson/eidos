@@ -40,7 +40,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "$REPO_DIR"
-cargo build --locked --release -p eidos-cli
+(cd web && npm ci && npm run build)
+EIDOS_REQUIRE_WEB=1 cargo build --locked --release -p eidos-cli
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

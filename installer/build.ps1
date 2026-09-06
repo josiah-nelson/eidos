@@ -2,15 +2,13 @@
 #
 #   .\installer\build.ps1                      # web UI + release exe + every artifact
 #   .\installer\build.ps1 -SkipWeb -SkipRust   # reuse web\dist and target\release\eidos.exe
-#   .\installer\build.ps1 -SkipWeb -SkipRust -SkipBundle -SkipCollectorBundle # stop before the bundles (CI signs first)
-#   .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipCollectorMsi -SkipUi # bundles only, from signed parts
+#   .\installer\build.ps1 -SkipWeb -SkipRust -SkipBundle # stop before the bundles (CI signs first)
+#   .\installer\build.ps1 -SkipWeb -SkipRust -SkipMsi -SkipUi # bundles only, from signed parts
 #   .\installer\build.ps1 -SkipWeb -SkipRust -BinDir target\debug
 #   .\installer\build.ps1 -Version 0.5.0        # explicit release metadata (must match Cargo.toml)
 #
-# eidos-setup.exe is the unified setup: it carries eidos.msi and, as an
-# optional package, eidos-collector.msi. eidos-collector-setup.exe is the
-# administrator/fleet-only collector setup. Each -Skip switch turns off
-# exactly one artifact; the unified bundle needs both MSIs built first.
+# eidos-setup.exe carries the core MSI and guided setup UI only.
+# Each -Skip switch turns off exactly one artifact.
 #
 # Requires: Node.js, Rust, .NET SDK 8+ (WiX v7 is restored from NuGet; the
 # OSMF EULA is accepted in the project files). Output: installer\out\.
@@ -20,8 +18,6 @@ param(
     [switch]$SkipMsi,
     [switch]$SkipUi,
     [switch]$SkipBundle,
-    [switch]$SkipCollectorMsi,
-    [switch]$SkipCollectorBundle,
     [string]$BinDir = "",
     [string]$Configuration = "Release",
     [string]$Version = ""
@@ -78,8 +74,14 @@ $baDir = Join-Path $PSScriptRoot "Eidos.Setup.Ui\bin\$Configuration\net472"
 # path: a changed BinDir can silently reuse the previous eidos.exe. Always
 # bind from scratch.
 function Clean($project) {
-    foreach ($stale in @("$project\obj", "$project\bin")) {
-        Remove-Item -Recurse -Force (Join-Path $PSScriptRoot $stale) -ErrorAction SilentlyContinue
+    if ($project -notin @("Eidos.Msi", "Eidos.Bundle")) { throw "unexpected clean project: $project" }
+    $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $project))
+    foreach ($folder in @("obj", "bin")) {
+        $target = [IO.Path]::GetFullPath((Join-Path $projectRoot $folder))
+        if (-not $target.StartsWith($projectRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "clean target escaped project: $target"
+        }
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
     }
 }
 
@@ -101,21 +103,8 @@ if (-not $SkipUi) {
     Write-Host "Setup UI: $baDir\eidos-setup-ui.exe" -ForegroundColor Green
 }
 
-if (-not $SkipCollectorMsi) {
-    Clean "Eidos.Collector.Msi"
-    Step "dotnet build Eidos.Collector.Msi" {
-        dotnet build (Join-Path $PSScriptRoot "Eidos.Collector.Msi\Eidos.Collector.Msi.wixproj") `
-            -c $Configuration -nologo -v minimal `
-            -p:Version=$msiVersion -p:BinDir=$BinDir -p:OutDir="$out\"
-    }
-    Write-Host "Collector MSI: $out\eidos-collector.msi" -ForegroundColor Green
-}
-
 if (-not $SkipBundle) {
     if (-not (Test-Path (Join-Path $out "eidos.msi"))) { throw "missing $out\eidos.msi" }
-    # The unified setup carries the collector package as an optional
-    # second package in its chain.
-    if (-not (Test-Path (Join-Path $out "eidos-collector.msi"))) { throw "missing $out\eidos-collector.msi (build the collector MSI first)" }
     foreach ($required in @("eidos-setup-ui.exe", "WixToolset.BootstrapperApplicationApi.dll", "mbanative.dll")) {
         if (-not (Test-Path (Join-Path $baDir $required))) { throw "setup UI build is missing $required in $baDir" }
     }
@@ -123,18 +112,7 @@ if (-not $SkipBundle) {
     Step "dotnet build Eidos.Bundle" {
         dotnet build (Join-Path $PSScriptRoot "Eidos.Bundle\Eidos.Bundle.wixproj") `
             -c $Configuration -nologo -v minimal `
-            -p:Version=$msiVersion -p:MsiPath="$out\eidos.msi" -p:CollectorMsiPath="$out\eidos-collector.msi" -p:BaDir=$baDir -p:OutDir="$out\"
+            -p:Version=$msiVersion -p:MsiPath="$out\eidos.msi" -p:BaDir=$baDir -p:OutDir="$out\"
     }
     Write-Host "Setup: $out\eidos-setup.exe" -ForegroundColor Green
-}
-
-if (-not $SkipCollectorBundle) {
-    if (-not (Test-Path (Join-Path $out "eidos-collector.msi"))) { throw "missing $out\eidos-collector.msi" }
-    Clean "Eidos.Collector.Bundle"
-    Step "dotnet build Eidos.Collector.Bundle" {
-        dotnet build (Join-Path $PSScriptRoot "Eidos.Collector.Bundle\Eidos.Collector.Bundle.wixproj") `
-            -c $Configuration -nologo -v minimal `
-            -p:Version=$msiVersion -p:MsiPath="$out\eidos-collector.msi" -p:OutDir="$out\"
-    }
-    Write-Host "Collector setup: $out\eidos-collector-setup.exe" -ForegroundColor Green
 }

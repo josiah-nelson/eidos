@@ -5,8 +5,8 @@ name: release
 # it is stamped into web/package.json, and it names the installers and the
 # GitHub release.
 #
-# `test` (the full gate) and `build` (compile, package, sign, verify) run in
-# parallel; `publish` waits for both, so nothing reaches the release page
+# Tests, signed build and installer lifecycle run in parallel;
+# publication waits for all three, so nothing reaches the release page
 # unless the whole suite passed on the tagged tree. A red suite wastes some
 # signing work but publishes nothing.
 on:
@@ -30,6 +30,9 @@ env:
   SIGN_TIMESTAMP: http://timestamp.acs.microsoft.com
 
 jobs:
+  lifecycle:
+    uses: ./.github/workflows/installer.yml
+
   # The same gate as scripts/check.ps1: format, lint, the generated API
   # contract, every Rust test on Windows, and the web lint/tests/build.
   test:
@@ -212,7 +215,7 @@ jobs:
         shell: pwsh
         env:
           EIDOS_RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
-        run: .\installer\build.ps1 -Version $env:EIDOS_RELEASE_VERSION -SkipWeb -SkipRust -SkipMsi -SkipBundle -SkipCollectorMsi -SkipCollectorBundle
+        run: .\installer\build.ps1 -Version $env:EIDOS_RELEASE_VERSION -SkipWeb -SkipRust -SkipMsi -SkipBundle
 
       - name: Sign eidos.exe and the setup UI
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
@@ -242,13 +245,13 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
-      - name: Build both MSIs (binding the signed executable)
+      - name: Build the core MSI (binding the signed executable)
         shell: pwsh
         env:
           EIDOS_RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
-        run: .\installer\build.ps1 -Version $env:EIDOS_RELEASE_VERSION -SkipWeb -SkipRust -SkipUi -SkipBundle -SkipCollectorBundle
+        run: .\installer\build.ps1 -Version $env:EIDOS_RELEASE_VERSION -SkipWeb -SkipRust -SkipUi -SkipBundle
 
-      - name: Sign both MSIs
+      - name: Sign the core MSI
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -259,7 +262,6 @@ jobs:
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
           files: |
             ${{ github.workspace }}\installer\out\eidos.msi
-            ${{ github.workspace }}\installer\out\eidos-collector.msi
           file-digest: SHA256
           timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
           timestamp-digest: SHA256
@@ -276,20 +278,19 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
-      - name: Build both bundles (from the signed MSIs and UI)
+      - name: Build the core bundle (from the signed MSI and UI)
         shell: pwsh
         env:
           EIDOS_RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
-        run: .\installer\build.ps1 -Version $env:EIDOS_RELEASE_VERSION -SkipWeb -SkipRust -SkipMsi -SkipUi -SkipCollectorMsi
+        run: .\installer\build.ps1 -Version $env:EIDOS_RELEASE_VERSION -SkipWeb -SkipRust -SkipMsi -SkipUi
 
-      - name: Detach the Burn engines
+      - name: Detach the Burn engine
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force installer\out\engine | Out-Null
           wix burn detach installer\out\eidos-setup.exe -engine installer\out\engine\burn-engine.exe
-          wix burn detach installer\out\eidos-collector-setup.exe -engine installer\out\engine\burn-engine-collector.exe
 
-      - name: Sign the Burn engines
+      - name: Sign the Burn engine
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -300,7 +301,6 @@ jobs:
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
           files: |
             ${{ github.workspace }}\installer\out\engine\burn-engine.exe
-            ${{ github.workspace }}\installer\out\engine\burn-engine-collector.exe
           file-digest: SHA256
           timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
           timestamp-digest: SHA256
@@ -326,18 +326,12 @@ jobs:
           $version = $env:RELEASE_TAG
           $setup = "installer\out\eidos-$version-setup.exe"
           $msi = "installer\out\eidos-$version.msi"
-          $collectorSetup = "installer\out\eidos-collector-$version-setup.exe"
-          $collectorMsi = "installer\out\eidos-collector-$version.msi"
           wix burn reattach installer\out\eidos-setup.exe -engine installer\out\engine\burn-engine.exe -o $setup
-          wix burn reattach installer\out\eidos-collector-setup.exe -engine installer\out\engine\burn-engine-collector.exe -o $collectorSetup
           Copy-Item installer\out\eidos.msi $msi
-          Copy-Item installer\out\eidos-collector.msi $collectorMsi
           "setup=$setup" >> $env:GITHUB_OUTPUT
           "msi=$msi" >> $env:GITHUB_OUTPUT
-          "collector_setup=$collectorSetup" >> $env:GITHUB_OUTPUT
-          "collector_msi=$collectorMsi" >> $env:GITHUB_OUTPUT
 
-      - name: Sign both setup bundles
+      - name: Sign the setup bundle
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -348,7 +342,6 @@ jobs:
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
           files: |
             ${{ github.workspace }}\${{ steps.names.outputs.setup }}
-            ${{ github.workspace }}\${{ steps.names.outputs.collector_setup }}
           file-digest: SHA256
           timestamp-rfc3161: ${{ env.SIGN_TIMESTAMP }}
           timestamp-digest: SHA256
@@ -370,8 +363,6 @@ jobs:
         env:
           SETUP: ${{ steps.names.outputs.setup }}
           MSI: ${{ steps.names.outputs.msi }}
-          COLLECTOR_SETUP: ${{ steps.names.outputs.collector_setup }}
-          COLLECTOR_MSI: ${{ steps.names.outputs.collector_msi }}
         run: |
           function Assert-Signed([string]$path) {
             $signature = Get-AuthenticodeSignature -LiteralPath $path
@@ -388,11 +379,8 @@ jobs:
           Assert-Signed $env:MSI
           Assert-Signed 'installer\out\engine\burn-engine.exe'
           Assert-Signed $env:SETUP
-          Assert-Signed $env:COLLECTOR_MSI
-          Assert-Signed 'installer\out\engine\burn-engine-collector.exe'
-          Assert-Signed $env:COLLECTOR_SETUP
 
-          foreach ($file in @($env:SETUP, $env:MSI, $env:COLLECTOR_SETUP, $env:COLLECTOR_MSI)) {
+          foreach ($file in @($env:SETUP, $env:MSI)) {
             $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $([IO.Path]::GetFileName($file))" | Set-Content -LiteralPath "$file.sha256" -NoNewline
             $certutil = & certutil.exe -hashfile $file SHA256
@@ -413,15 +401,11 @@ jobs:
             ${{ steps.names.outputs.setup }}.sha256
             ${{ steps.names.outputs.msi }}
             ${{ steps.names.outputs.msi }}.sha256
-            ${{ steps.names.outputs.collector_setup }}
-            ${{ steps.names.outputs.collector_setup }}.sha256
-            ${{ steps.names.outputs.collector_msi }}
-            ${{ steps.names.outputs.collector_msi }}.sha256
 
-  # Publishes only when the gate and the signed build both passed.
+  # Publish only after tests, signed build and installer lifecycle pass.
   publish:
     name: publish the release
-    needs: [test, build]
+    needs: [test, build, lifecycle]
     runs-on: ubuntu-latest
     permissions:
       contents: write

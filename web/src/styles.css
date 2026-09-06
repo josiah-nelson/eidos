@@ -802,6 +802,28 @@ dialog.modal::backdrop {
 .small { font-size: 12px; }
 input[type='number'].small { width: 64px; }
 .toggle { cursor: pointer; user-select: none; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.onboarding fieldset {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 0 0 12px;
+  padding: 12px;
+}
+.onboarding .toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0;
+  overflow-wrap: anywhere;
+}
+.onboarding input[type="checkbox"],
+.onboarding input[type="radio"] { flex-shrink: 0; }
+@media (max-width: 640px) {
+  .toolbar, .card .head { flex-wrap: wrap; }
+  .onboarding .actions .btn { flex-grow: 1; }
+  .results { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* ----- snippets ----- */
 .vrow.hitrow.with-snippets {

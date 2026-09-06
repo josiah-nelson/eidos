@@ -13,7 +13,7 @@ One search across every system you control, with the context and certainty ordin
 >
 > Eidos is under active development, and several capabilities described below are planned rather than available today. For an exact breakdown of the current implementation, see [What works today](#what-works-today) and the [release roadmap](docs/roadmap.md).
 >
-> The first packaged Windows release is [v0.5.0](https://github.com/josiah-nelson/eidos/releases/latest); see [installing.md](docs/installing.md). APIs, schemas, and query syntax may still change.
+> The v0.5.0 rollout failed operationally. A collector-free recovery is in progress; it is not yet deployment-qualified. See [recovery status and acceptance](docs/recovery.md) and [installing.md](docs/installing.md). APIs, schemas, and query syntax may still change.
 
 ## The file is somewhere. That should be enough.
 

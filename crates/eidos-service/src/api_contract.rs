@@ -85,6 +85,7 @@ fn typescript_contract() -> String {
     types.add::<crate::api::Health>();
     types.add::<crate::api::SourceView>();
     types.add::<crate::api::AddSourceBody>();
+    types.add::<crate::api::AddedSource>();
     types.add::<crate::api::SourceDetail>();
     types.add::<crate::api::ErrorsQuery>();
     types.add::<eidos_catalog::ErrorRecord>();
@@ -108,8 +109,6 @@ fn typescript_contract() -> String {
     types.add::<crate::content_control::WorkersBody>();
     types.add::<crate::content_control::WorkersView>();
     types.add::<crate::api::VolumeCandidateView>();
-    types.add::<crate::collector_api::CollectorView>();
-    types.add::<crate::collector_api::CollectorUploadBody>();
     types.add::<crate::api::ActivityView>();
     types.add::<crate::api::IndexStatus>();
     types.add::<crate::content_preview::PreviewQuery>();

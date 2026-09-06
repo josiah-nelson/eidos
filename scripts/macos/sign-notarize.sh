@@ -5,8 +5,7 @@ umask 077
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 OUTPUT_DIR="$REPO_DIR/dist/macos"
-APP="$OUTPUT_DIR/Eidos Collector.app"
-CLI="$OUTPUT_DIR/eidos"
+APP="$OUTPUT_DIR/Eidos.app"
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/eidos-sign.XXXXXX")
 TEMP_KEYCHAIN=""
 trap '[[ -z "$TEMP_KEYCHAIN" ]] || /usr/bin/security delete-keychain "$TEMP_KEYCHAIN" >/dev/null 2>&1 || true; rm -rf "$SCRATCH"' EXIT
@@ -34,45 +33,32 @@ fi
 [[ -n "$identity" && -n "$identity_hash" ]] || { printf '%s\n' 'no Developer ID Application signing identity found' >&2; exit 1; }
 
 build_for_identity() {
-    "$SCRIPT_DIR/build-collector.sh" --signing-cert-sha1 "$identity_hash"
-    mode=$(<"$OUTPUT_DIR/entitlement-mode")
-    if [[ "$mode" == endpoint-security ]]; then
-        entitlements="$SCRIPT_DIR/collector.entitlements"
-    else
-        entitlements="$SCRIPT_DIR/collector-pending.entitlements"
-    fi
+    "$SCRIPT_DIR/build-agent.sh" --no-sign
 }
 
 build_for_identity
 if [[ -n "$keychain_path" ]]; then
-    /usr/bin/codesign --force --options runtime --timestamp --entitlements "$entitlements" --sign "$identity" --keychain "$keychain_path" "$APP"
-elif ! /usr/bin/codesign --force --options runtime --timestamp --entitlements "$entitlements" --sign "$identity" "$APP"; then
+    /usr/bin/codesign --force --options runtime --timestamp --sign "$identity" --keychain "$keychain_path" "$APP"
+elif ! /usr/bin/codesign --force --options runtime --timestamp --sign "$identity" "$APP"; then
     if [[ -z "${APPLE_CERTIFICATE_P12:-}" ]]; then
         printf '%s\n' 'login-keychain identity could not sign and APPLE_CERTIFICATE_P12 is unavailable' >&2
         exit 1
     fi
     import_temporary_identity
     build_for_identity
-    /usr/bin/codesign --force --options runtime --timestamp --entitlements "$entitlements" --sign "$identity" --keychain "$keychain_path" "$APP"
-fi
-if [[ -n "$keychain_path" ]]; then
-    /usr/bin/codesign --force --options runtime --timestamp --sign "$identity" --keychain "$keychain_path" "$CLI"
-else
-    /usr/bin/codesign --force --options runtime --timestamp --sign "$identity" "$CLI"
+    /usr/bin/codesign --force --options runtime --timestamp --sign "$identity" --keychain "$keychain_path" "$APP"
 fi
 /usr/bin/codesign --verify --deep --strict -vv "$APP"
-/usr/bin/codesign --verify --strict -vv "$CLI"
 
 : "${APPLE_API_KEY_P8:?APPLE_API_KEY_P8 is required for notarization}"
 : "${APPLE_API_KEY_ID:?APPLE_API_KEY_ID is required for notarization}"
 : "${APPLE_API_ISSUER_ID:?APPLE_API_ISSUER_ID is required for notarization}"
 api_key="$SCRATCH/notary-key.p8"
 printf '%s' "$APPLE_API_KEY_P8" | /usr/bin/base64 -D >"$api_key"
-archive="$SCRATCH/Eidos Collector.notary.zip"
+archive="$SCRATCH/Eidos.notary.zip"
 notary_payload="$SCRATCH/notary-payload"
 /bin/mkdir "$notary_payload"
-/usr/bin/ditto "$APP" "$notary_payload/Eidos Collector.app"
-/usr/bin/ditto "$CLI" "$notary_payload/eidos"
+/usr/bin/ditto "$APP" "$notary_payload/Eidos.app"
 /usr/bin/ditto -c -k --keepParent "$notary_payload" "$archive"
 result="$SCRATCH/notary-result.json"
 /usr/bin/xcrun notarytool submit "$archive" --key "$api_key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --output-format json >"$result"
@@ -84,8 +70,6 @@ printf 'notarization id=%s status=%s\n' "$submission_id" "$submission_status"
 
 /usr/bin/xcrun stapler staple "$APP"
 /usr/bin/codesign --verify --deep --strict -vv "$APP"
-/usr/bin/codesign --verify --strict -vv "$CLI"
 /usr/sbin/spctl -a -vv -t exec "$APP"
-/usr/sbin/spctl -a -vv -t exec "$CLI"
-rm -f "$OUTPUT_DIR/Eidos Collector.app.zip"
-/usr/bin/ditto -c -k --keepParent "$APP" "$OUTPUT_DIR/Eidos Collector.app.zip"
+rm -f "$OUTPUT_DIR/Eidos.app.zip"
+/usr/bin/ditto -c -k --keepParent "$APP" "$OUTPUT_DIR/Eidos.app.zip"

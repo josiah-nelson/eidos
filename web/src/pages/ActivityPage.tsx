@@ -9,7 +9,7 @@ import {
   type RetryReport,
 } from '../api'
 import { ErrorBox, Spinner, StateBadge } from '../components'
-import { ago, bytes, count, duration, integerNumber, when } from '../format'
+import { bytes, count, duration, integerNumber, when } from '../format'
 
 const STATE_ORDER = ['indexed', 'partial', 'pending', 'stale', 'failed', 'unsupported', 'excluded']
 
@@ -404,7 +404,6 @@ export default function ActivityPage() {
         </div>
       )}
 
-      <CollectorCard />
 
       <h2>Sources</h2>
       <table className="grid">
@@ -493,106 +492,6 @@ export default function ActivityPage() {
           </table>
         </>
       )}
-    </>
-  )
-}
-
-// The collector daemon's forwarding state, answered by the service over the
-// collector's control pipe. Bundles are delivered daily to a configured
-// share; this card is where "are nodes uploading, and where?" gets its
-// answer — and where the destination is set without a terminal.
-function CollectorCard() {
-  const qc = useQueryClient()
-  const q = useQuery({ queryKey: ['collector'], queryFn: api.collector, refetchInterval: 5000, retry: false })
-  const upload = useMutation({
-    mutationFn: (body: { enabled?: boolean; destination?: string; hour?: number }) => api.setCollectorUpload(body),
-    onSuccess: (view) => qc.setQueryData(['collector'], view),
-  })
-  if (q.isPending || q.isError) return null
-  const c = q.data
-  if (!c.available) {
-    if (!c.detail || c.detail.includes('Windows hosts only')) return null
-    return (
-      <>
-        <h2>Collector</h2>
-        <div className="muted small">{c.detail}</div>
-      </>
-    )
-  }
-  const u = c.upload
-  return (
-    <>
-      <h2>Collector</h2>
-      <div className="cards">
-        <div className="card">
-          <div className="head">
-            <div className="grow">
-              <div className="name">
-                Bundle forwarding{' '}
-                {u?.enabled ? (
-                  u.destination ? (
-                    <span className="badge ok">on</span>
-                  ) : (
-                    <span className="badge warn">no destination</span>
-                  )
-                ) : (
-                  <span className="badge warn">off</span>
-                )}
-              </div>
-              <div className="path">
-                collector v{c.version} · {count(c.spool_records)} records spooled ·{' '}
-                {count(c.capture_gaps)} capture gaps
-              </div>
-            </div>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={u?.enabled ?? false}
-                disabled={upload.isPending}
-                onChange={(e) => upload.mutate({ enabled: e.target.checked })}
-              />{' '}
-              deliver daily
-            </label>
-          </div>
-          <div className="form">
-            <label>
-              Destination share (the daily bundle is copied here; the machine account needs write access)
-              <span style={{ display: 'flex', gap: 6 }}>
-                <input
-                  type="text"
-                  defaultValue={u?.destination ?? ''}
-                  key={u?.destination ?? ''}
-                  placeholder={'\\fileserver\share\eidos'}
-                  disabled={upload.isPending}
-                  onBlur={(e) => {
-                    if (e.target.value !== (u?.destination ?? '')) upload.mutate({ destination: e.target.value })
-                  }}
-                />
-                <input
-                  type="number"
-                  className="small"
-                  min={0}
-                  max={23}
-                  title="local hour the delivery runs at or after"
-                  defaultValue={u?.hour ?? 3}
-                  key={u?.hour ?? 3}
-                  disabled={upload.isPending}
-                  onBlur={(e) => {
-                    const v = Number(e.target.value)
-                    if (Number.isFinite(v) && v >= 0 && v <= 23 && v !== u?.hour) upload.mutate({ hour: v })
-                  }}
-                />
-              </span>
-            </label>
-            <div className="muted small">
-              {u?.last_upload_unix_ns != null ? `last delivered ${ago(u.last_upload_unix_ns)}` : 'nothing delivered yet'} ·{' '}
-              {count(u?.uploaded_total ?? 0)} bundles total · {count(u?.pending ?? 0)} staged locally
-              {u?.last_error ? ` · last attempt: ${u.last_error}` : ''}
-            </div>
-            {upload.isError && <div className="error-text">{upload.error.message}</div>}
-          </div>
-        </div>
-      </div>
     </>
   )
 }
