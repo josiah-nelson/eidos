@@ -12,7 +12,7 @@ use eidos_service::{
         CLAIM_BATCH,
     },
     resource_control::ResourceLimits,
-    scanner::{run_full_scan, ScanProgress},
+    scanner::{run_full_scan, start_scan, ScanProgress},
     state::AppState,
     ServiceConfig,
 };
@@ -275,4 +275,53 @@ async fn resource_api_validates_persists_and_reports_effective_limits() {
             .limits,
         state.resources.view().limits
     );
+}
+
+#[test]
+fn a_scan_queued_for_a_slot_does_not_starve_its_own_source_of_content_work() {
+    let (_dir, state, source) = fixture();
+    state
+        .resources
+        .set(ResourceLimits {
+            scan_threads: 1,
+            concurrent_scans: 1,
+            minimum_free_mib: 0,
+        })
+        .unwrap();
+    run_full_scan(&state, source, &ScanProgress::new(source)).unwrap();
+    assert_eq!(top_up_queue(&state).unwrap(), 2);
+
+    // Occupy the only scan slot, then start a scan that must queue behind it.
+    let slot = state.resources.try_scan().unwrap();
+    let queued = start_scan(&state, source).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !queued.view().phase.contains("slot") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!queued.is_admitted(), "{}", queued.view().phase);
+    let (reservation, jobs) = reserve_and_claim(&state, "fixture", CLAIM_BATCH)
+        .unwrap()
+        .expect("a scan merely waiting for a slot must not idle its source");
+    assert_eq!(jobs.len(), 1);
+    drop((reservation, jobs));
+
+    // Once it is admitted it owns the source again, as a running scan always has.
+    drop(slot);
+    wait_until(deadline, || queued.is_admitted() || queued.is_finished());
+    if !queued.is_finished() {
+        assert!(reserve_and_claim(&state, "fixture", CLAIM_BATCH)
+            .unwrap()
+            .is_none());
+    }
+    queued.cancel.store(true, Ordering::Relaxed);
+    wait_until(Instant::now() + Duration::from_secs(30), || {
+        queued.is_finished()
+    });
+}
+
+fn wait_until(deadline: Instant, mut ready: impl FnMut() -> bool) {
+    while !ready() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(ready(), "condition not reached before the deadline");
 }

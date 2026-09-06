@@ -107,6 +107,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub detach: bool,
     /// Enumeration worker threads per scan.
+    ///
+    /// Only seeds the durable limit on the first start with a given data
+    /// directory. Afterwards the saved value wins (it is persisted next to
+    /// the catalog); change it with `eidos resources` or Activity →
+    /// Resource limits.
     #[arg(long, default_value_t = 8)]
     pub scan_threads: usize,
     /// Disable automatic periodic rescans of sources without a change feed.

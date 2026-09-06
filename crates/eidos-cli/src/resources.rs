@@ -40,16 +40,19 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
         agent.get(&url).call()?
     };
     let status = response.status();
-    let body: serde_json::Value = response
-        .body_mut()
-        .read_json()
-        .context("read resource limits")?;
+    // Report the status even when the body is not the JSON API error shape
+    // (a wrong URL, a proxy, or a build without this route).
+    let body = response.body_mut().read_json::<serde_json::Value>();
     anyhow::ensure!(
         status.is_success(),
         "{}: {}",
         status,
-        body["error"].as_str().unwrap_or("resource request failed")
+        body.as_ref()
+            .ok()
+            .and_then(|body| body["error"].as_str())
+            .unwrap_or("resource request failed")
     );
+    let body = body.context("read resource limits")?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&body)?);
     } else {
@@ -58,9 +61,12 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
             "metadata threads: {}  concurrent scans: {}  data-volume reserve: {} MiB",
             limits["scan_threads"], limits["concurrent_scans"], limits["minimum_free_mib"]
         );
+        // 64-bit values use the API's decimal-string convention; print the
+        // number, not a quoted JSON string.
         println!(
             "active metadata scans: {}  free bytes: {}",
-            body["active_scans"], body["free_bytes"]
+            body["active_scans"],
+            body["free_bytes"].as_str().unwrap_or("unknown")
         );
         if let Some(reason) = body["admission_blocked"].as_str() {
             println!("waiting: {reason}");

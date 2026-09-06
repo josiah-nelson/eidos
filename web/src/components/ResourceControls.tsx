@@ -28,7 +28,8 @@ function LimitsEditor({ saved }: { saved: ResourceLimits }) {
     </label>
   )
   return (
-    <form onSubmit={e => { e.preventDefault(); save.mutate(draft) }}>
+    // A cleared or unparseable number field is NaN, which would POST `null`.
+    <form onSubmit={e => { e.preventDefault(); if (Object.values(draft).every(Number.isFinite)) save.mutate(draft) }}>
       <div className="toolbar" style={{ flexWrap: 'wrap', gap: 16 }}>
         {field('scan_threads', 'Threads per metadata scan', 1, 64)}
         {field('concurrent_scans', 'Concurrent metadata scans', 1, 16)}

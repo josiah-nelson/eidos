@@ -70,10 +70,13 @@ eidos content pause
 eidos content resume
 ```
 
-For discovery, `/api/volumes` uses a 60-second single-flight cache outside the
-operator thread pool, with a two-second cold-response deadline. Retrying a
-stuck probe never starts a second OS thread. Windows offers remote/removable/
-optical roots without opening them for capacity/capability information.
+For discovery, `/api/volumes` uses a five-second single-flight cache outside
+the operator thread pool, with a two-second cold-response deadline. The
+single-flight guard, not the cache lifetime, is what prevents a pile-up, so
+the lifetime stays short and setup's **Rescan drives** picks up media attached
+mid-onboarding. Retrying a stuck probe never starts a second OS thread.
+Windows offers remote/removable/optical roots without opening them for
+capacity/capability information.
 Unavailable metadata is unknown, not evidence that a drive is healthy.
 The advisory release check has a 15-second overall deadline including the body.
 

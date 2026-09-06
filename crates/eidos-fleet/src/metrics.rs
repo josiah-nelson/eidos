@@ -1,5 +1,5 @@
-//! Protocol-level measurements the product emits because the observatory
-//! cannot infer causality from system I/O alone (sprint section 7).
+//! Protocol-level measurements the product emits itself: system I/O counters
+//! alone cannot attribute causality to a fleet exchange.
 
 use crate::wire::Family;
 use serde::{Deserialize, Serialize};

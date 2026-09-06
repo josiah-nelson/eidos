@@ -75,7 +75,12 @@ impl<T: Clone + Send + 'static> BackgroundProbe<T> {
             })
         {
             state.running = false;
-            state.result = Some((Instant::now(), Err(error.to_string())));
+            // A transient spawn failure must not blank a warm cache or
+            // restart its TTL: that would turn one failed thread into a
+            // whole TTL of errors for every caller.
+            if state.result.is_none() {
+                state.result = Some((Instant::now(), Err(error.to_string())));
+            }
             self.changed.notify_waiters();
         }
     }

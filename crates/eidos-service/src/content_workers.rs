@@ -359,12 +359,16 @@ pub fn reserve_and_claim(
     }
     // Scan starts also hold the admission gate while inserting their
     // progress entry. A finished entry is harmless and does not keep its
-    // source idle during the 30-second diagnostics retention window.
+    // source idle during the 30-second diagnostics retention window, and
+    // neither does one still queued for a scan slot: an unadmitted scan has
+    // opened no generation and read nothing from the source.
     let active_scans: HashSet<SourceId> = state
         .scans
         .lock()
         .iter()
-        .filter_map(|(source, progress)| (!progress.is_finished()).then_some(*source))
+        .filter_map(|(source, progress)| {
+            (progress.is_admitted() && !progress.is_finished()).then_some(*source)
+        })
         .collect();
     let budgets = state.content_workers.budgets.clone();
     let mut admit = |source: SourceId| {

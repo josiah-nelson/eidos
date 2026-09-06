@@ -97,12 +97,21 @@ impl ResourceControl {
     pub fn set(&self, limits: ResourceLimits) -> anyhow::Result<()> {
         limits.validate().map_err(anyhow::Error::msg)?;
         let _write = self.settings_write.lock();
-        let tmp = self.data_dir.join("resource-limits.json.tmp");
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&serde_json::to_vec(&limits)?)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(tmp, self.data_dir.join(SETTINGS_FILE))?;
+        let tmp = self.data_dir.join(format!("{SETTINGS_FILE}.tmp"));
+        let replace = || -> anyhow::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&serde_json::to_vec(&limits)?)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, self.data_dir.join(SETTINGS_FILE))?;
+            Ok(())
+        };
+        if let Err(error) = replace() {
+            // Never leave a half-written temporary behind for the next save
+            // (or an operator reading the data directory) to trip over.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
         self.state.lock().0 = limits;
         Ok(())
     }

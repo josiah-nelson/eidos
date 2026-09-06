@@ -315,15 +315,21 @@ pub struct VolumeCandidateView {
     pub already_indexed: bool,
 }
 
+/// How long a drive enumeration is reused. Short enough that the picker's
+/// refresh reflects newly attached media.
+const VOLUME_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Local volumes for source selection. Empty on platforms without drive
 /// enumeration; the UI falls back to manual path entry.
 async fn volumes(State(st): State<Arc<AppState>>) -> ApiResult<Vec<VolumeCandidateView>> {
     // Isolate OS discovery from the operator pool. A slow/stuck drive probe
     // keeps its single dedicated thread, even after an HTTP deadline expires.
-    st.volume_candidates
-        .refresh(std::time::Duration::from_secs(60), || {
-            Ok(eidos_scanner::local_volume_candidates())
-        });
+    // The single-flight guard, not the TTL, is what stops a pile-up, so keep
+    // the TTL short: a drive attached during onboarding must appear on the
+    // next refresh rather than up to a cache lifetime later.
+    st.volume_candidates.refresh(VOLUME_CACHE_TTL, || {
+        Ok(eidos_scanner::local_volume_candidates())
+    });
     let candidates = st
         .volume_candidates
         .cached(std::time::Duration::from_secs(2))

@@ -1,7 +1,6 @@
 //! Content-defined chunking (FastCDC with normalized chunking) and a text
-//! heuristic. Shared by the observatory's content economics probe and the
-//! fleet's content-transfer bakeoff; platform-neutral so chunk stability
-//! under edits is tested directly.
+//! heuristic. Used by the fleet's content-transfer bakeoff; platform-neutral
+//! so chunk stability under edits is tested directly.
 
 /// Gear table derived from a fixed seed so chunk boundaries are identical
 /// on every host and build.
@@ -11,6 +10,8 @@ fn gear() -> &'static [u64; 256] {
     TABLE.get_or_init(|| {
         let mut table = [0u64; 256];
         let mut hasher = blake3::Hasher::new();
+        // Frozen seed string: changing it moves every chunk boundary, so it
+        // keeps its original spelling even though that pipeline is retired.
         hasher.update(b"eidos-observe-fastcdc-gear/1");
         let mut reader = hasher.finalize_xof();
         let mut bytes = [0u8; 256 * 8];

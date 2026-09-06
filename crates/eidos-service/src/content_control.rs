@@ -230,8 +230,9 @@ pub struct ContentStatusView {
     pub rebuild: RebuildStatus,
 }
 
-/// Derive the current content state. Cheap: atomics, one budget-table lock,
-/// and the rebuild mutex — no catalog or index reads. The function does not
+/// Derive the current content state. Cheap: atomics, the budget-table,
+/// resource-limit and disk-sample locks, and the rebuild mutex — no catalog
+/// or index reads. The function does not
 /// acquire the admission gate itself; control endpoints deliberately call it
 /// while holding that gate so their response describes their own transition.
 pub fn content_status(state: &AppState) -> ContentStatusView {
@@ -594,10 +595,11 @@ mod tests {
     fn a_resumed_backlog_waits_for_scan_ownership_to_end() {
         let (_dir, state, source) = state_with_queued_job();
         state.content_pause.set_paused(true).unwrap();
-        state
-            .scans
-            .lock()
-            .insert(source, Arc::new(ScanProgress::new(source)));
+        let scan = Arc::new(ScanProgress::new(source));
+        // Only a scan that has taken its slot owns the source; a scan still
+        // queued for one has read nothing from it.
+        scan.admit();
+        state.scans.lock().insert(source, scan);
 
         state.content_pause.set_paused(false).unwrap();
         assert!(
