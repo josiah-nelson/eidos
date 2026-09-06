@@ -199,7 +199,7 @@ pub fn stop_watcher(state: &AppState, source_id: SourceId) {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsnCheckpoint {
     pub journal_id: u64,
     pub next_usn: i64,
@@ -543,11 +543,13 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
 
 #[cfg(windows)]
 fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStatus>) {
+    use crate::usn_checkpoint::{CheckpointPlan, ReadAhead};
     use eidos_scanner::usn::{read_journal_wait, ReadOutcome, UsnError, VolumeHandle};
 
     let mut buf = vec![0u8; 1024 * 1024];
     let mut vol: Option<VolumeHandle> = None;
     let mut io_failures = 0u32;
+    let mut read_ahead = ReadAhead::new(Instant::now());
     let stop = |status: &WatcherStatus, reason: String| {
         tracing::info!(source = source_id.0, reason, "watcher stopped");
         status.set(WatcherState::Stopped, Some(reason));
@@ -646,6 +648,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 continue;
             }
         };
+        if read_ahead.synchronize(&cp, Instant::now()) {
+            vol = None;
+            status.last_position.store(cp.next_usn, Ordering::Relaxed);
+        }
         if vol.is_none() {
             match VolumeHandle::open_waitable(&cp.volume_root) {
                 Ok(v) => vol = Some(v),
@@ -677,7 +683,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
         match read_journal_wait(
             v,
             cp.journal_id,
-            cp.next_usn,
+            read_ahead.next_usn(),
             &mut buf,
             &status.journal_cancel,
         ) {
@@ -691,6 +697,22 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 }
                 io_failures = 0;
                 if records.is_empty() {
+                    match read_ahead.plan(next_usn, false, Instant::now()) {
+                        CheckpointPlan::Unchanged | CheckpointPlan::Deferred => {
+                            status.set(WatcherState::Live, None);
+                            continue;
+                        }
+                        CheckpointPlan::InvalidPosition => {
+                            tracing::error!(
+                                source = source_id.0,
+                                "journal returned a regressing cursor; retaining checkpoint"
+                            );
+                            vol = None;
+                            std::thread::sleep(Duration::from_secs(1));
+                            continue;
+                        }
+                        CheckpointPlan::Persist => {}
+                    }
                     if next_usn != cp.next_usn {
                         let next_cp = UsnCheckpoint {
                             next_usn,
@@ -709,6 +731,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         };
                         match advance {
                             Ok(true) => {
+                                read_ahead.committed(&next_cp, Instant::now());
                                 status.last_position.store(next_usn, Ordering::Relaxed);
                             }
                             Ok(false) => {
@@ -766,11 +789,45 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 let (events, tstats) = match translator.translate(&records) {
                     Ok(batch) => batch,
                     Err(error) => {
-                        tracing::error!(error = %error, "USN policy/catalog read failed; retaining checkpoint for retry");
+                        tracing::error!(error = %error, "USN translation failed; retaining checkpoint for retry");
+                        status.set(
+                            WatcherState::Starting,
+                            Some("retrying an incomplete change-feed batch".into()),
+                        );
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     }
                 };
+                // Recovery of an offline source also needs a fenced durable
+                // turn, so it is not postponed behind irrelevant read-ahead.
+                match read_ahead.plan(
+                    next_usn,
+                    !events.is_empty() || source.state == SourceState::Offline,
+                    Instant::now(),
+                ) {
+                    CheckpointPlan::Unchanged | CheckpointPlan::Deferred => {
+                        status.batches.fetch_add(1, Ordering::Relaxed);
+                        status.records.fetch_add(tstats.records, Ordering::Relaxed);
+                        *status.last_batch.lock() = Some(Instant::now());
+                        status
+                            .last_apply_ms
+                            .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        status.set(WatcherState::Live, None);
+                        // No catalog write or per-batch log for irrelevant
+                        // volume activity: either would itself feed the journal.
+                        continue;
+                    }
+                    CheckpointPlan::InvalidPosition => {
+                        tracing::error!(
+                            source = source_id.0,
+                            "journal returned a regressing cursor; retaining checkpoint"
+                        );
+                        vol = None;
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                    CheckpointPlan::Persist => {}
+                }
                 let new_cp = UsnCheckpoint {
                     next_usn,
                     ..cp.clone()
@@ -782,12 +839,22 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                         stop(&status, "cancelled".into());
                         return;
                     };
-                    state
-                        .catalog
-                        .apply_feed_changes(source_id, &events, &expected_cp, &next_cp)
+                    if events.is_empty() {
+                        state
+                            .catalog
+                            .advance_feed_checkpoint(source_id, &expected_cp, &next_cp)
+                            .map(|advanced| {
+                                advanced.then(eidos_catalog::changes::ApplyStats::default)
+                            })
+                    } else {
+                        state
+                            .catalog
+                            .apply_feed_changes(source_id, &events, &expected_cp, &next_cp)
+                    }
                 };
                 match apply {
                     Ok(Some(astats)) => {
+                        read_ahead.committed(&new_cp, Instant::now());
                         status.batches.fetch_add(1, Ordering::Relaxed);
                         status.events.fetch_add(astats.events, Ordering::Relaxed);
                         status.records.fetch_add(tstats.records, Ordering::Relaxed);

@@ -114,6 +114,10 @@ fn live_changes_restart_and_overflow() {
     .is_some());
 
     // 2. Create: visible within the 2-second gate.
+    assert!(
+        watcher.view().last_position > 0,
+        "initial durable position must be visible before the first checkpoint flush"
+    );
     std::fs::write(e.root.join("docs/new.txt"), b"new").unwrap();
     let latency = wait_until(Duration::from_secs(5), || {
         exists(&state, sid, "docs/new.txt")

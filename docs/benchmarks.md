@@ -4,6 +4,74 @@ Measured results on the reference corpus and bounded synthetic fixtures. Numbers
 git-ignored `bench-results/*.jsonl` records produced by the commands in
 [development.md](development.md). Dates are absolute; existing corpora stay read-only.
 
+## Two-root native-idle comparison (2026-09-06 UTC, development builds)
+
+Both runs used `scripts/recovery-smoke.ps1 -Files 384 -IdleSeconds 15
+-SourceCount 2 -ContentWorkers 2 -ScanThreads 2 -ConcurrentScans 1
+-DeviceReaders 2 -SourceReaders 4 -LargeFilesPerSource 2 -LargeFileMiB 2`.
+Two new temporary roots shared one resolved OS disk. The 772-file fixture
+contained 11,642,404 bytes, including four 2-MiB text files. Source creation and
+policy setup are excluded from the scan-request-to-drain clock. Queries were
+requested every 250 ms while work ran; no API polling occurred during idle.
+
+Before binary SHA-256:
+`5CBB09456C175C53A3460AFB99D43FCD1718005D5381D04355214B29E94EB5AB`.
+After binary SHA-256:
+`DB5CA07D2A805ACFD0971846E7E84C48D174D529220A0C5EB2E9B73664107954`.
+Private raw records: `bench-results/shared-roots-before-idle-fix-2026-09-06-01.json`
+and `bench-results/shared-roots-after-idle-fix-2026-09-06-01.json`.
+
+| Observation | Before | After |
+|---|---:|---:|
+| Scan request to complete | 7.118 s | 7.049 s |
+| Crawl query p95 (26 samples each) | 16.27 ms | 16.08 ms |
+| Observed combined readers / saved ceiling | 2 / 2 | 2 / 2 |
+| Unpolled idle duration | 15.097 s | 15.097 s |
+| Idle CPU time | 0.328125 s | 0.09375 s |
+| Idle process read bytes | 8,486,912 | 36,864 |
+| Idle process write bytes | 449,080 | 0 |
+| Catalog writer acquisitions during idle | 179 | 66 |
+| Watcher events during idle, both roots combined | 26 | 0 |
+
+The fixture was not changed during either idle window. Unknown deletions and
+irrelevant checkpoint writes explain a concrete path for unnecessary work;
+[ADR-0030](adr/0030-bound-irrelevant-journal-checkpoints.md) describes the fix.
+Zero measured writes in one short window is not a promise of I/O-free idle:
+bounded checkpoint flushes, real changes and normal maintenance remain. Writer
+acquisitions alone are not disk-write counts. The after build preceded the
+small initial-position display/offline-recovery follow-up.
+
+These are non-isolated Windows build-26100 development observations, not a
+controlled physical-media benchmark. The sample count is too small for a useful
+tail-latency qualification. Repeated/longer observations, measured profiles and
+installed qualification remain required; no production preset is inferred.
+
+The final initial-position/offline-recovery follow-up passed the full local
+Windows gate. Rebuilt binary SHA-256
+`91249905B6B897B9D0A2718C2C0282DDEFEC76DC7D1387EBB16BFE4E13A29A9A`
+repeated the same two-root/cap-two fixture with a **30.090-second** unpolled
+idle window: 0.171875 CPU seconds, 368,640 process read bytes and 8,240 write
+bytes (four write operations). Both watcher positions were populated and
+advanced across the bounded flush interval, with zero source events. Crawl
+time was 7.013 seconds; 26 queries had p95 19.59 ms. Private raw record:
+`bench-results/shared-roots-after-idle-fix-2026-09-06-02.json`. This longer
+observation confirms why the earlier zero-write sample is not a zero-I/O claim.
+
+An additional same-binary run used four workers, four scan threads, two
+concurrent scans, source/device caps of four and a 50-ms requested query
+interval, with `-CheckRestart`. It indexed all 772 files in 6.965 seconds;
+83 queries had p95 13.95 ms (still too few for a useful p99 qualification).
+The 15.089-second idle read 4,096 bytes and wrote zero, but used 0.1875 CPU
+seconds, **1.243% of one core**. That exceeds the proposed 1% profile-testing
+threshold: the four-worker tuple is not qualified or recommended. No source
+events occurred; 126 catalog writer acquisitions still occurred during idle.
+
+After drain, pause responded in 4.97 ms and the forced temporary-process restart
+became healthy in 525 ms. Saved pause, metadata/device/pool/source limits and
+ten queried content hits survived despite different command-line defaults;
+explicit resume succeeded. This is not a mid-file pause or an installed upgrade.
+Private record: `bench-results/shared-roots-restart-2026-09-06-01.json`.
+
 ## Device-admission smoke (2026-09-06 UTC, development build)
 
 `scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15 -DeviceReaders 2`,

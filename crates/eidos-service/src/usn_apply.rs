@@ -27,6 +27,18 @@ pub struct TranslateStats {
     pub io_errors: u64,
 }
 
+impl TranslateStats {
+    fn ensure_complete(&self) -> eidos_catalog::Result<()> {
+        if self.io_errors > 0 {
+            return Err(eidos_catalog::CatalogError::InvalidState(format!(
+                "USN batch has {} unread snapshots; retaining checkpoint for retry",
+                self.io_errors
+            )));
+        }
+        Ok(())
+    }
+}
+
 pub struct Translator<'a> {
     pub vol: &'a VolumeHandle,
     pub volume_serial: u64,
@@ -115,11 +127,14 @@ impl<'a> Translator<'a> {
                 }
             }
             if acc.deleted {
-                // Only meaningful if the object is known; apply_changes skips
-                // unknown keys cheaply.
-                events.push(ChangeEvent::Delete {
-                    object: self.key(frn),
-                });
+                // A volume journal includes other roots and our own stores.
+                // Unknown deletes are not source events: emitting them would
+                // force a checkpoint write for unrelated temporary-file churn.
+                if let Some(event) = known_deletion(self.catalog, self.source_id, self.key(frn))? {
+                    events.push(event);
+                } else {
+                    stats.out_of_scope += 1;
+                }
                 continue;
             }
             let latest_in_scope = acc
@@ -176,6 +191,9 @@ impl<'a> Translator<'a> {
                 }
             }
         }
+        // Both live watching and overlap replay must reject partial snapshots.
+        // An empty event list is not proof that an unread file is irrelevant.
+        stats.ensure_complete()?;
         Ok((events, stats))
     }
 
@@ -250,6 +268,16 @@ impl<'a> Translator<'a> {
     }
 }
 
+fn known_deletion(
+    catalog: &Catalog,
+    source: SourceId,
+    key: NativeKey,
+) -> eidos_catalog::Result<Option<ChangeEvent>> {
+    Ok(catalog
+        .object_by_native(source, key)?
+        .map(|_| ChangeEvent::Delete { object: key }))
+}
+
 pub fn to_snapshot(s: &FileSnapshot) -> ObjectSnapshot {
     ObjectSnapshot {
         native: s.native,
@@ -263,5 +291,99 @@ pub fn to_snapshot(s: &FileSnapshot) -> ObjectSnapshot {
         changed: s.changed,
         accessed: s.accessed,
         reparse_tag: s.reparse_tag,
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+
+    #[test]
+    fn partial_snapshot_translation_cannot_be_acknowledged_as_complete() {
+        assert!(TranslateStats::default().ensure_complete().is_ok());
+        assert!(TranslateStats {
+            io_errors: 1,
+            ..Default::default()
+        }
+        .ensure_complete()
+        .is_err());
+    }
+
+    #[test]
+    fn an_indexed_identity_still_emits_its_deletion() {
+        use eidos_catalog::{
+            scan::{run_scan, RunScanOptions},
+            NewSource,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("known.txt"), b"fixture").unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+        let host_id = catalog.ensure_host("fixture", "windows").unwrap();
+        let source = catalog
+            .add_source(&NewSource {
+                host_id,
+                name: "fixture".into(),
+                kind: eidos_domain::SourceKind::WindowsLocal,
+                root_path: root.to_string_lossy().into_owned(),
+                aliases: vec![],
+            })
+            .unwrap();
+        run_scan(
+            &catalog,
+            source,
+            eidos_scanner::default_lister().as_ref(),
+            &RunScanOptions::default(),
+        )
+        .unwrap();
+        let object = catalog
+            .resolve_relative(source, "known.txt")
+            .unwrap()
+            .unwrap();
+        let key = NativeKey::from(catalog.get_object(object).unwrap().unwrap().native.unwrap());
+        assert!(
+            matches!(known_deletion(&catalog, source, key).unwrap(), Some(ChangeEvent::Delete { object }) if object == key)
+        );
+    }
+
+    #[test]
+    fn deletes_absent_from_the_source_do_not_become_feed_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+        for id in 1..100 {
+            assert!(known_deletion(
+                &catalog,
+                SourceId(1),
+                NativeKey {
+                    volume_serial: 7,
+                    id
+                }
+            )
+            .unwrap()
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn a_failed_catalog_lookup_is_not_confused_with_an_unrelated_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+        // Fault injection in this disposable, empty catalog only.
+        catalog
+            .with_writer(|conn| {
+                conn.execute_batch("ALTER TABLE objects RENAME TO unavailable_objects")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(known_deletion(
+            &catalog,
+            SourceId(1),
+            NativeKey {
+                volume_serial: 7,
+                id: 1
+            }
+        )
+        .is_err());
     }
 }
