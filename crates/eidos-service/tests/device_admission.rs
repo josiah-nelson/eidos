@@ -110,6 +110,113 @@ fn an_eight_thread_scan_uses_only_the_width_left_by_content_work() {
     assert_eq!(state.devices.view().budget.devices[0].content_readers, 0);
 }
 
+/// Blocks inside the first directory listing until the test releases it, so
+/// assertions can run while enumeration is genuinely in flight.
+struct GateLister {
+    inner: Box<dyn eidos_scanner::DirectoryLister>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl eidos_scanner::DirectoryLister for GateLister {
+    fn list(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Vec<eidos_scanner::RawEntry>, eidos_scanner::ScanError> {
+        // Take the receiver and drop the guard before blocking on it.
+        let gate = self.release.lock().unwrap().take();
+        if let Some(release) = gate {
+            let _ = self.entered.send(());
+            let _ = release.recv();
+        }
+        self.inner.list(path)
+    }
+    fn stat(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<eidos_scanner::RawEntry, eidos_scanner::ScanError> {
+        self.inner.stat(path)
+    }
+    fn volume_info(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<eidos_scanner::VolumeInfo, eidos_scanner::ScanError> {
+        self.inner.volume_info(path)
+    }
+    fn name(&self) -> &'static str {
+        "gated width fixture"
+    }
+}
+
+#[test]
+fn a_scan_holds_both_reservations_while_it_enumerates() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    for i in 0..4 {
+        std::fs::create_dir(root.join(format!("branch-{i}"))).unwrap();
+    }
+    let mut state = AppState::open(&ServiceConfig {
+        data_dir: dir.path().join("data"),
+        scan_threads: 1,
+        fleet: false,
+        update_check: false,
+        auto_reconcile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let (entered, mid_scan) = std::sync::mpsc::sync_channel(1);
+    let (finish, release) = std::sync::mpsc::channel();
+    state.lister = Arc::new(GateLister {
+        inner: eidos_scanner::default_lister(),
+        entered,
+        release: std::sync::Mutex::new(Some(release)),
+    });
+    let source = state
+        .catalog
+        .add_source(&NewSource {
+            host_id: state.host_id,
+            name: "gated fixture".into(),
+            kind: SourceKind::WindowsGeneric,
+            root_path: root.to_string_lossy().into_owned(),
+            aliases: vec![],
+        })
+        .unwrap();
+    refresh_budgets(&state).unwrap();
+    state.devices.set_limit(1).unwrap();
+    let state = Arc::new(state);
+    let progress = Arc::new(eidos_service::scanner::ScanProgress::new(source));
+    let scanning = {
+        let (state, progress) = (state.clone(), progress.clone());
+        std::thread::spawn(move || eidos_service::scanner::run_full_scan(&state, source, &progress))
+    };
+    mid_scan
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("enumeration started");
+
+    // The admitted scan is a live binding through enumeration and publication,
+    // not a thread count extracted from a guard that was already dropped.
+    let budget = state.devices.view().budget;
+    assert_eq!(
+        budget.devices[0].scan_threads, 1,
+        "the device lease was released before enumeration ran"
+    );
+    assert_eq!(state.resources.view().active_scans, 1);
+    assert_eq!(
+        state
+            .devices
+            .try_reserve(source.0, eidos_service::device_budget::WorkKind::Content, 1)
+            .unwrap_err(),
+        eidos_service::device_budget::WaitReason::DeviceAtCapacity,
+        "a running scan must still occupy the shared-device ceiling"
+    );
+
+    finish.send(()).unwrap();
+    scanning.join().unwrap().unwrap();
+    assert_eq!(state.devices.view().budget.devices[0].scan_threads, 0);
+    assert_eq!(state.resources.view().active_scans, 0);
+}
+
 fn fixture() -> (tempfile::TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(
