@@ -650,6 +650,10 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
             }
         };
         if read_ahead.synchronize(&cp, Instant::now()) {
+            // A scan, recovery or journal/volume replacement moved the
+            // position, so the next batch is a different one: it must not
+            // inherit the old position's failure window and reconcile early.
+            batch_retry.reset();
             vol = None;
             status.last_position.store(cp.next_usn, Ordering::Relaxed);
         }
@@ -804,7 +808,7 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                 };
                 let (events, tstats) = match translator.translate(&records) {
                     Ok(batch) => {
-                        batch_retry.succeeded();
+                        batch_retry.reset();
                         batch
                     }
                     Err(error) => {

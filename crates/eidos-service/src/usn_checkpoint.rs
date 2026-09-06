@@ -33,9 +33,11 @@ impl BatchRetry {
         }
     }
 
-    /// A batch translated, so any earlier failure is over and a later one
-    /// starts its own window.
-    pub fn succeeded(&mut self) {
+    /// Forget any window in progress, so the next failure starts its own.
+    /// Either a batch translated, or the checkpoint was replaced and the next
+    /// batch is a different position that must not inherit the old one's
+    /// failures and reconcile early.
+    pub fn reset(&mut self) {
         self.failing_since = None;
     }
 
@@ -243,16 +245,22 @@ mod tests {
     }
 
     #[test]
-    fn a_translated_batch_clears_an_earlier_failure() {
+    fn a_translated_batch_or_replaced_checkpoint_clears_an_earlier_failure() {
         let now = Instant::now();
         let mut retry = BatchRetry::new();
         assert_eq!(retry.failed(now), FailedBatch::Retry);
-        retry.succeeded();
+        retry.reset();
         // A failure two hours later is its own problem, not a continuation.
+        let later = now + Duration::from_secs(7200);
         assert_eq!(
-            retry.failed(now + Duration::from_secs(7200)),
+            retry.failed(later),
             FailedBatch::Retry,
-            "an intervening success must not leave a stale failure window"
+            "a success or a replaced checkpoint must not leave a stale window"
+        );
+        assert_eq!(
+            retry.failed(later + RETRY_WINDOW - Duration::from_millis(1)),
+            FailedBatch::Retry,
+            "the new position gets a whole window, not the remains of one"
         );
     }
 

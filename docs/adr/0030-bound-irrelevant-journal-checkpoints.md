@@ -47,7 +47,9 @@ stalling. Bounding the retry never shortens it below the window, so a genuinely
 transient failure still clears on its own.
 
 The durable checkpoint remains the compare-and-swap fence. A scan/recovery or
-journal/volume replacement discards old read-ahead and reopens the proper handle.
+journal/volume replacement discards old read-ahead, reopens the proper handle
+and clears the failed-batch window, since the next batch is a different
+position that must not inherit the old one's failures.
 Restart replays the ignored tail; a wrapped/replaced journal still follows the
 existing reconciliation path. Never skip unapplied source events to reduce I/O.
 
