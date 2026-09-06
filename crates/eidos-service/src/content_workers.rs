@@ -519,6 +519,11 @@ fn coordinator_loop(state: &AppState) {
         let pending = status.pending_publish.lock().len();
         // A rebuild owns the writer; commits resume when it is done.
         let rebuilding = state.content_index.is_rebuilding();
+        if !rebuilding {
+            if let Err(e) = apply_policies_once(state) {
+                *status.last_error.lock() = Some(format!("exclusion application: {e}"));
+            }
+        }
         // `is_dirty`, not `uncommitted`: a reindex that produced no chunks
         // (the file turned binary, empty, unreadable, or unsupported) queues
         // only a deletion, and its old chunks stay searchable until it is
@@ -615,6 +620,39 @@ pub fn commit_and_publish(state: &AppState) -> anyhow::Result<u64> {
         );
     }
     Ok(n)
+}
+
+/// A bounded application turn, independent of content pause/enable controls.
+/// Explicit policy changes must also work for metadata-only sources.
+pub fn apply_policies_once(state: &AppState) -> anyhow::Result<()> {
+    for source in state.catalog.pending_policy_sources()? {
+        let result = (|| -> anyhow::Result<()> {
+            if state
+                .catalog
+                .active_job_counts(source, JobStage::ContentText)?
+                .1
+                > 0
+            {
+                return Ok(());
+            }
+            state.catalog.apply_policy_batch(source)?;
+            let deletes = state.catalog.policy_cleanup_batch(source)?;
+            if !deletes.is_empty() {
+                for id in &deletes {
+                    state.content_index.delete_object(*id);
+                }
+                commit_and_publish(state)?;
+            }
+            state.catalog.acknowledge_policy_cleanup(source, &deletes)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            state
+                .catalog
+                .set_policy_error(source, Some(&error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Enqueue pending objects for every enabled, published source whose queue

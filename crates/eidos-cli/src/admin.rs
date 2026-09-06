@@ -58,6 +58,12 @@ pub enum SourceCommand {
 pub fn run(args: SourceArgs) -> anyhow::Result<()> {
     let catalog = Catalog::open(args.data_dir.join("catalog.db"))?;
     let report = catalog.recover()?;
+    if matches!(
+        &args.command,
+        SourceCommand::Add { .. } | SourceCommand::Scan { .. }
+    ) {
+        catalog.protect_data_directory(&args.data_dir)?;
+    }
     for (sid, gen) in &report.aborted_generations {
         tracing::warn!(
             source = sid.0,

@@ -87,6 +87,10 @@ fn typescript_contract() -> String {
     types.add::<crate::api::AddSourceBody>();
     types.add::<crate::api::AddedSource>();
     types.add::<crate::api::SourceDetail>();
+    types.add::<eidos_catalog::exclusions::ExclusionPolicy>();
+    types.add::<eidos_catalog::exclusions::ApplyExclusions>();
+    types.add::<eidos_catalog::exclusions::PreviewExclusions>();
+    types.add::<eidos_catalog::exclusions::ExclusionPreview>();
     types.add::<crate::api::ErrorsQuery>();
     types.add::<eidos_catalog::ErrorRecord>();
     types.add::<crate::api::ObjectDetail>();

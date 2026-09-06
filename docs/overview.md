@@ -180,6 +180,11 @@ images, swap/hibernation files, recycle-bin contents, caches, dependency
 caches, and obvious binary data. Rules are context-sensitive: a name like
 `bin` is never globally excluded.
 
+The source's [Content rules editor](exclusions.md) supports ordered folder and
+regex rules, validation/preview, explicit application to existing content, and
+restart-safe progress/error recovery. Eidos's configured data/index/log trees
+are non-overridable inventory boundaries with explicit incomplete coverage.
+
 ### 7.6 Literal-text content processing
 
 Text-like files and extensionless text are processed in a streaming pipeline

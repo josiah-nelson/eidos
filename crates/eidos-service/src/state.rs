@@ -138,6 +138,9 @@ impl AppState {
         std::fs::create_dir_all(&config.data_dir)?;
         let catalog = Catalog::open(config.data_dir.join("catalog.db"))?;
         let report = catalog.recover()?;
+        let mut protected = vec![config.data_dir.clone()];
+        protected.extend(config.log_dir.iter().cloned());
+        catalog.configure_protected_paths(&protected)?;
         for (sid, gen) in &report.aborted_generations {
             tracing::warn!(
                 source = sid.0,

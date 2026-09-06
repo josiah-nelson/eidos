@@ -119,7 +119,16 @@ export function CompletenessBanner({ c }: { c: SourceCompleteness }) {
       </div>
     )
   }
-  if (!c.metadata_complete) {
+  // A protected boundary or an in-progress policy transition deliberately
+  // marks metadata incomplete. That must not read as "never scanned", and it
+  // must not hide independent listing or content warnings: render it beside
+  // them, the way `source_coverage` reports both reasons.
+  const policy = c.policy_note ? (
+    <div className="banner warn">
+      <strong>{c.name}</strong>: {c.policy_note}
+    </div>
+  ) : null
+  if (!c.metadata_complete && !policy) {
     return (
       <div className="banner bad">
         <span className="badge bad">not scanned</span>
@@ -129,8 +138,8 @@ export function CompletenessBanner({ c }: { c: SourceCompleteness }) {
       </div>
     )
   }
-  if (integerNumber(c.listing_errors) > 0) {
-    return (
+  const rest =
+    integerNumber(c.listing_errors) > 0 ? (
       <div className="banner warn">
         <span className="badge warn">complete with exceptions</span>
         <span>
@@ -139,10 +148,7 @@ export function CompletenessBanner({ c }: { c: SourceCompleteness }) {
           {integerNumber(c.content_pending) > 0 ? ` ${count(c.content_pending)} files await content indexing.` : ''}
         </span>
       </div>
-    )
-  }
-  if (integerNumber(c.content_pending) > 0) {
-    return (
+    ) : integerNumber(c.content_pending) > 0 ? (
       <div className="banner">
         <span className="badge ok">metadata complete</span>
         <span>
@@ -150,15 +156,20 @@ export function CompletenessBanner({ c }: { c: SourceCompleteness }) {
           content indexing.
         </span>
       </div>
+    ) : policy ? null : (
+      // Only a source with no policy gap can claim to be fully indexed.
+      <div className="banner ok">
+        <span className="badge ok">complete</span>
+        <span>
+          <strong>{c.name}</strong> is fully indexed. Last scan {ago(c.last_scan_completed)}.
+        </span>
+      </div>
     )
-  }
   return (
-    <div className="banner ok">
-      <span className="badge ok">complete</span>
-      <span>
-        <strong>{c.name}</strong> is fully indexed. Last scan {ago(c.last_scan_completed)}.
-      </span>
-    </div>
+    <>
+      {policy}
+      {rest}
+    </>
   )
 }
 

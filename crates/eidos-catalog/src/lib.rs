@@ -16,6 +16,7 @@ pub mod aggregates;
 pub mod archive;
 pub mod changes;
 pub mod content;
+pub mod exclusions;
 pub mod fleet;
 pub mod interactions;
 pub mod jobs;
@@ -66,6 +67,8 @@ pub struct Catalog {
     /// Batches recorded by [`Catalog::record_interactions`]; every Nth one
     /// enforces interaction retention in the same transaction.
     interaction_batches: AtomicU64,
+    policy_engines:
+        Mutex<std::collections::HashMap<eidos_domain::SourceId, exclusions::CachedPolicy>>,
 }
 
 #[derive(Debug, Default)]
@@ -210,6 +213,7 @@ impl Catalog {
             readers: rx,
             readers_return: tx,
             interaction_batches: AtomicU64::new(0),
+            policy_engines: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 

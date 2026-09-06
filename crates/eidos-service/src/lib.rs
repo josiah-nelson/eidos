@@ -14,6 +14,7 @@ mod background_probe;
 pub mod content_control;
 pub mod content_preview;
 pub mod content_workers;
+pub mod exclusions_api;
 pub mod export;
 pub mod fleet_api;
 pub mod follower;
@@ -42,6 +43,8 @@ pub use web::WebAssets;
 pub struct ServiceConfig {
     /// Directory holding `catalog.db` and (later) search indexes.
     pub data_dir: PathBuf,
+    /// Optional log directory outside the data tree, also protected from indexing.
+    pub log_dir: Option<PathBuf>,
     pub bind: SocketAddr,
     /// Built web application directory on disk. Overrides the embedded UI.
     pub web_dir: Option<PathBuf>,
@@ -86,6 +89,7 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("data"),
+            log_dir: None,
             bind: "127.0.0.1:7700".parse().expect("static addr"),
             web_dir: None,
             embedded_web: true,

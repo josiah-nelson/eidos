@@ -170,6 +170,8 @@ Minimum logical tables:
 - `jobs`
 - `outbox`
 - `policy_decisions`
+- `source_policy`, `protected_paths`, `policy_cleanup` (versioned rules and
+  resumable cross-index application; [ADR-0028](adr/0028-versioned-content-exclusions.md))
 - `errors`
 - later `entities`, `edges`, `symbols`, and `occurrences`
 

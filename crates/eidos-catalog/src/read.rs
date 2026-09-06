@@ -419,6 +419,7 @@ impl Catalog {
             let counts = light_counts_conn(conn, &src)?;
             let listing_errors = published_listing_errors_conn(conn, &src)?;
             let mut completeness = completeness_from(&src, &counts, listing_errors);
+            self.policy_coverage_conn(conn, &mut completeness)?;
             if src.kind == SourceKind::Remote {
                 // Replicas in v0.5 carry metadata only. Keep this false even
                 // if the replica bookkeeping row is missing or unreadable so
@@ -750,6 +751,7 @@ pub fn completeness_from(
         metadata_complete,
         content_complete,
         content_not_replicated,
+        policy_note: None,
         content_pending: counts.content_pending,
         content_failed: counts.content_failed,
         listing_errors,

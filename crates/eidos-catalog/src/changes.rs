@@ -20,7 +20,7 @@ use crate::read::get_source_conn;
 use crate::{Catalog, CatalogError, Result};
 use eidos_domain::{
     extension_of, ContentState, FileAttributes, IdentityConfidence, NativeIdentity, ObjectId,
-    ObjectKind, PolicyStage, SourceId, UnixNanos,
+    ObjectKind, SourceId, UnixNanos,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -360,7 +360,7 @@ impl<'a> Applier<'a> {
             source_id,
             root,
             stamp,
-            policy: PolicyEngine::new(),
+            policy: crate::exclusions::engine_conn(tx, source_id)?,
             stats: ApplyStats::default(),
             touched: HashSet::new(),
             now: UnixNanos::now().0,
@@ -459,33 +459,12 @@ impl<'a> Applier<'a> {
         let d = self
             .policy
             .file(name, snap.attributes, snap.reparse_tag, ctx);
-        let st = match d {
-            ContentDecision::Candidate => ContentState::Pending,
-            ContentDecision::Unsupported => ContentState::Unsupported,
-            ContentDecision::Excluded { .. } => ContentState::Excluded,
-        };
+        let st = d.initial_state();
         (st, d)
     }
 
     fn record_policy(&self, id: ObjectId, decision: ContentDecision) -> Result<()> {
-        match decision {
-            ContentDecision::Excluded { reason, rule } => {
-                self.tx
-                    .prepare_cached(
-                        "INSERT INTO policy_decisions (object_id, stage, included, reason, rule, policy_version)
-                         VALUES (?1, ?2, 0, ?3, ?4, ?5)
-                         ON CONFLICT(object_id, stage) DO UPDATE SET included = 0, reason = excluded.reason, rule = excluded.rule,
-                            policy_version = excluded.policy_version WHERE user_override = 0",
-                    )?
-                    .execute(params![id.0, PolicyStage::Content.as_str(), reason.as_str(), rule, self.policy.version as i64])?;
-            }
-            _ => {
-                self.tx
-                    .prepare_cached("DELETE FROM policy_decisions WHERE object_id = ?1 AND stage = ?2 AND user_override = 0")?
-                    .execute(params![id.0, PolicyStage::Content.as_str()])?;
-            }
-        }
-        Ok(())
+        self.policy.record(self.tx, id, decision)
     }
 
     fn outbox(&mut self, id: ObjectId, op: &str, generation: i64) -> Result<()> {
@@ -527,8 +506,15 @@ impl<'a> Applier<'a> {
                 // Identity reused for a different kind: retire the old row.
                 self.tombstone_object(ex.id)?;
             } else {
+                let policy_changed =
+                    snap.kind == ObjectKind::File && decision.changes_state(&ex.content_state);
                 let content_changed = snap.kind == ObjectKind::File
-                    && (ex.size != snap.size as i64 || ex.modified != snap.modified.map(|t| t.0));
+                    && (ex.size != snap.size as i64
+                        || ex.modified != snap.modified.map(|t| t.0)
+                        || policy_changed);
+                if policy_changed {
+                    crate::exclusions::reapply_conn(self.tx, self.source_id)?;
+                }
                 let (generation, state) = if content_changed {
                     self.stats.content_changed += 1;
                     (ex.generation + 1, new_state)
@@ -698,7 +684,33 @@ impl<'a> Applier<'a> {
             }
         };
         let ctx = self.policy_ctx(parent)?;
+        if self.policy.is_protected(&ctx.relative) {
+            return Ok(());
+        }
+        // Only a directory move needs the whole-source pass: it changes every
+        // descendant's relative path. A file's own decision is re-evaluated by
+        // `upsert_object` below, which schedules the pass precisely when that
+        // decision changes, so renaming one file must not restart a full
+        // catalog pass (which also holds this source's content claims).
+        let needs_policy_pass = snap.kind == ObjectKind::Directory
+            && match self.existing(NativeKey::from(snap.native))? {
+                Some(existing) => {
+                    let old = self.policy_ctx(existing.id)?;
+                    let new = self.policy.directory(name, &ctx);
+                    old.inherited_content_exclusion != new.inherited_content_exclusion
+                        || !self.policy.rules.is_empty()
+                        || !self.policy.protected.is_empty()
+                }
+                None => false,
+            };
         let (obj, created, state_delta) = self.upsert_object(snap, name, &ctx)?;
+        if snap.kind == ObjectKind::Directory
+            && self
+                .policy
+                .is_protected(&PolicyEngine::child_path(&ctx, name))
+        {
+            self.policy.record_boundary(self.tx, obj)?;
+        }
         let ext = if snap.kind == ObjectKind::File {
             extension_of(name)
         } else {
@@ -774,6 +786,9 @@ impl<'a> Applier<'a> {
             self.outbox(obj, "subtree", 0)?;
         }
         if !created {
+            if needs_policy_pass {
+                crate::exclusions::reapply_conn(self.tx, self.source_id)?;
+            }
             // Hard link count may have changed.
             self.tx.execute(
                 "UPDATE objects SET link_count = (SELECT COUNT(*) FROM entries e WHERE e.object_id = ?1 AND e.deleted_at IS NULL) WHERE object_id = ?1 AND kind = 'file'",
@@ -864,6 +879,12 @@ impl<'a> Applier<'a> {
             Some(p) => self.policy_ctx(ObjectId(p))?,
             None => PolicyCtx::root(),
         };
+        if self
+            .policy
+            .is_protected(&PolicyEngine::child_path(&ctx, &name))
+        {
+            return Ok(());
+        }
         let (obj, _, delta) = self.upsert_object(snap, &name, &ctx)?;
         if let Some(d) = delta {
             for p in self.parents_of(obj)? {
