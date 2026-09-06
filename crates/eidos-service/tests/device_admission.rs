@@ -215,6 +215,9 @@ fn a_catalog_claim_failure_releases_both_reservations() {
     assert!(reserve_and_claim(&state, "one", 1).is_err());
     assert_eq!(state.content_budgets().reserved(source), 0);
     assert_eq!(state.devices.view().budget.devices[0].content_readers, 0);
+    // The units were released without a file being read, so the reported
+    // high-water mark must not describe a claim that never committed.
+    assert_eq!(state.content_budgets().peak_reserved(source), 0);
     state
         .catalog
         .with_writer(|conn| {
@@ -222,7 +225,9 @@ fn a_catalog_claim_failure_releases_both_reservations() {
             Ok(())
         })
         .unwrap();
-    assert!(reserve_and_claim(&state, "two", 1).unwrap().is_some());
+    let claimed = reserve_and_claim(&state, "two", 1).unwrap();
+    assert!(claimed.is_some());
+    assert_eq!(state.content_budgets().peak_reserved(source), 1);
 }
 
 #[tokio::test]
