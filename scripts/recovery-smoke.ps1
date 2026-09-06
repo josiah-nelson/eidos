@@ -104,18 +104,14 @@ try {
     $idleAfter = Counters
     $idleElapsed = $idleClock.Elapsed.TotalSeconds
     $idleActivity = Invoke-RestMethod "$baseUrl/api/activity" -TimeoutSec 10
-    # Sample after the unpolled idle window, never during it. Exercise the
-    # actual CLI and exact-string API counters, with bounded cold-cache retry.
-    $memory = $null
-    for ($attempt = 0; $attempt -lt 20; $attempt++) {
-        $memoryJson = & $candidatePath resources --url $baseUrl --memory --json
-        if ($LASTEXITCODE -ne 0) { throw 'Memory CLI round trip failed.' }
-        $memory = $memoryJson | ConvertFrom-Json
-        if ($memory.process -and -not $memory.stale -and [long]$memory.sample_age_s -le 1) { break }
-        Start-Sleep -Milliseconds 100
-    }
+    # Sample after the unpolled idle window, never during it. One CLI call must
+    # be enough: the endpoint waits for the refresh an aged-out request starts,
+    # so a one-shot client is never told to retry. Exact-string API counters.
+    $memoryJson = & $candidatePath resources --url $baseUrl --memory --json
+    if ($LASTEXITCODE -ne 0) { throw 'Memory CLI round trip failed.' }
+    $memory = $memoryJson | ConvertFrom-Json
     if (-not $memory.process -or $memory.stale -or [long]$memory.sample_age_s -gt 1 -or $memory.process.pid -ne $candidate.Id -or [long]$memory.process.resident_bytes -le 0) {
-        throw 'Memory API did not report a fresh sample of the temporary candidate.'
+        throw 'Memory API did not report a fresh sample of the temporary candidate in one call.'
     }
     $sorted = @($latencies | Sort-Object)
     $report = [ordered]@{

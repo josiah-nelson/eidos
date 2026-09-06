@@ -66,10 +66,16 @@ return an actionable error.
 ```powershell
 eidos resources --json
 eidos resources --scan-threads 2 --concurrent-scans 1 --minimum-free-mib 2048
+eidos resources --memory            # process RAM and configured budgets
 eidos content workers 4
 eidos content pause
 eidos content resume
 ```
+
+`GET /api/memory` and `eidos resources --memory` report observed process memory
+alongside the configured cache and index-writer budgets. They set nothing; see
+[memory diagnostics](memory.md) for the freshness contract and for why a budget
+is not resident RAM.
 
 For discovery, `/api/volumes` uses a five-second single-flight cache outside
 the operator thread pool, with a two-second cold-response deadline. The

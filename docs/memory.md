@@ -7,10 +7,17 @@ it does not change resource limits or enable a new background collector.
 
 The process probe refreshes on demand at most once every five seconds. A
 single-flight worker prevents concurrent requests from multiplying probes.
-The first request may report a pending sample; retry shortly. During refresh,
-the previous sample remains available with its age. Samples older than 30
-seconds are marked stale. Errors and unsupported counters are unavailable,
-not zero. No sampling timer runs when the endpoint is not requested.
+A request that finds no sample, or one older than 30 seconds, waits up to two
+seconds for the refresh it just started, so a one-shot CLI call after a long
+idle period still answers with a current sample instead of asking the caller
+to retry. A usable sample never waits. If the probe is still running when that
+deadline passes, the response says so — pending or stale — rather than
+inventing a number, and no second probe is started. During a refresh the
+previous sample remains available with its age. Errors and unsupported
+counters are unavailable, not zero. No sampling timer runs when the endpoint
+is not requested. Activity polls once a second while a sample is pending or
+stale and once every five seconds afterwards; a failed poll reports the request
+failure without discarding the last successful sample and its budgets.
 
 ## What the numbers mean
 
