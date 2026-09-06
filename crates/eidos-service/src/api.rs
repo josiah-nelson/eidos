@@ -1173,6 +1173,7 @@ async fn set_content_policy(
             .clamp(1, 64);
         st.catalog.set_content_policy(sid, enabled, concurrency)?;
         st.content_budgets().set(sid, concurrency);
+        st.content_pause.work.notify_all();
         let s = st
             .catalog
             .get_source(sid)?

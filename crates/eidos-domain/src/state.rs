@@ -271,6 +271,16 @@ pub enum Priority {
 }
 
 impl Priority {
+    pub const ALL: [Self; 7] = [
+        Self::CatalogCritical,
+        Self::MetadataProjection,
+        Self::SmallText,
+        Self::NormalText,
+        Self::LargeText,
+        Self::ArchiveManifest,
+        Self::Enrichment,
+    ];
+
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             1 => Self::CatalogCritical,

@@ -60,10 +60,12 @@ fn parse_class(raw: Option<&str>) -> Result<Option<FailureClass>, ApiError> {
 }
 
 async fn run(st: Arc<AppState>, sel: RetrySelector) -> ApiResult<RetryReport> {
-    let report = tokio::task::spawn_blocking(move || st.catalog.retry_failed_jobs(&sel))
+    let retry_state = st.clone();
+    let report = tokio::task::spawn_blocking(move || retry_state.catalog.retry_failed_jobs(&sel))
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))??;
     if !report.preview && report.accepted > 0 {
+        st.content_pause.work.notify_all();
         tracing::info!(
             accepted = report.accepted,
             skipped = report.skipped,

@@ -113,6 +113,18 @@ bytes and 8,240 write bytes; see the [before/after evidence](benchmarks.md) and
 Do not choose performance presets or waive quiet-idle acceptance from the
 reader-cap smoke alone.
 
+The four-worker follow-up still found repeated empty writer claims after drain.
+Idle/surplus content workers now park behind a separate work notification;
+the existing coordinator uses bounded read-only due-job checks to wake them.
+Focused signal/readiness/parked-pool tests and existing pause/retry/resize tests
+pass, including a 100,000-future-job readiness regression. A same-conditions
+executable comparison reduced 15-second idle writer acquisitions from 126 to 6
+and CPU from 1.243% to 0.414% of one core. Saved controls, retained results and
+temporary restart/resume passed. This is not profile or deployment qualification;
+see [ADR-0031](adr/0031-park-drained-content-workers.md) and [evidence](benchmarks.md).
+The full Windows local gate passed, including 43 web utility and 32 rendered
+UI tests. Cross-platform review and repeated profile comparisons remain pending.
+
 ## What must pass before rollout
 
 - Rust, generated API, frontend type/build and behavioral page tests.

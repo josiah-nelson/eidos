@@ -79,6 +79,7 @@ pub struct ContentPause {
     paused: AtomicBool,
     /// Wall-clock second the pause was requested; meaningless when running.
     since_unix_s: AtomicU64,
+    pub(crate) work: crate::work_signal::WorkSignal,
 }
 
 impl ContentPause {
@@ -120,6 +121,7 @@ impl ContentPause {
             admission: Mutex::new(()),
             paused: AtomicBool::new(paused),
             since_unix_s: AtomicU64::new(since),
+            work: Default::default(),
         }
     }
 
@@ -173,6 +175,7 @@ impl ContentPause {
             }
         }
         self.paused.store(paused, Ordering::Release);
+        self.work.notify_all();
         tracing::info!(paused, "content claiming switched");
         Ok(true)
     }
