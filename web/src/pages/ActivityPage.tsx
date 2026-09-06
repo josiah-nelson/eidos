@@ -10,6 +10,7 @@ import {
 } from '../api'
 import { ErrorBox, Spinner, StateBadge } from '../components'
 import { bytes, count, duration, integerNumber, when } from '../format'
+import ResourceControls from '../components/ResourceControls'
 
 const STATE_ORDER = ['indexed', 'partial', 'pending', 'stale', 'failed', 'unsupported', 'excluded']
 
@@ -41,9 +42,8 @@ const SEARCH_BADGE: Record<ContentStatusView['search'], string> = {
   disabled: 'warn',
 }
 
-// The global extraction pool. Per-volume caps (the Volume cap column
-// below) bound how much of this pool one disk can absorb, so raising a
-// volume's cap past the pool size has no effect until the pool grows too.
+// The global extraction pool. Per-source caps below bound each source;
+// overlapping roots or partitions on one disk do not yet share a device cap.
 // The server clamps and persists the choice across restarts.
 function WorkerPoolControl({ workers }: { workers: number }) {
   const qc = useQueryClient()
@@ -52,7 +52,7 @@ function WorkerPoolControl({ workers }: { workers: number }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['activity'] }),
   })
   return (
-    <span title="global extraction worker pool, shared across all volumes; per-volume caps apply on top">
+    <span title="global extraction worker pool, shared across all sources; source caps apply on top">
       pool{' '}
       <input
         type="number"
@@ -101,7 +101,7 @@ function ContentControl({ content }: { content: ContentStatusView }) {
           title={
             content.paused
               ? 'Claim content jobs again'
-              : 'Stop claiming new jobs; batches already claimed finish and publish. Survives a restart.'
+              : 'Stop claiming new jobs; each worker finishes at most its current file and publishes. Large or stalled files can still take time. Survives a restart.'
           }
         >
           {content.paused ? 'Resume extraction' : 'Pause extraction'}
@@ -251,7 +251,7 @@ function SourceRow({ s }: { s: ActivitySourceView }) {
         />
         <div
           className="muted small"
-          title="workers reading this volume right now; the input above is this volume's cap on the global pool"
+          title="workers reading this source right now; overlapping sources do not share this cap"
         >
           {s.content_reserved} reading now (peak {s.content_peak_reserved})
         </div>
@@ -293,6 +293,8 @@ export default function ActivityPage() {
       <p className="muted small" style={{ marginTop: 0 }}>
         {a.content_status.detail}
       </p>
+
+      <ResourceControls />
 
       <div className="stats">
         <div className="stat">
@@ -411,8 +413,8 @@ export default function ActivityPage() {
           <tr>
             <th>Source</th>
             <th>Content</th>
-            <th className="num" title="per-volume cap on the global worker pool">
-              Volume cap
+            <th className="num" title="per-source cap on the global worker pool; not a shared physical-device cap">
+              Source cap
             </th>
             <th className="num">Queued</th>
             <th className="num">Running</th>

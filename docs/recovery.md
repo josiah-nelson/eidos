@@ -28,15 +28,38 @@ selection and durable approval. Those repairs are preserved.
 Authentication remains deliberately deferred for this trusted deployment.
 It is not a prerequisite substituted for operational recovery.
 
-## First recovery slice: local evidence
+## Current evidence
 
 Collector retirement and role-first onboarding are implemented. The local
 format/lint/API/Rust/web gate passes, including four source/API regressions
 and eight behavioral page tests. The core MSI and setup bundle build without
 collector payloads, and the MSI service table contains only eidos. Workflow
 lint and macOS script syntax checks pass. This is not yet evidence of an
-installed, signed recovery candidate; lifecycle and real-machine gates below
+installed, signed recovery candidate. PR #123 is merged; the unsigned Windows
+installer lifecycle passed on a disposable runner. Its macOS CI failed on a
+stale nextest filter naming the removed collector package; this follow-up
+removes that obsolete configuration. Signed and real-machine gates below
 remain required.
+
+The next runtime-safety vertical adds durable metadata scan ceilings and a
+data-volume reserve through Activity/API/CLI, single-file content claims,
+publication-failure backpressure/retry, and indexed source-completion checks.
+It also bounds discovery/update checks and fixes standalone setup advancing
+without saving when fleet status is unavailable. See
+[resource controls and limits](resource-controls.md).
+
+The Windows full local gate passed, followed by focused native-admission/
+restart tests after moving admission ahead of journal cursor capture. Twelve
+rendered web tests pass. A bounded development-build fixture indexed 1,024
+files in 7.058 seconds; its 30-second idle observation used 0.125 CPU seconds
+but still performed process I/O. [Raw-counter summary](benchmarks.md) records
+the limits of that evidence. No signed/installed recovery claim follows.
+
+Chunk B is **not complete**: writable exclusions and cross-stage self-store
+protection form the next policy vertical. Shared-device admission, RAM/cache
+visibility, measured profiles and real-workload qualification also remain.
+The current source cap is not a physical-device cap, and disk admission is
+not a hard quota. Signed pushed updates remain chunk C.
 
 ## What must pass before rollout
 

@@ -611,9 +611,9 @@ fn wide_to_string(buf: &[u16]) -> String {
 }
 
 /// Every present drive letter with its type, capabilities, and capacity —
-/// the pick-list for onboarding. A drive that cannot be probed is skipped
-/// rather than failing the enumeration; capacity reads that fail leave
-/// zeros (the UI treats 0 total as unknown).
+/// the pick-list for onboarding. Remote/removable/optical drives are offered
+/// without opening them or querying capacity: discovery must not wake them or
+/// attempt a disconnected share. Unavailable metadata stays unknown.
 pub fn list_volume_candidates() -> Vec<crate::VolumeCandidate> {
     use windows_sys::Win32::Storage::FileSystem::{
         GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives,
@@ -637,23 +637,29 @@ pub fn list_volume_candidates() -> Vec<crate::VolumeCandidate> {
             6 => "ramdisk",
             _ => continue,
         };
-        let info = match lister.volume_info(Path::new(&root)) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let probe = matches!(drive_type, "fixed" | "ramdisk");
+        let info = probe
+            .then(|| lister.volume_info(Path::new(&root)).ok())
+            .flatten();
         let (mut free, mut total) = (0u64, 0u64);
         // SAFETY: out-pointers to valid u64s; the last parameter is optional.
-        unsafe {
-            GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut());
+        if probe {
+            unsafe {
+                GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut());
+            }
         }
+        let supports_usn = info.as_ref().is_some_and(|v| v.supports_usn);
         out.push(crate::VolumeCandidate {
             root,
             drive_type: drive_type.to_string(),
-            filesystem: info.filesystem,
-            volume_name: info.volume_name,
+            filesystem: info
+                .as_ref()
+                .map(|v| v.filesystem.clone())
+                .unwrap_or_default(),
+            volume_name: info.map(|v| v.volume_name).unwrap_or_default(),
             total_bytes: total,
             free_bytes: free,
-            supports_usn: info.supports_usn,
+            supports_usn,
         });
     }
     out

@@ -1,8 +1,43 @@
 # Benchmarks
 
-Measured results on the reference corpus. Numbers are curated from the
+Measured results on the reference corpus and bounded synthetic fixtures. Numbers are curated from the
 git-ignored `bench-results/*.jsonl` records produced by the commands in
-[development.md](development.md). Dates are absolute; all runs were read-only.
+[development.md](development.md). Dates are absolute; existing corpora stay read-only.
+
+## Recovery smoke (2026-09-06 UTC, development build)
+
+`scripts/recovery-smoke.ps1 -IdleSeconds 30`, Windows build 26100, two content
+workers, two enumeration threads, one metadata scan. Only a new temporary
+fixture was indexed; no installed service or reference corpus was changed.
+Binary SHA-256: `D2C7AF0FD5852F60F241773BB5B443C97B347B10A29AFE52F3BDAE0F7B18A6DC`.
+Raw record: `bench-results/recovery-controls-2026-09-05-03.json` (private).
+
+| Observation | Result |
+|---|---:|
+| Synthetic text files / source bytes | 1,024 / 4,338,602 |
+| Add-source to content completion | 7.058 s (145.1 files/s) |
+| Concurrent HTTP query p95 / max, 27 samples | 14.8 / 16.8 ms |
+| Crawl CPU time | 3.031 s |
+| Crawl process read / write bytes | 90,393,458 / 71,062,612 |
+| Catalog writer maximum wait / hold at drain | 68.2 / 119.8 ms |
+| Working set at drain / end of idle | 142,766,080 / 63,021,056 bytes |
+| Idle observation | 30.096 s |
+| Idle CPU | 0.125 CPU s (0.415% of one core) |
+| Idle process read / write bytes | 1,515,520 / 61,800 |
+| Idle process read / write operations | 370 / 30 |
+| Stores after idle: catalog / name index / content index | 5,422,992 / 337,779 / 323,587 bytes |
+
+This is a smoke observation, **not deployment or physical-disk qualification**.
+The initial duration includes queue/commit cadence, not just extraction. The
+host was not isolated; the normal native change feed and worker polling were
+active. Process I/O includes cached/file/network operations and was not traced
+to physical media. The idle window was not I/O-free, and these results do not
+waive longer idle, shared-device, heavy-content or installed acceptance.
+
+The separate completion-query regression uses the actual catalog schema at
+1, 1,000 and 100,000 settled files: 51 SQLite VM steps with no unfinished file,
+41 with an unfinished file, and zero full-scan steps at every size. That
+establishes bounded query work for this case, not overall indexing throughput.
 
 ## Reference corpus
 

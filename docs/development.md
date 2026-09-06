@@ -40,6 +40,9 @@ The web gate includes both Node utility tests (`npm run test:unit`) and
 Vitest/React Testing Library page tests (`npm run test:pages`). The latter
 exercise real rendered setup controls in jsdom: role changes, joining,
 partial drive results, scan retry and state surviving query refreshes.
+Resource-control tests also exercise explicit saves, persistence errors and
+disk-pressure visibility; [resource-controls.md](resource-controls.md) has the
+bounded synthetic measurement procedure.
 They do not replace installed-browser or real two-host acceptance; see
 [recovery.md](recovery.md).
 

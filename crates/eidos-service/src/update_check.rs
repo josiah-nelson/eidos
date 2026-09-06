@@ -43,7 +43,17 @@ pub fn newer_release(current: &str, tag: &str) -> Option<String> {
 }
 
 fn check_once() -> anyhow::Result<Option<String>> {
-    let body: serde_json::Value = ureq::get(RELEASES_LATEST)
+    check_url(RELEASES_LATEST, Duration::from_secs(15))
+}
+
+fn check_url(url: &str, timeout: Duration) -> anyhow::Result<Option<String>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(timeout.min(Duration::from_secs(5))))
+        .build()
+        .into();
+    let body: serde_json::Value = agent
+        .get(url)
         // GitHub rejects requests without a user agent.
         .header("user-agent", concat!("eidos/", env!("CARGO_PKG_VERSION")))
         .header("accept", "application/vnd.github+json")
@@ -92,6 +102,49 @@ pub fn spawn_update_check(state: &Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::newer_release;
+
+    #[test]
+    fn response_body_stall_obeys_the_global_deadline() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "release-check client never connected"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            // Valid headers, but never finish the body until the caller returns.
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{").unwrap();
+            let _ = blocked.recv_timeout(Duration::from_secs(5));
+        });
+        let start = Instant::now();
+        let result = super::check_url(&format!("http://{address}"), Duration::from_millis(150));
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "body read did not time out"
+        );
+    }
 
     #[test]
     fn version_comparison_is_numeric_and_v_prefix_tolerant() {

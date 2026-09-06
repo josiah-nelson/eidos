@@ -910,6 +910,7 @@ dependencies = [
  "eidos-query",
  "eidos-scanner",
  "eidos-search",
+ "fs4",
  "futures-core",
  "http-body-util",
  "parking_lot",

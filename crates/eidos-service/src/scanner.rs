@@ -22,6 +22,10 @@ pub struct ScanProgress {
     pub errors: AtomicU64,
     pub cancel: Arc<AtomicBool>,
     phase: Mutex<String>,
+    /// Set when the scan takes its resource reservation. Until then it owns
+    /// the source (no second scan may start) but touches no source media, so
+    /// content workers must not treat it as active work on that volume.
+    admitted: AtomicBool,
     finished: AtomicBool,
     finished_at: Mutex<Option<Instant>>,
     pub result: Mutex<Option<Result<ScanSummary, String>>>,
@@ -54,6 +58,7 @@ impl ScanProgress {
             errors: AtomicU64::new(0),
             cancel: Arc::new(AtomicBool::new(false)),
             phase: Mutex::new("starting".into()),
+            admitted: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             finished_at: Mutex::new(None),
             result: Mutex::new(None),
@@ -66,6 +71,17 @@ impl ScanProgress {
 
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
+    }
+
+    /// Whether this scan holds a reservation and may be reading the source.
+    pub fn is_admitted(&self) -> bool {
+        self.admitted.load(Ordering::Acquire)
+    }
+
+    /// Record that the scan took its resource reservation. From here on it
+    /// owns the source for content workers as a running scan always has.
+    pub(crate) fn admit(&self) {
+        self.admitted.store(true, Ordering::Release);
     }
 
     pub fn finished_for(&self) -> Option<Duration> {
@@ -315,7 +331,17 @@ pub fn run_full_scan(
     source_id: SourceId,
     progress: &ScanProgress,
 ) -> anyhow::Result<ScanSummary> {
-    let session = enumerate(state, source_id, progress)?;
+    let reservation = wait_for_capacity(state, progress)?;
+    run_full_scan_admitted(state, source_id, progress, reservation.threads)
+}
+
+pub(crate) fn run_full_scan_admitted(
+    state: &Arc<AppState>,
+    source_id: SourceId,
+    progress: &ScanProgress,
+    threads: usize,
+) -> anyhow::Result<ScanSummary> {
+    let session = enumerate_admitted(state, source_id, progress, threads)?;
     progress.set_phase("publishing");
     Ok(session.finish()?)
 }
@@ -329,6 +355,25 @@ pub fn enumerate(
     source_id: SourceId,
     progress: &ScanProgress,
 ) -> anyhow::Result<ScanSession> {
+    // Do not open a generation or probe source media while queued. The
+    // reservation covers enumeration; cancellation stays responsive while
+    // waiting for capacity or for the data volume to recover.
+    //
+    // Unlike `run_full_scan`/`native_scan_sequence`, the slot is released
+    // when this returns rather than held through `ScanSession::finish`: the
+    // caller owns publication, so it must take its own reservation if it
+    // needs one. Only tests split enumeration from publication this way.
+    let reservation = wait_for_capacity(state, progress)?;
+    enumerate_admitted(state, source_id, progress, reservation.threads)
+}
+
+pub(crate) fn enumerate_admitted(
+    state: &Arc<AppState>,
+    source_id: SourceId,
+    progress: &ScanProgress,
+    threads: usize,
+) -> anyhow::Result<ScanSession> {
+    progress.set_phase("enumerating");
     let source = state
         .catalog
         .get_source(source_id)?
@@ -363,7 +408,7 @@ pub fn enumerate(
         }
     }
     let walk_opts = WalkOptions {
-        threads: state.scan_threads,
+        threads,
         cancel: Some(progress.cancel.clone()),
         ..Default::default()
     };
@@ -399,4 +444,29 @@ pub fn enumerate(
         anyhow::bail!("scan cancelled");
     }
     Ok(session)
+}
+
+pub(crate) fn wait_for_capacity(
+    state: &AppState,
+    progress: &ScanProgress,
+) -> anyhow::Result<crate::resource_control::ScanReservation> {
+    loop {
+        anyhow::ensure!(
+            !progress.cancel.load(Ordering::Relaxed) && !state.shutdown.load(Ordering::Relaxed),
+            "scan cancelled"
+        );
+        state.resources.refresh_disk();
+        match state.resources.try_scan() {
+            Ok(reservation) => {
+                // Only now does this scan start touching the source. Content
+                // workers idle a source for an *admitted* scan; queue time
+                // must not stop its extraction for the leading scan's whole
+                // duration.
+                progress.admit();
+                return Ok(reservation);
+            }
+            Err(reason) => progress.set_phase(&reason),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

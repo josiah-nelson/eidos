@@ -84,7 +84,7 @@ export default function Onboarding({ onDone, onManual }: { onDone: () => void; o
               className="btn primary"
               disabled={roleChange.isPending || (!roleLocked && (!role || (role !== 'standalone' && !current) || role === 'join')) || Boolean(current?.pending_join?.rejected_reason)}
               onClick={() => {
-                if (roleLocked || (role === 'standalone' && fleet.isError)) setChoosingRoots(true)
+                if (roleLocked) setChoosingRoots(true)
                 else roleChange.mutate()
               }}
             >Choose sources</button>
@@ -93,6 +93,9 @@ export default function Onboarding({ onDone, onManual }: { onDone: () => void; o
           <>
             <h3>Choose drives</h3>
             <p className="muted">Metadata becomes searchable first; file content is processed in the background. Start with a deliberately chosen root.</p>
+            <button type="button" className="small" disabled={busy || volumes.isFetching}
+              onClick={() => { void qc.invalidateQueries({ queryKey: ['volumes'] }) }}
+            >{volumes.isFetching ? 'Rescanning drives…' : 'Rescan drives'}</button>
             {volumes.isPending && <Spinner label="Reading local drives…" />}
             {volumes.isError && <ErrorBox error={volumes.error} />}
             {!volumes.isPending && !volumes.data?.length && <p>No drives listed. Add a folder or network share manually.</p>}
