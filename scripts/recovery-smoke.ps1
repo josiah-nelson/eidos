@@ -158,8 +158,9 @@ try {
     if ([long]$activity.jobs.queued -ne 0 -or [long]$activity.jobs.running -ne 0 -or [long]$activity.workers.pending_publish -ne 0) {
         throw 'Source reported complete before the pipeline drained.'
     }
-    $search = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10" -TimeoutSec 15
-    if ($search.hits.Count -ne 10 -or [long]$activity.workers.files_indexed -ne $totalFiles -or [long]$activity.workers.files_failed -ne 0) {
+    $search = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10&count=exact" -TimeoutSec 15
+    if ($search.hits.Count -ne 10 -or -not $search.total.exact -or [long]$search.total.value -ne $totalFiles -or
+        [long]$activity.workers.files_indexed -ne $totalFiles -or [long]$activity.workers.files_failed -ne 0) {
         throw 'The completed synthetic fixture is not searchable as expected.'
     }
     # Let trailing commits/merges settle; no API polling during idle sample.
@@ -218,13 +219,16 @@ try {
             $persistedSource = Invoke-RestMethod "$baseUrl/api/sources/$id" -TimeoutSec 5
             if ($persistedSource.source.content_concurrency -ne $SourceReaders) { throw 'Source policy did not survive restart.' }
         }
-        $retained = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10" -TimeoutSec 15
-        if ($retained.hits.Count -ne 10) { throw 'Restart lost searchable fixture content.' }
+        $retained = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10&count=exact" -TimeoutSec 15
+        if ($retained.hits.Count -ne 10 -or -not $retained.total.exact -or [long]$retained.total.value -ne $totalFiles) {
+            throw 'Restart lost searchable fixture content.'
+        }
         $resumed = Invoke-RestMethod "$baseUrl/api/content/resume" -Method Post -TimeoutSec 10
         if ($resumed.paused) { throw 'Candidate did not resume explicitly.' }
         $restart = @{ performed = $true; qualification = 'forced restart after drain; not mid-file pause or installed upgrade'
             original_pid = $originalPid; restarted_pid = $candidate.Id; pause_response_ms = $pauseMs; restart_health_ms = $restartReadyMs
-            pause_and_limits_preserved = $true; retained_search_hits = $retained.hits.Count; resumed = $true }
+            pause_and_limits_preserved = $true; retained_search_hits = $retained.hits.Count
+            retained_search_total = $retained.total; resumed = $true }
     }
     $sorted = @($latencies | Sort-Object)
     $report = [ordered]@{
@@ -232,6 +236,7 @@ try {
         qualification = 'synthetic smoke only; process I/O is not physical disk I/O'
         conditions = 'host not isolated; normal native change feed may observe other host-volume activity'
         platform = [Environment]::OSVersion.VersionString; version = $health.version; binary_sha256 = $sha
+        fixture_directory = $fixtureDir
         fixture_files = $totalFiles; fixture_bytes = $sourceBytes; source_count = $SourceCount
         small_files_per_source = $Files; large_files_per_source = $LargeFilesPerSource; large_file_mib = $LargeFileMiB
         content_workers = $ContentWorkers; scan_threads = $ScanThreads; concurrent_scans = $ConcurrentScans; source_readers = $SourceReaders
@@ -239,6 +244,7 @@ try {
         crawl = (Delta $before $after $elapsed)
         files_per_s = $totalFiles / $elapsed; source_bytes_per_s = $sourceBytes / $elapsed
         http_query_samples = $sorted.Count
+        http_query_latencies_ms = $latencies.ToArray()
         query_interval_ms = $QueryIntervalMilliseconds
         http_query_p95_ms = $sorted[[Math]::Max(0, [Math]::Ceiling($sorted.Count * 0.95) - 1)]
         http_query_p99_ms = $sorted[[Math]::Max(0, [Math]::Ceiling($sorted.Count * 0.99) - 1)]
@@ -259,12 +265,14 @@ try {
         watchers_before_idle = @($idleSourcesBefore | ForEach-Object { @{ source = $_.source.id; watcher = $_.watcher } })
         watchers_after_idle = @($idleSourcesAfter | ForEach-Object { @{ source = $_.source.id; watcher = $_.watcher } })
         files_indexed = $activity.workers.files_indexed
+        search_total = $search.total
         restart_after_idle = $restart
     }
     $json = $report | ConvertTo-Json -Depth 8
     [IO.File]::WriteAllText((Join-Path $fixtureDir 'report.json'), $json, $utf8)
     Write-Output $json
 } catch {
+    $_.Exception.Data['recovery_fixture_directory'] = $fixtureDir
     $failure = @{ measured_at_utc = [DateTime]::UtcNow.ToString('o'); status = 'failed'; error = $_.Exception.Message
         binary_sha256 = $sha; fixture_files = $totalFiles; fixture_bytes = $sourceBytes; source_count = $SourceCount
         content_workers = $ContentWorkers; scan_threads = $ScanThreads; concurrent_scans = $ConcurrentScans; device_readers = $DeviceReaders }

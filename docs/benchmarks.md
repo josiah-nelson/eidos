@@ -4,6 +4,64 @@ Measured results on the reference corpus and bounded synthetic fixtures. Numbers
 git-ignored `bench-results/*.jsonl` records produced by the commands in
 [development.md](development.md). Dates are absolute; existing corpora stay read-only.
 
+## Repeated resource comparison (2026-09-06 UTC, reviewed development build)
+
+All six runs of `scripts/recovery-matrix.ps1` passed the fixed synthetic gates.
+The required-web development candidate was rebuilt from `7e0703f`, including
+the merged review fixes in PRs #126–129. Binary SHA-256:
+`600E131A7D6B78D1D3288361A2A8E21B8D093C4D3445F7A8C5F333F5C0C22FE9`.
+Private plan, executable snapshot, individual query latencies, raw reports and
+completion summary: `bench-results/matrix-4fea8087545c4365a2894b4564aecfe7/`.
+
+Windows build 26100; non-isolated host. Each run created two new temporary
+roots sharing a resolved OS disk, with 384 small text files and two 2-MiB text
+files per root: 772 files / 11,642,404 source bytes. Source reader caps stayed
+at four. The tuple below means content workers / scan threads / concurrent
+scans / device readers. The second pass reversed the first pass's order.
+No fixture or catalog was reused, and no installed service was changed.
+
+The runner sleeps 25 ms between crawl query/status polls, so the query interval
+also includes request time. Source setup is excluded from crawl timing; exact
+result-count checks occur after drain and restart, outside the crawl sample.
+Every idle interval was unpolled for at least 15 seconds after a five-second
+settling period. These conditions differ from the earlier 50-ms worker study.
+
+| Run | Tuple | Crawl seconds | Queries | Query p95 / p99 ms | Idle CPU, % one core | Idle read / write bytes |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | 1/1/1/1 | 6.183 | 100 | 21.99 / 24.53 | 0.621 | 40,960 / 0 |
+| 2 | 2/2/1/2 | 6.877 | 133 | 13.92 / 18.94 | 0.518 | 61,440 / 0 |
+| 3 | 4/4/2/4 | 6.860 | 128 | 13.69 / 16.56 | 0.414 | 65,536 / 0 |
+| 4 | 4/4/2/4 | 6.888 | 130 | 14.66 / 16.84 | 0.311 | 49,152 / 0 |
+| 5 | 2/2/1/2 | 6.913 | 129 | 16.95 / 20.05 | 0.311 | 45,056 / 0 |
+| 6 | 1/1/1/1 | 6.889 | 132 | 15.12 / 17.64 | 0.207 | 49,152 / 0 |
+
+All 772 content matches survived each forced temporary-process restart, along
+with saved pause, pool, scan, device and source limits; explicit resume passed.
+Observed combined reader peaks stayed within each ceiling with resolved shared
+membership. Peak resident memory ranged from 136.5 to 164.7 MiB; maximum writer
+hold stayed at or below 46.01 ms. Every idle interval recorded six writer
+acquisitions. Drained pause responded in 5.07–9.82 ms and restart became healthy
+in 518.34–525.63 ms. The acceptance script also checks each percentile against
+the saved samples and rejects malformed or missing gate measurements.
+
+The fixed limits remain: drain within 180 seconds; at least 100 crawl queries,
+p95 <=150 ms and p99 <=250 ms; resident peak <=512 MiB; writer hold <=500 ms;
+idle <=1% of one core and <=4 MiB process read/write transfers, plus correctness,
+admission and restart checks. No criteria were relaxed after observing results.
+
+An earlier six-run matrix also passed its original gates at pre-review SHA
+`B5ECD2DB4057E1DCCC033FEAB41D4A57FB86F2BD04BD55C8A329CFF1F1790CF3`:
+`bench-results/matrix-4c57fcc23407462ab7f7bfaaa01dff1a/`. It did not retain
+individual query latencies or verify the full search total across restart;
+its results remain separate from the reviewed-candidate evidence above.
+
+This small fixture does not demonstrate a repeatable throughput advantage for
+larger pools, nor does 100–133 samples establish production tail latency.
+No normal/background/initial-index preset is recommended from it. Process I/O
+is not physical-disk I/O, and short zero-write intervals do not establish
+zero-I/O idle. Longer workloads, real media, mid-file pause, installed and
+two-host/signed-canary qualification remain open.
+
 ## Two-root native-idle comparison (2026-09-06 UTC, development builds)
 
 Both runs used `scripts/recovery-smoke.ps1 -Files 384 -IdleSeconds 15

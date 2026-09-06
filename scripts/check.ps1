@@ -20,6 +20,7 @@ function Step($name, $cmd) {
 }
 
 Step "cargo fmt --check"  { cargo fmt --check }
+Step "recovery measurement gates" { & (Join-Path $PSScriptRoot 'test-recovery-acceptance.ps1') }
 Step "cargo clippy"       { cargo clippy --all-targets -- -D warnings }
 Step "generated API contract" {
     $contract = Join-Path $root "web/src/generated/api.ts"

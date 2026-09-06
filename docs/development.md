@@ -54,6 +54,48 @@ protected inventory boundaries and interrupted content cleanup. See
 They do not replace installed-browser or real two-host acceptance; see
 [recovery.md](recovery.md).
 
+### Bounded resource comparison (Windows)
+
+The matrix compares candidate pool/scan/concurrent-scan/device-reader tuples
+1/1/1/1, 2/2/1/2 and 4/4/2/4 twice, reversing order on the second pass. It uses
+six new temporary two-root fixtures, under 80 MiB total generated source bytes,
+with explicit source caps of four. It never builds a binary, crawls an existing
+corpus or changes an installed service. Supply an already built required-web
+development candidate. The matrix saves one executable snapshot for every
+launch and restart, checking its hash before and after each run.
+
+```powershell
+./scripts/test-recovery-acceptance.ps1 # pure boundary/failure and script syntax tests
+./scripts/recovery-matrix.ps1 -Binary ./target/debug/eidos.exe
+```
+
+Each run records individual crawl query latencies (25-ms sleep between polls),
+admitted reader peaks, CPU/memory/process I/O, 15-second unpolled idle and a
+forced temporary-process restart after drain. The runner writes its plan and binary hash before starting,
+then keeps the executable, raw reports and all pass/fail outcomes in a new ignored
+`bench-results/matrix-*` directory. `summary.json` records completed matrices;
+`failure.json` records an incomplete matrix and links a failed smoke's fixture.
+Temporary stores/logs remain available through the raw reports' fixture paths.
+A startup, correctness or reader-cap failure aborts with an incomplete record.
+Evaluated performance failures remain in the six-run comparison and give a
+nonzero exit at the end.
+
+Fixed thresholds: correct drain within 180 seconds; resolved shared-device
+membership with no observed cap violation; at least 100 crawl queries with
+p95 <=150 ms and p99 <=250 ms; peak resident <=512 MiB; maximum catalog writer
+hold <=500 ms; idle <=1% of one CPU core and <=4 MiB process transfers; saved
+controls/results retained across restart and successful explicit resume. Exact
+search totals must match all 772 files both after drain and after restart;
+these correctness queries are outside the crawl latency sample. Sample counts
+and percentiles must agree with the recorded crawl latencies.
+Missing, nonfinite or malformed gate measurements fail closed. Do not add idle
+queries to inflate the crawl sample count or relax criteria after a failure.
+
+These are development evidence gates, not recommended performance presets.
+Host activity and reviewer builds may overlap; process transfers are not
+physical-disk I/O. Real-media, installed, mid-file pause and fleet/canary
+qualification remain separate. Curated observations belong in [benchmarks](benchmarks.md).
+
 ```bash
 # macOS or another Unix host: the same steps in the same order.
 scripts/check.sh               # --skip-web / --skip-release to shorten
