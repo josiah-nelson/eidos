@@ -23,9 +23,15 @@ neither future retries nor historical jobs require a whole-queue aggregate or
 a new migration. This also wakes future retries when their due time arrives,
 without depending on an unrelated write. Workers still atomically claim jobs
 and enforce source/device/policy/global admission; the readiness result is
-only a hint. A due backlog blocked by a source or policy can still produce
-periodic admission attempts: this change specifically removes per-worker
-writer polling after drain, not every coordinator check during active work.
+only a hint. Because it is only a hint it wakes one worker, not the pool: a
+worker whose claim succeeds wakes the next one, so an admittable backlog
+still fills the pool in a chain, while a backlog the claim refuses — a source
+at its concurrency budget, a taken device reader lease, an active scan on
+that source, or a source whose policy is not yet applied — costs one empty
+claim per hint instead of one per worker. Control transitions still wake
+everyone, because each worker has to re-evaluate its own state. This removes
+per-worker writer polling after drain; it does not remove the coordinator's
+own checks or every attempt made during active work.
 
 Pause/resume, resizing, explicit retry, resource/source control changes and
 shutdown notify the pool explicitly. Do not reuse the general catalog-write
@@ -53,6 +59,13 @@ production build. The final service regression also covers a future retry
 becoming due with no new write/control notification. That follow-up adds tests
 and removes a duplicate blocked-reason check; the recorded hash identifies the
 preceding measured executable, not a subsequently rebuilt binary.
+
+Review then replaced the pool-wide readiness broadcast with the one-worker
+baton above, and added the surplus-resize and refused-backlog regressions that
+pin both halves of it. The recorded idle comparison is unaffected: an idle
+queue produces no readiness hints at all, so that path is identical in both
+binaries. The scan and query rows were measured before that change and were
+not re-measured for it.
 
 This does not imply zero CPU, zero I/O, a hard resource quota or a qualified
 performance preset. The coordinator, real source changes and maintenance still

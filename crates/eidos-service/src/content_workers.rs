@@ -418,7 +418,14 @@ fn worker_loop(state: &AppState, index: usize, name: &str) {
             continue;
         }
         let (reservation, jobs) = match reserve_and_claim(state, name, CLAIM_BATCH) {
-            Ok(Some(claimed)) => claimed,
+            Ok(Some(claimed)) => {
+                // A claim that got through is the only evidence admission is
+                // letting content work in right now, so hand the baton to one
+                // more parked worker before extracting. A real backlog fills
+                // the pool in a chain; one admission refuses stops here.
+                state.content_pause.work.notify_one();
+                claimed
+            }
             Ok(None) => {
                 state.content_pause.work.wait(observed, IDLE_FALLBACK);
                 continue;
@@ -615,7 +622,12 @@ fn wake_due_workers(state: &AppState) {
         .catalog
         .has_due_jobs(JobStage::ContentText, eidos_domain::UnixNanos::now())
     {
-        Ok(true) => state.content_pause.work.notify_all(),
+        // One worker, not the pool: the readiness row may still be refused by
+        // a source budget, a device lease, an active scan or an unapplied
+        // policy, and waking every worker into the serialized writer path for
+        // that is the exact cost this change exists to remove. The claiming
+        // worker wakes the next one, so an admittable backlog still ramps up.
+        Ok(true) => state.content_pause.work.notify_one(),
         Ok(false) => {}
         Err(error) => {
             *state.content_workers.last_error.lock() = Some(format!("content readiness: {error}"));
@@ -948,5 +960,147 @@ mod idle_tests {
         await_condition(|| {
             f.state.catalog.get_job(future).unwrap().unwrap().state == JobState::Done
         });
+    }
+
+    /// The surplus branch a shrink creates has no other wakeup: without the
+    /// resize notification a regrown pool would wait out the 30-second
+    /// fallback before its parked thread claimed anything.
+    #[test]
+    fn growing_the_pool_wakes_a_parked_surplus_worker() {
+        use eidos_catalog::{jobs::NewJob, NewSource};
+        use eidos_domain::{JobState, Priority, SourceKind};
+        let f = Fixture::new();
+        let source = f
+            .state
+            .catalog
+            .add_source(&NewSource {
+                host_id: f.state.host_id,
+                name: "surplus fixture".into(),
+                kind: SourceKind::WindowsGeneric,
+                root_path: "synthetic-surplus-root".into(),
+                aliases: vec![],
+            })
+            .unwrap();
+        refresh_budgets(&f.state).unwrap();
+        let job = f
+            .state
+            .catalog
+            .enqueue(&NewJob {
+                source_id: source,
+                object_id: None,
+                object_generation: 1,
+                stage: JobStage::ContentText,
+                priority: Priority::NormalText,
+                idempotency_key: "surplus".into(),
+                payload: None,
+                estimated_cost: 0,
+            })
+            .unwrap()
+            .unwrap();
+
+        // One desired worker but two threads' worth of index space: index 1 is
+        // exactly what a shrink leaves parked. No coordinator is started here,
+        // so the readiness poll cannot stand in for the resize notification.
+        f.state.content_workers.workers.store(1, Ordering::Relaxed);
+        f.state.content_workers.spawned.store(2, Ordering::Relaxed);
+        let st = f.state.clone();
+        std::thread::Builder::new()
+            .name("content-1".into())
+            .spawn(move || worker_loop(&st, 1, "content-1"))
+            .unwrap();
+        await_condition(|| f.state.content_pause.work.waiting() == 1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            f.state.catalog.get_job(job).unwrap().unwrap().state,
+            JobState::Queued,
+            "a parked surplus worker must not claim"
+        );
+
+        assert_eq!(resize_workers(&f.state, 2).unwrap(), 2);
+        await_condition(|| f.state.catalog.get_job(job).unwrap().unwrap().state == JobState::Done);
+    }
+
+    /// Readiness stays true forever when a due backlog cannot pass admission.
+    /// Waking the whole pool for that would put every worker back on the
+    /// serialized writer path twice a second — the polling this change
+    /// removes — so the hint must cost one empty claim, not one per worker.
+    #[test]
+    fn a_backlog_admission_refuses_costs_one_empty_claim_per_readiness_hint() {
+        use eidos_catalog::{jobs::NewJob, NewSource};
+        use eidos_domain::{JobState, Priority, SourceKind};
+        let f = Fixture::new();
+        let source = f
+            .state
+            .catalog
+            .add_source(&NewSource {
+                host_id: f.state.host_id,
+                name: "refused fixture".into(),
+                kind: SourceKind::WindowsGeneric,
+                root_path: "synthetic-refused-root".into(),
+                aliases: vec![],
+            })
+            .unwrap();
+        // Pin the source to one unit and hold that unit for the whole test,
+        // so every claim reaches the writer and comes back empty. Budget
+        // refreshes preserve live reservations, so the coordinator's periodic
+        // refresh cannot hand the pool a second unit.
+        f.state
+            .catalog
+            .with_writer(|conn| {
+                conn.execute(
+                    "UPDATE sources SET content_concurrency = 1 WHERE source_id = ?1",
+                    [source.0],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        refresh_budgets(&f.state).unwrap();
+        let _held = f
+            .state
+            .content_workers
+            .budgets
+            .try_reserve(source)
+            .expect("the fixture holds the only content unit");
+        let queued: Vec<_> = (0..4)
+            .map(|i| {
+                f.state
+                    .catalog
+                    .enqueue(&NewJob {
+                        source_id: source,
+                        object_id: None,
+                        object_generation: 1,
+                        stage: JobStage::ContentText,
+                        priority: Priority::NormalText,
+                        idempotency_key: format!("refused-{i}"),
+                        payload: None,
+                        estimated_cost: 0,
+                    })
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        spawn_content_workers(&f.state, 8);
+        // One worker may be mid-hint at any moment; the rest must be parked.
+        await_condition(|| f.state.content_pause.work.waiting() >= 7);
+
+        let window = Duration::from_millis(2_000);
+        let before = f.state.catalog.writer_stats().acquisitions;
+        std::thread::sleep(window);
+        let claims = f.state.catalog.writer_stats().acquisitions - before;
+        // Readiness must have stayed true for the whole window, or the count
+        // above would be low for the wrong reason.
+        for job in queued {
+            assert_eq!(
+                f.state.catalog.get_job(job).unwrap().unwrap().state,
+                JobState::Queued,
+                "admission must have refused every job for the whole window"
+            );
+        }
+        // Four hints fit in the window. Waking all eight workers for each of
+        // them would take roughly thirty writer turns instead.
+        assert!(
+            claims <= 12,
+            "{claims} empty writer claims in {window:?} for a refused backlog"
+        );
     }
 }
