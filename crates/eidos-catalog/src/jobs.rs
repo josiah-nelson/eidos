@@ -17,6 +17,10 @@ use ts_rs::TS;
 
 pub const MAX_TRANSIENT_ATTEMPTS: u32 = 6;
 
+// Equality on the first three jobs_queue columns makes scheduled_at a bounded
+// index range. Do not scan every future retry or aggregate the entire queue.
+const DUE_AT_PRIORITY_SQL: &str = "SELECT EXISTS(SELECT 1 FROM jobs WHERE state = 'queued' AND stage = ?1 AND priority = ?2 AND scheduled_at <= ?3 LIMIT 1)";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewJob {
     pub source_id: SourceId,
@@ -155,6 +159,23 @@ pub struct JobCounts {
 }
 
 impl Catalog {
+    /// Read-only hint for waking the extraction pool, not a job reservation.
+    /// The claiming transaction still checks policy, time and all admission
+    /// guards. Seven indexed seeks stay bounded even with many future retries.
+    pub fn has_due_jobs(&self, stage: JobStage, now: UnixNanos) -> Result<bool> {
+        self.with_reader(|conn| {
+            let mut statement = conn.prepare_cached(DUE_AT_PRIORITY_SQL)?;
+            for priority in Priority::ALL {
+                if statement.query_row(params![stage.as_str(), priority as u8, now.0], |row| {
+                    row.get::<_, bool>(0)
+                })? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
     pub fn enqueue(&self, job: &NewJob) -> Result<Option<JobId>> {
         self.with_writer(|conn| enqueue_conn(conn, job))
     }
@@ -600,4 +621,91 @@ pub struct OutboxRow {
     pub op: String,
     pub generation: i64,
     pub created_at: UnixNanos,
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use rusqlite::StatementStatus;
+
+    #[test]
+    fn readiness_respects_stage_due_time_and_every_supported_priority_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+        let priorities: Vec<_> = (0..=u8::MAX).filter_map(Priority::from_u8).collect();
+        assert_eq!(
+            priorities,
+            Priority::ALL,
+            "new priorities must participate in readiness"
+        );
+        for priority in Priority::ALL {
+            let job = catalog
+                .enqueue(&NewJob {
+                    source_id: SourceId(1),
+                    object_id: None,
+                    object_generation: 1,
+                    stage: JobStage::ContentText,
+                    priority,
+                    idempotency_key: format!("readiness:{}", priority as u8),
+                    payload: None,
+                    estimated_cost: 0,
+                })
+                .unwrap()
+                .unwrap();
+            catalog
+                .with_writer(|conn| {
+                    conn.execute(
+                        "UPDATE jobs SET scheduled_at = 100 WHERE job_id = ?1",
+                        [job.0],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let before = catalog.writer_stats().acquisitions;
+            assert!(!catalog
+                .has_due_jobs(JobStage::ContentText, UnixNanos(99))
+                .unwrap());
+            assert!(catalog
+                .has_due_jobs(JobStage::ContentText, UnixNanos(100))
+                .unwrap());
+            assert!(!catalog
+                .has_due_jobs(JobStage::MetadataProjection, UnixNanos(100))
+                .unwrap());
+            assert_eq!(catalog.writer_stats().acquisitions, before);
+            catalog.complete_job(job).unwrap();
+            assert!(!catalog
+                .has_due_jobs(JobStage::ContentText, UnixNanos(100))
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn future_retries_do_not_turn_readiness_into_a_queue_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+        catalog.with_writer(|conn| {
+            for total in [1, 1_000, 100_000] {
+                conn.execute("DELETE FROM jobs", [])?;
+                conn.execute("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < ?1)
+                    INSERT INTO jobs(source_id, object_generation, stage, priority, state, idempotency_key, created_at, scheduled_at)
+                    SELECT 1, 1, 'content_text', 1 + (x % 7), 'queued', 'future-' || x, 0, 10000 FROM n", [total])?;
+                let mut sum = 0;
+                for priority in Priority::ALL {
+                    let mut stmt = conn.prepare(DUE_AT_PRIORITY_SQL)?;
+                    assert!(!stmt.query_row(params!["content_text", priority as u8, 100], |row| row.get::<_, bool>(0))?);
+                    assert_eq!(stmt.get_status(StatementStatus::FullscanStep), 0);
+                    assert_eq!(stmt.get_status(StatementStatus::Sort), 0);
+                    sum += stmt.get_status(StatementStatus::VmStep);
+                }
+                assert!(sum < 250, "{total} future retries caused {sum} VM steps");
+                eprintln!("readiness: future_jobs={total}, vm_steps={sum}, fullscan_steps=0");
+                // A due low-priority job must not hide behind future urgent jobs.
+                conn.execute("UPDATE jobs SET priority = 7, scheduled_at = 100 WHERE job_id = (SELECT MAX(job_id) FROM jobs)", [])?;
+                let mut stmt = conn.prepare(DUE_AT_PRIORITY_SQL)?;
+                assert!(stmt.query_row(params!["content_text", 7, 100], |row| row.get::<_, bool>(0))?);
+                assert_eq!(stmt.get_status(StatementStatus::FullscanStep), 0);
+            }
+            Ok(())
+        }).unwrap();
+    }
 }

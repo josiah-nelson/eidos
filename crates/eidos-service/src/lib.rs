@@ -38,6 +38,7 @@ pub mod usn_apply;
 mod usn_checkpoint;
 pub mod watcher;
 pub mod web;
+mod work_signal;
 
 use std::future::Future;
 use std::net::SocketAddr;

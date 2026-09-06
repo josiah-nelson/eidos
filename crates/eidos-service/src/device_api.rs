@@ -26,6 +26,7 @@ async fn set_limits(
             .devices
             .save_limits(&state.data_dir, limits)
             .map_err(|error| ApiError::internal(error.to_string()))?;
+        state.content_pause.work.notify_all();
         Ok(ApiJson(state.devices.view()))
     })
     .await

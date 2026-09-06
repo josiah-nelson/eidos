@@ -412,6 +412,7 @@ impl AppState {
     pub fn request_shutdown(&self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.content_pause.work.notify_all();
         // Shed queued expensive work at once: graceful shutdown then waits
         // only for the operations that already hold a permit.
         self.admission.close();

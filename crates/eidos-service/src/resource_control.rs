@@ -192,6 +192,7 @@ async fn set_limits(
         st.resources
             .set(limits)
             .map_err(|e| ApiError::internal(e.to_string()))?;
+        st.content_pause.work.notify_all();
         Ok(ApiJson(st.resources.view()))
     })
     .await

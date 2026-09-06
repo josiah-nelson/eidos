@@ -78,6 +78,43 @@ ten queried content hits survived despite different command-line defaults;
 explicit resume succeeded. This is not a mid-file pause or an installed upgrade.
 Private record: `bench-results/shared-roots-restart-2026-09-06-01.json`.
 
+## Drained content-worker comparison (2026-09-06 UTC, development builds)
+
+The four-worker restart run above is the before case. The after case used the
+same two-root fixture, pool/scan/device/source ceilings of four, two concurrent
+scans, requested 50-ms queries, 15-second idle and `-CheckRestart`. Only new
+temporary fixtures were used. After binary SHA-256:
+`834E9EC6C10C76C645BFB35C735EB545E694239C423FADCE0942AC495AC23047`.
+Private raw record: `bench-results/idle-content-wait-2026-09-06-01.json`.
+
+| Observation | Before | After |
+|---|---:|---:|
+| Scan request to complete, 772 files | 6.965 s | 5.975 s |
+| Crawl query samples / p95 | 83 / 13.95 ms | 70 / 17.53 ms |
+| Unpolled idle duration | 15.089 s | 15.102 s |
+| Idle CPU time / one-core utilization | 0.1875 s / 1.243% | 0.0625 s / 0.414% |
+| Idle process read / write bytes | 4,096 / 0 | 65,536 / 0 |
+| Catalog writer acquisitions during idle | 126 | 6 |
+| Native source events during idle | 0 | 0 |
+
+The after case observed a shared resolved OS disk and reader peak four, within
+its saved ceiling. Peak resident memory was 169,443,328 bytes; writer maximum
+hold was 29.75 ms. After drain, pause responded in 4.02 ms and the temporary
+forced restart became healthy in 521 ms. Pause and all saved limits survived
+different startup defaults, ten queried content hits were retained, and resume
+succeeded. No installed service or private corpus was touched.
+
+[ADR-0031](adr/0031-park-drained-content-workers.md) explains the empty-claim
+wakeup path and bounded readiness checks. This single non-isolated development
+comparison is evidence for removing that path, not a measured profile. There
+are fewer than 100 crawl queries per run, no useful p99 qualification, and no
+physical-disk or installed-upgrade claim. Repeated profile comparisons remain
+required; the previously chosen acceptance thresholds have not been relaxed.
+The after binary also predates the review changes to the wakeup path (one-worker
+hints and the separate surplus wait set). The idle rows are unaffected, because
+an idle queue emits no readiness hint in either binary; the scan and query rows
+were not re-measured.
+
 ## Device-admission smoke (2026-09-06 UTC, development build)
 
 `scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15 -DeviceReaders 2`,
