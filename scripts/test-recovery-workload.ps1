@@ -62,7 +62,7 @@ CheckFixture {
 $pauseLimits = Get-RecoveryActivePauseThresholds
 $pauseJson = @{
     performed = $true; in_flight_at_pause = 2; queued_before_pause = '3'; queued_after_drain = '1'
-    observed_files = @(@{ size = '1048576' }); pause_response_ms = $pauseLimits.response_ms
+    observed_files = @(@{ size = "$($pauseLimits.large_file_bytes)" }); pause_response_ms = $pauseLimits.response_ms
     extraction_drain_seconds = $pauseLimits.extraction_drain_seconds
     hold_seconds = $pauseLimits.hold_seconds_minimum; total_seconds = 8.15
     extraction_stayed_stopped = $true; resumed = $true
@@ -93,10 +93,11 @@ CheckPause { param($p) $p.in_flight_at_pause = 3 } 'active_backlog'
 CheckPause { param($p) $p.in_flight_at_pause = 0.5 } 'valid_report'
 CheckPause { param($p) $p.queued_before_pause = '2' } 'active_backlog'
 CheckPause { param($p) $p.queued_after_drain = '0' } 'active_backlog'
-CheckPause { param($p) $p.observed_files[0].size = '1048575' } 'active_backlog'
-CheckPause { param($p) $p.pause_response_ms = 150.1 } 'response'
-CheckPause { param($p) $p.extraction_drain_seconds = 5.1 } 'drain'
-CheckPause { param($p) $p.hold_seconds = 2.9 } 'held'
+CheckPause { param($p) $p.observed_files[0].size = "$($pauseLimits.large_file_bytes - 1)" } 'active_backlog'
+CheckPause { param($p) $p.observed_files = 'one file' } 'valid_report'
+CheckPause { param($p) $p.pause_response_ms = $pauseLimits.response_ms + 0.1 } 'response'
+CheckPause { param($p) $p.extraction_drain_seconds = $pauseLimits.extraction_drain_seconds + 0.1 } 'drain'
+CheckPause { param($p) $p.hold_seconds = $pauseLimits.hold_seconds_minimum - 0.1 } 'held'
 CheckPause { param($p) $p.extraction_stayed_stopped = 'true' } 'held'
 CheckPause { param($p) $p.resumed = $false } 'resumed'
 CheckPause { param($p) $p.pause_response_ms = 'NaN' } 'valid_report'

@@ -23,6 +23,7 @@ function Get-RecoveryActivePauseThresholds {
         response_ms = 150
         extraction_drain_seconds = 5
         hold_seconds_minimum = 3
+        large_file_bytes = 1MB
     }
 }
 
@@ -157,7 +158,7 @@ function Test-RecoveryActivePause {
         $largeFile = $false
         if ($Pause.observed_files -isnot [Array]) { throw 'missing observed files' }
         foreach ($file in $Pause.observed_files) {
-            if ((ConvertTo-RecoveryNumber $file.size -Count) -ge 1MB) { $largeFile = $true }
+            if ((ConvertTo-RecoveryNumber $file.size -Count) -ge $limits.large_file_bytes) { $largeFile = $true }
         }
         $checks.active_backlog = $inFlight -ge 1 -and $inFlight -le $Tuple.workers -and
             $queuedBefore -gt $Tuple.workers -and $queuedAfter -gt 0 -and $largeFile
