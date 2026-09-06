@@ -53,3 +53,44 @@ test('disk-pressure reason is visible and polling shows recovery', async () => {
   act(() => client.setQueryData(['resources'], initial))
   await waitFor(() => expect(screen.queryByText(/New scans and content reads are waiting/)).toBeNull())
 })
+
+test('an untouched form follows limits changed elsewhere', async () => {
+  mount()
+  const input = await screen.findByLabelText('Threads per metadata scan') as HTMLInputElement
+  expect(input.value).toBe('8')
+  act(() => client.setQueryData(['resources'], {
+    ...initial, limits: { scan_threads: 4, concurrent_scans: 2, minimum_free_mib: 512 },
+  }))
+  await waitFor(() => expect(input.value).toBe('4'))
+  expect(screen.queryByText(/changed elsewhere/)).toBeNull()
+})
+
+test('a draft survives a conflicting change and can adopt the current values', async () => {
+  mount()
+  const input = await screen.findByLabelText('Threads per metadata scan') as HTMLInputElement
+  await userEvent.clear(input)
+  await userEvent.type(input, '3')
+  act(() => client.setQueryData(['resources'], {
+    ...initial, limits: { scan_threads: 4, concurrent_scans: 2, minimum_free_mib: 512 },
+  }))
+  // The operator's edit is never discarded, but the conflict is visible.
+  expect(input.value).toBe('3')
+  await screen.findByText(/changed elsewhere/)
+  await userEvent.click(screen.getByRole('button', { name: 'Load the current values' }))
+  expect(input.value).toBe('4')
+  expect(screen.queryByText(/changed elsewhere/)).toBeNull()
+})
+
+test('a save landing back from the server is not reported as a conflict', async () => {
+  mount()
+  const input = await screen.findByLabelText('Threads per metadata scan') as HTMLInputElement
+  await userEvent.clear(input)
+  await userEvent.type(input, '3')
+  await userEvent.click(screen.getByRole('button', { name: 'Save resource limits' }))
+  await screen.findByText(/Resource limits saved/)
+  act(() => client.setQueryData(['resources'], {
+    ...initial, limits: { scan_threads: 3, concurrent_scans: 1, minimum_free_mib: 1024 },
+  }))
+  expect(screen.queryByText(/changed elsewhere/)).toBeNull()
+  expect(input.value).toBe('3')
+})

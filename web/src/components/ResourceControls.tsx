@@ -4,10 +4,28 @@ import { api, type ResourceLimits } from '../api'
 import { bytes } from '../format'
 import { ErrorBox, Spinner } from '../components'
 
+const same = (a: ResourceLimits, b: ResourceLimits) =>
+  a.scan_threads === b.scan_threads &&
+  a.concurrent_scans === b.concurrent_scans &&
+  a.minimum_free_mib === b.minimum_free_mib
+
 function LimitsEditor({ saved }: { saved: ResourceLimits }) {
   const qc = useQueryClient()
-  // Background status polling must never overwrite an operator's draft.
+  // Background status polling must never overwrite an operator's draft, but an
+  // untouched form has no draft to protect and must not go stale: saving it
+  // would silently revert limits another tab or `eidos resources` just set.
   const [draft, setDraft] = useState(saved)
+  const [base, setBase] = useState(saved)
+  const [conflict, setConflict] = useState(false)
+  if (!same(base, saved)) {
+    // `same(draft, saved)` is our own save landing, not someone else's change.
+    if (same(draft, base) || same(draft, saved)) {
+      setDraft(saved)
+      setConflict(false)
+    } else setConflict(true)
+    setBase(saved)
+  }
+  const adopt = () => { setDraft(saved); setConflict(false) }
   const save = useMutation({
     mutationFn: api.setResources,
     onSuccess: () => {
@@ -35,8 +53,14 @@ function LimitsEditor({ saved }: { saved: ResourceLimits }) {
         {field('concurrent_scans', 'Concurrent metadata scans', 1, 16)}
         {field('minimum_free_mib', 'Data-volume reserve (MiB)', 0, 4294967295)}
         <button type="submit" disabled={save.isPending}>{save.isPending ? 'Saving…' : 'Save resource limits'}</button>
-        <button type="button" disabled={save.isPending} onClick={() => { setDraft(saved); save.reset() }}>Reset to saved</button>
+        <button type="button" disabled={save.isPending} onClick={() => { adopt(); save.reset() }}>Reset to saved</button>
       </div>
+      {conflict && <p className="banner warn" role="status">
+        These limits were changed elsewhere while you were editing. Saving now replaces that
+        configuration with what is in this form.{' '}
+        <button type="button" className="small" disabled={save.isPending}
+          onClick={() => { adopt(); save.reset() }}>Load the current values</button>
+      </p>}
       {save.isError && <ErrorBox error={save.error} />}
       {save.isSuccess && <p role="status">Resource limits saved. New scans use these limits; active work drains normally.</p>}
     </form>
