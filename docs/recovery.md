@@ -93,7 +93,7 @@ reservations, durable limits and Activity/API/CLI controls. A device refusal is
 checked before the per-source budget is charged, so a shared ceiling holding the
 work no longer inflates another source's peak reservation. The full Windows
 local gate passed on the merged head: format, all-target clippy, generated API
-contract, all Rust tests and doc-tests (73 service unit tests, six device
+contract, all Rust tests and doc-tests (74 service unit tests, six device
 admission regressions), 45 web utility tests, 33 rendered UI tests and the
 production web build. An earlier smoke caught a populated-map JSON
 serialization bug, now covered by an exact-integer map regression. A rebuilt

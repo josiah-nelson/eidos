@@ -383,11 +383,15 @@ pub fn reserve_and_claim(
             .devices
             .would_admit(source.0, crate::device_budget::WorkKind::Content, 1)
             .ok()?;
-        let source_reservation = budgets.try_reserve(source)?;
+        let mut source_reservation = budgets.try_reserve(source)?;
         let device = state
             .devices
             .try_reserve(source.0, crate::device_budget::WorkKind::Content, 1)
             .ok()?;
+        // Both gates granted. The check above is advisory, so a worker that
+        // lost the last device unit between it and here releases its source
+        // unit unconfirmed rather than recording a peak it never used.
+        source_reservation.confirm();
         Some(ContentReservation {
             _source: source_reservation,
             _device: device,
