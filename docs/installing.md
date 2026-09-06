@@ -71,6 +71,15 @@ service password readable. An unattended upgrade must pass
 Removal keeps the data folder unless you tick *Also delete the indexed
 data*; the files that were indexed are never touched.
 
+The disposable Windows installer workflow seeds four synthetic text files and
+checks exact content results, source-file hashes, saved source/resource limits
+and pause state after machine upgrade, repair and data-preserving reinstall.
+Every seeded limit differs from its default and the service must not have
+rebuilt its content index, so state lost during one of those operations cannot
+satisfy the checks by falling back to a default or being reconstructed.
+It also checks stable fleet identity. These checks use unsigned development
+packages; they do not establish signed release or real-machine qualification.
+
 ### Retiring an existing collector
 
 The recovery installer does not carry or adopt the profiling collector.
