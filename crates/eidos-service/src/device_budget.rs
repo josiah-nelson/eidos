@@ -188,6 +188,22 @@ impl DeviceBudgets {
         }
     }
 
+    /// What [`Self::try_reserve`] would grant, without charging anything.
+    ///
+    /// A refusal here applies to every source sharing the budget, so callers
+    /// check this *before* taking another subsystem's reservation. Taking and
+    /// immediately dropping one of those would raise its peak counters for
+    /// work this gate is what actually held.
+    pub fn would_admit(
+        &self,
+        source: SourceKey,
+        kind: WorkKind,
+        requested: u32,
+    ) -> Result<u32, WaitReason> {
+        let state = self.state.lock().unwrap();
+        plan(&state, source, kind, requested).map(|(_, units)| units)
+    }
+
     /// Atomically charge all backing devices. Scans may receive less than the
     /// requested width. Content always requests one unit before a one-file claim.
     pub fn try_reserve(
@@ -196,27 +212,8 @@ impl DeviceBudgets {
         kind: WorkKind,
         requested: u32,
     ) -> Result<DeviceLease, WaitReason> {
-        if !(1..=64).contains(&requested) || (kind == WorkKind::Content && requested != 1) {
-            return Err(WaitReason::InvalidWidth);
-        }
         let mut state = self.state.lock().unwrap();
-        if state.pending.is_some() {
-            return Err(WaitReason::TopologyDraining);
-        }
-        let keys = state.keys(source).ok_or(WaitReason::UnknownSource)?;
-        let units = keys
-            .iter()
-            .map(|key| {
-                state
-                    .limit
-                    .saturating_sub(state.counts.get(key).map(Counts::total).unwrap_or(0))
-            })
-            .min()
-            .unwrap_or(0)
-            .min(requested);
-        if units == 0 {
-            return Err(WaitReason::DeviceAtCapacity);
-        }
+        let (keys, units) = plan(&state, source, kind, requested)?;
         for key in keys.iter() {
             let count = state.counts.get_mut(key).expect("registered device exists");
             match kind {
@@ -262,6 +259,37 @@ impl DeviceBudgets {
             devices,
         }
     }
+}
+
+/// The single admission decision shared by the charging and read-only paths,
+/// so a check can never disagree with the reservation it precedes.
+fn plan(
+    state: &State,
+    source: SourceKey,
+    kind: WorkKind,
+    requested: u32,
+) -> Result<(Arc<[String]>, u32), WaitReason> {
+    if !(1..=64).contains(&requested) || (kind == WorkKind::Content && requested != 1) {
+        return Err(WaitReason::InvalidWidth);
+    }
+    if state.pending.is_some() {
+        return Err(WaitReason::TopologyDraining);
+    }
+    let keys = state.keys(source).ok_or(WaitReason::UnknownSource)?;
+    let units = keys
+        .iter()
+        .map(|key| {
+            state
+                .limit
+                .saturating_sub(state.counts.get(key).map(Counts::total).unwrap_or(0))
+        })
+        .min()
+        .unwrap_or(0)
+        .min(requested);
+    if units == 0 {
+        return Err(WaitReason::DeviceAtCapacity);
+    }
+    Ok((keys, units))
 }
 
 fn validate_limit(limit: u32) -> Result<(), &'static str> {
@@ -441,6 +469,42 @@ mod tests {
         assert_eq!(b.snapshot().devices[0].scan_threads, 2);
         drop(held);
         assert_eq!(b.snapshot().devices[0].scan_threads, 0);
+    }
+
+    #[test]
+    fn a_read_only_check_matches_the_reservation_without_charging_anything() {
+        let b = fixture(2, &[(1, &["a"]), (2, &["a", "b"]), (3, &["c"])]);
+        assert_eq!(b.would_admit(2, WorkKind::Scan, 8), Ok(2));
+        assert_eq!(b.would_admit(1, WorkKind::Content, 1), Ok(1));
+        assert_eq!(
+            b.would_admit(9, WorkKind::Content, 1),
+            Err(WaitReason::UnknownSource)
+        );
+        assert_eq!(
+            b.would_admit(1, WorkKind::Content, 2),
+            Err(WaitReason::InvalidWidth)
+        );
+        // Repeated checks must not consume, charge or raise a peak.
+        for _ in 0..8 {
+            assert_eq!(b.would_admit(1, WorkKind::Content, 1), Ok(1));
+        }
+        assert!(b.snapshot().devices.iter().all(|d| d.peak_readers == 0));
+
+        let held = b.try_reserve(2, WorkKind::Content, 1).unwrap();
+        assert_eq!(b.would_admit(1, WorkKind::Scan, 8), Ok(1));
+        let second = b.try_reserve(1, WorkKind::Content, 1).unwrap();
+        assert_eq!(b.would_admit(3, WorkKind::Content, 1), Ok(1));
+        assert_eq!(
+            b.would_admit(1, WorkKind::Content, 1),
+            Err(WaitReason::DeviceAtCapacity)
+        );
+        b.set_topology(topology(&[(1, &["a"])]));
+        assert_eq!(
+            b.would_admit(1, WorkKind::Content, 1),
+            Err(WaitReason::TopologyDraining)
+        );
+        drop((held, second));
+        assert_eq!(b.would_admit(1, WorkKind::Content, 1), Ok(1));
     }
 
     #[test]

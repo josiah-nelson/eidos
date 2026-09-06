@@ -183,6 +183,30 @@ fn real_job_claims_charge_one_shared_budget_across_source_roots_and_release() {
 }
 
 #[test]
+fn a_device_refusal_does_not_inflate_per_source_peak_reservations() {
+    let (_dir, state) = fixture();
+    let a = source(&state, "device-blocked-first");
+    let b = source(&state, "device-blocked-second");
+    refresh_budgets(&state).unwrap();
+    state.devices.set_limit(1).unwrap();
+    // One admitted claim exhausts the shared budget both sources are charged
+    // against; every later attempt is refused by the device, not the source.
+    let held = reserve_and_claim(&state, "one", 1).unwrap().unwrap();
+    for _ in 0..8 {
+        assert!(reserve_and_claim(&state, "two", 1).unwrap().is_none());
+    }
+    let budgets = state.content_budgets();
+    assert_eq!(
+        budgets.peak_reserved(a) + budgets.peak_reserved(b),
+        1,
+        "a shared-device refusal must not raise another source's peak reservation"
+    );
+    assert_eq!(state.devices.view().budget.devices[0].peak_readers, 1);
+    drop(held);
+    assert!(reserve_and_claim(&state, "three", 1).unwrap().is_some());
+}
+
+#[test]
 fn a_catalog_claim_failure_releases_both_reservations() {
     let (_dir, state) = fixture();
     let source = source(&state, "failure");

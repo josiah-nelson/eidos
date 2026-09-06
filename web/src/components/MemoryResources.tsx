@@ -1,19 +1,28 @@
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../api'
 import { bytes, count } from '../format'
+import { memoryPollInterval } from '../memory-polling'
 import { ErrorBox, Spinner } from '../components'
 
 export default function MemoryResources() {
-  const q = useQuery({ queryKey: ['memory'], queryFn: api.memory, refetchInterval: 5000 })
+  const q = useQuery({
+    queryKey: ['memory'],
+    queryFn: api.memory,
+    refetchInterval: (query) => memoryPollInterval(query.state.data),
+  })
   const memory = q.data
   const value = (n: string | null | undefined) => n == null ? 'unavailable' : bytes(n)
   return <section aria-labelledby="memory-heading">
     <h2 id="memory-heading">Memory usage and budgets</h2>
-    {q.isPending ? <Spinner label="Sampling process memory…" /> : q.isError ? <ErrorBox error={q.error} /> : memory && <>
+    {/* A failed refetch must not blank diagnostics that already loaded: report
+        the request failure above the last successful sample and its budgets. */}
+    {q.isError && <ErrorBox error={q.error} />}
+    {q.isPending ? <Spinner label="Sampling process memory…" /> : memory && <>
       <p role="status">
         {memory.process ? `Process ${memory.process.pid}` : 'Process memory pending or unavailable'}
         {memory.sample_age_s !== null && ` · sampled ${memory.sample_age_s}s ago`}
         {memory.stale && ' · awaiting a fresh sample'}
+        {q.isError && ' · last successful response; the service is not answering'}
       </p>
       {memory.error && <p className="banner warn" role="alert">Memory sample unavailable: {memory.error}</p>}
       <div className="stats">

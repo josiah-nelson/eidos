@@ -241,6 +241,17 @@ impl DeviceControl {
         }
     }
 
+    /// Read-only capacity check; see [`DeviceBudgets::would_admit`].
+    pub fn would_admit(
+        &self,
+        source: SourceKey,
+        kind: WorkKind,
+        width: u32,
+    ) -> Result<u32, WaitReason> {
+        self.expire();
+        self.budgets.would_admit(source, kind, width)
+    }
+
     pub fn try_reserve(
         &self,
         source: SourceKey,
