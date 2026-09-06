@@ -7,17 +7,20 @@ it does not change resource limits or enable a new background collector.
 
 The process probe refreshes on demand at most once every five seconds. A
 single-flight worker prevents concurrent requests from multiplying probes.
-A request that finds no sample, or one older than 30 seconds, waits up to two
-seconds for the refresh it just started, so a one-shot CLI call after a long
-idle period still answers with a current sample instead of asking the caller
-to retry. A usable sample never waits. If the probe is still running when that
-deadline passes, the response says so — pending or stale — rather than
-inventing a number, and no second probe is started. During a refresh the
-previous sample remains available with its age. Errors and unsupported
-counters are unavailable, not zero. No sampling timer runs when the endpoint
-is not requested. Activity polls once a second while a sample is pending or
-stale and once every five seconds afterwards; a failed poll reports the request
-failure without discarding the last successful sample and its budgets.
+A request that starts a refresh — because nothing is cached, or the cached
+reading has passed the refresh interval — waits up to two seconds for that
+refresh rather than answering with the reading it just superseded. So a
+one-shot CLI call after an idle period reports memory as it is now, not as it
+was before the idle period, and is never told to retry. A sample inside the
+refresh interval is served from cache without waiting. If the probe is still
+running when the two-second deadline passes, the response says so — pending,
+or stale once the sample passes 30 seconds — rather than inventing a number,
+and no second probe is started. Errors and unsupported counters are
+unavailable, not zero. `sample_age_s` always states how old the reading is.
+No sampling timer runs when the endpoint is not requested. Activity polls once
+a second while a sample is pending or stale and once every five seconds
+afterwards; a failed poll reports the request failure without discarding the
+last successful sample and its budgets.
 
 ## What the numbers mean
 

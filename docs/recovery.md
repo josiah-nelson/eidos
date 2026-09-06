@@ -71,11 +71,11 @@ See
 Process RAM and configured cache/index budgets are implemented in the Activity
 page, memory API and resource CLI. The values distinguish resident RAM, Windows
 private commit, baseline/scan page-cache targets and effective mapped-file
-limits. A request that finds no sample, or one aged out by idleness, waits
-briefly for its own refresh, so a one-shot CLI call is never told to retry.
-See [memory diagnostics](memory.md). The full Windows local gate passed,
-including seven memory unit tests, a read-only API regression, 45 web utility
-tests, 26 rendered UI tests and the production web build. The required-web
+limits. A request that starts a refresh waits briefly for it, so a one-shot CLI
+call reports memory as it is now rather than a superseded reading, and is never
+told to retry. See [memory diagnostics](memory.md). The full Windows local gate
+passed, including eight memory unit tests, a read-only API regression, 45 web utility
+tests, 29 rendered UI tests and the production web build. The required-web
 development binary passed a 256-file synthetic crawl, single-call CLI round
 trip and 15-second unpolled idle observation; see
 [the recorded smoke limits](benchmarks.md).

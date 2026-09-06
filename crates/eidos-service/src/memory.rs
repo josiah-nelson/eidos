@@ -12,9 +12,10 @@ use ts_rs::TS;
 
 const REFRESH: Duration = Duration::from_secs(5);
 const MAX_AGE: Duration = Duration::from_secs(30);
-/// A one-shot caller such as `eidos resources --memory` cannot poll, so a cold
-/// or aged-out cache waits this long for the refresh the same request started.
-/// A usable sample never waits, and the wait never starts a second probe.
+/// A one-shot caller such as `eidos resources --memory` cannot poll, so a
+/// request that starts a refresh waits this long for it rather than returning
+/// the reading it just superseded. A sample inside `REFRESH` never waits, and
+/// the wait never starts a second probe.
 const SAMPLE_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -56,7 +57,7 @@ impl MemoryTelemetry {
         self.probe.refresh(REFRESH, sample_process);
         let _ = self
             .probe
-            .cached_within(Some(MAX_AGE), SAMPLE_DEADLINE)
+            .cached_within(Some(REFRESH), SAMPLE_DEADLINE)
             .await;
         self.cached_view(catalog)
     }
@@ -246,6 +247,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sample_inside_the_refresh_interval_is_served_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = eidos_catalog::Catalog::open(dir.path().join("catalog.db")).unwrap();
+        let cached = ProcessMemory {
+            pid: 0,
+            resident_bytes: 1,
+            peak_resident_bytes: None,
+            private_commit_bytes: None,
+        };
+        let telemetry = MemoryTelemetry {
+            probe: Arc::new(BackgroundProbe::seeded(Ok(cached))),
+        };
+        // No refresh is due, so the cache answers and no probe runs at all.
+        let view = telemetry.view(&catalog).await;
+        let process = view.process.expect("a fresh sample must be served");
+        assert_eq!(process.pid, 0);
+        assert_eq!(process.resident_bytes, 1);
+        assert!(!view.stale);
+    }
+
+    #[tokio::test]
     async fn a_recent_probe_failure_answers_without_waiting_for_a_new_sample() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = eidos_catalog::Catalog::open(dir.path().join("catalog.db")).unwrap();
@@ -274,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-    async fn a_sample_aged_out_by_idleness_is_replaced_before_answering() {
+    async fn a_sample_the_request_supersedes_is_replaced_before_answering() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = eidos_catalog::Catalog::open(dir.path().join("catalog.db")).unwrap();
         let telemetry = MemoryTelemetry {
@@ -285,11 +307,13 @@ mod tests {
                     peak_resident_bytes: None,
                     private_commit_bytes: None,
                 }),
-                MAX_AGE + Duration::from_secs(1),
+                // Old enough that this request starts a refresh: answering
+                // with the superseded reading would report pre-idle memory.
+                REFRESH + Duration::from_secs(1),
             )),
         };
         let view = telemetry.view(&catalog).await;
-        let process = view.process.expect("an aged sample must be refreshed");
+        let process = view.process.expect("a superseded sample must be replaced");
         assert_eq!(process.pid, std::process::id());
         assert!(process.resident_bytes > 1);
         assert!(!view.stale);

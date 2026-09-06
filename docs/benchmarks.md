@@ -8,19 +8,23 @@ git-ignored `bench-results/*.jsonl` records produced by the commands in
 
 `scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15`, Windows build 26100,
 two content workers and two enumeration threads. Binary SHA-256:
-`552FC6367739AE52CE6F13D1F3096F48D2E8021E1956D5F1751D89CA87C25FF9`.
-Raw record: `bench-results/memory-visibility-2026-09-06-01.json` (private).
+`DCB1A2B3A32D3134EFE0AE3A018484D9C3B2D5149697924E4716B377C22941CE`.
+Raw record: `bench-results/memory-visibility-2026-09-06-02.json` (private).
 
-The 256-file / 1,084,562-byte temporary fixture drained in 7.246 seconds;
-28 concurrent HTTP queries had p95 10.7 ms and maximum 15.5 ms. The 15.083-second
-unpolled idle window used 0.0625 CPU seconds, 155,648 process read bytes and
-4,120 process write bytes. It was not I/O-free.
+The 256-file / 1,084,562-byte temporary fixture drained in 7.038 seconds;
+27 concurrent HTTP queries had p95 9.3 ms and maximum 25.5 ms. The 15.087-second
+unpolled idle window used 0.031 CPU seconds, 147,456 process read bytes and
+8,240 process write bytes. It was not I/O-free.
 
-After idle, the actual `resources --memory --json` CLI returned the candidate's
-PID and a fresh sample: resident 54,267,904 bytes, peak resident 122,712,064
-bytes and Windows private commit 64,630,784 bytes. Configured budgets remained
-distinct: 872,415,232 baseline page-cache target bytes and a 1 TiB effective
-mapped-file ceiling per connection, neither an allocated-RAM total.
+A cold `GET /api/memory` before the crawl returned the candidate's own PID in
+one call. After idle, one `resources --memory --json` CLI call returned that
+same PID and a sample of age 0 s: resident 52,985,856 bytes, peak resident
+125,321,216 bytes and Windows private commit 62,558,208 bytes. The reading
+tracks the run — the idle window ended at a 52,580,352-byte working set and the
+crawl peaked at 124,862,464 — because a request that starts a refresh waits for
+it instead of returning the pre-crawl reading it supersedes. Configured budgets
+remained distinct: 872,415,232 baseline page-cache target bytes and a 1 TiB
+effective mapped-file ceiling per connection, neither an allocated-RAM total.
 
 Only disposable synthetic data was indexed. The host was not isolated, the
 build was a development binary, process I/O is not physical-disk I/O, and the
