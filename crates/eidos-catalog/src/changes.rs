@@ -687,19 +687,21 @@ impl<'a> Applier<'a> {
         if self.policy.is_protected(&ctx.relative) {
             return Ok(());
         }
-        let needs_policy_pass =
-            if let Some(existing) = self.existing(NativeKey::from(snap.native))? {
-                if snap.kind == ObjectKind::Directory {
+        // Only a directory move needs the whole-source pass: it changes every
+        // descendant's relative path. A file's own decision is re-evaluated by
+        // `upsert_object` below, which schedules the pass precisely when that
+        // decision changes, so renaming one file must not restart a full
+        // catalog pass (which also holds this source's content claims).
+        let needs_policy_pass = snap.kind == ObjectKind::Directory
+            && match self.existing(NativeKey::from(snap.native))? {
+                Some(existing) => {
                     let old = self.policy_ctx(existing.id)?;
                     let new = self.policy.directory(name, &ctx);
                     old.inherited_content_exclusion != new.inherited_content_exclusion
                         || !self.policy.rules.is_empty()
                         || !self.policy.protected.is_empty()
-                } else {
-                    !self.policy.rules.is_empty()
                 }
-            } else {
-                false
+                None => false,
             };
         let (obj, created, state_delta) = self.upsert_object(snap, name, &ctx)?;
         if snap.kind == ObjectKind::Directory
