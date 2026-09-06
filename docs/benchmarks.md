@@ -8,23 +8,24 @@ git-ignored `bench-results/*.jsonl` records produced by the commands in
 
 `scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15 -DeviceReaders 2`,
 Windows build 26100, two content workers/two requested enumeration threads.
-Required-web development binary SHA-256:
-`5CBB09456C175C53A3460AFB99D43FCD1718005D5381D04355214B29E94EB5AB`.
-Raw record: `bench-results/device-admission-2026-09-06-01.json` (private).
+Re-measured on the review head after merging the memory work, so these numbers
+describe the branch as it stands. Required-web development binary SHA-256:
+`E5A32C5E280175F279896478E24E7AA7E2BAB061AB930803E95B6FAACC356554`.
+Raw record: `bench-results/device-admission-2026-09-06-02.json` (private).
 
-The 256-file / 1,084,562-byte fixture drained in 6.700 seconds; 25 HTTP queries
-had p95 15.8 ms and maximum 17.6 ms. The observed combined device reservations
+The 256-file / 1,084,562-byte fixture drained in 6.872 seconds; 26 HTTP queries
+had p95 9.4 ms and maximum 11.3 ms. The observed combined device reservations
 peaked at two, never above the saved ceiling; a resolved Windows backing device
-was observed. Both the device-limit write and populated diagnostics CLI passed.
-An earlier smoke caught double-quoted numeric map keys; the shared JSON
-formatter now has an exact-integer map regression and the device API test
-exercises populated source membership.
+was observed rather than the unknown fallback. Both the device-limit write and
+the populated diagnostics CLI passed. An earlier smoke caught double-quoted
+numeric map keys; the shared JSON formatter now has an exact-integer map
+regression and the device API test exercises populated source membership.
 
-The 15.102-second unpolled idle used 0.15625 CPU seconds (1.035% of one core),
-4,804,608 process read bytes and 509,784 write bytes. This remains unexplained
+The 15.099-second unpolled idle used 0.125 CPU seconds (0.828% of one core),
+2,019,328 process read bytes and 78,280 write bytes. This remains unexplained
 idle I/O, not a quiet-idle qualification. After idle, resident memory was
-52,871,168 bytes, peak resident 138,215,424 bytes and private commit 60,432,384
-bytes. Catalog writer maximum wait/hold at drain was 18.94/18.56 ms.
+54,435,840 bytes, peak resident 116,363,264 bytes and private commit 63,610,880
+bytes. Catalog writer maximum wait/hold at drain was 18.86/19.74 ms.
 
 Only one temporary root was crawled. Separate integration tests cover shared
 roots, multi-disk accounting, topology changes and an eight-thread scan using

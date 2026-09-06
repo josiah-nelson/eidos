@@ -36,7 +36,10 @@ admit independently when there are no unresolved roots.
 ## Accounting and freshness
 
 A content worker reserves its source slot and device slot before claiming a
-job. Empty/failed claims, errors, cancellation and unwind release the guards.
+job. The device ceiling is checked first, because a refusal there holds every
+source sharing the budget: Activity's per-source peak reservation therefore
+counts work this service actually admitted, not attempts this ceiling refused.
+Empty/failed claims, errors, cancellation and unwind release the guards.
 Scans reserve their granted enumeration width: a request for eight threads
 with one unit available runs with one thread. The scan reservation covers the
 native scan sequence through replay/publication. Queued scans remain cancellable

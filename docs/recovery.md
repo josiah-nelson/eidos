@@ -89,14 +89,19 @@ limit or measured presets.
 
 Shared-device reader admission is implemented with Windows backing-disk
 discovery, an explicit unknown-topology fallback, combined scan/content
-reservations, durable limits and Activity/API/CLI controls. The full Windows
-local gate passed, including 43 web utility and 32 rendered UI tests. Follow-up
-service unit tests (67 passed), 20 integration/export regressions, all-target
-service/CLI clippy and the device page tests/build/lint passed after the smoke
-caught a populated-map JSON serialization bug. A rebuilt required-web CLI
-passed the 256-file device-limit/diagnostics smoke, but its short idle window
-still recorded process I/O requiring investigation. Cross-platform review is
-pending; see [scope and fallback semantics](device-budgets.md) and the
+reservations, durable limits and Activity/API/CLI controls. A device refusal is
+checked before the per-source budget is charged, so a shared ceiling holding the
+work no longer inflates another source's peak reservation. The full Windows
+local gate passed on the merged head: format, all-target clippy, generated API
+contract, all Rust tests and doc-tests (73 service unit tests, six device
+admission regressions), 45 web utility tests, 33 rendered UI tests and the
+production web build. An earlier smoke caught a populated-map JSON
+serialization bug, now covered by an exact-integer map regression. A rebuilt
+required-web CLI passed the 256-file device-limit/diagnostics smoke, observing a
+resolved backing disk and reservations that never exceeded the saved ceiling,
+but its short idle window still recorded process I/O requiring investigation.
+Cross-platform review is pending; see
+[scope and fallback semantics](device-budgets.md) and the
 [measured limits](benchmarks.md).
 
 Chunk B is **not complete**. Device qualification, measured profiles,
