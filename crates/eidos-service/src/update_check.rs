@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often a node whose operator turned automatic checks off re-reads that
+/// setting, so turning it back on takes effect without restarting the service.
+const DISABLED_INTERVAL: Duration = Duration::from_secs(60);
 /// First check shortly after start so the UI is honest without a day's wait,
 /// but off the startup path (scans and recovery come first).
 const FIRST_DELAY: Duration = Duration::from_secs(60);
@@ -28,6 +31,12 @@ pub fn spawn_update_check(state: &Arc<AppState>) {
                     let slice = Duration::from_secs(1).min(delay - waited);
                     std::thread::sleep(slice);
                     waited += slice;
+                }
+                // Read the durable setting every pass: a node that reported
+                // `checks_enabled: false` must not still be checking daily.
+                if !st.updates.checks_enabled() {
+                    delay = DISABLED_INTERVAL;
+                    continue;
                 }
                 match st.updates.check() {
                     Ok(state) => if let Some(release) = state.available {

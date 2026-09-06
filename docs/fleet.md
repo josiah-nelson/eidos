@@ -7,7 +7,11 @@ newer compatible setup into verified staging. Configure the exact expected
 Authenticode publisher certificate subject before staging. The service also
 checks the release asset's fixed name and URL, declared size, GitHub SHA-256
 digest, Windows trust result, product name, and version. State and failures
-survive restart.
+survive restart, turning automatic checks on or off takes effect without one,
+and staging keeps only the artifact the page still reports.
+
+A release that is newer but not a compatible upgrade for the running build is
+reported as available information; it is never staged.
 
 This prepares an artifact only. Master-initiated installation, node draining,
 restart health checks, retries, and canary scheduling are not enabled yet. No

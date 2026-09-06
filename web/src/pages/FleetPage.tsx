@@ -218,7 +218,11 @@ function UpdatePreparation() {
         <span className={`badge ${u.stage_phase === 'staged' ? 'ok' : u.stage_phase === 'failed' ? 'bad' : 'info'}`}>{u.stage_phase}</span>
       </div>
       <div className="muted small">
-        Running {u.current_version}. {u.available ? `Release ${u.available.version} is available (${bytes(integerNumber(u.available.size))}).` : 'No compatible newer release is recorded.'}
+        Running {u.current_version}. {u.available
+          ? `Release ${u.available.version} is available (${bytes(integerNumber(u.available.size))}).`
+          : u.latest_version
+            ? `Release ${u.latest_version} exists but is not a compatible upgrade for this build.`
+            : 'No compatible newer release is recorded.'}
       </div>
       {u.check_error && <div className="error-text">Check failed: {u.check_error}</div>}
       {u.stage_error && <div className="error-text">Staging failed: {u.stage_error}</div>}
@@ -227,6 +231,8 @@ function UpdatePreparation() {
         <button type="button" className="btn small" disabled={refresh.isPending || stage.isPending} onClick={() => refresh.mutate()}>Check now</button>
         <button type="button" className="btn small" disabled={!u.available || refresh.isPending || stage.isPending} onClick={() => stage.mutate()}>{stage.isPending ? 'Staging…' : 'Verify & stage'}</button>
       </div>
+      {settings.isPending && <div className="muted small">Loading update settings…</div>}
+      {settings.isError && <div className="error-text">Update settings unavailable: {settings.error.message}</div>}
       {settings.data && <UpdateSettingsForm key={JSON.stringify(settings.data)} initial={settings.data} />}
       {refresh.isError && <div className="error-text">{refresh.error.message}</div>}
       {stage.isError && <div className="error-text">{stage.error.message}</div>}

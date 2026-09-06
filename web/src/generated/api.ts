@@ -350,7 +350,7 @@ export type UnixNanos = ApiInt;
 
 export type UpdateSettings = { automatic_checks: boolean, expected_publisher: string | null, expected_product: string, max_artifact_bytes: ApiInt, };
 
-export type UpdateState = { checks_enabled: boolean, current_version: string, checked_at: UnixNanos | null, check_error: string | null, available: ReleaseArtifact | null, stage_phase: StagePhase, stage_error: string | null, staged: StagedArtifact | null, };
+export type UpdateState = { checks_enabled: boolean, current_version: string, checked_at: UnixNanos | null, check_error: string | null, latest_version: string | null, available: ReleaseArtifact | null, stage_phase: StagePhase, stage_error: string | null, staged: StagedArtifact | null, };
 
 export type VolumeCandidateView = { root: string, drive_type: string, filesystem: string, volume_name: string, total_bytes: ApiInt, free_bytes: ApiInt, supports_usn: boolean, already_indexed: boolean, };
 

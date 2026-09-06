@@ -403,7 +403,9 @@ impl AppState {
         crate::watcher::spawn_reconciler(self);
         crate::follower::spawn_follower(self);
         crate::content_workers::spawn_content_workers(self, self.content_worker_count);
-        if self.updates.view().checks_enabled {
+        // The driver re-reads the operator's setting on every pass, so it is
+        // started whenever the command line permits checks at all.
+        if self.updates.periodic_checks_allowed() {
             crate::update_check::spawn_update_check(self);
         }
         Ok(())

@@ -139,6 +139,8 @@ fn print_state(state: &UpdateState) {
             "available {}  {} bytes  sha256 {}",
             release.version, release.size, release.sha256
         );
+    } else if let Some(latest) = &state.latest_version {
+        println!("latest release {latest} is not a compatible upgrade for this build");
     } else {
         println!("available: none");
     }

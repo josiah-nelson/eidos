@@ -26,8 +26,10 @@ const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/josiah-nelson/eidos/re
 const UPDATES_DIR: &str = "updates";
 const SETTINGS_FILE: &str = "settings.json";
 const STATE_FILE: &str = "state.json";
+const STAGING_DIR: &str = "staging";
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const HARD_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
@@ -82,6 +84,15 @@ pub struct ReleaseArtifact {
     pub sha256: String,
 }
 
+/// One completed look at the project's latest release. `latest_version` is the
+/// newest published release whatever this build can do with it; `artifact` is
+/// only present when that release is also a stageable candidate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReleaseCheck {
+    pub latest_version: Option<String>,
+    pub artifact: Option<ReleaseArtifact>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum StagePhase {
@@ -109,6 +120,8 @@ pub struct UpdateState {
     pub current_version: String,
     pub checked_at: Option<UnixNanos>,
     pub check_error: Option<String>,
+    /// Newest published release, even when this build cannot stage it.
+    pub latest_version: Option<String>,
     pub available: Option<ReleaseArtifact>,
     pub stage_phase: StagePhase,
     pub stage_error: Option<String>,
@@ -122,6 +135,7 @@ impl Default for UpdateState {
             current_version: env!("CARGO_PKG_VERSION").into(),
             checked_at: None,
             check_error: None,
+            latest_version: None,
             available: None,
             stage_phase: StagePhase::Idle,
             stage_error: None,
@@ -156,7 +170,7 @@ pub trait ArtifactVerifier: Send + Sync {
 }
 
 pub trait ReleaseSource: Send + Sync {
-    fn check(&self, current: &str, max_bytes: u64) -> anyhow::Result<Option<ReleaseArtifact>>;
+    fn check(&self, current: &str, max_bytes: u64) -> anyhow::Result<ReleaseCheck>;
     fn download(
         &self,
         artifact: &ReleaseArtifact,
@@ -169,7 +183,7 @@ pub trait ReleaseSource: Send + Sync {
 pub struct GithubReleaseSource;
 
 impl ReleaseSource for GithubReleaseSource {
-    fn check(&self, current: &str, max_bytes: u64) -> anyhow::Result<Option<ReleaseArtifact>> {
+    fn check(&self, current: &str, max_bytes: u64) -> anyhow::Result<ReleaseCheck> {
         fetch_release(RELEASES_LATEST, current, max_bytes, Duration::from_secs(15))
     }
     fn download(
@@ -310,9 +324,7 @@ impl ArtifactVerifier for SystemArtifactVerifier {
         anyhow::ensure!(
             got.version
                 .as_deref()
-                .and_then(normalize_version)
-                .as_deref()
-                == Some(version),
+                .is_some_and(|got| product_version_matches(got, version)),
             "version mismatch: expected {version}, got {}",
             got.version.as_deref().unwrap_or("<missing>")
         );
@@ -407,6 +419,13 @@ impl UpdateManager {
         }) {
             state.available = None;
         }
+        if state
+            .latest_version
+            .as_deref()
+            .is_some_and(|version| !version_is_newer(env!("CARGO_PKG_VERSION"), version))
+        {
+            state.latest_version = None;
+        }
         if state.staged.as_ref().is_some_and(|artifact| {
             !version_is_compatible_newer(env!("CARGO_PKG_VERSION"), &artifact.version)
         }) {
@@ -422,7 +441,21 @@ impl UpdateManager {
             state.stage_error =
                 Some("staging was interrupted; retry to download a fresh artifact".into());
         }
-        store_json(&dir.join(STATE_FILE), &state)?;
+        // Whatever this build no longer retains is bytes it will never use.
+        prune_staging(
+            &dir.join(STAGING_DIR),
+            state
+                .staged
+                .as_ref()
+                .map(|artifact| format!("eidos-v{}-setup.exe", artifact.version))
+                .as_deref(),
+        );
+        if let Err(error) = store_json(&dir.join(STATE_FILE), &state) {
+            // Advisory checks and staging are not worth refusing to open the
+            // service for: fail this subsystem closed and report why.
+            state.checks_enabled = false;
+            state.check_error = Some(format!("update state is unwritable: {error:#}"));
+        }
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             settings: Mutex::new(settings),
@@ -436,6 +469,15 @@ impl UpdateManager {
 
     pub fn view(&self) -> UpdateState {
         self.state.lock().clone()
+    }
+    /// Whether this process is allowed to run the periodic driver at all.
+    /// Independent of the operator's setting, which the driver re-reads.
+    pub fn periodic_checks_allowed(&self) -> bool {
+        self.command_line_checks
+    }
+    /// Whether an automatic check should happen right now.
+    pub fn checks_enabled(&self) -> bool {
+        self.state.lock().checks_enabled
     }
     pub fn settings(&self) -> UpdateSettings {
         self.settings.lock().clone()
@@ -470,8 +512,9 @@ impl UpdateManager {
         let mut state = self.state.lock();
         state.checked_at = Some(UnixNanos::now());
         match result {
-            Ok(available) => {
-                state.available = available;
+            Ok(found) => {
+                state.latest_version = found.latest_version;
+                state.available = found.artifact;
                 state.check_error = None;
             }
             Err(error) => {
@@ -500,7 +543,7 @@ impl UpdateManager {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("check for a compatible release before staging"))?;
         validate_artifact(&artifact, settings.max_artifact_bytes)?;
-        let dir = self.data_dir.join(UPDATES_DIR).join("staging");
+        let dir = self.data_dir.join(UPDATES_DIR).join(STAGING_DIR);
         std::fs::create_dir_all(&dir)?;
         let partial = dir.join(format!("{}.part", artifact.name));
         let final_path = dir.join(&artifact.name);
@@ -511,8 +554,8 @@ impl UpdateManager {
         let result = (|| {
             self.source
                 .download(&artifact, &partial, settings.max_artifact_bytes)?;
-            verify_staged_bytes(&partial, &artifact, settings.max_artifact_bytes)?;
             self.set_phase(StagePhase::Verifying, None)?;
+            verify_staged_bytes(&partial, &artifact, settings.max_artifact_bytes)?;
             let identity = self.verifier.verify(
                 &partial,
                 &artifact.version,
@@ -520,6 +563,7 @@ impl UpdateManager {
                 &settings.expected_product,
             )?;
             replace_file(&partial, &final_path)?;
+            prune_staging(&dir, Some(&artifact.name));
             let mut state = self.state.lock();
             state.stage_phase = StagePhase::Staged;
             state.stage_error = None;
@@ -601,37 +645,68 @@ async fn stage(State(st): State<Arc<AppState>>) -> ApiResult<UpdateState> {
     .map(ApiJson)
 }
 
-fn normalize_version(value: &str) -> Option<String> {
-    let pieces: Vec<_> = value.trim().trim_start_matches('v').split('.').collect();
-    if pieces.len() < 3 || pieces.iter().any(|p| p.parse::<u64>().is_err()) {
-        return None;
-    }
-    Some(format!("{}.{}.{}", pieces[0], pieces[1], pieces[2]))
-}
-
-fn version_is_compatible_newer(current: &str, candidate: &str) -> bool {
-    let parse = |v: &str| -> Option<[u64; 3]> {
-        let p: Vec<_> = v
-            .trim()
-            .trim_start_matches('v')
-            .split('.')
-            .map(str::parse)
-            .collect::<Result<_, _>>()
-            .ok()?;
-        (p.len() == 3).then(|| [p[0], p[1], p[2]])
+/// Whether a Windows version resource names exactly this release. The resource
+/// may carry a fourth component the three-part release version does not have
+/// (`0.5.1.0`), so the remainder is required to be zero rather than discarded:
+/// `0.5.1.999` is a different build and must not verify as `0.5.1`.
+#[cfg(windows)]
+fn product_version_matches(value: &str, expected: &str) -> bool {
+    let Some(want) = parse_version(expected) else {
+        return false;
     };
-    matches!((parse(current), parse(candidate)), (Some(c), Some(n)) if n[0] == c[0] && n > c)
+    let Some(got) = value
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|piece| piece.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    got.len() >= 3 && got[..3] == want && got[3..].iter().all(|&extra| extra == 0)
 }
 
-fn release_from_json(
-    body: &[u8],
-    current: &str,
-    max: u64,
-) -> anyhow::Result<Option<ReleaseArtifact>> {
+/// Exactly three numeric components, with an optional `v` prefix. Anything
+/// else (a nightly tag, a docs tag) is not a release this build reasons about.
+fn parse_version(value: &str) -> Option<[u64; 3]> {
+    let p: Vec<_> = value
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (p.len() == 3).then(|| [p[0], p[1], p[2]])
+}
+
+/// Newer in any direction, including a new major. Advisory only.
+fn version_is_newer(current: &str, candidate: &str) -> bool {
+    matches!((parse_version(current), parse_version(candidate)), (Some(c), Some(n)) if n > c)
+}
+
+/// Newer *and* the same major: the only shape this build will ever stage.
+fn version_is_compatible_newer(current: &str, candidate: &str) -> bool {
+    matches!((parse_version(current), parse_version(candidate)), (Some(c), Some(n)) if n[0] == c[0] && n > c)
+}
+
+fn release_from_json(body: &[u8], current: &str, max: u64) -> anyhow::Result<ReleaseCheck> {
     let release: GithubRelease = serde_json::from_slice(body)?;
-    let version = release.tag_name.trim().trim_start_matches('v');
-    if !version_is_compatible_newer(current, version) {
-        return Ok(None);
+    let Some(parsed) = parse_version(&release.tag_name) else {
+        return Ok(ReleaseCheck::default());
+    };
+    let version = format!("{}.{}.{}", parsed[0], parsed[1], parsed[2]);
+    if !version_is_newer(current, &version) {
+        return Ok(ReleaseCheck::default());
+    }
+    // Say that a newer release exists even when this build refuses to stage
+    // it, so the badge and the CLI stay as informative as the advisory check
+    // this module replaced.
+    let latest_version = Some(version.clone());
+    if !version_is_compatible_newer(current, &version) {
+        return Ok(ReleaseCheck {
+            latest_version,
+            artifact: None,
+        });
     }
     let name = format!("eidos-v{version}-setup.exe");
     let Some(asset) = release
@@ -659,13 +734,16 @@ fn release_from_json(
         digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
         "release asset SHA-256 digest is malformed"
     );
-    Ok(Some(ReleaseArtifact {
-        version: version.into(),
-        name,
-        download_url: expected_url,
-        size: asset.size,
-        sha256: digest.to_ascii_lowercase(),
-    }))
+    Ok(ReleaseCheck {
+        latest_version,
+        artifact: Some(ReleaseArtifact {
+            version,
+            name,
+            download_url: expected_url,
+            size: asset.size,
+            sha256: digest.to_ascii_lowercase(),
+        }),
+    })
 }
 
 fn fetch_release(
@@ -673,7 +751,7 @@ fn fetch_release(
     current: &str,
     max: u64,
     timeout: Duration,
-) -> anyhow::Result<Option<ReleaseArtifact>> {
+) -> anyhow::Result<ReleaseCheck> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .timeout_connect(Some(timeout.min(Duration::from_secs(5))))
@@ -706,8 +784,10 @@ fn download_bounded(artifact: &ReleaseArtifact, path: &Path, max: u64) -> anyhow
         artifact.size <= max,
         "artifact exceeds configured size bound"
     );
+    // Still a hard deadline, but one an artifact at the configured ceiling can
+    // actually finish inside: 120s demanded better than 2 MB/s for 256 MiB.
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(120)))
+        .timeout_global(Some(DOWNLOAD_DEADLINE))
         .timeout_connect(Some(Duration::from_secs(10)))
         .build()
         .into();
@@ -752,6 +832,25 @@ fn download_bounded(artifact: &ReleaseArtifact, path: &Path, max: u64) -> anyhow
         .collect::<String>();
     anyhow::ensure!(got == artifact.sha256, "artifact SHA-256 mismatch");
     Ok(())
+}
+
+/// Remove superseded setup artifacts and interrupted downloads so staging
+/// cannot grow by one release ceiling per version. Only this directory's own
+/// canonical names are considered, and only the retained artifact survives.
+fn prune_staging(dir: &Path, keep: Option<&str>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let ours = name.starts_with("eidos-v")
+            && (name.ends_with("-setup.exe") || name.ends_with("-setup.exe.part"));
+        if !ours || keep == Some(name) || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
 }
 
 fn validate_artifact(artifact: &ReleaseArtifact, max: u64) -> anyhow::Result<()> {
@@ -908,21 +1007,116 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_product_version_must_name_exactly_the_release() {
+        assert!(product_version_matches("0.5.1", "0.5.1"));
+        assert!(product_version_matches(" v0.5.1.0 ", "0.5.1"));
+        assert!(
+            !product_version_matches("0.5.1.999", "0.5.1"),
+            "a discarded fourth component would verify a different build"
+        );
+        assert!(!product_version_matches("0.5.10", "0.5.1"));
+        assert!(!product_version_matches("0.5", "0.5.1"));
+        assert!(!product_version_matches("0.5.1-rc1", "0.5.1"));
+    }
+
     #[test]
     fn release_selection_is_exact_bounded_and_digest_backed() {
         let body = br#"{"tag_name":"v0.5.1","assets":[{"name":"eidos-v0.5.1-setup.exe","browser_download_url":"https://github.com/josiah-nelson/eidos/releases/download/v0.5.1/eidos-v0.5.1-setup.exe","size":1048576,"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"uploaded"}]}"#;
-        let got = release_from_json(body, "0.5.0", 2_000_000)
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.version, "0.5.1");
-        assert!(release_from_json(body, "0.5.1", 2_000_000)
-            .unwrap()
-            .is_none());
+        let got = release_from_json(body, "0.5.0", 2_000_000).unwrap();
+        assert_eq!(got.latest_version.as_deref(), Some("0.5.1"));
+        assert_eq!(got.artifact.unwrap().version, "0.5.1");
+        let current = release_from_json(body, "0.5.1", 2_000_000).unwrap();
+        assert_eq!(current, ReleaseCheck::default(), "no release, no advisory");
         assert!(release_from_json(body, "0.5.0", 100).is_err());
         let hostile = String::from_utf8(body.to_vec())
             .unwrap()
             .replace("github.com/josiah-nelson", "example.test/josiah-nelson");
         assert!(release_from_json(hostile.as_bytes(), "0.5.0", 2_000_000).is_err());
+    }
+
+    #[test]
+    fn a_newer_major_release_is_advertised_but_never_stageable() {
+        let body = br#"{"tag_name":"v1.0.0","assets":[{"name":"eidos-v1.0.0-setup.exe","browser_download_url":"https://github.com/josiah-nelson/eidos/releases/download/v1.0.0/eidos-v1.0.0-setup.exe","size":1048576,"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"uploaded"}]}"#;
+        let got = release_from_json(body, "0.5.0", 2_000_000).unwrap();
+        assert_eq!(got.latest_version.as_deref(), Some("1.0.0"));
+        assert!(
+            got.artifact.is_none(),
+            "a new major is advisory only; this build must not stage it"
+        );
+        let nightly = br#"{"tag_name":"nightly","assets":[]}"#;
+        assert_eq!(
+            release_from_json(nightly, "0.5.0", 2_000_000).unwrap(),
+            ReleaseCheck::default(),
+            "a non-numeric tag never advertises anything"
+        );
+    }
+
+    #[test]
+    fn automatic_check_setting_is_readable_by_the_periodic_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = UpdateManager::load_with_adapters(
+            dir.path(),
+            true,
+            Arc::new(SystemArtifactVerifier),
+            Arc::new(GithubReleaseSource),
+        )
+        .unwrap();
+        assert!(manager.periodic_checks_allowed() && manager.checks_enabled());
+        manager
+            .save_settings(UpdateSettings {
+                automatic_checks: false,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!manager.checks_enabled());
+        assert!(
+            manager.periodic_checks_allowed(),
+            "the driver must keep running so the setting can be turned back on"
+        );
+        manager.save_settings(UpdateSettings::default()).unwrap();
+        assert!(manager.checks_enabled(), "and back on without a restart");
+        let disabled = UpdateManager::load_with_adapters(
+            dir.path(),
+            false,
+            Arc::new(SystemArtifactVerifier),
+            Arc::new(GithubReleaseSource),
+        )
+        .unwrap();
+        assert!(!disabled.periodic_checks_allowed() && !disabled.checks_enabled());
+    }
+
+    #[test]
+    fn startup_drops_stale_advisories_and_unusable_staged_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("updates/staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("eidos-v0.4.9-setup.exe"), b"superseded").unwrap();
+        std::fs::write(staging.join("eidos-v0.4.9-setup.exe.part"), b"interrupted").unwrap();
+        std::fs::write(staging.join("operator-notes.txt"), b"not ours").unwrap();
+        store_json(
+            &dir.path().join("updates/state.json"),
+            &UpdateState {
+                latest_version: Some("0.0.1".into()),
+                ..UpdateState::default()
+            },
+        )
+        .unwrap();
+        let manager = UpdateManager::load_with_adapters(
+            dir.path(),
+            true,
+            Arc::new(SystemArtifactVerifier),
+            Arc::new(GithubReleaseSource),
+        )
+        .unwrap();
+        assert_eq!(manager.view().latest_version, None, "older than this build");
+        assert!(!staging.join("eidos-v0.4.9-setup.exe").exists());
+        assert!(!staging.join("eidos-v0.4.9-setup.exe.part").exists());
+        assert!(
+            staging.join("operator-notes.txt").exists(),
+            "only canonical staging names are removed"
+        );
     }
     #[test]
     fn interrupted_stage_is_durably_failed_on_restart() {
@@ -985,8 +1179,11 @@ mod tests {
     }
 
     impl ReleaseSource for FixtureSource {
-        fn check(&self, _current: &str, _max: u64) -> anyhow::Result<Option<ReleaseArtifact>> {
-            Ok(Some(self.artifact.clone()))
+        fn check(&self, _current: &str, _max: u64) -> anyhow::Result<ReleaseCheck> {
+            Ok(ReleaseCheck {
+                latest_version: Some(self.artifact.version.clone()),
+                artifact: Some(self.artifact.clone()),
+            })
         }
         fn download(
             &self,
@@ -1053,9 +1250,16 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        let superseded = dir.path().join("updates/staging/eidos-v0.4.9-setup.exe");
+        std::fs::create_dir_all(superseded.parent().unwrap()).unwrap();
+        std::fs::write(&superseded, b"an earlier staged release").unwrap();
         manager.check().unwrap();
         let state = manager.stage().unwrap();
         assert_eq!(state.stage_phase, StagePhase::Staged);
         assert!(Path::new(&state.staged.unwrap().path).is_file());
+        assert!(
+            !superseded.exists(),
+            "staging retains only the verified artifact"
+        );
     }
 }

@@ -17,7 +17,7 @@ const settings = {
 } as UpdateSettings
 const state = {
   checks_enabled: true, current_version: '0.5.0', checked_at: null, check_error: null,
-  available: null, stage_phase: 'idle', stage_error: null, staged: null,
+  latest_version: null, available: null, stage_phase: 'idle', stage_error: null, staged: null,
 } as UpdateState
 
 function mount() {
@@ -38,4 +38,22 @@ test('Nodes presents staging as preparation and requires a discovered release', 
   await userEvent.type(screen.getByLabelText('Expected publisher certificate subject'), 'CN=Test Publisher')
   await userEvent.click(screen.getByRole('button', { name: 'Save update settings' }))
   expect(save).toHaveBeenCalledWith(expect.objectContaining({ expected_publisher: 'CN=Test Publisher' }))
+})
+
+test('Nodes explains an unreachable settings endpoint instead of hiding the form', async () => {
+  vi.spyOn(api, 'fleetStatus').mockResolvedValue(fleet)
+  vi.spyOn(api, 'updateStatus').mockResolvedValue(state)
+  vi.spyOn(api, 'updateSettings').mockRejectedValue(new Error('settings are unreadable'))
+  mount()
+  await screen.findByText(/Update settings unavailable: settings are unreadable/)
+  expect(screen.queryByLabelText('Expected publisher certificate subject')).toBeNull()
+})
+
+test('Nodes reports a newer release it cannot stage as advice, not as a candidate', async () => {
+  vi.spyOn(api, 'fleetStatus').mockResolvedValue(fleet)
+  vi.spyOn(api, 'updateSettings').mockResolvedValue(settings)
+  vi.spyOn(api, 'updateStatus').mockResolvedValue({ ...state, latest_version: '1.0.0' })
+  mount()
+  await screen.findByText(/Release 1.0.0 exists but is not a compatible upgrade for this build/)
+  expect((screen.getByRole('button', { name: 'Verify & stage' }) as HTMLButtonElement).disabled).toBe(true)
 })

@@ -293,11 +293,16 @@ async fn health(State(st): State<Arc<AppState>>) -> ApiResult<Health> {
             export_max_rows: st.export.max_rows,
             content_status: crate::content_control::content_status(&st),
             storage: st.storage(),
-            update_available: st
-                .updates
-                .view()
-                .available
-                .map(|a| format!("v{}", a.version)),
+            update_available: {
+                // A stageable candidate names itself; a newer release this
+                // build cannot stage is still worth telling the operator about.
+                let updates = st.updates.view();
+                updates
+                    .available
+                    .map(|a| a.version)
+                    .or(updates.latest_version)
+                    .map(|version| format!("v{version}"))
+            },
         })
     })
     .await
