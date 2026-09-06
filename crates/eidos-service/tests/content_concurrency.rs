@@ -34,7 +34,7 @@ fn env() -> Env {
 
 /// A source with no scanned tree; only its identity matters here.
 fn add_source(state: &AppState, name: &str) -> SourceId {
-    state
+    let source = state
         .catalog
         .add_source(&NewSource {
             host_id: state.host_id,
@@ -43,7 +43,20 @@ fn add_source(state: &AppState, name: &str) -> SourceId {
             root_path: format!("\\\\fileserver\\share\\{name}"),
             aliases: vec![],
         })
-        .unwrap()
+        .unwrap();
+    // These tests isolate source caps; the shared-device gate has its own
+    // integration suite and must not accidentally become the limiting factor.
+    state.devices.set_sources(
+        state
+            .catalog
+            .list_sources()
+            .unwrap()
+            .into_iter()
+            .map(|source| (source.id.0, source.root_path.into()))
+            .collect(),
+    );
+    state.devices.set_limit(64).unwrap();
+    source
 }
 
 /// Queue `n` content jobs for `source`. They carry no object, so a worker

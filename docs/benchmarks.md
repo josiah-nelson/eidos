@@ -4,6 +4,35 @@ Measured results on the reference corpus and bounded synthetic fixtures. Numbers
 git-ignored `bench-results/*.jsonl` records produced by the commands in
 [development.md](development.md). Dates are absolute; existing corpora stay read-only.
 
+## Device-admission smoke (2026-09-06 UTC, development build)
+
+`scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15 -DeviceReaders 2`,
+Windows build 26100, two content workers/two requested enumeration threads.
+Required-web development binary SHA-256:
+`5CBB09456C175C53A3460AFB99D43FCD1718005D5381D04355214B29E94EB5AB`.
+Raw record: `bench-results/device-admission-2026-09-06-01.json` (private).
+
+The 256-file / 1,084,562-byte fixture drained in 6.700 seconds; 25 HTTP queries
+had p95 15.8 ms and maximum 17.6 ms. The observed combined device reservations
+peaked at two, never above the saved ceiling; a resolved Windows backing device
+was observed. Both the device-limit write and populated diagnostics CLI passed.
+An earlier smoke caught double-quoted numeric map keys; the shared JSON
+formatter now has an exact-integer map regression and the device API test
+exercises populated source membership.
+
+The 15.102-second unpolled idle used 0.15625 CPU seconds (1.035% of one core),
+4,804,608 process read bytes and 509,784 write bytes. This remains unexplained
+idle I/O, not a quiet-idle qualification. After idle, resident memory was
+52,871,168 bytes, peak resident 138,215,424 bytes and private commit 60,432,384
+bytes. Catalog writer maximum wait/hold at drain was 18.94/18.56 ms.
+
+Only one temporary root was crawled. Separate integration tests cover shared
+roots, multi-disk accounting, topology changes and an eight-thread scan using
+only one remaining reader unit. Neither that nor this smoke establishes
+physical-media independence, multi-root throughput, measured presets or an
+installed candidate. The host was not isolated; native feeds remained active.
+Process I/O is not physical-disk I/O. See [device scope](device-budgets.md).
+
 ## Memory diagnostics smoke (2026-09-06 UTC, development build)
 
 `scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15`, Windows build 26100,

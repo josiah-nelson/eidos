@@ -352,7 +352,7 @@ pub fn reserve_and_claim(
     state: &AppState,
     worker: &str,
     limit: u32,
-) -> eidos_catalog::Result<Option<(SourceReservation, Vec<JobRecord>)>> {
+) -> eidos_catalog::Result<Option<(ContentReservation, Vec<JobRecord>)>> {
     let _admission = state.content_pause.admission_guard();
     if !claiming_allowed(state) {
         return Ok(None);
@@ -372,13 +372,33 @@ pub fn reserve_and_claim(
         .collect();
     let budgets = state.content_workers.budgets.clone();
     let mut admit = |source: SourceId| {
-        (!active_scans.contains(&source))
-            .then(|| budgets.try_reserve(source))
-            .flatten()
+        if active_scans.contains(&source) {
+            return None;
+        }
+        let source_reservation = budgets.try_reserve(source)?;
+        let device = state
+            .devices
+            .try_reserve(source.0, crate::device_budget::WorkKind::Content, 1)
+            .ok()?;
+        Some(ContentReservation {
+            _source: source_reservation,
+            _device: device,
+        })
     };
     state
         .catalog
         .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)
+}
+
+pub struct ContentReservation {
+    _source: SourceReservation,
+    _device: crate::device_budget::DeviceLease,
+}
+
+impl ContentReservation {
+    pub fn source(&self) -> SourceId {
+        self._source.source()
+    }
 }
 
 fn worker_loop(state: &AppState, index: usize, name: &str) {
@@ -661,6 +681,7 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
     let status = &state.content_workers;
     let by_source = state.catalog.jobs_by_source(JobStage::ContentText)?;
     let mut total = 0;
+    let mut device_work = false;
     for s in refresh_budgets(state)? {
         if !s.content_enabled
             || s.published_generation.is_none()
@@ -670,6 +691,7 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
             continue;
         }
         let queued = by_source.get(&s.id).map(|q| q.0).unwrap_or(0);
+        device_work |= by_source.get(&s.id).is_some_and(|q| q.0 > 0 || q.1 > 0);
         if queued >= QUEUE_LOW_WATER {
             continue;
         }
@@ -680,6 +702,9 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
         total += n;
     }
     status.enqueued.fetch_add(total, Ordering::Relaxed);
+    if device_work || total > 0 {
+        state.devices.refresh();
+    }
     Ok(total)
 }
 
@@ -694,6 +719,13 @@ pub fn refresh_budgets(state: &AppState) -> anyhow::Result<Vec<eidos_catalog::So
         .map(|s| (s.id, s.content_concurrency))
         .collect();
     state.content_workers.budgets.set_all(&budgets);
+    state.devices.set_sources(
+        sources
+            .iter()
+            .filter(|source| !source.kind.is_remote() && source.state != SourceState::Retired)
+            .map(|source| (source.id.0, std::path::PathBuf::from(&source.root_path)))
+            .collect(),
+    );
     Ok(sources)
 }
 

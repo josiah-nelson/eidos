@@ -10,7 +10,8 @@ error instead of silently restoring more aggressive defaults.
 Defaults are the launch-time `--scan-threads` value (bounded to 1–64), one
 concurrent scan, and a 1,024 MiB free-space reserve. These are explicit
 admission ceilings, **not measured optimal performance profiles**. New scans
-use the saved width. Active enumeration keeps its starting width; lowering
+request the saved width; shared-device availability can grant fewer threads.
+Active enumeration keeps its granted starting width; lowering
 concurrency admits nothing further until reservations drain. Queued scans
 show their waiting reason and can be cancelled without opening a generation.
 The running service reserves before native capability/cursor probes and holds
@@ -23,10 +24,11 @@ and publishes normally; it no longer drains a sixteen-file preclaimed batch.
 A large file or a stalled filesystem read can still take time. This is not
 mid-file cancellation or a hard I/O deadline. Pause remains durable.
 
-Source caps are per source, **not per physical disk**. Overlapping roots,
-partitions and shares may share underlying hardware without sharing a cap.
-Shared-device admission and measured normal/background/initial-index profiles
-remain recovery work; raising the pool is not a substitute for those controls.
+Source caps are per source, **not per physical disk**. The additional
+[shared-device reader ceiling](device-budgets.md) combines scan/content readers
+across roots on known backing OS disks, with a conservative shared fallback for
+unknown topology. Raising the pool does not bypass it. Measured
+normal/background/initial-index profiles remain recovery work.
 
 ## Disk pressure and publication faults
 

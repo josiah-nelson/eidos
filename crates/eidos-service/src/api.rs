@@ -60,6 +60,7 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
         .merge(crate::content_control::routes())
         .merge(crate::resource_control::routes())
         .merge(crate::memory::routes())
+        .merge(crate::device_api::routes())
         .merge(crate::exclusions_api::routes())
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())
@@ -517,6 +518,11 @@ fn create_source_with_scan(
             .err()
             .map(|error| format!("Source created, but volume metadata could not be saved: {error}"))
     });
+    // Cache membership even when the operator deliberately creates without
+    // scanning. No topology OS probe is performed by this refresh.
+    if let Err(error) = crate::content_workers::refresh_budgets(st) {
+        tracing::warn!(source = id.0, %error, "source admission cache refresh failed");
+    }
     let scan_error = if body.scan {
         scan(st, id).err().map(|error| error.to_string())
     } else {

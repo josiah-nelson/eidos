@@ -449,10 +449,17 @@ pub(crate) fn enumerate_admitted(
     Ok(session)
 }
 
+pub(crate) struct AdmittedScan {
+    _scan: crate::resource_control::ScanReservation,
+    _device: crate::device_budget::DeviceLease,
+    pub threads: usize,
+}
+
 pub(crate) fn wait_for_capacity(
     state: &AppState,
     progress: &ScanProgress,
-) -> anyhow::Result<crate::resource_control::ScanReservation> {
+) -> anyhow::Result<AdmittedScan> {
+    crate::content_workers::refresh_budgets(state)?;
     loop {
         anyhow::ensure!(
             !progress.cancel.load(Ordering::Relaxed) && !state.shutdown.load(Ordering::Relaxed),
@@ -467,12 +474,36 @@ pub(crate) fn wait_for_capacity(
         }
         match state.resources.try_scan() {
             Ok(reservation) => {
+                state.devices.refresh();
+                let device = match state.devices.try_reserve(
+                    progress.source_id.0,
+                    crate::device_budget::WorkKind::Scan,
+                    reservation.threads as u32,
+                ) {
+                    Ok(device) => device,
+                    Err(reason) => {
+                        progress.set_phase(match reason {
+                            crate::device_budget::WaitReason::TopologyDraining => "waiting for old device reservations to drain after topology changed",
+                            crate::device_budget::WaitReason::DeviceAtCapacity => "waiting for shared-device reader capacity",
+                            crate::device_budget::WaitReason::UnknownSource => "waiting for local-source topology registration",
+                            crate::device_budget::WaitReason::InvalidWidth => "invalid device reader request",
+                        });
+                        drop(reservation);
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                };
                 // Only now does this scan start touching the source. Content
                 // workers idle a source for an *admitted* scan; queue time
                 // must not stop its extraction for the leading scan's whole
                 // duration.
+                let _admission = state.content_pause.admission_guard();
                 progress.admit();
-                return Ok(reservation);
+                return Ok(AdmittedScan {
+                    threads: device.units() as usize,
+                    _scan: reservation,
+                    _device: device,
+                });
             }
             Err(reason) => progress.set_phase(&reason),
         }

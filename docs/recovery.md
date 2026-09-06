@@ -62,9 +62,14 @@ data/index/log boundaries. Focused tests cover old-content removal, preserved
 metadata, native changes, unavailable sources and restart after a failed cleanup
 acknowledgement. The full Windows local integration gate passed: format,
 clippy, generated API, Rust tests/docs, 43 web utility tests, 21 rendered UI
-tests and the production web build. Cross-platform CI/review for this policy
-change remains pending. Final focused checks also passed: 22 service tests
-(including ten policy regressions), 20 catalog unit tests and all-target clippy.
+tests and the production web build. PR #125 is now merged with cross-platform
+CI passing. Review fixes avoid file-rename whole-source passes, avoid needless
+index cleanup commits, preserve policy-pass progress during directory moves,
+and keep independent coverage warnings visible. Its final full Rust suite,
+14 policy regressions, 20 catalog unit tests, clippy and 24 rendered web tests
+passed. Sustained directory moves can still request successive catalog policy
+passes and hold that source's content admission; subtree-scoped application
+remains a recovery follow-up before qualification under that workload.
 See
 [exclusion controls](exclusions.md) for semantics and path-alias limitations.
 
@@ -79,10 +84,22 @@ development binary passed a 256-file synthetic crawl, CLI round trip and
 Cross-platform review remains pending. This does not introduce a hard memory
 limit or measured presets.
 
-Chunk B is **not complete**. Shared-device admission,
-measured profiles and real-workload qualification also remain.
-The current source cap is not a physical-device cap, and disk admission is
-not a hard quota. Signed pushed updates remain chunk C.
+Shared-device reader admission is implemented with Windows backing-disk
+discovery, an explicit unknown-topology fallback, combined scan/content
+reservations, durable limits and Activity/API/CLI controls. The full Windows
+local gate passed, including 43 web utility and 32 rendered UI tests. Follow-up
+service unit tests (67 passed), 20 integration/export regressions, all-target
+service/CLI clippy and the device page tests/build/lint passed after the smoke
+caught a populated-map JSON serialization bug. A rebuilt required-web CLI
+passed the 256-file device-limit/diagnostics smoke, but its short idle window
+still recorded process I/O requiring investigation. Cross-platform review is
+pending; see [scope and fallback semantics](device-budgets.md) and the
+[measured limits](benchmarks.md).
+
+Chunk B is **not complete**. Device qualification, measured profiles,
+sustained-directory-move behavior and real-workload qualification remain.
+OS-device admission is not a physical-media guarantee or hard I/O quota.
+Signed pushed updates remain chunk C.
 
 ## What must pass before rollout
 

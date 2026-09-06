@@ -19,6 +19,12 @@ pub struct ResourceArgs {
     /// Show process memory and configured cache/index budgets instead of limits.
     #[arg(long, conflicts_with_all = ["scan_threads", "concurrent_scans", "minimum_free_mib"])]
     memory: bool,
+    /// Show shared-device reader limits, membership, reservations and probe errors.
+    #[arg(long, conflicts_with_all = ["memory", "scan_threads", "concurrent_scans", "minimum_free_mib"])]
+    devices: bool,
+    /// Save readers per backing device (1..64). Separate from source/pool limits.
+    #[arg(long, conflicts_with_all = ["memory", "scan_threads", "concurrent_scans", "minimum_free_mib"], value_parser = clap::value_parser!(u32).range(1..=64))]
+    device_readers: Option<u32>,
     #[arg(long)]
     json: bool,
 }
@@ -32,9 +38,19 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
     let url = format!(
         "{}/api/{}",
         args.url.trim_end_matches('/'),
-        if args.memory { "memory" } else { "resources" }
+        if args.memory {
+            "memory"
+        } else if args.devices || args.device_readers.is_some() {
+            "devices"
+        } else {
+            "resources"
+        }
     );
-    let mut response = if let (Some(scan_threads), Some(concurrent_scans), Some(minimum_free_mib)) = (
+    let mut response = if let Some(readers_per_device) = args.device_readers {
+        agent
+            .post(&url)
+            .send_json(serde_json::json!({ "readers_per_device": readers_per_device }))?
+    } else if let (Some(scan_threads), Some(concurrent_scans), Some(minimum_free_mib)) = (
         args.scan_threads,
         args.concurrent_scans,
         args.minimum_free_mib,
@@ -62,6 +78,47 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
     let body = body.context("read resource limits")?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&body)?);
+    } else if args.devices || args.device_readers.is_some() {
+        println!(
+            "reader limit per device: {}  shared unknown fallback: {}  topology draining: {}",
+            body["budget"]["readers_per_device"],
+            body["budget"]["unresolved_shared_fallback"],
+            body["budget"]["topology_draining"]
+        );
+        println!(
+            "topology sample age (s): {}  stale: {}",
+            body["sample_age_s"].as_str().unwrap_or("unavailable"),
+            body["stale"]
+        );
+        if let Some(devices) = body["budget"]["devices"].as_array() {
+            for device in devices {
+                println!(
+                    "{}: content readers {}  scan threads {}  peak {}  sources {}",
+                    device["key"].as_str().unwrap_or("unknown"),
+                    device["content_readers"],
+                    device["scan_threads"],
+                    device["peak_readers"],
+                    device["sources"]
+                );
+            }
+        }
+        if let Some(errors) = body["source_errors"].as_object() {
+            for (source, error) in errors {
+                println!(
+                    "source {source}: {}",
+                    error.as_str().unwrap_or("topology unavailable")
+                );
+            }
+        }
+        if let Some(roots) = body["source_roots"].as_object() {
+            for (source, root) in roots {
+                println!(
+                    "source {source}: {}",
+                    root.as_str().unwrap_or("unknown root")
+                );
+            }
+        }
+        println!("Covers scan enumerators and content readers, not writers, native feeds, query I/O or the single background topology probe. OS disks may hide shared RAID/virtual storage.");
     } else if args.memory {
         let value = |v: &serde_json::Value| v.as_str().unwrap_or("unavailable").to_owned();
         println!(

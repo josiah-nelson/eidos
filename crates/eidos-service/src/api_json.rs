@@ -14,7 +14,9 @@ use std::io::{self, Write};
 pub struct ApiJson<T>(pub T);
 
 #[derive(Default)]
-struct StringifyLargeIntegers;
+struct StringifyLargeIntegers {
+    in_string: bool,
+}
 
 fn write_decimal_string<W: ?Sized + Write, T: std::fmt::Display>(
     writer: &mut W,
@@ -24,12 +26,32 @@ fn write_decimal_string<W: ?Sized + Write, T: std::fmt::Display>(
 }
 
 impl Formatter for StringifyLargeIntegers {
+    fn begin_string<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.in_string = true;
+        writer.write_all(b"\"")
+    }
+
+    fn end_string<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.in_string = false;
+        writer.write_all(b"\"")
+    }
+
     fn write_i64<W: ?Sized + Write>(&mut self, writer: &mut W, value: i64) -> io::Result<()> {
-        write_decimal_string(writer, value)
+        // serde_json already surrounds numeric object keys with begin/end_string.
+        // Adding another pair of quotes produces invalid JSON for populated maps.
+        if self.in_string {
+            write!(writer, "{value}")
+        } else {
+            write_decimal_string(writer, value)
+        }
     }
 
     fn write_u64<W: ?Sized + Write>(&mut self, writer: &mut W, value: u64) -> io::Result<()> {
-        write_decimal_string(writer, value)
+        if self.in_string {
+            write!(writer, "{value}")
+        } else {
+            write_decimal_string(writer, value)
+        }
     }
 }
 
@@ -37,7 +59,8 @@ impl Formatter for StringifyLargeIntegers {
 /// responses use this too, so they cannot quietly diverge from `ApiJson`.
 pub(crate) fn to_vec<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, StringifyLargeIntegers);
+    let mut serializer =
+        serde_json::Serializer::with_formatter(&mut bytes, StringifyLargeIntegers::default());
     value.serialize(&mut serializer)?;
     Ok(bytes)
 }
@@ -60,6 +83,33 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use serde_json::json;
+
+    #[test]
+    fn numeric_map_keys_are_quoted_once_and_values_remain_exact() {
+        use std::collections::BTreeMap;
+        #[derive(Serialize)]
+        struct Shape {
+            signed: BTreeMap<i64, u64>,
+            unsigned: BTreeMap<u64, i64>,
+            strings: BTreeMap<String, u64>,
+            trailing: i64,
+        }
+        let bytes = to_vec(&Shape {
+            signed: BTreeMap::from([(i64::MIN, u64::MAX)]),
+            unsigned: BTreeMap::from([(u64::MAX, i64::MIN)]),
+            strings: BTreeMap::from([("quoted\"key".into(), u64::MAX)]),
+            trailing: 9_007_199_254_740_993,
+        })
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["signed"][i64::MIN.to_string()], u64::MAX.to_string());
+        assert_eq!(
+            parsed["unsigned"][u64::MAX.to_string()],
+            i64::MIN.to_string()
+        );
+        assert_eq!(parsed["strings"]["quoted\"key"], u64::MAX.to_string());
+        assert_eq!(parsed["trailing"], "9007199254740993");
+    }
 
     #[tokio::test]
     async fn stringifies_only_large_rust_integer_types() {

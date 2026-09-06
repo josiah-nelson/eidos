@@ -4,7 +4,8 @@
 param(
     [string]$Binary = (Join-Path $PSScriptRoot "../target/debug/eidos.exe"),
     [ValidateRange(32, 4096)][int]$Files = 1024,
-    [ValidateRange(5, 30)][int]$IdleSeconds = 15
+    [ValidateRange(5, 30)][int]$IdleSeconds = 15,
+    [ValidateRange(1, 64)][int]$DeviceReaders = 2
 )
 $ErrorActionPreference = 'Stop'
 if (-not $IsWindows) { throw 'This measurement script uses Windows process I/O counters.' }
@@ -70,6 +71,10 @@ try {
     $saved = & $candidatePath resources --url $baseUrl --scan-threads 2 --concurrent-scans 1 --minimum-free-mib 1024 --json
     if ($LASTEXITCODE -ne 0) { throw 'Resource CLI round trip failed.' }
     if (($saved | ConvertFrom-Json).limits.scan_threads -ne 2) { throw 'Resource limits were not saved.' }
+    $deviceSaved = & $candidatePath resources --url $baseUrl --device-readers $DeviceReaders --json
+    if ($LASTEXITCODE -ne 0 -or ($deviceSaved | ConvertFrom-Json).budget.readers_per_device -ne $DeviceReaders) {
+        throw 'Device-limit CLI round trip failed.'
+    }
     # Warm the on-demand sampler; this reads only the candidate's own process.
     $null = Invoke-RestMethod "$baseUrl/api/memory" -TimeoutSec 5
     $before = Counters
@@ -78,11 +83,24 @@ try {
         @{ name = 'recovery-fixture'; root_path = $sourceDir; scan = $true } | ConvertTo-Json)
     if ($added.scan_error) { throw $added.scan_error }
     $latencies = [Collections.Generic.List[double]]::new()
+    $deviceSamples = 0
+    $maxDeviceReaders = 0
+    $sawResolvedDevice = $false
     do {
         if ($clock.Elapsed.TotalSeconds -gt 180) { throw 'Synthetic content crawl did not drain in 180 seconds.' }
         $queryClock = [Diagnostics.Stopwatch]::StartNew()
         $null = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10" -TimeoutSec 15
         $latencies.Add($queryClock.Elapsed.TotalMilliseconds)
+        $devices = Invoke-RestMethod "$baseUrl/api/devices" -TimeoutSec 5
+        $deviceSamples++
+        $sawResolvedDevice = $sawResolvedDevice -or (-not $devices.budget.unresolved_shared_fallback -and $devices.budget.devices.Count -gt 0)
+        foreach ($device in $devices.budget.devices) {
+            $readers = [int]$device.content_readers + [int]$device.scan_threads
+            $maxDeviceReaders = [Math]::Max($maxDeviceReaders, [Math]::Max($readers, [int]$device.peak_readers))
+            if ($readers -gt $DeviceReaders -or [int]$device.peak_readers -gt $DeviceReaders) {
+                throw 'Observed device reader reservations exceeded the saved ceiling.'
+            }
+        }
         $source = Invoke-RestMethod "$baseUrl/api/sources/$($added.source.id)" -TimeoutSec 10
         if ($source.source.state -ne 'complete') { Start-Sleep -Milliseconds 250 }
     } while ($source.source.state -ne 'complete')
@@ -117,6 +135,9 @@ try {
     if (-not $memory.process -or $memory.stale -or [long]$memory.sample_age_s -gt 1 -or $memory.process.pid -ne $candidate.Id -or [long]$memory.process.resident_bytes -le 0) {
         throw 'Memory API did not report a fresh sample of the temporary candidate.'
     }
+    $deviceJson = & $candidatePath resources --url $baseUrl --devices --json
+    if ($LASTEXITCODE -ne 0) { throw 'Device diagnostics CLI failed.' }
+    $devicesAfterIdle = $deviceJson | ConvertFrom-Json
     $sorted = @($latencies | Sort-Object)
     $report = [ordered]@{
         measured_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -134,6 +155,11 @@ try {
         catalog_writer_after_idle = $idleActivity.catalog_writer
         storage_after_idle = $idleActivity.storage
         memory_after_idle = $memory
+        device_reader_limit = $DeviceReaders
+        device_status_samples_during_crawl = $deviceSamples
+        max_observed_device_reservations = $maxDeviceReaders
+        resolved_device_observed = $sawResolvedDevice
+        devices_after_idle = $devicesAfterIdle
         files_indexed = $activity.workers.files_indexed
     }
     $json = $report | ConvertTo-Json -Depth 8
