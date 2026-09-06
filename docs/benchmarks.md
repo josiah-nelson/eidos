@@ -110,6 +110,10 @@ comparison is evidence for removing that path, not a measured profile. There
 are fewer than 100 crawl queries per run, no useful p99 qualification, and no
 physical-disk or installed-upgrade claim. Repeated profile comparisons remain
 required; the previously chosen acceptance thresholds have not been relaxed.
+The after binary also predates the review changes to the wakeup path (one-worker
+hints and the separate surplus wait set). The idle rows are unaffected, because
+an idle queue emits no readiness hint in either binary; the scan and query rows
+were not re-measured.
 
 ## Device-admission smoke (2026-09-06 UTC, development build)
 

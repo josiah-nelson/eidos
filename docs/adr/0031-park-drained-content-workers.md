@@ -76,6 +76,13 @@ queue produces no readiness hints at all, so that path is identical in both
 binaries. The scan and query rows were measured before that change and were
 not re-measured for it.
 
+New-work responsiveness now depends on the coordinator thread. While it is
+inside a long commit or publication the pool gets no readiness hints, so a
+worker that has drained waits for the next hint or, at worst, the 30-second
+fallback; before this change each worker polled independently of it. A
+coordinator that far behind is already not publishing, so this trades latency
+in a state that is degraded either way for the idle cost measured above.
+
 This does not imply zero CPU, zero I/O, a hard resource quota or a qualified
 performance preset. The coordinator, real source changes and maintenance still
 perform work. Installed and real-media qualification remain required.
