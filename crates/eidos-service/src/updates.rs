@@ -214,35 +214,83 @@ impl ArtifactVerifier for SystemArtifactVerifier {
         product: &str,
     ) -> anyhow::Result<VerifiedIdentity> {
         // Use Windows' Authenticode policy provider and version-resource reader
-        // through the inbox PowerShell host. The program and script are fixed;
-        // the downloaded path is passed as a separate argument.
+        // through the inbox PowerShell host. The script is UTF-16/base64 encoded
+        // and the path is carried only in this child's environment, so neither
+        // PowerShell's native `-Command` concatenation nor path punctuation can
+        // turn the path into script text.
+        use base64::Engine;
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const OUTPUT_LIMIT: usize = 64 * 1024;
+        const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
         let system_root = std::env::var_os("SystemRoot")
             .ok_or_else(|| anyhow::anyhow!("SystemRoot is unavailable"))?;
-        let powershell =
-            PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        let script = "$s=Get-AuthenticodeSignature -LiteralPath $args[0];$v=[Diagnostics.FileVersionInfo]::GetVersionInfo($args[0]);[pscustomobject]@{status=[string]$s.Status;publisher=if($s.SignerCertificate){$s.SignerCertificate.Subject}else{''};product=$v.ProductName;version=$v.ProductVersion}|ConvertTo-Json -Compress";
-        let output = std::process::Command::new(powershell)
+        let powershell_root = PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0");
+        let powershell = powershell_root.join("powershell.exe");
+        let module_path = powershell_root.join("Modules");
+        let script = "$ErrorActionPreference='Stop';$p=[Environment]::GetEnvironmentVariable('EIDOS_UPDATE_VERIFY_PATH','Process');if([string]::IsNullOrWhiteSpace($p)){throw 'verification path is unavailable'};$s=Get-AuthenticodeSignature -LiteralPath $p;$v=[Diagnostics.FileVersionInfo]::GetVersionInfo($p);[pscustomobject]@{status=[string]$s.Status;publisher=if($s.SignerCertificate){$s.SignerCertificate.Subject}else{''};product=$v.ProductName;version=$v.ProductVersion}|ConvertTo-Json -Compress";
+        let utf16 = script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+        let mut child = std::process::Command::new(powershell)
             .args([
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
-                "-Command",
-                script,
+                "-EncodedCommand",
+                &encoded,
             ])
-            .arg(path)
-            .output()?;
+            .env("EIDOS_UPDATE_VERIFY_PATH", path)
+            // Do not inherit a PowerShell 7 module path into Windows
+            // PowerShell; load only its inbox modules for this fixed check.
+            .env("PSModulePath", module_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()?;
+        let stdout = bounded_pipe_reader(child.stdout.take().unwrap(), OUTPUT_LIMIT);
+        let stderr = bounded_pipe_reader(child.stderr.take().unwrap(), OUTPUT_LIMIT);
+        let deadline = std::time::Instant::now() + VERIFY_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout.join();
+                let _ = stderr.join();
+                anyhow::bail!("Windows signature inspection timed out");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let (output, stdout_overflow) = stdout
+            .join()
+            .map_err(|_| anyhow::anyhow!("signature output reader failed"))??;
+        let (error, stderr_overflow) = stderr
+            .join()
+            .map_err(|_| anyhow::anyhow!("signature error reader failed"))??;
         anyhow::ensure!(
-            output.status.success(),
-            "Windows signature inspection failed"
+            !stdout_overflow && !stderr_overflow,
+            "Windows signature inspection output exceeded its bound"
+        );
+        anyhow::ensure!(
+            status.success(),
+            "Windows signature inspection failed: {}",
+            String::from_utf8_lossy(&error).trim()
         );
         #[derive(Deserialize)]
         struct Identity {
             status: String,
             publisher: String,
-            product: String,
-            version: String,
+            product: Option<String>,
+            version: Option<String>,
         }
-        let got: Identity = serde_json::from_slice(&output.stdout)
+        let got: Identity = serde_json::from_slice(&output)
             .map_err(|e| anyhow::anyhow!("invalid Windows signature response: {e}"))?;
         anyhow::ensure!(
             got.status == "Valid",
@@ -255,20 +303,46 @@ impl ArtifactVerifier for SystemArtifactVerifier {
             got.publisher
         );
         anyhow::ensure!(
-            got.product == product,
+            got.product.as_deref() == Some(product),
             "product mismatch: expected {product}, got {}",
-            got.product
+            got.product.as_deref().unwrap_or("<missing>")
         );
         anyhow::ensure!(
-            normalize_version(&got.version).as_deref() == Some(version),
-            "version mismatch: expected {version}, got {}",
             got.version
+                .as_deref()
+                .and_then(normalize_version)
+                .as_deref()
+                == Some(version),
+            "version mismatch: expected {version}, got {}",
+            got.version.as_deref().unwrap_or("<missing>")
         );
         Ok(VerifiedIdentity {
             publisher: got.publisher,
-            product: got.product,
+            product: got.product.unwrap(),
         })
     }
+}
+
+#[cfg(windows)]
+fn bounded_pipe_reader(
+    mut pipe: impl Read + Send + 'static,
+    limit: usize,
+) -> std::thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>> {
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut overflow = false;
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = pipe.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let available = limit.saturating_sub(kept.len());
+            kept.extend_from_slice(&buffer[..count.min(available)]);
+            overflow |= count > available;
+        }
+        Ok((kept, overflow))
+    })
 }
 
 pub struct UpdateManager {
@@ -787,6 +861,25 @@ fn replace_file(from: &Path, to: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn inbox_verifier_handles_owned_unsigned_path_with_spaces_and_apostrophe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsigned 'fixture with spaces'.exe");
+        // The test harness is a valid PE image and local development builds
+        // are unsigned. Copying it also avoids asking Windows to interpret a
+        // malformed text file as a signature-bearing executable.
+        std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+        let error = SystemArtifactVerifier
+            .verify(&path, "0.5.1", "CN=Nobody", "Eidos")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Authenticode trust failed: NotSigned"),
+            "path transport must reach the unsigned-file trust result: {error}"
+        );
+    }
 
     #[test]
     fn release_response_body_is_bounded_by_the_global_deadline() {
