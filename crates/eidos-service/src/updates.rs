@@ -563,24 +563,36 @@ impl UpdateManager {
                 &settings.expected_product,
             )?;
             replace_file(&partial, &final_path)?;
-            prune_staging(&dir, Some(&artifact.name));
-            let mut state = self.state.lock();
-            state.stage_phase = StagePhase::Staged;
-            state.stage_error = None;
-            state.staged = Some(StagedArtifact {
-                version: artifact.version,
-                path: final_path.display().to_string(),
-                size: artifact.size,
-                sha256: artifact.sha256,
-                publisher: identity.publisher,
-                product: identity.product,
-            });
-            self.store_state(&state)?;
-            Ok(state.clone())
+            let retain = artifact.name.clone();
+            let mut guard = self.state.lock();
+            let committed = UpdateState {
+                stage_phase: StagePhase::Staged,
+                stage_error: None,
+                staged: Some(StagedArtifact {
+                    version: artifact.version,
+                    path: final_path.display().to_string(),
+                    size: artifact.size,
+                    sha256: artifact.sha256,
+                    publisher: identity.publisher,
+                    product: identity.product,
+                }),
+                ..guard.clone()
+            };
+            // Record the new artifact before removing the one it replaces. If
+            // this write fails, durable state still names an artifact that is
+            // still on disk, instead of naming neither.
+            self.store_state(&committed)?;
+            *guard = committed.clone();
+            drop(guard);
+            prune_staging(&dir, Some(&retain));
+            Ok(committed)
         })();
         if let Err(error) = &result {
             let _ = std::fs::remove_file(&partial);
-            self.set_phase(StagePhase::Failed, Some(format!("{error:#}")))?;
+            // Failing to record the failure must not replace the reason for it.
+            if let Err(store) = self.set_phase(StagePhase::Failed, Some(format!("{error:#}"))) {
+                tracing::warn!(error = %store, "could not record the staging failure");
+            }
         }
         result
     }
@@ -1219,6 +1231,93 @@ mod tests {
                 product: product.into(),
             })
         }
+    }
+
+    fn hex_digest(bytes: &[u8]) -> String {
+        ring::digest::digest(&SHA256, bytes)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Verifies successfully, but first makes the durable state file
+    /// unwritable, so the commit that follows verification fails.
+    struct SabotageCommitVerifier {
+        state_path: PathBuf,
+    }
+
+    impl ArtifactVerifier for SabotageCommitVerifier {
+        fn verify(
+            &self,
+            _path: &Path,
+            _version: &str,
+            publisher: &str,
+            product: &str,
+        ) -> anyhow::Result<VerifiedIdentity> {
+            let _ = std::fs::remove_file(&self.state_path);
+            std::fs::create_dir_all(&self.state_path)?;
+            Ok(VerifiedIdentity {
+                publisher: publisher.into(),
+                product: product.into(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_failed_commit_keeps_the_artifact_durable_state_still_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("updates/staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let retained = staging.join("eidos-v0.5.2-setup.exe");
+        let retained_bytes = b"an already verified newer setup".to_vec();
+        std::fs::write(&retained, &retained_bytes).unwrap();
+        store_json(
+            &dir.path().join("updates/state.json"),
+            &UpdateState {
+                stage_phase: StagePhase::Staged,
+                staged: Some(StagedArtifact {
+                    version: "0.5.2".into(),
+                    path: retained.display().to_string(),
+                    size: retained_bytes.len() as u64,
+                    sha256: hex_digest(&retained_bytes),
+                    publisher: "CN=Test Publisher".into(),
+                    product: "Eidos".into(),
+                }),
+                ..UpdateState::default()
+            },
+        )
+        .unwrap();
+        let bytes = b"a replacement setup fixture".to_vec();
+        let artifact = ReleaseArtifact {
+            version: "0.5.1".into(),
+            name: "eidos-v0.5.1-setup.exe".into(),
+            download_url: format!("{RELEASE_DOWNLOAD_PREFIX}v0.5.1/eidos-v0.5.1-setup.exe"),
+            size: bytes.len() as u64,
+            sha256: hex_digest(&bytes),
+        };
+        let manager = UpdateManager::load_with_adapters(
+            dir.path(),
+            true,
+            Arc::new(SabotageCommitVerifier {
+                state_path: dir.path().join("updates/state.json"),
+            }),
+            Arc::new(FixtureSource { artifact, bytes }),
+        )
+        .unwrap();
+        assert!(retained.exists(), "startup keeps what state still names");
+        manager
+            .save_settings(UpdateSettings {
+                expected_publisher: Some("CN=Test Publisher".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        manager.check().unwrap();
+        assert!(manager.stage().is_err(), "the durable commit must fail");
+        assert!(
+            retained.exists(),
+            "a failed commit must not leave durable state naming an artifact it already deleted"
+        );
     }
 
     #[test]
