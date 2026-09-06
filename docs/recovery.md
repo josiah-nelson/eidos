@@ -84,8 +84,8 @@ tests, 29 rendered UI tests and the production web build. The required-web
 development binary passed a 256-file synthetic crawl, single-call CLI round
 trip and 15-second unpolled idle observation; see
 [the recorded smoke limits](benchmarks.md).
-Cross-platform review remains pending. This does not introduce a hard memory
-limit or measured presets.
+PR #126 is merged with cross-platform CI passing. This does not introduce a
+hard memory limit or measured presets.
 
 Shared-device reader admission is implemented with Windows backing-disk
 discovery, an explicit unknown-topology fallback, combined scan/content
@@ -100,7 +100,7 @@ serialization bug, now covered by an exact-integer map regression. A rebuilt
 required-web CLI passed the 256-file device-limit/diagnostics smoke, observing a
 resolved backing disk and reservations that never exceeded the saved ceiling,
 but its short idle window still recorded process I/O requiring investigation.
-Cross-platform review is pending; see
+PR #127 is merged with cross-platform CI passing; see
 [scope and fallback semantics](device-budgets.md) and the
 [measured limits](benchmarks.md).
 
@@ -117,7 +117,8 @@ immediate and restart-safe. Ten new USN/cursor/catalog-fault tests pass, as do
 the actual native change/restart/overflow tests and full Windows local gate.
 A rebuilt two-root candidate's 30-second idle recorded 368,640 process read
 bytes and 8,240 write bytes; see the [before/after evidence](benchmarks.md) and
-[ADR-0030](adr/0030-bound-irrelevant-journal-checkpoints.md). Review remains pending.
+[ADR-0030](adr/0030-bound-irrelevant-journal-checkpoints.md). PR #128 is merged
+with cross-platform CI passing.
 Do not choose performance presets or waive quiet-idle acceptance from the
 reader-cap smoke alone.
 
@@ -130,8 +131,25 @@ executable comparison reduced 15-second idle writer acquisitions from 126 to 6
 and CPU from 1.243% to 0.414% of one core. Saved controls, retained results and
 temporary restart/resume passed. This is not profile or deployment qualification;
 see [ADR-0031](adr/0031-park-drained-content-workers.md) and [evidence](benchmarks.md).
-The full Windows local gate passed, including 43 web utility and 32 rendered
-UI tests. Cross-platform review and repeated profile comparisons remain pending.
+PR #129 is merged with cross-platform CI passing. Review fixes bound admission
+refusals to one worker per readiness hint and keep surplus workers on a separate
+wait set. The full Windows gate on its final head passed, including 680 Rust
+tests, 45 web utility and 33 rendered UI tests. Earlier executable measurements
+predate those review fixes; repeated profile comparisons remain required.
+
+The rebuilt `7e0703f` required-web candidate subsequently passed all six runs
+of the fixed two-root resource matrix. Every run indexed and retained all 772
+content matches through restart, respected its shared-device ceiling and
+passed the query, resident-memory, writer-hold and unpolled-idle gates. Crawl
+times were 6.183–6.913 seconds; 100–133 crawl queries per run had p99 at or below
+24.54 ms. Idle used 0.207–0.621% of one core and 40,960–65,536 process read bytes,
+with zero measured writes in these short windows. Individual query samples,
+the executable snapshot and all outcomes are retained; see
+[the repeated comparison and its limits](benchmarks.md#repeated-resource-comparison-2026-09-06-utc-reviewed-development-build).
+The harness has 39 dependency-free boundary/failure tests wired into Windows
+CI and the local gate. The small workload shows no repeatable throughput
+advantage for larger pools; measured presets and deployment qualification
+remain open.
 
 ## What must pass before rollout
 

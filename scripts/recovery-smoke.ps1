@@ -25,35 +25,13 @@ $logDir = Join-Path $fixtureDir 'logs'
 New-Item -ItemType Directory -Path $dataDir, $logDir | Out-Null
 $utf8 = [Text.UTF8Encoding]::new($false)
 $payload = ("recoveryneedle synthetic indexing fixture apple maple river cloud`n" * 64)
+# Everything that can still fail runs inside the protected lifecycle below,
+# so a fixture-generation, hashing or launch failure also records failure.json
+# beside its retained fixture and names that fixture to the caller.
 $sourceBytes = 0L
-$sourceDirs = @(for ($root = 0; $root -lt $SourceCount; $root++) {
-    $sourceDir = Join-Path $fixtureDir "source-$root"
-    New-Item -ItemType Directory -Path $sourceDir | Out-Null
-    for ($i = 0; $i -lt $Files; $i++) {
-        $text = "document $i`n" + $payload
-        [IO.File]::WriteAllText((Join-Path $sourceDir "document-$i.txt"), $text, $utf8)
-        $sourceBytes += $utf8.GetByteCount($text)
-    }
-    for ($i = 0; $i -lt $LargeFilesPerSource; $i++) {
-        # ASCII, bounded at 8 MiB per file / four files per root; no real corpus.
-        $length = $LargeFileMiB * 1MB
-        $text = ($payload * [int][Math]::Ceiling($length / $payload.Length)).Substring(0, $length)
-        [IO.File]::WriteAllText((Join-Path $sourceDir "large-$i.txt"), $text, $utf8)
-        $sourceBytes += $utf8.GetByteCount($text)
-    }
-    $sourceDir
-})
-$totalFiles = $SourceCount * ($Files + $LargeFilesPerSource)
-$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
-$listener.Start()
-$port = $listener.LocalEndpoint.Port
-$listener.Stop()
-$baseUrl = "http://127.0.0.1:$port"
-$arguments = @('serve', '--bind', "127.0.0.1:$port", '--data-dir', ('"' + $dataDir + '"'),
-    '--log-dir', ('"' + $logDir + '"'), '--scan-threads', "$ScanThreads", '--content-workers', "$ContentWorkers",
-    '--no-auto-reconcile', '--no-fleet', '--no-update-check')
-$sha = (Get-FileHash -LiteralPath $candidatePath -Algorithm SHA256).Hash
-$candidate = Start-Process -FilePath $candidatePath -ArgumentList $arguments -PassThru -WindowStyle Hidden
+$totalFiles = 0
+$sha = $null
+$candidate = $null
 function Counters {
     $p = Get-CimInstance Win32_Process -Filter "ProcessId = $($candidate.Id)"
     if (-not $p) { throw 'Synthetic service exited unexpectedly.' }
@@ -92,6 +70,34 @@ function Await-CandidateHealth {
     $health
 }
 try {
+    $sourceDirs = @(for ($root = 0; $root -lt $SourceCount; $root++) {
+        $sourceDir = Join-Path $fixtureDir "source-$root"
+        New-Item -ItemType Directory -Path $sourceDir | Out-Null
+        for ($i = 0; $i -lt $Files; $i++) {
+            $text = "document $i`n" + $payload
+            [IO.File]::WriteAllText((Join-Path $sourceDir "document-$i.txt"), $text, $utf8)
+            $sourceBytes += $utf8.GetByteCount($text)
+        }
+        for ($i = 0; $i -lt $LargeFilesPerSource; $i++) {
+            # ASCII, bounded at 8 MiB per file / four files per root; no real corpus.
+            $length = $LargeFileMiB * 1MB
+            $text = ($payload * [int][Math]::Ceiling($length / $payload.Length)).Substring(0, $length)
+            [IO.File]::WriteAllText((Join-Path $sourceDir "large-$i.txt"), $text, $utf8)
+            $sourceBytes += $utf8.GetByteCount($text)
+        }
+        $sourceDir
+    })
+    $totalFiles = $SourceCount * ($Files + $LargeFilesPerSource)
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $port = $listener.LocalEndpoint.Port
+    $listener.Stop()
+    $baseUrl = "http://127.0.0.1:$port"
+    $arguments = @('serve', '--bind', "127.0.0.1:$port", '--data-dir', ('"' + $dataDir + '"'),
+        '--log-dir', ('"' + $logDir + '"'), '--scan-threads', "$ScanThreads", '--content-workers', "$ContentWorkers",
+        '--no-auto-reconcile', '--no-fleet', '--no-update-check')
+    $sha = (Get-FileHash -LiteralPath $candidatePath -Algorithm SHA256).Hash
+    $candidate = Start-Process -FilePath $candidatePath -ArgumentList $arguments -PassThru -WindowStyle Hidden
     $health = Await-CandidateHealth
     $saved = & $candidatePath resources --url $baseUrl --scan-threads $ScanThreads --concurrent-scans $ConcurrentScans --minimum-free-mib 1024 --json
     if ($LASTEXITCODE -ne 0) { throw 'Resource CLI round trip failed.' }
@@ -158,8 +164,9 @@ try {
     if ([long]$activity.jobs.queued -ne 0 -or [long]$activity.jobs.running -ne 0 -or [long]$activity.workers.pending_publish -ne 0) {
         throw 'Source reported complete before the pipeline drained.'
     }
-    $search = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10" -TimeoutSec 15
-    if ($search.hits.Count -ne 10 -or [long]$activity.workers.files_indexed -ne $totalFiles -or [long]$activity.workers.files_failed -ne 0) {
+    $search = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10&count=exact" -TimeoutSec 15
+    if ($search.hits.Count -ne 10 -or -not $search.total.exact -or [long]$search.total.value -ne $totalFiles -or
+        [long]$activity.workers.files_indexed -ne $totalFiles -or [long]$activity.workers.files_failed -ne 0) {
         throw 'The completed synthetic fixture is not searchable as expected.'
     }
     # Let trailing commits/merges settle; no API polling during idle sample.
@@ -218,13 +225,16 @@ try {
             $persistedSource = Invoke-RestMethod "$baseUrl/api/sources/$id" -TimeoutSec 5
             if ($persistedSource.source.content_concurrency -ne $SourceReaders) { throw 'Source policy did not survive restart.' }
         }
-        $retained = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10" -TimeoutSec 15
-        if ($retained.hits.Count -ne 10) { throw 'Restart lost searchable fixture content.' }
+        $retained = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10&count=exact" -TimeoutSec 15
+        if ($retained.hits.Count -ne 10 -or -not $retained.total.exact -or [long]$retained.total.value -ne $totalFiles) {
+            throw 'Restart lost searchable fixture content.'
+        }
         $resumed = Invoke-RestMethod "$baseUrl/api/content/resume" -Method Post -TimeoutSec 10
         if ($resumed.paused) { throw 'Candidate did not resume explicitly.' }
         $restart = @{ performed = $true; qualification = 'forced restart after drain; not mid-file pause or installed upgrade'
             original_pid = $originalPid; restarted_pid = $candidate.Id; pause_response_ms = $pauseMs; restart_health_ms = $restartReadyMs
-            pause_and_limits_preserved = $true; retained_search_hits = $retained.hits.Count; resumed = $true }
+            pause_and_limits_preserved = $true; retained_search_hits = $retained.hits.Count
+            retained_search_total = $retained.total; resumed = $true }
     }
     $sorted = @($latencies | Sort-Object)
     $report = [ordered]@{
@@ -232,6 +242,7 @@ try {
         qualification = 'synthetic smoke only; process I/O is not physical disk I/O'
         conditions = 'host not isolated; normal native change feed may observe other host-volume activity'
         platform = [Environment]::OSVersion.VersionString; version = $health.version; binary_sha256 = $sha
+        fixture_directory = $fixtureDir
         fixture_files = $totalFiles; fixture_bytes = $sourceBytes; source_count = $SourceCount
         small_files_per_source = $Files; large_files_per_source = $LargeFilesPerSource; large_file_mib = $LargeFileMiB
         content_workers = $ContentWorkers; scan_threads = $ScanThreads; concurrent_scans = $ConcurrentScans; source_readers = $SourceReaders
@@ -239,6 +250,7 @@ try {
         crawl = (Delta $before $after $elapsed)
         files_per_s = $totalFiles / $elapsed; source_bytes_per_s = $sourceBytes / $elapsed
         http_query_samples = $sorted.Count
+        http_query_latencies_ms = $latencies.ToArray()
         query_interval_ms = $QueryIntervalMilliseconds
         http_query_p95_ms = $sorted[[Math]::Max(0, [Math]::Ceiling($sorted.Count * 0.95) - 1)]
         http_query_p99_ms = $sorted[[Math]::Max(0, [Math]::Ceiling($sorted.Count * 0.99) - 1)]
@@ -259,19 +271,29 @@ try {
         watchers_before_idle = @($idleSourcesBefore | ForEach-Object { @{ source = $_.source.id; watcher = $_.watcher } })
         watchers_after_idle = @($idleSourcesAfter | ForEach-Object { @{ source = $_.source.id; watcher = $_.watcher } })
         files_indexed = $activity.workers.files_indexed
+        search_total = $search.total
         restart_after_idle = $restart
     }
     $json = $report | ConvertTo-Json -Depth 8
     [IO.File]::WriteAllText((Join-Path $fixtureDir 'report.json'), $json, $utf8)
     Write-Output $json
 } catch {
-    $failure = @{ measured_at_utc = [DateTime]::UtcNow.ToString('o'); status = 'failed'; error = $_.Exception.Message
-        binary_sha256 = $sha; fixture_files = $totalFiles; fixture_bytes = $sourceBytes; source_count = $SourceCount
+    $failed = $_
+    # Record the failure first: nothing below may replace the error being described.
+    $failure = @{ measured_at_utc = [DateTime]::UtcNow.ToString('o'); status = 'failed'; error = $failed.Exception.Message
+        binary_sha256 = $sha; fixture_directory = $fixtureDir
+        fixture_files = $totalFiles; fixture_bytes = $sourceBytes; source_count = $SourceCount
         content_workers = $ContentWorkers; scan_threads = $ScanThreads; concurrent_scans = $ConcurrentScans; device_readers = $DeviceReaders }
     [IO.File]::WriteAllText((Join-Path $fixtureDir 'failure.json'), ($failure | ConvertTo-Json -Depth 5), $utf8)
-    throw
+    # A caller that never received a report still learns which fixture to read.
+    try { $failed.Exception.Data['recovery_fixture_directory'] = $fixtureDir } catch { }
+    throw $failed
 } finally {
-    # Stop only the process launched above; never match eidos by executable name.
-    if (-not $candidate.HasExited) { Stop-Process -InputObject $candidate -Force }
+    # Stop only the process launched above; never match eidos by executable name,
+    # and never let cleanup hide the failure that brought us here.
+    if ($null -ne $candidate -and -not $candidate.HasExited) {
+        try { Stop-Process -InputObject $candidate -Force }
+        catch { Write-Warning "Candidate $($candidate.Id) could not be stopped: $($_.Exception.Message)" }
+    }
     Write-Host "Temporary fixture and measurement retained: $fixtureDir"
 }
