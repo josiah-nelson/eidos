@@ -150,12 +150,18 @@ impl PolicyEngine {
         reparse_tag: u32,
         parent: &PolicyCtx,
     ) -> ContentDecision {
-        let relative = Self::child_path(parent, name);
-        if self.is_protected(&relative) {
-            return ContentDecision::Excluded {
-                reason: ReasonCode::SelfStore,
-                rule: "self-store",
-            };
+        // The source-relative path costs an allocation for every file in
+        // every scan. Build it only when a rule or a protected boundary can
+        // actually consult it; the default policy has neither.
+        let relative = (!self.protected.is_empty() || !self.rules.is_empty())
+            .then(|| Self::child_path(parent, name));
+        if let Some(relative) = &relative {
+            if self.is_protected(relative) {
+                return ContentDecision::Excluded {
+                    reason: ReasonCode::SelfStore,
+                    rule: "self-store",
+                };
+            }
         }
         if attributes.is_reparse() || reparse_tag != 0 {
             match reparse::content_rule(reparse_tag) {
@@ -201,17 +207,19 @@ impl PolicyEngine {
                 rule: "offline-attribute",
             };
         }
-        if let Some((index, r)) = self
-            .rules
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, r)| r.matches(&relative, self.case_sensitive))
-        {
-            return ContentDecision::Operator {
-                include: r.rule.include,
-                index,
-            };
+        if let Some(relative) = &relative {
+            if let Some((index, r)) = self
+                .rules
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, r)| r.matches(relative, self.case_sensitive))
+            {
+                return ContentDecision::Operator {
+                    include: r.rule.include,
+                    index,
+                };
+            }
         }
         if let Some((reason, rule)) = parent.inherited_content_exclusion {
             return ContentDecision::Excluded { reason, rule };

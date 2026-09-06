@@ -635,6 +635,10 @@ CREATE TABLE source_policy (
     cursor INTEGER NOT NULL DEFAULT 0,
     processed INTEGER NOT NULL DEFAULT 0,
     changed INTEGER NOT NULL DEFAULT 0,
+    -- A path change observed mid-pass queues exactly one more full pass
+    -- instead of rewinding the running one, so application still converges
+    -- on a source that is being reorganized while it runs.
+    restart_requested INTEGER NOT NULL DEFAULT 0,
     error TEXT
 );
 CREATE TABLE protected_paths (path TEXT PRIMARY KEY) WITHOUT ROWID;
