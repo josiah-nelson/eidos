@@ -9,7 +9,6 @@ use axum::{extract::State, routing::get, Json, Router};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -187,21 +186,7 @@ async fn set_limits(
 /// by both the ordinary endpoint and coordinated recovery.
 pub(crate) fn persist_limits(data_dir: &Path, limits: ResourceLimits) -> anyhow::Result<()> {
     limits.validate().map_err(anyhow::Error::msg)?;
-    let tmp = data_dir.join(format!("{SETTINGS_FILE}.tmp"));
-    let replace = || -> anyhow::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&serde_json::to_vec(&limits)?)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, data_dir.join(SETTINGS_FILE))?;
-        Ok(())
-    };
-    if let Err(error) = replace() {
-        // Never leave a half-written temporary behind for the next save
-        // (or an operator reading the data directory) to trip over.
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
+    crate::durable_file::replace(&data_dir.join(SETTINGS_FILE), &serde_json::to_vec(&limits)?)?;
     Ok(())
 }
 

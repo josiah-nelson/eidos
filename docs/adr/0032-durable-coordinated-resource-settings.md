@@ -21,10 +21,13 @@ initial-index recommendations yet.
 
 Keep the three component files and add a synced operation journal containing a
 complete custom target, an ordered component plan and completed-step count.
-Apply tighter constraints before relaxed constraints, checkpoint after each
-idempotent component replacement and remove the journal only after the full
-target is live. Treat component, checkpoint and final cleanup failures as
-explicit partial outcomes with the current tuple and repair details.
+Give the journal and all three component files one durable replacement and
+removal helper: fsynced temporary, rename, then a parent-directory sync where
+the platform provides one. Apply tighter constraints before relaxed
+constraints, checkpoint after each idempotent component replacement and remove
+the journal only after the full target is live. Treat component, checkpoint
+and final cleanup failures as explicit partial outcomes with the current tuple
+and repair details.
 
 Replay a valid pending journal before component controls load and before any
 configuration-dependent background work starts. Fail startup closed for an
@@ -42,11 +45,17 @@ pause state outside the tuple. Existing leases drain when ceilings fall.
 
 ## Consequences
 
-The operation is recoverable rather than filesystem-atomic. During a failed
-live operation, already completed tighter settings can be visible while later
-components still have old values; the response says so and preserves the
-target. Manual mutation is temporarily unavailable until repair completes.
-Startup may refuse service when durable intent cannot be trusted or completed.
+The operation is recoverable rather than filesystem-atomic. It answers for a
+process exit, a crash, a lost client response and a filesystem write failure,
+not for an unclean host power loss: Windows has no portable directory sync, so
+there a surviving directory entry can still be the pre-rename one exactly as
+for any individual setting file. Each file stays independently valid, so the
+worst case is a restart loading the mixture that survived without a journal,
+which re-applying the tuple restores. During a failed live operation, already
+completed tighter settings can be visible while later components still have
+old values; the response says so and preserves the target. Manual mutation is
+temporarily unavailable until repair completes. Startup may refuse service
+when durable intent cannot be trusted or completed.
 
 Named resource choices require separate, repeatable workload evidence. Adding
 them later must map to the same complete request and status must still derive
@@ -58,10 +67,12 @@ Four coordinator tests cover tighter-before-relaxed ordering, invalid journal
 rejection, an injected partial component write followed by repair, and restart
 replay before component controls load. Two HTTP tests cover the complete wire
 operation, preserved source-specific caps, explicit partial state, conflicting
-manual-write rejection and repair.
+manual-write rejection and repair. One helper test covers a failed replacement
+leaving neither a temporary nor a changed file.
 
-The affected service and CLI package gate passed 200 tests with one intentional
-OS-topology smoke ignored. All-target clippy passed. The web gate passed 45
-utility tests and 36 rendered tests, including polling-safe drafts and partial
+The affected service and CLI package gate passed 206 tests with one intentional
+OS-topology smoke ignored. Format check and all-target clippy passed. The web
+gate passed 45 utility tests and 37 rendered tests, including polling-safe
+drafts, a failed background poll that keeps an unsaved draft, and partial
 repair, followed by lint and the production TypeScript build. The generated
-API contract check passed.
+API contract check reproduced the checked-in file unchanged.

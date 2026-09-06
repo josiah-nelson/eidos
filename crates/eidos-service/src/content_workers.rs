@@ -249,22 +249,8 @@ pub(crate) fn persist_workers_override(
             format!("content workers must be 1..={MAX_WORKERS}"),
         ));
     }
-    let path = data_dir.join(WORKERS_MARKER);
-    let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_vec(&WorkersMarker { workers }).map_err(io::Error::other)?;
-    let replace = || -> io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        use std::io::Write;
-        file.write_all(&body)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &path)
-    };
-    if let Err(error) = replace() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
-    Ok(())
+    crate::durable_file::replace(&data_dir.join(WORKERS_MARKER), &body)
 }
 
 /// Resize the global pool at runtime and return the effective size.

@@ -262,18 +262,25 @@ fn run_coordinated(
         }
     };
     let status = response.status();
-    let body = response
-        .body_mut()
-        .read_json::<serde_json::Value>()
-        .context("read coordinated resource settings")?;
+    // Report the status even when the body is not the JSON API error shape
+    // (a wrong URL, a proxy, or a build without this route).
+    let body = response.body_mut().read_json::<serde_json::Value>();
     anyhow::ensure!(
         status.is_success(),
         "{}: {}",
         status,
-        body["error"]
-            .as_str()
+        body.as_ref()
+            .ok()
+            .and_then(|body| body["error"].as_str())
             .unwrap_or("coordinated resource request failed")
     );
+    let body = body.context("read coordinated resource settings")?;
+    let outcome = body["outcome"].as_str().unwrap_or("unknown");
+    // A live failure reports its reason at the top level; after a restart only
+    // the retained journal still carries it. Print whichever the service gave.
+    let failure = body["error"]
+        .as_str()
+        .or_else(|| body["pending"]["error"].as_str());
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
     } else {
@@ -286,7 +293,7 @@ fn run_coordinated(
             current["minimum_free_mib"],
             current["readers_per_device"]
         );
-        println!("outcome: {}", body["outcome"].as_str().unwrap_or("unknown"));
+        println!("outcome: {outcome}");
         if let Some(pending) = body["pending"].as_object() {
             println!(
                 "repair required: completed {}  next {}  cleanup pending {}",
@@ -294,15 +301,22 @@ fn run_coordinated(
                 pending["next_component"],
                 pending["cleanup_pending"]
             );
-            if let Some(error) = pending["error"].as_str() {
-                println!("failure: {error}");
-            }
+        }
+        if let Some(error) = failure {
+            println!("failure: {error}");
         }
         println!("Source-specific reader caps are independent and unchanged.");
     }
+    // `failed` means the journal never reached disk and nothing changed, so
+    // there is no durable target for repair to replay: the apply is re-run.
     anyhow::ensure!(
-        body["pending"].is_null() && body["outcome"] != "failed",
-        "coordinated resource operation is incomplete; run `eidos resources coordinated repair` after correcting the persistence failure ({url})"
+        body["pending"].is_null() && outcome != "failed",
+        "coordinated resource operation is incomplete ({url}); {}",
+        if body["pending"].is_null() {
+            "no component changed, so re-run the apply after correcting the persistence failure"
+        } else {
+            "run `eidos resources coordinated repair` after correcting the persistence failure"
+        }
     );
     Ok(())
 }

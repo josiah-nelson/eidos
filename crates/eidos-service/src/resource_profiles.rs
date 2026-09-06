@@ -13,7 +13,7 @@ use axum::{extract::State, routing::get, Json, Router};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc},
 };
@@ -505,25 +505,12 @@ fn load_journal(data_dir: &Path) -> anyhow::Result<Option<OperationJournal>> {
 }
 
 fn write_journal(data_dir: &Path, journal: &OperationJournal) -> anyhow::Result<()> {
-    let path = journal_path(data_dir);
-    let tmp = path.with_extension("json.tmp");
-    let replace = || -> anyhow::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&serde_json::to_vec(journal)?)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    };
-    if let Err(error) = replace() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
+    crate::durable_file::replace(&journal_path(data_dir), &serde_json::to_vec(journal)?)?;
     Ok(())
 }
 
 fn remove_journal(data_dir: &Path) -> std::io::Result<()> {
-    std::fs::remove_file(journal_path(data_dir))
+    crate::durable_file::remove(&journal_path(data_dir))
 }
 
 fn apply_file_component(

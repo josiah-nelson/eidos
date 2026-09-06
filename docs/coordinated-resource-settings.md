@@ -37,6 +37,29 @@ device reservations finish and release normally; no lease is revoked. The
 ordinary manual controls and their restart behavior remain available whenever
 no repair is pending.
 
+## Durability boundary
+
+The journal and every component file are replaced the same way: the new bytes
+go to a temporary file that is fsynced and renamed over the old name, and the
+containing directory is fsynced afterwards on platforms that need it to make
+the new directory entry durable. Windows has no portable directory sync, so
+there the new entry follows NTFS rename semantics.
+
+That makes the operation recoverable across a process exit, a crash, a lost
+client response and a filesystem write failure. It is not a claim about an
+unclean host power loss: without a directory sync the surviving entry can
+still be the pre-rename one, exactly as for any individual setting file. Each
+file stays independently valid, so the worst case is a restart loading the
+mixture that survived with the journal gone. These are admission ceilings, not
+indexed data, so nothing is corrupted and re-applying the tuple restores it.
+
+If startup fails closed because the journal cannot be read or completed,
+correct the storage problem and restart. If the journal itself is unreadable,
+deleting `resource-settings-operation.json` also starts the service: the three
+component files remain individually valid, the service loads whichever mixture
+survived, and the tuple can be applied again.
+
+
 ## API and CLI
 
 `GET /api/resource-settings` returns the current live tuple and any pending
@@ -69,5 +92,8 @@ eidos resources coordinated repair
 ```
 
 Add `--json` before the `coordinated` subcommand for the complete wire response.
-The CLI exits nonzero when the result remains incomplete, which makes partial
-application visible to scripts.
+The CLI prints the failure reason the service reported and exits nonzero when
+the result remains incomplete, which makes partial application visible to
+scripts. It asks for `repair` only when a durable target exists; a `failed`
+outcome wrote no journal, so the apply is simply re-run once the persistence
+problem is corrected.

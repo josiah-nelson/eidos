@@ -93,3 +93,15 @@ test('partial application names the remaining component and repairs explicitly',
   await waitFor(() => expect(api.repairResourceSettings).toHaveBeenCalledTimes(1))
   await waitFor(() => expect(screen.queryByText(/needs repair/)).toBeNull())
 })
+
+test('a failed background poll keeps the unsaved draft and shows the error', async () => {
+  mount()
+  const workers = await screen.findByLabelText('Content workers') as HTMLInputElement
+  await userEvent.clear(workers)
+  await userEvent.type(workers, '3')
+  vi.mocked(api.resourceSettings).mockRejectedValue(new Error('the service is unreachable'))
+  await act(async () => { await client.refetchQueries({ queryKey: ['resource-settings'] }) })
+  await screen.findByText('the service is unreachable')
+  expect((screen.getByLabelText('Content workers') as HTMLInputElement).value).toBe('3')
+  expect(screen.getByRole('button', { name: 'Apply coordinated settings' })).toBeTruthy()
+})

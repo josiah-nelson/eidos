@@ -107,13 +107,17 @@ export default function CoordinatedResources() {
   const query = useQuery({
     queryKey: ['resource-settings'], queryFn: api.resourceSettings, refetchInterval: 2000,
   })
+  // A failed background poll must not unmount the editor: React Query keeps
+  // the last view, and remounting would silently discard an unsaved draft.
+  const view = query.data
   return <section aria-labelledby="coordinated-resources-heading">
     <h2 id="coordinated-resources-heading">Coordinated resource settings</h2>
-    {query.isPending ? <Spinner label="Loading coordinated resource settings…" />
-      : query.isError ? <ErrorBox error={query.error} />
+    {query.isError && <ErrorBox error={query.error} />}
+    {view === undefined
+      ? query.isError ? null : <Spinner label="Loading coordinated resource settings…" />
       : <>
         <p>Apply the complete custom tuple as one recoverable operation. No measured preset is selected.</p>
-        <SettingsEditor view={query.data} />
+        <SettingsEditor view={view} />
         <p className="muted small">
           The service records the target before changing any component. A partial filesystem failure stays visible and can be repaired after the underlying problem is corrected.
           Lower ceilings stop new admissions and let active scans, reservations, and files drain; they do not revoke work already running.

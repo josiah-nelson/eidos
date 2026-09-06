@@ -18,6 +18,7 @@ mod device_api;
 pub mod device_budget;
 pub mod device_control;
 mod device_topology;
+mod durable_file;
 pub mod exclusions_api;
 pub mod export;
 pub mod fleet_api;
