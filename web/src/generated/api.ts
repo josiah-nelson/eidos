@@ -20,6 +20,8 @@ export type ApiErrorBody = { error: string, kind: string, };
 
 export type ApplyExclusions = { expected_revision: number, rules: Array<ExclusionRule>, };
 
+export type ApplyResourceSettings = { settings: ResourceSettings, };
+
 export type ArchiveMember = { ordinal: number, path: string, name: string, parent: string, raw_name: string, is_dir: boolean, implicit: boolean, size: ApiInt, compressed: ApiInt, method: number, crc32: number, modified: UnixNanos | null, encrypted: boolean, flags: number, };
 
 export type ArchiveQuery = { parent: string | null, prefix: string | null, offset: number, limit: number, };
@@ -222,6 +224,8 @@ export type PeerView = { node_id: NodeId, name: string, role: string, fingerprin
 
 export type PendingJoinTarget = { request_id: string, endpoint: string, master_name: string, master_fingerprint: string, requested_at: UnixNanos, rejected_reason?: string, };
 
+export type PendingResourceOperation = { target: ResourceSettings, completed_components: Array<ResourceComponent>, next_component: ResourceComponent | null, failed_component: ResourceComponent | null, error: string | null, cleanup_pending: boolean, };
+
 export type PlanStep = { stage: string, description: string, candidates?: ApiInt, verified?: ApiInt, elapsed_ms?: number, };
 
 export type PolicyDecision = { object_id: ObjectId, stage: string, included: boolean, reason: string, rule: string, policy_version: number, user_override: boolean, };
@@ -258,7 +262,15 @@ export type ResolveQuery = { source: ApiInt, path: string, };
 
 export type ResolveView = { object_id: ObjectId, path: string | null, };
 
+export type ResourceApplyOutcome = "current" | "applied" | "partial" | "failed";
+
+export type ResourceComponent = "content_workers" | "metadata_limits" | "device_readers" | "operation_journal" | "journal_cleanup";
+
 export type ResourceLimits = { scan_threads: number, concurrent_scans: number, minimum_free_mib: number, };
+
+export type ResourceSettings = { content_workers: number, scan_threads: number, concurrent_scans: number, minimum_free_mib: number, readers_per_device: number, };
+
+export type ResourceSettingsView = { current: ResourceSettings, outcome: ResourceApplyOutcome, pending: PendingResourceOperation | null, error: string | null, };
 
 export type ResourceView = { limits: ResourceLimits, active_scans: number, free_bytes: ApiInt | null, disk_sample_age_s: ApiInt | null, admission_blocked: string | null, };
 

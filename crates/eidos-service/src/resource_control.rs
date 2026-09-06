@@ -97,21 +97,7 @@ impl ResourceControl {
     pub fn set(&self, limits: ResourceLimits) -> anyhow::Result<()> {
         limits.validate().map_err(anyhow::Error::msg)?;
         let _write = self.settings_write.lock();
-        let tmp = self.data_dir.join(format!("{SETTINGS_FILE}.tmp"));
-        let replace = || -> anyhow::Result<()> {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(&serde_json::to_vec(&limits)?)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp, self.data_dir.join(SETTINGS_FILE))?;
-            Ok(())
-        };
-        if let Err(error) = replace() {
-            // Never leave a half-written temporary behind for the next save
-            // (or an operator reading the data directory) to trip over.
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error);
-        }
+        persist_limits(&self.data_dir, limits)?;
         self.state.lock().0 = limits;
         Ok(())
     }
@@ -189,13 +175,34 @@ async fn set_limits(
 ) -> ApiResult<ResourceView> {
     limits.validate().map_err(ApiError::bad_request)?;
     blocking(move || {
-        st.resources
-            .set(limits)
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        st.resource_profiles
+            .manual_update(|| st.resources.set(limits))?;
         st.content_pause.work.notify_all();
         Ok(ApiJson(st.resources.view()))
     })
     .await
+}
+
+/// Write the standalone resource file using the same durable replacement used
+/// by both the ordinary endpoint and coordinated recovery.
+pub(crate) fn persist_limits(data_dir: &Path, limits: ResourceLimits) -> anyhow::Result<()> {
+    limits.validate().map_err(anyhow::Error::msg)?;
+    let tmp = data_dir.join(format!("{SETTINGS_FILE}.tmp"));
+    let replace = || -> anyhow::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec(&limits)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, data_dir.join(SETTINGS_FILE))?;
+        Ok(())
+    };
+    if let Err(error) = replace() {
+        // Never leave a half-written temporary behind for the next save
+        // (or an operator reading the data directory) to trip over.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

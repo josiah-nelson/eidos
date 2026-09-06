@@ -27,6 +27,7 @@ mod fsevents_apply;
 pub mod interactions_api;
 pub mod memory;
 pub mod resource_control;
+pub mod resource_profiles;
 pub mod retry_api;
 pub mod scanner;
 pub mod source_budget;

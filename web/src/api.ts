@@ -32,6 +32,8 @@ import type {
   PeerView,
   ResolveView,
   ResourceLimits,
+  ResourceSettings,
+  ResourceSettingsView,
   ResourceView,
   MemoryView,
   DeviceLimits,
@@ -173,6 +175,13 @@ export const api = {
   setDeviceLimits: (body: DeviceLimits) => request<DeviceView>('/api/devices', { method: 'POST', body: JSON.stringify(body) }),
   setResources: (body: ResourceLimits) =>
     request<ResourceView>('/api/resources', { method: 'POST', body: JSON.stringify(body) }),
+  resourceSettings: () => request<ResourceSettingsView>('/api/resource-settings'),
+  applyResourceSettings: (settings: ResourceSettings) =>
+    request<ResourceSettingsView>('/api/resource-settings', {
+      method: 'POST', body: JSON.stringify({ settings }),
+    }),
+  repairResourceSettings: () =>
+    request<ResourceSettingsView>('/api/resource-settings/repair', { method: 'POST' }),
   contentStatus: () => request<ContentStatusView>('/api/content/status'),
   /** Stop or start claiming content jobs; answers with the resulting state. */
   setContentPaused: (paused: boolean) =>

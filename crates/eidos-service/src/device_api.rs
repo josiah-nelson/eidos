@@ -23,9 +23,8 @@ async fn set_limits(
     limits.validate().map_err(ApiError::bad_request)?;
     blocking(move || {
         state
-            .devices
-            .save_limits(&state.data_dir, limits)
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+            .resource_profiles
+            .manual_update(|| state.devices.save_limits(&state.data_dir, limits))?;
         state.content_pause.work.notify_all();
         Ok(ApiJson(state.devices.view()))
     })
