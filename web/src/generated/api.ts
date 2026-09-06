@@ -102,7 +102,7 @@ export type ErrorRecord = { id: ApiInt, source_id: SourceId, object_id: ObjectId
 
 export type ErrorsQuery = { include_resolved: boolean, limit: number, };
 
-export type ExclusionPolicy = { revision: number, engine_version: number, rules: Array<ExclusionRule>, phase: string, processed: ApiInt, changed: ApiInt, error: string | null, protected_directories: Array<string>, case_sensitive: boolean, };
+export type ExclusionPolicy = { revision: number, engine_version: number, rules: Array<ExclusionRule>, phase: string, processed: ApiInt, changed: ApiInt, error: string | null, repair_phase: string, repair_processed: ApiInt, repair_changed: ApiInt, repair_pending: ApiInt, repair_error: string | null, protected_directories: Array<string>, case_sensitive: boolean, };
 
 export type ExclusionPreview = { path: string, state: ContentState, reason: string, rule: string, catalogued: boolean, };
 

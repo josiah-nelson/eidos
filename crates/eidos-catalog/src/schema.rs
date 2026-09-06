@@ -653,6 +653,35 @@ CREATE INDEX objects_policy_apply ON objects(source_id, object_id)
     WHERE deleted_at IS NULL AND kind IN ('file','directory');
 "#,
     ),
+    (
+        "bounded path-policy subtree repair",
+        r#"
+-- Path changes do not change the operator's policy revision. Keep their
+-- repair state separate so unrelated content jobs remain admissible while
+-- the affected namespace is checked in bounded catalog-only pages.
+CREATE TABLE policy_repair_state (
+    source_id INTEGER PRIMARY KEY REFERENCES sources(source_id),
+    phase TEXT NOT NULL DEFAULT 'applying',
+    processed INTEGER NOT NULL DEFAULT 0,
+    changed INTEGER NOT NULL DEFAULT 0,
+    pending INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    CHECK (phase IN ('applied', 'applying', 'purging'))
+);
+CREATE TABLE policy_repair_frontier (
+    source_id INTEGER NOT NULL,
+    object_id INTEGER NOT NULL,
+    -- -1 means evaluate the object itself. Nonnegative values are the last
+    -- direct-child entry_id expanded for a directory.
+    entry_cursor INTEGER NOT NULL DEFAULT -1,
+    PRIMARY KEY (source_id, object_id)
+) WITHOUT ROWID;
+-- Direct-child expansion is keyset-paged. This avoids a recursive subtree
+-- materialization and keeps work independent of unrelated source size.
+CREATE INDEX entries_policy_repair_children
+    ON entries(parent_id, entry_id) WHERE deleted_at IS NULL;
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.

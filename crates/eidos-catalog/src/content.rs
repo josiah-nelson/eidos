@@ -20,9 +20,54 @@ use ts_rs::TS;
 
 pub const ZSTD_LEVEL: i32 = 1;
 
-fn ensure_content_generation(conn: &Connection, object: ObjectId, generation: u32) -> Result<()> {
-    let current: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE object_id = ?1 AND generation = ?2 AND deleted_at IS NULL AND content_state NOT IN ('excluded','not_applicable','not_replicated'))", params![object.0, generation], |r| r.get(0))?;
-    if !current {
+fn content_generation_source(
+    catalog: &Catalog,
+    conn: &Connection,
+    object: ObjectId,
+    generation: u32,
+) -> Result<Option<SourceId>> {
+    let row: Option<(i64, u32, u32)> = conn
+        .query_row(
+            "SELECT source_id, attributes, reparse_tag FROM objects
+             WHERE object_id = ?1 AND generation = ?2 AND deleted_at IS NULL
+               AND kind = 'file' AND content_state NOT IN ('excluded','not_applicable','not_replicated')",
+            params![object.0, generation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((source_id, attributes, tag)) = row else {
+        return Ok(None);
+    };
+    let Some(path) = crate::read::render_path_conn(conn, object)? else {
+        return Ok(None);
+    };
+    let source = SourceId(source_id);
+    let engine = catalog.cached_policy_conn(conn, source)?;
+    let root: String = conn.query_row(
+        "SELECT root_path FROM sources WHERE source_id = ?1",
+        [source_id],
+        |r| r.get(0),
+    )?;
+    let path = crate::exclusions::normalized_absolute(&path);
+    let root = crate::exclusions::normalized_absolute(&root);
+    let relative = path
+        .strip_prefix(&root)
+        .unwrap_or(&path)
+        .trim_start_matches('/');
+    let candidate = engine
+        .path_decision(relative, eidos_domain::FileAttributes(attributes), tag)
+        .initial_state()
+        == ContentState::Pending;
+    Ok(candidate.then_some(source))
+}
+
+fn ensure_content_generation(
+    catalog: &Catalog,
+    conn: &Connection,
+    object: ObjectId,
+    generation: u32,
+) -> Result<()> {
+    if content_generation_source(catalog, conn, object, generation)?.is_none() {
         return Err(CatalogError::InvalidState(
             "content generation was superseded or excluded".into(),
         ));
@@ -189,7 +234,7 @@ impl Catalog {
         }
         self.with_writer(|conn| {
             let tx = conn.transaction()?;
-            ensure_content_generation(&tx, object, generation)?;
+            ensure_content_generation(self, &tx, object, generation)?;
             {
                 let mut stmt = tx.prepare_cached(
                     "INSERT OR REPLACE INTO chunks (object_id, generation, ordinal, byte_start, byte_end, line_start, line_end, chars, text)
@@ -248,7 +293,7 @@ impl Catalog {
     ) -> Result<()> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            ensure_content_generation(&tx, rec.object_id, rec.generation)?;
+            ensure_content_generation(self, &tx, rec.object_id, rec.generation)?;
             if !chunks.is_empty() {
                 let mut stmt = tx.prepare_cached(
                     "INSERT OR REPLACE INTO chunks (object_id, generation, ordinal, byte_start, byte_end, line_start, line_end, chars, text)
@@ -331,6 +376,23 @@ impl Catalog {
                     .optional()?;
                 if current != Some(gen) {
                     tx.execute("UPDATE content_records SET state = 'stale' WHERE object_id = ?1", params![o.0])?;
+                    continue;
+                }
+                // The content index committed before this acknowledgement.
+                // Re-check the current path policy inside the publication
+                // transaction so a move between extraction/storage and index
+                // commit cannot publish content that is now excluded. Repair
+                // queues a durable delete before this acknowledgement returns.
+                if content_generation_source(self, &tx, *o, gen as u32)?.is_none() {
+                    crate::exclusions::repair_object_now_conn(
+                        &tx,
+                        SourceId(source_id),
+                        *o,
+                    )?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO policy_cleanup(object_id, source_id) VALUES (?1, ?2)",
+                        params![o.0, source_id],
+                    )?;
                     continue;
                 }
                 let state = if coverage == Coverage::Full.as_str() {

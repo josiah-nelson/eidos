@@ -275,7 +275,13 @@ impl Catalog {
                 };
                 let sql = format!(
                     "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued' AND stage IN ({stage_list}) AND scheduled_at <= ?1{exclude}
-                     AND (stage != 'content_text' OR source_id NOT IN (SELECT source_id FROM source_policy WHERE phase != 'applied'))
+                     AND (stage != 'content_text' OR (
+                         source_id NOT IN (SELECT source_id FROM source_policy WHERE phase != 'applied')
+                         AND NOT EXISTS (
+                             SELECT 1 FROM policy_repair_frontier f
+                             WHERE f.source_id = jobs.source_id AND f.object_id = jobs.object_id
+                         )
+                     ))
                      ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT 1"
                 );
                 let first = match tx.query_row(&sql, params![now], job_from_row).optional()? {
@@ -293,6 +299,10 @@ impl Catalog {
                 let more_sql = format!(
                     "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued' AND stage IN ({stage_list}) AND scheduled_at <= ?1
                        AND source_id = ?2 AND job_id != ?3
+                       AND (stage != 'content_text' OR NOT EXISTS (
+                           SELECT 1 FROM policy_repair_frontier f
+                           WHERE f.source_id = jobs.source_id AND f.object_id = jobs.object_id
+                       ))
                      ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT ?4"
                 );
                 let more: Vec<JobRecord> = tx

@@ -39,8 +39,9 @@ boundary clears only after successful enumeration.
 
 - Applying policy works on an unavailable source, without a new disk crawl.
 - Search coverage changes progressively, with explicit progress and errors.
-- Directory moves can schedule a catalog policy pass and temporarily hold
-  source content claims. They do not initiate an additional source crawl.
+- Directory moves schedule the separate bounded subtree repair defined by
+  [ADR-0033](0033-bounded-subtree-policy-repair.md). Unaffected content claims
+  continue while coverage reports the pending repair and purge.
 - Protected paths are not a sandbox or a proof of arbitrary alias/hard-link
   equivalence. The configured roots must describe the indexed namespace.
 - The new seek index is a migration cost on existing catalogs; installed

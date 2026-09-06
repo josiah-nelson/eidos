@@ -495,7 +495,7 @@ impl<'a> Applier<'a> {
     ) -> Result<(ObjectId, bool, Option<AggDelta>)> {
         let key = NativeKey::from(snap.native);
         let kind = snap.kind.as_str();
-        let (new_state, decision) = self.content_state_for(snap, name_for_policy, ctx);
+        let (mut new_state, mut decision) = self.content_state_for(snap, name_for_policy, ctx);
         let ext = if snap.kind == ObjectKind::File {
             extension_of(name_for_policy)
         } else {
@@ -506,6 +506,32 @@ impl<'a> Applier<'a> {
                 // Identity reused for a different kind: retire the old row.
                 self.tombstone_object(ex.id)?;
             } else {
+                // A newly observed hard link does not replace the object's
+                // canonical policy path. Reuse the first live entry exactly as
+                // render_path_conn does. A rename has already unlinked its old
+                // entry, so it correctly falls back to the incoming path.
+                if snap.kind == ObjectKind::File {
+                    let canonical: Option<(i64, String)> = self
+                        .tx
+                        .query_row(
+                            "SELECT parent_id, name FROM entries
+                             WHERE object_id = ?1 AND deleted_at IS NULL AND parent_id IS NOT NULL
+                             ORDER BY entry_id LIMIT 1",
+                            [ex.id.0],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?;
+                    if let Some((parent, name)) = canonical {
+                        let canonical_ctx = self.policy_ctx(ObjectId(parent))?;
+                        decision = self.policy.file(
+                            &name,
+                            snap.attributes,
+                            snap.reparse_tag,
+                            &canonical_ctx,
+                        );
+                        new_state = decision.initial_state();
+                    }
+                }
                 let policy_changed =
                     snap.kind == ObjectKind::File && decision.changes_state(&ex.content_state);
                 let content_changed = snap.kind == ObjectKind::File
@@ -513,7 +539,7 @@ impl<'a> Applier<'a> {
                         || ex.modified != snap.modified.map(|t| t.0)
                         || policy_changed);
                 if policy_changed {
-                    crate::exclusions::reapply_conn(self.tx, self.source_id)?;
+                    crate::exclusions::enqueue_repair_conn(self.tx, self.source_id, ex.id)?;
                 }
                 let (generation, state) = if content_changed {
                     self.stats.content_changed += 1;
@@ -687,12 +713,10 @@ impl<'a> Applier<'a> {
         if self.policy.is_protected(&ctx.relative) {
             return Ok(());
         }
-        // Only a directory move needs the whole-source pass: it changes every
-        // descendant's relative path. A file's own decision is re-evaluated by
-        // `upsert_object` below, which schedules the pass precisely when that
-        // decision changes, so renaming one file must not restart a full
-        // catalog pass (which also holds this source's content claims).
-        let needs_policy_pass = snap.kind == ObjectKind::Directory
+        // Only a path-sensitive directory move needs subtree repair: it changes
+        // every descendant's relative path. A file's own decision is handled
+        // by `upsert_object`, which queues only that object when needed.
+        let needs_policy_repair = snap.kind == ObjectKind::Directory
             && match self.existing(NativeKey::from(snap.native))? {
                 Some(existing) => {
                     let old = self.policy_ctx(existing.id)?;
@@ -786,8 +810,8 @@ impl<'a> Applier<'a> {
             self.outbox(obj, "subtree", 0)?;
         }
         if !created {
-            if needs_policy_pass {
-                crate::exclusions::reapply_conn(self.tx, self.source_id)?;
+            if needs_policy_repair {
+                crate::exclusions::enqueue_repair_conn(self.tx, self.source_id, obj)?;
             }
             // Hard link count may have changed.
             self.tx.execute(
@@ -808,7 +832,20 @@ impl<'a> Applier<'a> {
             }
         };
         match self.find_entry(parent, name)? {
-            Some((entry_id, obj)) => self.tombstone_entry(entry_id, obj, parent),
+            Some((entry_id, obj)) => {
+                self.tombstone_entry(entry_id, obj, parent)?;
+                let linked_file: bool = self.tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM objects o JOIN entries e ON e.object_id = o.object_id
+                         WHERE o.object_id = ?1 AND o.kind = 'file' AND o.deleted_at IS NULL
+                           AND e.deleted_at IS NULL)",
+                        [obj.0],
+                        |r| r.get(0),
+                    )?;
+                if linked_file {
+                    crate::exclusions::enqueue_repair_conn(self.tx, self.source_id, obj)?;
+                }
+                Ok(())
+            }
             None => {
                 self.stats.unmatched_object += 1;
                 Ok(())

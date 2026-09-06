@@ -1,6 +1,9 @@
 //! Ordered content rules, immutable self-store protection, and catalog-only
-//! reapplication. Each apply batch and its cursor commit together. Content
-//! admission stays closed until the derived-index cleanup is acknowledged.
+//! reapplication. Full rule revisions close source admission; path changes
+//! use a separate durable subtree frontier so unrelated content can continue.
+//! Each cursor and cleanup intent commits with the catalog mutation that
+//! produced it, and coverage stays incomplete until derived-index cleanup is
+//! acknowledged.
 
 use crate::policy::{ContentDecision, PolicyCtx, PolicyEngine, POLICY_VERSION};
 use crate::{Catalog, CatalogError, Result};
@@ -12,6 +15,7 @@ use std::path::PathBuf;
 use ts_rs::TS;
 
 const APPLY_OBJECTS: &str = "SELECT object_id FROM objects WHERE source_id = ?1 AND object_id > ?2 AND deleted_at IS NULL AND kind IN ('file','directory') ORDER BY object_id LIMIT 128";
+const APPLY_WORK: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +44,15 @@ pub struct ExclusionPolicy {
     #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
     pub changed: u64,
     pub error: Option<String>,
+    /// Catalog-only path repair is independent of full rule application.
+    pub repair_phase: String,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
+    pub repair_processed: u64,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
+    pub repair_changed: u64,
+    #[serde(deserialize_with = "eidos_domain::json::u64_string::deserialize")]
+    pub repair_pending: u64,
+    pub repair_error: Option<String>,
     /// Source-relative boundaries; empty string means the entire root.
     pub protected_directories: Vec<String>,
     pub case_sensitive: bool,
@@ -238,25 +251,141 @@ pub(crate) fn applying_conn(conn: &Connection, source: SourceId) -> Result<bool>
     )?)
 }
 
-/// A path change can alter inherited decisions without changing file bytes.
-/// Restart the bounded catalog pass, retaining the operator's revision/rules.
-///
-/// A pass that is already running is *not* rewound: repeated moves on an
-/// actively reorganized source would otherwise discard progress indefinitely
-/// and hold its content claims closed. One more full pass is queued instead,
-/// which `acknowledge_policy_cleanup` starts once this one has committed.
-pub(crate) fn reapply_conn(conn: &Connection, source: SourceId) -> Result<()> {
+/// Persist a path-policy repair root in the same transaction as the path
+/// change. The primary key deduplicates overlapping discovery and repeated
+/// moves of a root that has not yet been processed. Resetting a root already
+/// in progress is intentional: a later move invalidates its child cursor.
+pub(crate) fn enqueue_repair_conn(
+    conn: &Connection,
+    source: SourceId,
+    object: ObjectId,
+) -> Result<()> {
     conn.execute(
-        "INSERT INTO source_policy (source_id, revision, rules) VALUES (?1, 0, '[]')
-        ON CONFLICT(source_id) DO UPDATE SET
-            restart_requested = (phase != 'applied'),
+        "INSERT INTO policy_repair_state(source_id, phase, pending)
+         VALUES (?1, 'applying', 0)
+         ON CONFLICT(source_id) DO UPDATE SET
             phase = 'applying',
-            cursor = CASE WHEN phase = 'applied' THEN 0 ELSE cursor END,
             processed = CASE WHEN phase = 'applied' THEN 0 ELSE processed END,
             changed = CASE WHEN phase = 'applied' THEN 0 ELSE changed END",
         [source.0],
     )?;
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO policy_repair_frontier(source_id, object_id, entry_cursor)
+         VALUES (?1, ?2, -1)",
+        params![source.0, object.0],
+    )?;
+    if inserted == 0 {
+        conn.execute(
+            "UPDATE policy_repair_frontier SET entry_cursor = -1
+             WHERE source_id = ?1 AND object_id = ?2",
+            params![source.0, object.0],
+        )?;
+    }
+    conn.execute(
+        "UPDATE policy_repair_state SET pending = pending + ?2 WHERE source_id = ?1",
+        params![source.0, inserted as i64],
+    )?;
     Ok(())
+}
+
+/// Re-evaluate one live catalog object against its current canonical path.
+/// The caller owns the transaction, so decision changes, generation fencing,
+/// cached-row removal, outbox work, and cleanup intent are atomic.
+fn apply_object_policy(
+    conn: &Connection,
+    source: SourceId,
+    engine: &PolicyEngine,
+    root: &str,
+    id: ObjectId,
+) -> Result<bool> {
+    let Some(path) = crate::read::render_path_conn(conn, id)? else {
+        return Ok(false);
+    };
+    let absolute = normalized_absolute(&path);
+    let relative = absolute
+        .strip_prefix(root)
+        .unwrap_or(&absolute)
+        .trim_start_matches('/');
+    let row: Option<(String, String, u32, u32)> = conn
+        .query_row(
+            "SELECT kind, content_state, attributes, reparse_tag FROM objects
+             WHERE object_id = ?1 AND source_id = ?2 AND deleted_at IS NULL",
+            params![id.0, source.0],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((kind, old, attributes, tag)) = row else {
+        return Ok(false);
+    };
+    if kind == "directory" {
+        if engine.is_protected(relative) {
+            engine.record_boundary(conn, id)?;
+        }
+        // A removed boundary remains a coverage gap until that directory is
+        // successfully enumerated again.
+        return Ok(false);
+    }
+    if kind != "file" {
+        return Ok(false);
+    }
+    let decision = engine.path_decision(relative, FileAttributes(attributes), tag);
+    engine.record(conn, id, decision)?;
+    let next = decision.initial_state();
+    let has_stored: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM content_records WHERE object_id = ?1)",
+        [id.0],
+        |r| r.get(0),
+    )?;
+    let change = decision.changes_state(&old) || (next != ContentState::Pending && has_stored);
+    if !change {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE objects SET generation = generation + 1, content_id = NULL WHERE object_id = ?1",
+        [id.0],
+    )?;
+    crate::content::flip_state(conn, id, next, None)?;
+    crate::sync::touch_conn(conn, source, id)?;
+    let stored = conn.execute("DELETE FROM chunks WHERE object_id = ?1", [id.0])?
+        + conn.execute("DELETE FROM content_records WHERE object_id = ?1", [id.0])?;
+    crate::archive::retire_virtual_tree(conn, id, eidos_domain::UnixNanos::now().0)?;
+    conn.execute("DELETE FROM archive_members WHERE object_id = ?1", [id.0])?;
+    conn.execute("DELETE FROM archive_records WHERE object_id = ?1", [id.0])?;
+    let generation: i64 = conn.query_row(
+        "SELECT generation FROM objects WHERE object_id = ?1",
+        [id.0],
+        |r| r.get(0),
+    )?;
+    crate::jobs::outbox_append_conn(conn, source, id, "subtree", generation)?;
+    conn.execute(
+        "UPDATE jobs SET state = 'superseded' WHERE object_id = ?1 AND stage = 'content_text' AND state = 'queued'",
+        [id.0],
+    )?;
+    if stored > 0 {
+        conn.execute(
+            "INSERT OR IGNORE INTO policy_cleanup (object_id, source_id) VALUES (?1, ?2)",
+            params![id.0, source.0],
+        )?;
+    }
+    Ok(true)
+}
+
+/// Re-evaluate one object immediately inside another catalog transaction.
+/// Content publication uses this after the derived-index commit to close the
+/// final move race and durably queue deletion of any document that just became
+/// excluded.
+pub(crate) fn repair_object_now_conn(
+    conn: &Connection,
+    source: SourceId,
+    object: ObjectId,
+) -> Result<bool> {
+    let engine = engine_conn(conn, source)?;
+    let root: String = conn.query_row(
+        "SELECT root_path FROM sources WHERE source_id = ?1",
+        [source.0],
+        |r| r.get(0),
+    )?;
+    apply_object_policy(conn, source, &engine, &normalized_absolute(&root), object)
 }
 
 pub(crate) struct CachedPolicy {
@@ -328,8 +457,27 @@ impl PolicyEngine {
         conn.execute("INSERT INTO policy_decisions (object_id, stage, included, reason, rule, policy_version)
             VALUES (?1, 'inventory', 0, 'self_store', 'self-store', ?2)
             ON CONFLICT(object_id, stage) DO UPDATE SET included = 0, reason = 'self_store', rule = 'self-store', policy_version = excluded.policy_version", params![id.0, self.version])?;
-        conn.execute("WITH RECURSIVE ancestors(id) AS (SELECT ?1 UNION SELECT e.parent_id FROM entries e JOIN ancestors a ON e.object_id = a.id WHERE e.deleted_at IS NULL AND e.parent_id IS NOT NULL)
-            UPDATE directory_aggregates SET complete = 0 WHERE object_id IN (SELECT id FROM ancestors)", [id.0])?;
+        // Directory topology has one canonical parent. Keep the coverage walk
+        // under the same explicit depth bound as path rendering instead of
+        // materializing an arbitrary recursive ancestor set.
+        let mut current = Some(id);
+        for _ in 0..512 {
+            let Some(object) = current else { break };
+            conn.execute(
+                "UPDATE directory_aggregates SET complete = 0 WHERE object_id = ?1",
+                [object.0],
+            )?;
+            current = conn
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE object_id = ?1 AND deleted_at IS NULL
+                     ORDER BY entry_id LIMIT 1",
+                    [object.0],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten()
+                .map(ObjectId);
+        }
         Ok(())
     }
 }
@@ -383,6 +531,15 @@ impl Catalog {
         if applying_conn(conn, c.source_id)? {
             c.content_complete = false;
             notes.push("exclusion policy application is pending; search coverage changes progressively (see source policy progress/errors)".into());
+        }
+        let repair_pending: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM policy_repair_state WHERE source_id = ?1 AND phase != 'applied')",
+            [c.source_id.0],
+            |r| r.get(0),
+        )?;
+        if repair_pending {
+            c.content_complete = false;
+            notes.push("path-policy repair is pending for changed subtrees; unaffected content work continues (see source policy progress/errors)".into());
         }
         if !notes.is_empty() {
             c.policy_note = Some(notes.join("; "));
@@ -450,10 +607,23 @@ impl Catalog {
             let mut view = ExclusionPolicy {
                 revision: engine.revision, engine_version: engine.version,
                 rules: engine.rules.iter().map(|r| r.rule.clone()).collect(), phase: "applied".into(), processed: 0, changed: 0, error: None,
+                repair_phase: "applied".into(), repair_processed: 0,
+                repair_changed: 0, repair_pending: 0, repair_error: None,
                 protected_directories: engine.protected.clone(), case_sensitive: engine.case_sensitive,
             };
             if let Some((phase, processed, changed, error)) = conn.query_row("SELECT phase, processed, changed, error FROM source_policy WHERE source_id = ?1", [source.0], |r| Ok((r.get(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?))).optional()? {
                 view.phase = phase; view.processed = processed as u64; view.changed = changed as u64; view.error = error;
+            }
+            if let Some((phase, processed, changed, pending, error)) = conn.query_row(
+                "SELECT phase, processed, changed, pending, error FROM policy_repair_state WHERE source_id = ?1",
+                [source.0],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get(4)?)),
+            ).optional()? {
+                view.repair_phase = phase;
+                view.repair_processed = processed as u64;
+                view.repair_changed = changed as u64;
+                view.repair_pending = pending as u64;
+                view.repair_error = error;
             }
             Ok(view)
         })
@@ -571,15 +741,31 @@ impl Catalog {
     }
 
     pub fn pending_policy_sources(&self) -> Result<Vec<SourceId>> {
-        self.with_reader(|conn| Ok(conn.prepare_cached("SELECT source_id FROM source_policy WHERE phase != 'applied' AND error IS NULL ORDER BY source_id")?.query_map([], |r| r.get::<_, i64>(0).map(SourceId))?.collect::<rusqlite::Result<_>>()?))
+        self.with_reader(|conn| {
+            Ok(conn
+                .prepare_cached(
+                    "SELECT source_id FROM source_policy WHERE phase != 'applied' AND error IS NULL
+             UNION
+             SELECT source_id FROM policy_repair_state WHERE phase != 'applied' AND error IS NULL
+             ORDER BY source_id",
+                )?
+                .query_map([], |r| r.get::<_, i64>(0).map(SourceId))?
+                .collect::<rusqlite::Result<_>>()?)
+        })
     }
 
     pub fn set_policy_error(&self, source: SourceId, error: Option<&str>) -> Result<()> {
         self.with_writer(|conn| {
-            conn.execute(
-                "UPDATE source_policy SET error = ?2 WHERE source_id = ?1",
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE source_policy SET error = ?2 WHERE source_id = ?1 AND phase != 'applied'",
                 params![source.0, error],
             )?;
+            tx.execute(
+                "UPDATE policy_repair_state SET error = ?2 WHERE source_id = ?1 AND phase != 'applied'",
+                params![source.0, error],
+            )?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -600,44 +786,163 @@ impl Catalog {
             let root = normalized_absolute(&root);
             let mut changed = 0;
             for id in &ids {
-                let Some(path) = crate::read::render_path_conn(&tx, *id)? else { continue; };
-                let absolute = normalized_absolute(&path);
-                let relative = absolute.strip_prefix(&root).unwrap_or(&absolute).trim_start_matches('/');
-                let (kind, old, attributes, tag): (String, String, u32, u32) = tx.query_row("SELECT kind, content_state, attributes, reparse_tag FROM objects WHERE object_id = ?1", [id.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-                if kind == "directory" {
-                    if engine.is_protected(relative) { engine.record_boundary(&tx, *id)?; }
-                    // A removed boundary remains a coverage gap until that
-                    // directory is successfully enumerated again.
-                    continue;
-                }
-                let decision = engine.path_decision(relative, FileAttributes(attributes), tag);
-                engine.record(&tx, *id, decision)?;
-                let next = decision.initial_state();
-                let change = decision.changes_state(&old) || (next != ContentState::Pending && tx.query_row("SELECT EXISTS(SELECT 1 FROM content_records WHERE object_id = ?1)", [id.0], |r| r.get::<_, bool>(0))?);
-                if !change { continue; }
-                changed += 1;
-                tx.execute("UPDATE objects SET generation = generation + 1, content_id = NULL WHERE object_id = ?1", [id.0])?;
-                crate::content::flip_state(&tx, *id, next, None)?;
-                crate::sync::touch_conn(&tx, source, *id)?;
-                let stored = tx.execute("DELETE FROM chunks WHERE object_id = ?1", [id.0])?
-                    + tx.execute("DELETE FROM content_records WHERE object_id = ?1", [id.0])?;
-                crate::archive::retire_virtual_tree(&tx, *id, eidos_domain::UnixNanos::now().0)?;
-                tx.execute("DELETE FROM archive_members WHERE object_id = ?1", [id.0])?;
-                tx.execute("DELETE FROM archive_records WHERE object_id = ?1", [id.0])?;
-                let generation: i64 = tx.query_row("SELECT generation FROM objects WHERE object_id = ?1", [id.0], |r| r.get(0))?;
-                crate::jobs::outbox_append_conn(&tx, source, *id, "subtree", generation)?;
-                tx.execute("UPDATE jobs SET state = 'superseded' WHERE object_id = ?1 AND stage = 'content_text' AND state = 'queued'", [id.0])?;
-                // Chunk rows are written to the catalog before their documents
-                // reach the derived index, so an object that stored neither
-                // chunks nor a content record cannot have documents there.
-                // Queuing the rest would commit a durable no-op delete page for
-                // every 128 objects of a never-indexed corpus.
-                if stored > 0 {
-                    tx.execute("INSERT OR IGNORE INTO policy_cleanup (object_id, source_id) VALUES (?1, ?2)", params![id.0, source.0])?;
-                }
+                changed += i64::from(apply_object_policy(&tx, source, &engine, &root, *id)?);
             }
             tx.execute("UPDATE source_policy SET cursor = ?2, processed = processed + ?3, changed = changed + ?4, phase = ?5 WHERE source_id = ?1",
                 params![source.0, ids.last().map(|id| id.0).unwrap_or(cursor), ids.len() as i64, changed, if ids.len() < 128 { "purging" } else { "applying" }])?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Process at most 128 repair work units. An object evaluation and each
+    /// direct-child edge expanded count as one unit. Path rendering is capped
+    /// by its existing 512-component catalog bound, so work is independent of
+    /// unrelated source size while still depending on affected path depth.
+    pub fn apply_policy_repair_batch(&self, source: SourceId) -> Result<()> {
+        self.with_writer(|conn| {
+            let tx = conn.transaction()?;
+            let row: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT phase, error FROM policy_repair_state WHERE source_id = ?1",
+                    [source.0],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((phase, error)) = row else {
+                return Ok(());
+            };
+            if phase != "applying" || error.is_some() {
+                return Ok(());
+            }
+            let engine = self.cached_policy_conn(&tx, source)?;
+            let root: String = tx.query_row(
+                "SELECT root_path FROM sources WHERE source_id = ?1",
+                [source.0],
+                |r| r.get(0),
+            )?;
+            let root = normalized_absolute(&root);
+            let mut remaining = APPLY_WORK;
+            let mut processed = 0i64;
+            let mut changed = 0i64;
+            let mut pending_delta = 0i64;
+
+            while remaining > 0 {
+                let frontier: Option<(ObjectId, i64)> = tx
+                    .query_row(
+                        "SELECT object_id, entry_cursor FROM policy_repair_frontier
+                         WHERE source_id = ?1 ORDER BY object_id LIMIT 1",
+                        [source.0],
+                        |r| Ok((ObjectId(r.get(0)?), r.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((object, mut cursor)) = frontier else {
+                    break;
+                };
+                let kind: Option<String> = tx
+                    .query_row(
+                        "SELECT kind FROM objects WHERE object_id = ?1 AND source_id = ?2
+                         AND deleted_at IS NULL AND kind IN ('file','directory')",
+                        params![object.0, source.0],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(kind) = kind else {
+                    tx.execute(
+                        "DELETE FROM policy_repair_frontier WHERE source_id = ?1 AND object_id = ?2",
+                        params![source.0, object.0],
+                    )?;
+                    pending_delta -= 1;
+                    remaining -= 1;
+                    continue;
+                };
+
+                if cursor < 0 {
+                    changed += i64::from(apply_object_policy(
+                        &tx, source, &engine, &root, object,
+                    )?);
+                    processed += 1;
+                    remaining -= 1;
+                    if kind == "file" {
+                        tx.execute(
+                            "DELETE FROM policy_repair_frontier WHERE source_id = ?1 AND object_id = ?2",
+                            params![source.0, object.0],
+                        )?;
+                        pending_delta -= 1;
+                        continue;
+                    }
+                    cursor = 0;
+                    tx.execute(
+                        "UPDATE policy_repair_frontier SET entry_cursor = 0
+                         WHERE source_id = ?1 AND object_id = ?2",
+                        params![source.0, object.0],
+                    )?;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+
+                let limit = remaining as i64;
+                let children: Vec<(i64, ObjectId)> = tx
+                    .prepare_cached(
+                        "SELECT e.entry_id, e.object_id FROM entries e
+                         JOIN objects o ON o.object_id = e.object_id
+                         WHERE e.parent_id = ?1 AND e.entry_id > ?2
+                           AND e.deleted_at IS NULL AND o.deleted_at IS NULL
+                           AND o.source_id = ?3 AND o.kind IN ('file','directory')
+                         ORDER BY e.entry_id LIMIT ?4",
+                    )?
+                    .query_map(params![object.0, cursor, source.0, limit], |r| {
+                        Ok((r.get(0)?, ObjectId(r.get(1)?)))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (_, child) in &children {
+                    let inserted = tx.execute(
+                        "INSERT OR IGNORE INTO policy_repair_frontier(source_id, object_id, entry_cursor)
+                         VALUES (?1, ?2, -1)",
+                        params![source.0, child.0],
+                    )?;
+                    pending_delta += inserted as i64;
+                }
+                // Even an empty page probe is one bounded work unit. Without
+                // charging it, a turn could delete an unbounded collection of
+                // completed or tombstoned frontier rows.
+                remaining -= children.len().max(1);
+                if children.len() < limit as usize {
+                    tx.execute(
+                        "DELETE FROM policy_repair_frontier WHERE source_id = ?1 AND object_id = ?2",
+                        params![source.0, object.0],
+                    )?;
+                    pending_delta -= 1;
+                } else if let Some((last, _)) = children.last() {
+                    tx.execute(
+                        "UPDATE policy_repair_frontier SET entry_cursor = ?3
+                         WHERE source_id = ?1 AND object_id = ?2",
+                        params![source.0, object.0, last],
+                    )?;
+                }
+            }
+
+            let frontier_empty: bool = tx.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM policy_repair_frontier WHERE source_id = ?1)",
+                [source.0],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "UPDATE policy_repair_state SET
+                    processed = processed + ?2,
+                    changed = changed + ?3,
+                    pending = MAX(0, pending + ?4),
+                    phase = ?5
+                 WHERE source_id = ?1",
+                params![
+                    source.0,
+                    processed,
+                    changed,
+                    pending_delta,
+                    if frontier_empty { "purging" } else { "applying" }
+                ],
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -654,7 +959,8 @@ impl Catalog {
             for object in objects { tx.execute("DELETE FROM policy_cleanup WHERE object_id = ?1 AND source_id = ?2", params![object.0, source.0])?; }
             let ready: Option<bool> = tx.query_row(
                 "SELECT restart_requested != 0 FROM source_policy
-                 WHERE source_id = ?1 AND phase = 'purging' AND NOT EXISTS(SELECT 1 FROM policy_cleanup WHERE source_id = ?1)",
+                 WHERE source_id = ?1 AND phase = 'purging' AND error IS NULL
+                   AND NOT EXISTS(SELECT 1 FROM policy_cleanup WHERE source_id = ?1)",
                 [source.0], |r| r.get(0)).optional()?;
             match ready {
                 // A path change arrived while this pass ran, so objects it
@@ -666,6 +972,24 @@ impl Catalog {
                     crate::content::refresh_source_content_state_conn(&tx, source)?;
                 }
                 None => {}
+            }
+            let repair_ready: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM policy_repair_state r
+                    WHERE r.source_id = ?1 AND r.phase = 'purging' AND r.error IS NULL
+                      AND NOT EXISTS(SELECT 1 FROM policy_repair_frontier f WHERE f.source_id = r.source_id)
+                      AND NOT EXISTS(SELECT 1 FROM policy_cleanup c WHERE c.source_id = r.source_id)
+                 )",
+                [source.0],
+                |r| r.get(0),
+            )?;
+            if repair_ready {
+                tx.execute(
+                    "UPDATE policy_repair_state SET phase = 'applied', pending = 0, error = NULL
+                     WHERE source_id = ?1",
+                    [source.0],
+                )?;
+                crate::content::refresh_source_content_state_conn(&tx, source)?;
             }
             tx.commit()?;
             Ok(())
@@ -714,9 +1038,17 @@ impl eidos_scanner::DirectoryLister for ProtectedLister<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static REPAIR_VM_STEPS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_repair_vm_steps(_: *mut std::ffi::c_void) -> i32 {
+        REPAIR_VM_STEPS.fetch_add(1, Ordering::Relaxed);
+        0
+    }
 
     #[test]
-    fn apply_pages_seek_the_source_index_without_a_temporary_sort() {
+    fn apply_and_repair_pages_seek_indexes_without_a_temporary_sort() {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::schema::migrate(&mut conn).unwrap();
         let plan = conn
@@ -729,6 +1061,182 @@ mod tests {
             .join("; ");
         assert!(plan.contains("objects_policy_apply"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        let repair = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT e.entry_id, e.object_id FROM entries e
+                 JOIN objects o ON o.object_id = e.object_id
+                 WHERE e.parent_id = ?1 AND e.entry_id > ?2 AND e.deleted_at IS NULL
+                   AND o.deleted_at IS NULL AND o.source_id = ?3
+                   AND o.kind IN ('file','directory') ORDER BY e.entry_id LIMIT ?4",
+            )
+            .unwrap()
+            .query_map(params![1, 0, 1, 128], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(
+            repair.contains("entries_policy_repair_children"),
+            "{repair}"
+        );
+        assert!(!repair.contains("SCAN e"), "{repair}");
+        assert!(!repair.contains("TEMP B-TREE"), "{repair}");
+    }
+
+    #[test]
+    fn tiny_subtree_repair_vm_work_is_independent_of_unrelated_source_size() {
+        let mut measured = Vec::new();
+        for unrelated in [1i64, 100_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+            let host = catalog.ensure_host("fixture", "test").unwrap();
+            let source = catalog
+                .add_source(&crate::NewSource {
+                    host_id: host,
+                    name: "fixture".into(),
+                    kind: eidos_domain::SourceKind::WindowsGeneric,
+                    root_path: "fixture".into(),
+                    aliases: vec![],
+                })
+                .unwrap();
+            let affected = catalog
+                .with_writer(|conn| {
+                    conn.execute(
+                        "INSERT INTO source_policy(source_id, revision, rules, phase)
+                         VALUES (?1, 1, ?2, 'applied')",
+                        params![
+                            source.0,
+                            serde_json::to_string(&vec![ExclusionRule {
+                                id: "hidden".into(),
+                                kind: RuleKind::Directory,
+                                pattern: "hidden".into(),
+                                include: false,
+                            }])?
+                        ],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO objects(source_id, kind, identity_confidence, content_state, first_seen_generation, last_seen_generation)
+                         VALUES (?1, 'directory', 'path_derived', 'not_applicable', 1, 1)",
+                        [source.0],
+                    )?;
+                    let root = ObjectId(conn.last_insert_rowid());
+                    conn.execute(
+                        "UPDATE sources SET root_object_id = ?2 WHERE source_id = ?1",
+                        params![source.0, root.0],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO entries(source_id, parent_id, object_id, name, name_folded, first_seen_generation, last_seen_generation)
+                         VALUES (?1, NULL, ?2, '', '', 1, 1)",
+                        params![source.0, root.0],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO directory_aggregates(object_id, source_id, generation, complete)
+                         VALUES (?1, ?2, 1, 1)",
+                        params![root.0, source.0],
+                    )?;
+
+                    conn.execute(
+                        "INSERT INTO objects(source_id, kind, identity_confidence, content_state, first_seen_generation, last_seen_generation)
+                         VALUES (?1, 'directory', 'path_derived', 'not_applicable', 1, 1)",
+                        [source.0],
+                    )?;
+                    let affected = ObjectId(conn.last_insert_rowid());
+                    conn.execute(
+                        "INSERT INTO entries(source_id, parent_id, object_id, name, name_folded, first_seen_generation, last_seen_generation)
+                         VALUES (?1, ?2, ?3, 'hidden', 'hidden', 1, 1)",
+                        params![source.0, root.0, affected.0],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO directory_aggregates(object_id, source_id, generation, complete)
+                         VALUES (?1, ?2, 1, 1)",
+                        params![affected.0, source.0],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO objects(source_id, kind, identity_confidence, content_state, first_seen_generation, last_seen_generation)
+                         VALUES (?1, 'file', 'path_derived', 'pending', 1, 1)",
+                        [source.0],
+                    )?;
+                    let tiny = ObjectId(conn.last_insert_rowid());
+                    conn.execute(
+                        "INSERT INTO entries(source_id, parent_id, object_id, name, name_folded, extension, first_seen_generation, last_seen_generation)
+                         VALUES (?1, ?2, ?3, 'tiny.txt', 'tiny.txt', 'txt', 1, 1)",
+                        params![source.0, affected.0, tiny.0],
+                    )?;
+
+                    conn.execute(
+                        "INSERT INTO objects(source_id, kind, identity_confidence, content_state, first_seen_generation, last_seen_generation)
+                         VALUES (?1, 'directory', 'path_derived', 'not_applicable', 1, 1)",
+                        [source.0],
+                    )?;
+                    let stable = ObjectId(conn.last_insert_rowid());
+                    conn.execute(
+                        "INSERT INTO entries(source_id, parent_id, object_id, name, name_folded, first_seen_generation, last_seen_generation)
+                         VALUES (?1, ?2, ?3, 'stable', 'stable', 1, 1)",
+                        params![source.0, root.0, stable.0],
+                    )?;
+                    conn.execute(
+                        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ?3)
+                         INSERT INTO objects(source_id, kind, identity_confidence, content_state, first_seen_generation, last_seen_generation)
+                         SELECT ?1, 'file', 'path_derived', 'pending', 1, 1 FROM n",
+                        params![source.0, stable.0, unrelated],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO entries(source_id, parent_id, object_id, name, name_folded, extension, first_seen_generation, last_seen_generation)
+                         SELECT ?1, ?2, object_id, 'unrelated-' || object_id || '.txt', 'unrelated-' || object_id || '.txt', 'txt', 1, 1
+                         FROM objects WHERE source_id = ?1 AND object_id > ?3",
+                        params![source.0, stable.0, stable.0],
+                    )?;
+                    enqueue_repair_conn(conn, source, affected)?;
+                    Ok(affected)
+                })
+                .unwrap();
+            assert!(affected.0 > 0);
+
+            REPAIR_VM_STEPS.store(0, Ordering::Relaxed);
+            catalog
+                .with_writer(|conn| {
+                    // SAFETY: the callback and its context remain valid for
+                    // the connection's lifetime and never unwind or abort.
+                    unsafe {
+                        rusqlite::ffi::sqlite3_progress_handler(
+                            conn.handle(),
+                            1,
+                            Some(count_repair_vm_steps),
+                            std::ptr::null_mut(),
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            catalog.apply_policy_repair_batch(source).unwrap();
+            let steps = REPAIR_VM_STEPS.load(Ordering::Relaxed);
+            catalog
+                .with_writer(|conn| {
+                    // SAFETY: removing the handler with a null callback is the
+                    // SQLite API contract; the connection is exclusively held.
+                    unsafe {
+                        rusqlite::ffi::sqlite3_progress_handler(
+                            conn.handle(),
+                            0,
+                            None,
+                            std::ptr::null_mut(),
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            eprintln!("subtree repair: unrelated={unrelated}, vm_steps={steps}");
+            measured.push(steps);
+        }
+        assert!(
+            measured[0] < 20_000,
+            "tiny repair took {} VM steps",
+            measured[0]
+        );
+        assert!(
+            measured[1] <= measured[0] + 1_000,
+            "unrelated source size changed repair work: {measured:?}"
+        );
     }
 
     struct NoIo;
