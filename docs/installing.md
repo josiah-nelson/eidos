@@ -1,5 +1,9 @@
 # Installing eidos on Windows
 
+These instructions describe the collector-free recovery build. v0.5.0 does
+not contain the recovery fixes; do not treat a source build or a passing CI
+run as a qualified replacement release. See [recovery.md](recovery.md).
+
 Download `eidos-<version>-setup.exe` from the
 [releases page](https://github.com/josiah-nelson/eidos/releases) and run
 it. 64-bit Windows 10 or later (Windows Server 2019 or later) is required.
@@ -36,18 +40,14 @@ and read what it indexes.
 
 **Ready to install** — start automatically (service at boot, or background
 process at sign-in), Start-menu shortcuts, and whether to open eidos in the
-browser when setup finishes. *Advanced: profiling collector* adds the
-observatory collector: a separate privileged service
-that records bounded, privacy-preserving workload measurements
-([observatory.md](observatory.md)). It has its own data directory
-(`%ProgramData%\eidos-collector`), identity, and removal. It may be combined
-with either core scope; adding it to *Just me* leaves the core per-user but
-requires administrator approval for the collector service. On a later run of
-the setup the checkbox shows whether the collector is installed, and leaving
-it as it is never removes one.
+browser when setup finishes. Only the core product is installed.
 
-Adding sources, content policies and everything else happens in the web
-interface once eidos is running.
+Open **Sources > Node setup** to choose standalone, master, or joining an
+existing master. Then explicitly select drives or add folders. Nothing is
+preselected. Each drive retains its success or error result, and **Retry
+failed drives** submits only failed creations. If a source was added but its
+scan could not start, **Retry scan** uses that source; it does not add it again.
+You can also leave scans off and start them later from Sources.
 
 ## After installation
 
@@ -69,12 +69,22 @@ account's password again before an upgrade; Windows does not make the stored
 service password readable. An unattended upgrade must pass
 `EIDOS_SERVICE_PASSWORD` again.
 Removal keeps the data folder unless you tick *Also delete the indexed
-data*; the files that were indexed are never touched. When the collector is
-installed, removal offers to remove its service too (on by default) and,
-separately, to delete its study data (off by default, so a later reinstall
-keeps its object tokens comparable). A host set up earlier with the
-separate collector setup is upgraded in place by this setup; its study key,
-spool and configuration are kept.
+data*; the files that were indexed are never touched.
+
+### Retiring an existing collector
+
+The recovery installer does not carry or adopt the profiling collector.
+Before upgrading, remove **eidos observatory collector** from Settings > Apps
+using its existing uninstall entry. Keep study data (the default); do not
+select its data-purge option. If the entry is missing, use the original
+collector installer to uninstall it. Check that `eidos-collector` is no
+longer registered in Services before running the new setup. Setup and the
+bare MSI block installation while the legacy package/service is detected,
+without changing its data or the core catalog. Do not delete registry keys
+to bypass this check: that would leave the service or package behind.
+
+Collector spool, configuration and study key are not used by the core. Keep
+any required archive independently; recovery does not delete it automatically.
 
 ## Unattended installs
 
@@ -82,9 +92,7 @@ spool and configuration are kept.
 eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_PORT=7700
 eidos-setup.exe /quiet EIDOS_SCOPE=perMachine EIDOS_SERVICE_ACCOUNT_KIND=user EIDOS_SERVICE_DOMAIN=CORP EIDOS_SERVICE_USER=svc-eidos EIDOS_SERVICE_PASSWORD=...
 eidos-setup.exe /passive                               # per-user, progress only
-eidos-setup.exe /quiet EIDOS_SCOPE=perUser EIDOS_INSTALL_COLLECTOR=1 EIDOS_STUDY_KEY=<64 hex> EIDOS_LANES=usn
 eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_DATA=1
-eidos-setup.exe /quiet /uninstall EIDOS_REMOVE_COLLECTOR=1 EIDOS_COLLECTOR_REMOVE_DATA=1
 ```
 
 Variables: `EIDOS_SCOPE` (`perUser` | `perMachine`), `EIDOS_INSTALLDIR`,
@@ -92,14 +100,6 @@ Variables: `EIDOS_SCOPE` (`perUser` | `perMachine`), `EIDOS_INSTALLDIR`,
 (`local-system` | `local-service` | `network-service` | `user`),
 `EIDOS_SERVICE_DOMAIN`, `EIDOS_SERVICE_USER`, `EIDOS_SERVICE_PASSWORD`,
 `EIDOS_START_SERVICE`, `EIDOS_START_MENU`, `EIDOS_REMOVE_DATA` (`1`/`0`).
-Collector: `EIDOS_INSTALL_COLLECTOR` (`1` installs or keeps it, `0` leaves it
-out or removes it during install/modify, empty keeps the detected state),
-`EIDOS_REMOVE_COLLECTOR`
-(`0` keeps the collector service when eidos is removed),
-`EIDOS_COLLECTOR_REMOVE_DATA` (`1` deletes its study data), and the
-collector's own `EIDOS_STUDY_KEY`, `EIDOS_LANES`, `EIDOS_UPLOAD`,
-`EIDOS_UPLOAD_HOUR`, `EIDOS_COLLECTOR_INSTALLDIR`, `EIDOS_COLLECTOR_DATADIR`,
-`EIDOS_COLLECTOR_START` (see [observatory.md](observatory.md)).
 Setup logs are written to `%TEMP%\eidos_<timestamp>.log` (`/log <path>`
 to choose).
 

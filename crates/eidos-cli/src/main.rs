@@ -21,7 +21,6 @@ mod content;
 mod detach;
 mod fleet;
 mod logging;
-mod observe;
 mod profile;
 mod search;
 #[cfg(windows)]
@@ -74,8 +73,6 @@ enum Command {
     Archive(archive::ArchiveArgs),
     /// Content job controls in the running service (retry failures).
     Content(content::ContentArgs),
-    /// Manage a bounded, privacy-preserving workload observation study.
-    Observe(observe::ObserveArgs),
     /// Fleet identity, master role, approved joining, and sync status.
     Fleet(fleet::FleetArgs),
 }
@@ -115,6 +112,9 @@ pub struct ServeArgs {
     /// Do not extract or index file content (metadata only).
     #[arg(long)]
     pub no_content: bool,
+    /// Disable the daily read-only release check against GitHub.
+    #[arg(long)]
+    pub no_update_check: bool,
     /// Content extraction threads (per-source budgets apply on top).
     #[arg(long, env = "EIDOS_CONTENT_WORKERS", default_value_t = 4)]
     pub content_workers: usize,
@@ -175,6 +175,7 @@ impl ServeArgs {
             scan_threads: self.scan_threads,
             auto_reconcile: !self.no_auto_reconcile,
             content: !self.no_content,
+            update_check: !self.no_update_check,
             content_workers: self.content_workers,
             admission: eidos_service::admission::AdmissionConfig {
                 concurrency: self.max_concurrent_queries.max(1),
@@ -252,6 +253,9 @@ impl ServeArgs {
         if self.no_content {
             v.push("--no-content".into());
         }
+        if self.no_update_check {
+            v.push("--no-update-check".into());
+        }
         if self.no_fleet {
             v.push("--no-fleet".into());
         }
@@ -272,15 +276,6 @@ fn main() -> anyhow::Result<()> {
             return service::run(args.clone(), cli.log.clone(), cli.log_json);
         }
     }
-    // The Windows collector service likewise logs to its own data directory.
-    if let Command::Observe(args) = &cli.command {
-        if args.is_service_entry() {
-            let Command::Observe(args) = cli.command else {
-                unreachable!()
-            };
-            return observe::run(args, &cli.log);
-        }
-    }
     let _log_guard = match &cli.command {
         Command::Serve(args) => {
             logging::init(&cli.log, cli.log_json, args.log_dir.as_deref(), true)?
@@ -294,7 +289,6 @@ fn main() -> anyhow::Result<()> {
         Command::Activity(args) => activity::run(args),
         Command::Archive(args) => archive::run(args),
         Command::Content(args) => content::run(args),
-        Command::Observe(args) => observe::run(args, &cli.log),
         Command::Fleet(args) => fleet::run(args),
         #[cfg(any(windows, target_os = "macos"))]
         Command::Service(args) => service::run(args, cli.log, cli.log_json),

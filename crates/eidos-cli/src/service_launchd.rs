@@ -12,8 +12,7 @@
 //! - The agent is a **LaunchAgent running as the user**, not a root
 //!   LaunchDaemon. It indexes the user's files, so it needs the user's
 //!   privacy grants and the shares mounted in their session; a root daemon
-//!   has neither. (The observatory collector is a daemon precisely because it
-//!   measures the machine rather than one person's files.)
+//!   has neither.
 //!
 //! Full Disk Access is only properly supported for executables inside an app
 //! bundle, so `install` says so when it is asked to register a loose binary.

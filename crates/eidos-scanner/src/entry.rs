@@ -95,6 +95,22 @@ impl VolumeInfo {
     }
 }
 
+/// One local volume root a source-selection UI can offer. Capacity comes
+/// from the OS at enumeration time; capability flags from `volume_info`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeCandidate {
+    /// Drive root such as `G:\`.
+    pub root: String,
+    /// `fixed`, `removable`, `remote`, `cdrom`, or `ramdisk`.
+    pub drive_type: String,
+    pub filesystem: String,
+    pub volume_name: String,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// Eligible for the USN incremental fast path.
+    pub supports_usn: bool,
+}
+
 /// Generic (crawl-only) source kind for the agent this build targets, used
 /// both by [`VolumeInfo::source_kind`] and by callers that could not probe the
 /// volume at all. Windows and macOS are the supported agents; any other target

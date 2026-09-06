@@ -168,26 +168,26 @@ private fleet with the release candidate and recorded in the release notes.
 | Retained suffix no longer covers central | automated: `a_cursor_below_the_compaction_floor_is_repaired_by_merkle_leaves` |
 | Central unavailable during heavy local churn | automated: local search and scans never wait on the fleet (separate tasks, bounded blocking calls); soak: churn with the central stopped, backlog within its ceiling |
 | Unknown peers and old/new protocol versions meet | automated: unknown peers may only submit a quarantined join request; malformed requests and foreign versions fail closed before any catalog payload |
-| Core or collector upgraded while busy | installer workflow: busy upgrade of the collector, repair and reinstall keep the fleet identity and the study key |
+| Core upgrade, repair and reinstall | installer workflow checks stable fleet identity; real busy-core and legacy retirement rehearsals remain release gates |
 
 ## Soak checklist (release candidate)
 
-1. Install the release candidate with the unified setup on the central,
-   one stable workstation, and one intermittently connected machine, with
-   the collector selected on each.
-2. Record the sync-off baseline on every host (`observe status`, the
-   product's `/api/activity`, and search p95 from `eidos bench search`).
+1. Retire any old collector using its original uninstall entry, keeping
+   study data. Install the core release candidate on the master,
+   one stable workstation and one intermittently connected machine.
+2. Record a sync-off baseline on every host (process CPU/memory/disk I/O,
+   the product's `/api/activity`, and search p95 from `eidos bench search`).
 3. Run `eidos fleet master` on the designated master. Join both nodes by
    discovery or master IP and approve their notifications from the master's
    Nodes page. Give the master the workstation's endpoint so one session is
    master-initiated.
 4. Run normal work for the soak window; keep `eidos fleet status` output
-   and the collector bundles.
+   and direct core resource measurements, including a quiet-idle window.
 5. Exercise the matrix rows marked *soak*: stop the central during churn,
    disconnect the laptop for the longest window available, restore a node's
    catalog from a backup and confirm the fence, replace a USN journal.
 6. Compare search p95 with sync on against the baseline (gate: within 15 %),
    central apply capacity against the fleet's aggregate arrival rate (gate:
    5x), and backlog growth over the longest disconnection.
-7. Record every result in the release notes; a failed fleet gate ships the
-   same installer with sync disabled and the gate documented.
+7. Record every result in the release notes. A failed recovery gate blocks
+   rollout; see [recovery.md](recovery.md).

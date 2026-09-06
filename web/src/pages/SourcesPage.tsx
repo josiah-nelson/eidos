@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
 import { api, type ApiInt, type SourceView } from '../api'
+import Onboarding, { CreatedSourceResult } from './Onboarding'
 import { ErrorBox, Spinner, StateBadge } from '../components'
 import { ago, bytes, count, duration, integerNumber, rate, when } from '../format'
 
@@ -13,6 +14,8 @@ export default function SourcesPage() {
     refetchInterval: (q) => (q.state.data?.some((s) => s.scan?.running) ? 1000 : 5000),
   })
   const [adding, setAdding] = useState(false)
+  const [setupOpen, setSetupOpen] = useState<boolean | null>(null)
+  if (setupOpen === null && sources.data) setSetupOpen(sources.data.length === 0)
   const scan = useMutation({
     mutationFn: (id: ApiInt) => api.scanSource(id),
     onSettled: () => qc.invalidateQueries({ queryKey: ['sources'] }),
@@ -27,18 +30,16 @@ export default function SourcesPage() {
       <div className="toolbar">
         <h1 style={{ margin: 0 }}>Sources</h1>
         <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn" onClick={() => setSetupOpen(true)}>Node setup</button>
         <button className="btn primary" onClick={() => setAdding(true)}>
           Add source
         </button>
       </div>
       {sources.isError && <ErrorBox error={sources.error} />}
       {scan.isError && <ErrorBox error={scan.error} />}
+      {cancel.isError && <ErrorBox error={cancel.error} />}
       {sources.isPending && <Spinner />}
-      {sources.data && sources.data.length === 0 && (
-        <div className="empty">
-          No sources yet. Add a drive root such as <code>G:\</code> or a folder to begin.
-        </div>
-      )}
+      {setupOpen && <Onboarding onManual={() => setAdding(true)} onDone={() => setSetupOpen(false)} />}
       <div className="cards">
         {sources.data?.map((s) => (
           <SourceCard
@@ -208,14 +209,13 @@ function AddSourceModal({ onClose }: { onClose: () => void }) {
     mutationFn: () => api.addSource({ name: name.trim(), root_path: root.trim(), scan: scanNow }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['sources'] })
-      onClose()
     },
   })
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop">
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h1>Add source</h1>
-        <form
+        {add.data ? <><CreatedSourceResult added={add.data} /><button className="btn primary" onClick={onClose}>Done</button></> : <form
           className="form"
           onSubmit={(e) => {
             e.preventDefault()
@@ -241,14 +241,14 @@ function AddSourceModal({ onClose }: { onClose: () => void }) {
           </label>
           {add.isError && <div className="error-text">{(add.error as Error).message}</div>}
           <div className="actions">
-            <button type="button" className="btn" onClick={onClose}>
+            <button type="button" className="btn" disabled={add.isPending} onClick={onClose}>
               Cancel
             </button>
             <button type="submit" className="btn primary" disabled={add.isPending || !name.trim() || !root.trim()}>
               Add
             </button>
           </div>
-        </form>
+        </form>}
       </div>
     </div>
   )

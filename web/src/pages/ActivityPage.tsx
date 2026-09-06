@@ -404,6 +404,7 @@ export default function ActivityPage() {
         </div>
       )}
 
+
       <h2>Sources</h2>
       <table className="grid">
         <thead>

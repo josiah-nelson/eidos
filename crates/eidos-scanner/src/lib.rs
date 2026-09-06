@@ -63,3 +63,17 @@ pub fn default_lister() -> Box<dyn DirectoryLister> {
         Box::new(std_lister::StdLister)
     }
 }
+
+/// Local volumes a source-selection UI can offer. Windows enumerates drive
+/// letters; other platforms return nothing and the UI falls back to manual
+/// path entry.
+pub fn local_volume_candidates() -> Vec<VolumeCandidate> {
+    #[cfg(windows)]
+    {
+        win::list_volume_candidates()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}

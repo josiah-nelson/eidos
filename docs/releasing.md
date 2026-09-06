@@ -4,56 +4,37 @@ Pushing a tag that starts with `v` builds and signs the Windows x86-64
 installer in `.github/workflows/release.yml` and publishes it on the GitHub
 release for that tag:
 
-- `eidos-<tag>-setup.exe` — the guided installer (Burn bundle with the setup
-  UI, the core MSI and the optional collector MSI); this is what people
-  download.
-- `eidos-<tag>.msi`, `eidos-collector-<tag>.msi`,
-  `eidos-collector-<tag>-setup.exe` — the bare packages and the
-  collector-only setup for administrators and fleet installs.
-- `.sha256` checksums for every asset.
+- `eidos-<tag>-setup.exe` — guided core installer.
+- `eidos-<tag>.msi` — bare core package for administrators.
+- `.sha256` checksums for both assets.
 
-The workflow runs two jobs in parallel - the full test gate (format, lint,
-the generated API contract, every Rust test on Windows via cargo-nextest,
-and the web lint/tests/build) and the signed build - and a third publishes
-only when both are green, so a red suite wastes some signing work but
-publishes nothing. The build job builds the web UI, the Rust executable
-(with the UI embedded), the setup UI, both MSIs and both bundles, and signs
-every executable piece with Azure Artifact Signing in the order the Windows
-Installer and Burn require:
+The collector is retired and is not built, signed or published. Existing
+installations follow [the retirement path](installing.md#retiring-an-existing-collector).
 
-1. `eidos.exe` and `eidos-setup-ui.exe` (before they are bound into the MSI
-   and bundle);
-2. `eidos.msi` and `eidos-collector.msi`;
-3. both Burn engines, detached from the bundles with `wix burn detach`, then
-   reattached with `wix burn reattach` — this is what the UAC prompt and
-   Programs and Features show for repair/uninstall;
-4. the finished unified and collector-only setup executables.
+Publication requires three successful jobs: the full Windows/web test gate,
+the signed build, and the reusable installer lifecycle workflow. Azure
+Artifact Signing signs the executable and setup UI, then the core MSI, then
+the detached Burn engine, then the reattached setup executable. Each
+signature and timestamp is verified before asset upload. Signing
+infrastructure already exists; it must also be used by the planned pushed
+update path, which is not implemented by the advisory version badge.
 
-Every signature and timestamp is verified with `Get-AuthenticodeSignature`
-before any asset is uploaded; a failure anywhere uploads nothing. See
-`installer/README.md` for the authoring and `installer/build.ps1` for the
-stages the workflow calls (the core and `-SkipCollector*` stage flags).
-
-Nothing is built or signed on a pull request. The same MSIs, UI and bundles can be
-exercised unsigned on demand with `installer.yml`, which builds from a debug
-executable, exercises the lifecycle paths below, and keeps the installer
-artifacts and logs as a workflow artifact:
+Run the unsigned lifecycle gate once for an installer change:
 
 ```powershell
 gh workflow run installer.yml --ref <branch>
 ```
 
-Run it before tagging whenever a change touches `installer/`, `build.ps1`, or
-the way the web UI is embedded — ordinary CI does not cover any of that. It
-covers core-only per-user, a per-user core with the per-machine collector,
-core-plus-collector per-machine through the unified setup, same-version
-adoption and later upgrade from the separate collector package, repair,
-uninstall keeping data, and explicit purge of exactly one product's data.
+It tests per-user and machine installations, upgrade, repair, retirement
+detection, invalid unattended values, retained data, reinstall and explicit
+purge. Its synthetic retired-package registration is not a substitute for
+rehearsing removal of a real older collector MSI. See [recovery.md](recovery.md).
 
 ## Release checklist
 
-The tag is the release. Everything the workflow needs is in the tree it
-tags; there is no separate rehearsal to pass first.
+Do not tag the recovery release until the real-machine acceptance evidence
+in [recovery.md](recovery.md) is recorded. Everything CI needs must be in the
+tagged tree, but ordinary CI does not prove quiet disks or a safe fleet rollout.
 
 1. Bump the workspace `version` in `Cargo.toml` (and `Cargo.lock`, via
    `cargo update -w --offline` or any build) and `web/package.json`
@@ -64,10 +45,10 @@ tags; there is no separate rehearsal to pass first.
 3. `scripts\check.ps1` passes on the release commit.
 4. Push the tag from that commit. The workflow refuses a tag that does not
    match `Cargo.toml`, runs the full gate and the signed build in parallel,
-   and publishes only when both are green.
+   and publishes only when tests, signed build and installer lifecycle pass.
 
-`installer.yml` (lifecycle rehearsal on an unsigned build) and
-`sync-soak.yml` stay on demand for changes that touch what they cover.
+`installer.yml` also remains callable on demand. `sync-soak.yml` is a
+protocol simulation; real-machine I/O and interruption evidence is separate.
 
 ## macOS
 
@@ -75,11 +56,11 @@ There is no macOS release job yet. `scripts/macos/build-agent.sh` produces
 `dist/macos/Eidos.app` — the bundle the agent is installed from, because Full
 Disk Access is only properly supported for bundled executables — signing with
 a *Developer ID Application* identity when the keychain has one and ad-hoc
-otherwise. `scripts/macos/sign-notarize.sh` already carries the notarisation
-path used for the observatory collector (temporary keychain from
-`APPLE_CERTIFICATE_P12`, `notarytool submit --wait`, `stapler staple`); a
-macOS release job reuses it for the agent bundle and publishes the notarised
-`Eidos.app`.
+otherwise. `scripts/macos/sign-notarize.sh` builds that core app with the
+embedded web UI, signs it with a Developer ID identity (including the temporary
+keychain path), submits it to Apple, staples the accepted ticket and creates
+`Eidos.app.zip`. It no longer builds or packages the collector. This path
+still requires validation on macOS; a Windows build cannot qualify it.
 
 Until then, macOS is installed from source: see
 [installing-macos.md](installing-macos.md).

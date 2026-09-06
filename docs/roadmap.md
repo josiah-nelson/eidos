@@ -30,9 +30,9 @@ Product statement:
 The standalone product remains the release floor. The targeted
 [v0.5 dogfood-fleet sprint](v0.5-dogfood-fleet-sprint.md) adds one manually
 configured master, approved joining, bidirectional connection initiation,
-real metadata replication, and an optional profiling collector before the
-signed release. It is a measured private-fleet vertical slice, not the full v1
-control plane.
+real metadata replication, and originally a profiling collector before the
+signed release. The collector is now retired. The failed rollout is followed
+by [collector-free recovery](recovery.md), not the full v1 control plane.
 
 ### 2.1 Milestone 0: repository and benchmark foundation
 
@@ -233,10 +233,8 @@ macOS parity so shared contracts do not become Windows-locked:
   behind an opaque, versioned feed-cursor contract
 - APFS identity, clone/snapshot, and apparent/allocated size semantics
   recorded as explicit decisions rather than normalized to NTFS behavior
-- a read-only, notify-only `eidos observe` collector that records bounded,
-  pseudonymized workload measurements for manual export; it never uploads,
-  listens, or accepts remote commands, and its privileged file-access lane is
-  separately enabled
+- core operational measurements without a separately deployed collector
+  ([retirement decision](adr/0026-retire-profiling-collector.md))
 
 Remaining parity work in this section:
 

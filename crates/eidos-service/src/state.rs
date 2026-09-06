@@ -92,6 +92,10 @@ pub struct AppState {
     pub data_dir: std::path::PathBuf,
     /// Cached on-disk footprint; recomputed lazily by [`AppState::storage`].
     pub storage_cache: Mutex<Option<(Instant, crate::api::StorageView)>>,
+    /// Newer release tag from the daily update check, if any.
+    pub update_available: Mutex<Option<String>>,
+    /// Whether the daily release check runs at all.
+    pub update_check: bool,
     /// Serializes expired cache refreshes. Callers double-check the cache
     /// after acquiring this lock so a health-check burst performs one disk
     /// traversal and every waiter reuses its result.
@@ -229,6 +233,8 @@ impl AppState {
                 .unwrap_or(config.content_workers),
             data_dir: config.data_dir.clone(),
             storage_cache: Mutex::new(None),
+            update_available: Mutex::new(None),
+            update_check: config.update_check,
             storage_refresh: Mutex::new(()),
             exec_opts: eidos_search::exec::ExecOptions::default(),
             export: export_limits,
@@ -383,6 +389,9 @@ impl AppState {
         crate::watcher::spawn_reconciler(self);
         crate::follower::spawn_follower(self);
         crate::content_workers::spawn_content_workers(self, self.content_worker_count);
+        if self.update_check {
+            crate::update_check::spawn_update_check(self);
+        }
         Ok(())
     }
 
