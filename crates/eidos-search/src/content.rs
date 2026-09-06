@@ -29,6 +29,7 @@ use tantivy::{DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Tantivy
 use ts_rs::TS;
 
 pub const CONTENT_SCHEMA_VERSION: u32 = 2;
+pub const CONTENT_WRITER_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 pub const TRIGRAM_TOKENIZER: &str = "eidos_trigram";
 pub const TEXT_TOKENIZER: &str = "eidos_text";
 /// Same tokenisation without case folding: exact whole-word literals.
@@ -320,7 +321,7 @@ impl ContentIndex {
         }
         let index = Index::open_in_dir(&dir)?;
         register_tokenizers(&index);
-        let writer = index.writer_with_num_threads(4, 256 * 1024 * 1024)?;
+        let writer = index.writer_with_num_threads(4, CONTENT_WRITER_MEMORY_BYTES)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)

@@ -4,6 +4,29 @@ Measured results on the reference corpus and bounded synthetic fixtures. Numbers
 git-ignored `bench-results/*.jsonl` records produced by the commands in
 [development.md](development.md). Dates are absolute; existing corpora stay read-only.
 
+## Memory diagnostics smoke (2026-09-06 UTC, development build)
+
+`scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15`, Windows build 26100,
+two content workers and two enumeration threads. Binary SHA-256:
+`552FC6367739AE52CE6F13D1F3096F48D2E8021E1956D5F1751D89CA87C25FF9`.
+Raw record: `bench-results/memory-visibility-2026-09-06-01.json` (private).
+
+The 256-file / 1,084,562-byte temporary fixture drained in 7.246 seconds;
+28 concurrent HTTP queries had p95 10.7 ms and maximum 15.5 ms. The 15.083-second
+unpolled idle window used 0.0625 CPU seconds, 155,648 process read bytes and
+4,120 process write bytes. It was not I/O-free.
+
+After idle, the actual `resources --memory --json` CLI returned the candidate's
+PID and a fresh sample: resident 54,267,904 bytes, peak resident 122,712,064
+bytes and Windows private commit 64,630,784 bytes. Configured budgets remained
+distinct: 872,415,232 baseline page-cache target bytes and a 1 TiB effective
+mapped-file ceiling per connection, neither an allocated-RAM total.
+
+Only disposable synthetic data was indexed. The host was not isolated, the
+build was a development binary, process I/O is not physical-disk I/O, and the
+short idle/CLI check does not qualify heavy workloads, resource presets,
+installation or deployment. See [memory semantics](memory.md).
+
 ## Recovery smoke (2026-09-06 UTC, development build)
 
 `scripts/recovery-smoke.ps1 -IdleSeconds 30`, Windows build 26100, two content

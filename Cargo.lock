@@ -914,6 +914,7 @@ dependencies = [
  "fs4",
  "futures-core",
  "http-body-util",
+ "libc",
  "parking_lot",
  "rust-embed",
  "serde",
@@ -926,6 +927,7 @@ dependencies = [
  "tracing",
  "ts-rs",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

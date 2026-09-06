@@ -70,6 +70,8 @@ try {
     $saved = & $candidatePath resources --url $baseUrl --scan-threads 2 --concurrent-scans 1 --minimum-free-mib 1024 --json
     if ($LASTEXITCODE -ne 0) { throw 'Resource CLI round trip failed.' }
     if (($saved | ConvertFrom-Json).limits.scan_threads -ne 2) { throw 'Resource limits were not saved.' }
+    # Warm the on-demand sampler; this reads only the candidate's own process.
+    $null = Invoke-RestMethod "$baseUrl/api/memory" -TimeoutSec 5
     $before = Counters
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $added = Invoke-RestMethod "$baseUrl/api/sources" -Method Post -ContentType 'application/json' -TimeoutSec 10 -Body (
@@ -102,6 +104,19 @@ try {
     $idleAfter = Counters
     $idleElapsed = $idleClock.Elapsed.TotalSeconds
     $idleActivity = Invoke-RestMethod "$baseUrl/api/activity" -TimeoutSec 10
+    # Sample after the unpolled idle window, never during it. Exercise the
+    # actual CLI and exact-string API counters, with bounded cold-cache retry.
+    $memory = $null
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        $memoryJson = & $candidatePath resources --url $baseUrl --memory --json
+        if ($LASTEXITCODE -ne 0) { throw 'Memory CLI round trip failed.' }
+        $memory = $memoryJson | ConvertFrom-Json
+        if ($memory.process -and -not $memory.stale -and [long]$memory.sample_age_s -le 1) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $memory.process -or $memory.stale -or [long]$memory.sample_age_s -gt 1 -or $memory.process.pid -ne $candidate.Id -or [long]$memory.process.resident_bytes -le 0) {
+        throw 'Memory API did not report a fresh sample of the temporary candidate.'
+    }
     $sorted = @($latencies | Sort-Object)
     $report = [ordered]@{
         measured_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -118,6 +133,7 @@ try {
         catalog_writer_after_crawl = $activity.catalog_writer
         catalog_writer_after_idle = $idleActivity.catalog_writer
         storage_after_idle = $idleActivity.storage
+        memory_after_idle = $memory
         files_indexed = $activity.workers.files_indexed
     }
     $json = $report | ConvertTo-Json -Depth 8

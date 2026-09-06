@@ -40,8 +40,9 @@ explicitly disables this check.
 Already running files/scans, index publication, native changes and fleet writes
 are not interrupted. Consequently the reserve is an admission threshold, not
 a guaranteed remaining-space quota. It does not protect separately configured
-log volumes or every other writer. RAM/cache budgets and cross-stage
-self-store protection are also still required before deployment qualification.
+log volumes or every other writer. Memory usage and configured cache budgets
+are visible in [Activity and the CLI](memory.md); they are not a hard RAM quota.
+Cross-stage self-store protection is described in [exclusions](exclusions.md).
 
 When an index commit or its catalog acknowledgement fails, the content pipeline
 retains pending IDs, holds new extraction and retries publication at the normal

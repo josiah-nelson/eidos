@@ -60,6 +60,7 @@ pub type Result<T> = std::result::Result<T, CatalogError>;
 /// Handle to the catalog database.
 pub struct Catalog {
     path: PathBuf,
+    memory_config: CatalogMemoryConfig,
     writer: Mutex<Connection>,
     writer_coordination: Arc<WriterCoordination>,
     readers: crossbeam_channel::Receiver<Connection>,
@@ -188,6 +189,17 @@ impl std::fmt::Debug for Catalog {
 
 const READER_POOL: usize = 12;
 
+/// Configuration targets, not resident memory or a process-wide ceiling.
+#[derive(Debug, Clone, Copy, serde::Serialize, TS)]
+pub struct CatalogMemoryConfig {
+    pub baseline_connections: u32,
+    pub page_cache_per_connection_bytes: u64,
+    pub page_cache_baseline_target_bytes: u64,
+    pub mmap_per_connection_limit_bytes: u64,
+}
+
+const PAGE_CACHE_KIB: u64 = 64 * 1024;
+
 impl Catalog {
     /// Open (creating if necessary) and migrate the catalog at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<Catalog>> {
@@ -200,6 +212,14 @@ impl Catalog {
         }
         let mut writer = open_connection(&path)?;
         schema::migrate(&mut writer)?;
+        let memory_config = CatalogMemoryConfig {
+            baseline_connections: (READER_POOL + 1) as u32,
+            page_cache_per_connection_bytes: PAGE_CACHE_KIB * 1024,
+            page_cache_baseline_target_bytes: (READER_POOL as u64 + 1) * PAGE_CACHE_KIB * 1024,
+            mmap_per_connection_limit_bytes: writer
+                .query_row("PRAGMA mmap_size", [], |r| r.get::<_, i64>(0))?
+                .max(0) as u64,
+        };
         let (tx, rx) = crossbeam_channel::bounded(READER_POOL);
         for _ in 0..READER_POOL {
             let c = open_connection(&path)?;
@@ -208,6 +228,7 @@ impl Catalog {
         }
         Ok(Arc::new(Catalog {
             path,
+            memory_config,
             writer: Mutex::new(writer),
             writer_coordination: Arc::new(WriterCoordination::default()),
             readers: rx,
@@ -219,6 +240,12 @@ impl Catalog {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Startup connection settings, without checking out a reader or touching
+    /// the writer. Scan sessions open additional connections with these targets.
+    pub fn memory_config(&self) -> CatalogMemoryConfig {
+        self.memory_config
     }
 
     /// Open an additional write connection (used by long-running scan
@@ -310,10 +337,10 @@ fn open_connection(path: &Path) -> Result<Connection> {
     conn.execute_batch(
         "PRAGMA synchronous = NORMAL;
          PRAGMA temp_store = MEMORY;
-         PRAGMA cache_size = -65536;
          PRAGMA mmap_size = 1099511627776;
          PRAGMA foreign_keys = OFF;",
     )?;
+    conn.pragma_update(None, "cache_size", -(PAGE_CACHE_KIB as i64))?;
     Ok(conn)
 }
 

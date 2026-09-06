@@ -16,6 +16,9 @@ pub struct ResourceArgs {
     /// Free MiB reserved on the data volume; zero disables this check.
     #[arg(long, requires_all = ["scan_threads", "concurrent_scans"])]
     minimum_free_mib: Option<u32>,
+    /// Show process memory and configured cache/index budgets instead of limits.
+    #[arg(long, conflicts_with_all = ["scan_threads", "concurrent_scans", "minimum_free_mib"])]
+    memory: bool,
     #[arg(long)]
     json: bool,
 }
@@ -26,7 +29,11 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
         .http_status_as_error(false)
         .build()
         .into();
-    let url = format!("{}/api/resources", args.url.trim_end_matches('/'));
+    let url = format!(
+        "{}/api/{}",
+        args.url.trim_end_matches('/'),
+        if args.memory { "memory" } else { "resources" }
+    );
     let mut response = if let (Some(scan_threads), Some(concurrent_scans), Some(minimum_free_mib)) = (
         args.scan_threads,
         args.concurrent_scans,
@@ -55,6 +62,27 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
     let body = body.context("read resource limits")?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&body)?);
+    } else if args.memory {
+        let value = |v: &serde_json::Value| v.as_str().unwrap_or("unavailable").to_owned();
+        println!(
+            "resident bytes: {}  peak resident bytes: {}  private committed bytes: {}",
+            value(&body["process"]["resident_bytes"]),
+            value(&body["process"]["peak_resident_bytes"]),
+            value(&body["process"]["private_commit_bytes"])
+        );
+        println!(
+            "sample age (s): {}  stale: {}",
+            value(&body["sample_age_s"]),
+            body["stale"]
+        );
+        println!("catalog baseline connections: {}  page-cache target bytes each: {}  baseline target bytes: {}",
+            body["catalog"]["baseline_connections"], value(&body["catalog"]["page_cache_per_connection_bytes"]), value(&body["catalog"]["page_cache_baseline_target_bytes"]));
+        println!("mapped file limit per connection: {}  name-index writer budget: {}  content-index writer budget: {}",
+            value(&body["catalog"]["mmap_per_connection_limit_bytes"]), value(&body["catalog_writer_budget_bytes"]), value(&body["content_writer_budget_bytes"]));
+        println!("Budgets are not allocated RAM or a hard process limit; scan connections and other allocations are additional.");
+        if let Some(error) = body["error"].as_str() {
+            println!("memory sample unavailable: {error}");
+        }
     } else {
         let limits = &body["limits"];
         println!(

@@ -68,8 +68,19 @@ change remains pending. Final focused checks also passed: 22 service tests
 See
 [exclusion controls](exclusions.md) for semantics and path-alias limitations.
 
-Chunk B is **not complete**. Shared-device admission, RAM/cache
-visibility, measured profiles and real-workload qualification also remain.
+Process RAM and configured cache/index budgets are implemented in the Activity
+page, memory API and resource CLI. The values distinguish resident RAM, Windows
+private commit, baseline/scan page-cache targets and effective mapped-file
+limits. See [memory diagnostics](memory.md). The full Windows local gate passed,
+including four memory unit tests, a read-only API regression, 43 web utility
+tests, 25 rendered UI tests and the production web build. The required-web
+development binary passed a 256-file synthetic crawl, CLI round trip and
+15-second unpolled idle observation; see [the recorded smoke limits](benchmarks.md).
+Cross-platform review remains pending. This does not introduce a hard memory
+limit or measured presets.
+
+Chunk B is **not complete**. Shared-device admission,
+measured profiles and real-workload qualification also remain.
 The current source cap is not a physical-device cap, and disk admission is
 not a hard quota. Signed pushed updates remain chunk C.
 
