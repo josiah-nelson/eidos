@@ -59,6 +59,7 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
         .route("/sources/{id}/archives", post(requeue_archives))
         .merge(crate::content_control::routes())
         .merge(crate::resource_control::routes())
+        .merge(crate::memory::routes())
         .merge(crate::exclusions_api::routes())
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())

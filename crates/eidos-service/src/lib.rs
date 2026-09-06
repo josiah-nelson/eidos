@@ -21,6 +21,7 @@ pub mod follower;
 #[cfg(target_os = "macos")]
 mod fsevents_apply;
 pub mod interactions_api;
+pub mod memory;
 pub mod resource_control;
 pub mod retry_api;
 pub mod scanner;

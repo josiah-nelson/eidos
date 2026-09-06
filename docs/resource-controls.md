@@ -40,8 +40,9 @@ explicitly disables this check.
 Already running files/scans, index publication, native changes and fleet writes
 are not interrupted. Consequently the reserve is an admission threshold, not
 a guaranteed remaining-space quota. It does not protect separately configured
-log volumes or every other writer. RAM/cache budgets and cross-stage
-self-store protection are also still required before deployment qualification.
+log volumes or every other writer. Memory usage and configured cache budgets
+are visible in [Activity and the CLI](memory.md); they are not a hard RAM quota.
+Cross-stage self-store protection is described in [exclusions](exclusions.md).
 
 When an index commit or its catalog acknowledgement fails, the content pipeline
 retains pending IDs, holds new extraction and retries publication at the normal
@@ -65,10 +66,16 @@ return an actionable error.
 ```powershell
 eidos resources --json
 eidos resources --scan-threads 2 --concurrent-scans 1 --minimum-free-mib 2048
+eidos resources --memory            # process RAM and configured budgets
 eidos content workers 4
 eidos content pause
 eidos content resume
 ```
+
+`GET /api/memory` and `eidos resources --memory` report observed process memory
+alongside the configured cache and index-writer budgets. They set nothing; see
+[memory diagnostics](memory.md) for the freshness contract and for why a budget
+is not resident RAM.
 
 For discovery, `/api/volumes` uses a five-second single-flight cache outside
 the operator thread pool, with a two-second cold-response deadline. The

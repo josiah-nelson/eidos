@@ -73,6 +73,7 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
 }
 
 pub struct AppState {
+    pub memory: crate::memory::MemoryTelemetry,
     /// Bounded gate in front of expensive HTTP operations.
     pub admission: Arc<crate::admission::Admission>,
     pub catalog: Arc<Catalog>,
@@ -226,6 +227,7 @@ impl AppState {
             .min(config.admission.concurrency.saturating_sub(1))
             .max(1);
         let state = Self {
+            memory: crate::memory::MemoryTelemetry::default(),
             admission: Arc::new(crate::admission::Admission::new(config.admission.clone())),
             catalog,
             index,

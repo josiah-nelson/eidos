@@ -32,6 +32,8 @@ export type ArchiveSummary = { container_id: ObjectId, depth: number, member_pat
 
 export type ArchiveView = { object_id: ObjectId, path: string | null, record: ArchiveRecord, members: Array<ArchiveMember>, total: ApiInt, query: MemberQuery, };
 
+export type CatalogMemoryConfig = { baseline_connections: number, page_cache_per_connection_bytes: ApiInt, page_cache_baseline_target_bytes: ApiInt, mmap_per_connection_limit_bytes: ApiInt, };
+
 export type CatalogWriterStats = { acquisitions: ApiInt, contended_acquisitions: ApiInt, waiting: ApiInt, total_wait_ms: number, max_wait_ms: number, total_hold_ms: number, max_hold_ms: number, };
 
 export type CentralBody = { central?: boolean, listen?: string, };
@@ -186,6 +188,8 @@ export type LocalSourceSync = { source_id: SourceId, name: string, policy: strin
 
 export type MemberQuery = { parent: string | null, prefix: string | null, offset: number, limit: number, };
 
+export type MemoryView = { process: ProcessMemory | null, sample_age_s: ApiInt | null, stale: boolean, error: string | null, catalog: CatalogMemoryConfig, catalog_writer_budget_bytes: ApiInt, content_writer_budget_bytes: ApiInt, };
+
 export type NativeIdentity = { volume_serial: ApiInt, file_id_high: ApiInt, file_id_low: ApiInt, confidence: IdentityConfidence, };
 
 export type NodeId = string;
@@ -223,6 +227,8 @@ export type PreviewLimits = { max_neighbors: number, max_bytes: number, max_line
 export type PreviewQuery = { generation?: number | null, ordinal: number, before: number, after: number, };
 
 export type Priority = "catalog_critical" | "metadata_projection" | "small_text" | "normal_text" | "large_text" | "archive_manifest" | "enrichment";
+
+export type ProcessMemory = { pid: number, resident_bytes: ApiInt, peak_resident_bytes: ApiInt | null, private_commit_bytes: ApiInt | null, };
 
 export type Query = { "op": "all" } | { "op": "and", clauses: Array<Query>, } | { "op": "or", clauses: Array<Query>, } | { "op": "not", clause: Query, } | { "op": "text", field: TextField, mode: TextMode, value: string, case_sensitive: boolean, slop: number, } | { "op": "host", ids: Array<HostId>, names?: Array<string>, } | { "op": "source", ids: Array<SourceId>, names?: Array<string>, } | { "op": "object", ids: Array<ObjectId>, } | { "op": "path", mode: PathMode, value: string, case_sensitive: boolean, } | { "op": "descendant_of", directory: ObjectId, max_depth?: number | null, } | { "op": "extension", values: Array<string>, } | { "op": "kind", values: Array<ObjectKind>, } | { "op": "size", field: SizeField, min?: ApiInt | null, max?: ApiInt | null, } | { "op": "time", field: TimeField, after?: UnixNanos | null, before?: UnixNanos | null, } | { "op": "attributes", all_of: number, none_of: number, } | { "op": "content_state", states: Array<ContentState>, } | { "op": "descendant_extension", extension: string, min_count: ApiInt, max_count?: ApiInt | null, } | { "op": "subtree_size", field: SizeField, min?: ApiInt | null, max?: ApiInt | null, } | { "op": "descendant_count", min?: ApiInt | null, max?: ApiInt | null, } | { "op": "archive", in_archive?: boolean | null, container?: ObjectId | null, max_depth?: number | null, };
 

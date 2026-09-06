@@ -29,9 +29,16 @@ impl<T: Clone + Send + 'static> Default for BackgroundProbe<T> {
 
 impl<T: Clone + Send + 'static> BackgroundProbe<T> {
     pub fn seeded(result: Result<T, String>) -> Self {
+        Self::seeded_at(result, Duration::ZERO)
+    }
+
+    /// Seed a result that already carries `age`, so age-sensitive callers can
+    /// be exercised without sleeping.
+    pub fn seeded_at(result: Result<T, String>, age: Duration) -> Self {
+        let now = Instant::now();
         Self {
             state: Mutex::new(ProbeState {
-                result: Some((Instant::now(), result)),
+                result: Some((now.checked_sub(age).unwrap_or(now), result)),
                 running: false,
             }),
             ..Self::default()
@@ -88,21 +95,36 @@ impl<T: Clone + Send + 'static> BackgroundProbe<T> {
     /// Wait only for a cold cache. A warm caller gets the cached answer while
     /// any refresh continues separately (including a stuck OS call).
     pub async fn cached(&self, deadline: Duration) -> Result<T, String> {
+        self.cached_within(None, deadline).await.unwrap_or_else(|| {
+            Err("OS probe is still running; retry shortly or enter a path manually".to_string())
+        })
+    }
+
+    /// Wait, bounded by `deadline`, for a cached result no older than `max_age`
+    /// (any age when `None`). `None` means nothing usable arrived in time: the
+    /// running probe keeps its thread and no replacement is ever started. An
+    /// age bound lets a one-shot caller receive the refresh it just triggered
+    /// instead of an arbitrarily old sample.
+    pub async fn cached_within(
+        &self,
+        max_age: Option<Duration>,
+        deadline: Duration,
+    ) -> Option<Result<T, String>> {
         let wait = async {
             loop {
                 let changed = self.changed.notified();
                 // Register before inspecting state to avoid a lost wake-up.
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                if let Some((_, result)) = self.snapshot() {
-                    return result;
+                if let Some((age, result)) = self.snapshot() {
+                    if max_age.is_none_or(|max| age <= max) {
+                        return result;
+                    }
                 }
                 changed.await;
             }
         };
-        tokio::time::timeout(deadline, wait).await.map_err(|_| {
-            "OS probe is still running; retry shortly or enter a path manually".to_string()
-        })?
+        tokio::time::timeout(deadline, wait).await.ok()
     }
 }
 
@@ -146,5 +168,41 @@ mod tests {
         });
         assert_eq!(probe.cached(Duration::from_millis(20)).await.unwrap(), 3);
         release.send(()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_age_bound_waits_for_a_refresh_without_starting_a_second_probe() {
+        let probe = Arc::new(BackgroundProbe::seeded_at(Ok(1), Duration::from_secs(60)));
+        let usable = Some(Duration::from_secs(30));
+        // Nothing is refreshing yet, so only the deadline can end this wait.
+        assert!(probe
+            .cached_within(usable, Duration::from_millis(20))
+            .await
+            .is_none());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, blocked) = mpsc::channel();
+        let count = calls.clone();
+        probe.refresh(Duration::ZERO, move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            blocked.recv().unwrap();
+            Ok(2)
+        });
+        // A caller that accepts any age still gets the old value immediately,
+        // and neither caller launches a replacement probe.
+        assert_eq!(probe.cached(Duration::ZERO).await.unwrap(), 1);
+        assert!(probe
+            .cached_within(usable, Duration::from_millis(20))
+            .await
+            .is_none());
+        release.send(()).unwrap();
+        assert_eq!(
+            probe
+                .cached_within(usable, Duration::from_secs(2))
+                .await
+                .unwrap()
+                .unwrap(),
+            2
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

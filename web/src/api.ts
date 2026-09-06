@@ -33,6 +33,7 @@ import type {
   ResolveView,
   ResourceLimits,
   ResourceView,
+  MemoryView,
   ResultMode,
   RetryBody,
   RetryReport,
@@ -165,6 +166,7 @@ export const api = {
   indexStatus: () => request<IndexStatus>('/api/index'),
   activity: () => request<ActivityView>('/api/activity'),
   resources: () => request<ResourceView>('/api/resources'),
+  memory: () => request<MemoryView>('/api/memory'),
   setResources: (body: ResourceLimits) =>
     request<ResourceView>('/api/resources', { method: 'POST', body: JSON.stringify(body) }),
   contentStatus: () => request<ContentStatusView>('/api/content/status'),

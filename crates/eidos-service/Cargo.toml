@@ -31,6 +31,12 @@ rust-embed = { workspace = true }
 # Release update check (read-only GitHub API poll).
 ureq = { version = "3.4", features = ["json"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 eidos-archive = { workspace = true }
