@@ -13,7 +13,9 @@ param(
     [ValidateRange(1, 8)][int]$SourceReaders = 2,
     [ValidateRange(0, 4)][int]$LargeFilesPerSource = 0,
     [ValidateRange(1, 8)][int]$LargeFileMiB = 2,
+    [ValidateSet(0, 64)][int]$SmallFileKiB = 0,
     [ValidateRange(25, 1000)][int]$QueryIntervalMilliseconds = 250,
+    [switch]$CheckActivePause,
     [switch]$CheckRestart
 )
 $ErrorActionPreference = 'Stop'
@@ -25,6 +27,24 @@ $logDir = Join-Path $fixtureDir 'logs'
 New-Item -ItemType Directory -Path $dataDir, $logDir | Out-Null
 $utf8 = [Text.UTF8Encoding]::new($false)
 $payload = ("recoveryneedle synthetic indexing fixture apple maple river cloud`n" * 64)
+# One definition per query: the reported string and the issued URL cannot drift.
+# The foreground sample stays ranked (its total is capped, so it is never a
+# completeness claim); the completeness gate uses exact-token counting.
+$foregroundQuery = 'content:recoveryneedle'
+$completenessQuery = 'content:=recoveryneedle'
+$foregroundUrlQuery = [Uri]::EscapeDataString($foregroundQuery)
+$completenessUrlQuery = [Uri]::EscapeDataString($completenessQuery)
+# What the active-pause attempt intends to do. These are the harness's own
+# controlled values; recovery-acceptance.ps1 judges the measured result against
+# its gate independently, so the measurement is never sized to pass a check.
+$activePauseLargeFileBytes = 1MB
+$activePauseDrainSeconds = 5
+$activePauseHoldSeconds = 3
+$activePauseMaximumAttempts = 8
+# Schema 1 recorded the large file only as it was seen before the pause request.
+# Schema 2 also records what was still extracting once the pause was
+# acknowledged, which is what an active-pause claim actually rests on.
+$activePauseSchema = 2
 # Everything that can still fail runs inside the protected lifecycle below,
 # so a fixture-generation, hashing or launch failure also records failure.json
 # beside its retained fixture and names that fixture to the caller.
@@ -32,6 +52,11 @@ $sourceBytes = 0L
 $totalFiles = 0
 $sha = $null
 $candidate = $null
+$latencies = $null
+$activity = $null
+$search = $null
+$retained = $null
+$activePause = $null
 function Counters {
     $p = Get-CimInstance Win32_Process -Filter "ProcessId = $($candidate.Id)"
     if (-not $p) { throw 'Synthetic service exited unexpectedly.' }
@@ -69,12 +94,89 @@ function Await-CandidateHealth {
     }
     $health
 }
+function Resume-MissedActivePause($reason, [double]$responseMs) {
+    $resumed = Invoke-RestMethod "$baseUrl/api/content/resume" -Method Post -TimeoutSec 10
+    if ($resumed.paused) { throw 'Missed active-pause attempt did not resume.' }
+    @{ performed = $false; missed_attempt = $true; missed_because = $reason; pause_response_ms = $responseMs }
+}
+function Measure-ActivePause($activityBefore) {
+    # The preceding observation must include a large file and remaining queued
+    # work, but a worker can finish that file and claim the next batch in the
+    # milliseconds before the pause lands. A nonzero reservation count alone
+    # would then measure a small file's drain while the report named a large
+    # one, so read the held set back and require the large file to still be
+    # extracting. An attempt that raced completion is recorded and retried,
+    # never reclassified as active-pause evidence. That read-back is part of
+    # the acknowledged pause, so the drain clock starts at the acknowledgement
+    # and not after it: a slow /api/activity lengthens the reported drain
+    # rather than disappearing from it.
+    $pauseClock = [Diagnostics.Stopwatch]::StartNew()
+    $paused = Invoke-RestMethod "$baseUrl/api/content/pause" -Method Post -TimeoutSec 10
+    $pauseMs = $pauseClock.Elapsed.TotalMilliseconds
+    $drainClock = [Diagnostics.Stopwatch]::StartNew()
+    if (-not $paused.paused) { throw 'Active pause was not acknowledged.' }
+    if ([int]$paused.in_flight -eq 0) {
+        return Resume-MissedActivePause 'no extraction was in flight when the pause landed' $pauseMs
+    }
+    $atPause = Invoke-RestMethod "$baseUrl/api/activity" -TimeoutSec 10
+    $heldFiles = @($atPause.workers.current | Where-Object { [long]$_.size -ge $activePauseLargeFileBytes })
+    if ($heldFiles.Count -eq 0) {
+        return Resume-MissedActivePause 'no large file was still extracting when the pause landed' $pauseMs
+    }
+    # Allow the drain to overshoot the gate so an overrun is measured and
+    # judged by Test-RecoveryActivePause, not hidden behind a harness abort.
+    $drainAbortSeconds = 2 * $activePauseDrainSeconds
+    do {
+        $status = Invoke-RestMethod "$baseUrl/api/content/status" -TimeoutSec 5
+        if (-not $status.paused) { throw 'Pause disappeared while extraction was draining.' }
+        if ($drainClock.Elapsed.TotalSeconds -gt $drainAbortSeconds) {
+            throw "Active extraction did not drain within $drainAbortSeconds seconds."
+        }
+        if ([int]$status.in_flight -gt 0) { Start-Sleep -Milliseconds 25 }
+    } while ([int]$status.in_flight -gt 0)
+    $drainSeconds = $drainClock.Elapsed.TotalSeconds
+    $drained = Invoke-RestMethod "$baseUrl/api/activity" -TimeoutSec 10
+    if ([long]$drained.jobs.queued -le 0 -or $drained.workers.current.Count -ne 0) {
+        throw 'Active pause must retain a queued backlog after current files drain.'
+    }
+    # Hold against the clock that is reported, so timer granularity can never
+    # record a window shorter than the one we intended to hold. No API call
+    # runs inside the window; progress is compared across it afterwards.
+    $holdClock = [Diagnostics.Stopwatch]::StartNew()
+    do { Start-Sleep -Milliseconds 50 } while ($holdClock.Elapsed.TotalSeconds -lt $activePauseHoldSeconds)
+    $held = Invoke-RestMethod "$baseUrl/api/activity" -TimeoutSec 10
+    if (-not $held.content_status.paused -or [int]$held.content_status.in_flight -ne 0 -or
+        $held.workers.current.Count -ne 0 -or [long]$held.jobs.queued -le 0 -or
+        [long]$held.workers.files_indexed -ne [long]$drained.workers.files_indexed -or
+        [long]$held.workers.bytes_read -ne [long]$drained.workers.bytes_read) {
+        throw 'Extraction progressed during the held pause.'
+    }
+    $holdSeconds = $holdClock.Elapsed.TotalSeconds
+    $resumed = Invoke-RestMethod "$baseUrl/api/content/resume" -Method Post -TimeoutSec 10
+    if ($resumed.paused) { throw 'Active workload did not resume explicitly.' }
+    # observed_files keeps its original meaning -- the snapshot that triggered
+    # the attempt, taken before the pause request. in_flight_files_at_pause is
+    # the new evidence and the reason for the schema number: a schema-1 record
+    # has only the earlier snapshot and cannot show what was still extracting
+    # once the pause was acknowledged.
+    @{ schema = $activePauseSchema; performed = $true; pause_response_ms = $pauseMs
+        in_flight_at_pause = $paused.in_flight; in_flight_files_at_pause = $heldFiles
+        observed_files = $activityBefore.workers.current
+        queued_before_pause = $activityBefore.jobs.queued
+        extraction_drain_seconds = $drainSeconds; queued_after_drain = $drained.jobs.queued
+        hold_seconds = $holdSeconds; extraction_stayed_stopped = $true; resumed = $true
+        total_seconds = $pauseClock.Elapsed.TotalSeconds }
+}
 try {
     $sourceDirs = @(for ($root = 0; $root -lt $SourceCount; $root++) {
         $sourceDir = Join-Path $fixtureDir "source-$root"
         New-Item -ItemType Directory -Path $sourceDir | Out-Null
         for ($i = 0; $i -lt $Files; $i++) {
             $text = "document $i`n" + $payload
+            if ($SmallFileKiB -gt 0) {
+                $length = $SmallFileKiB * 1KB
+                $text = ($text + $payload * [int][Math]::Ceiling($length / $payload.Length)).Substring(0, $length)
+            }
             [IO.File]::WriteAllText((Join-Path $sourceDir "document-$i.txt"), $text, $utf8)
             $sourceBytes += $utf8.GetByteCount($text)
         }
@@ -138,10 +240,12 @@ try {
     $maxDeviceReaders = 0
     $sawResolvedDevice = $false
     $sawSharedDevice = $false
+    $activePause = @{ performed = $false }
+    $activePauseAttempts = [Collections.Generic.List[object]]::new()
     do {
         if ($clock.Elapsed.TotalSeconds -gt 180) { throw 'Synthetic content crawl did not drain in 180 seconds.' }
         $queryClock = [Diagnostics.Stopwatch]::StartNew()
-        $null = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10" -TimeoutSec 15
+        $null = Invoke-RestMethod "$baseUrl/api/search?q=$foregroundUrlQuery&limit=10" -TimeoutSec 15
         $latencies.Add($queryClock.Elapsed.TotalMilliseconds)
         $devices = Invoke-RestMethod "$baseUrl/api/devices" -TimeoutSec 5
         $deviceSamples++
@@ -156,15 +260,32 @@ try {
         }
         $sources = @(foreach ($id in $sourceIds) { Invoke-RestMethod "$baseUrl/api/sources/$id" -TimeoutSec 10 })
         $unfinished = @($sources | Where-Object { $_.source.state -ne 'complete' }).Count
+        if ($CheckActivePause -and -not $activePause.performed -and
+            $activePauseAttempts.Count -lt $activePauseMaximumAttempts -and
+            @($sources | Where-Object { -not $_.completeness.metadata_complete }).Count -eq 0) {
+            $pauseCandidate = Invoke-RestMethod "$baseUrl/api/activity" -TimeoutSec 10
+            if ([long]$pauseCandidate.jobs.queued -gt $ContentWorkers -and
+                @($pauseCandidate.workers.current | Where-Object { [long]$_.size -ge $activePauseLargeFileBytes }).Count -gt 0) {
+                $attempt = Measure-ActivePause $pauseCandidate
+                $activePauseAttempts.Add($attempt)
+                if ($attempt.performed) { $activePause = $attempt }
+            }
+        }
         if ($unfinished -gt 0) { Start-Sleep -Milliseconds $QueryIntervalMilliseconds }
     } while ($unfinished -gt 0)
     $elapsed = $clock.Elapsed.TotalSeconds
     $after = Counters
+    if ($CheckActivePause -and -not $activePause.performed) {
+        $missed = @($activePauseAttempts | ForEach-Object { $_.missed_because }) -join '; '
+        throw "No pause caught an active large file with queued backlog after $($activePauseAttempts.Count) attempts: $missed"
+    }
     $activity = Invoke-RestMethod "$baseUrl/api/activity" -TimeoutSec 10
     if ([long]$activity.jobs.queued -ne 0 -or [long]$activity.jobs.running -ne 0 -or [long]$activity.workers.pending_publish -ne 0) {
         throw 'Source reported complete before the pipeline drained.'
     }
-    $search = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10&count=exact" -TimeoutSec 15
+    # Ranked foreground queries cap matching chunks, so their totals need not
+    # be exhaustive. Use the exact-token mode for the separate completeness gate.
+    $search = Invoke-RestMethod "$baseUrl/api/search?q=$completenessUrlQuery&limit=10&count=exact" -TimeoutSec 15
     if ($search.hits.Count -ne 10 -or -not $search.total.exact -or [long]$search.total.value -ne $totalFiles -or
         [long]$activity.workers.files_indexed -ne $totalFiles -or [long]$activity.workers.files_failed -ne 0) {
         throw 'The completed synthetic fixture is not searchable as expected.'
@@ -225,7 +346,7 @@ try {
             $persistedSource = Invoke-RestMethod "$baseUrl/api/sources/$id" -TimeoutSec 5
             if ($persistedSource.source.content_concurrency -ne $SourceReaders) { throw 'Source policy did not survive restart.' }
         }
-        $retained = Invoke-RestMethod "$baseUrl/api/search?q=content%3Arecoveryneedle&limit=10&count=exact" -TimeoutSec 15
+        $retained = Invoke-RestMethod "$baseUrl/api/search?q=$completenessUrlQuery&limit=10&count=exact" -TimeoutSec 15
         if ($retained.hits.Count -ne 10 -or -not $retained.total.exact -or [long]$retained.total.value -ne $totalFiles) {
             throw 'Restart lost searchable fixture content.'
         }
@@ -245,13 +366,17 @@ try {
         fixture_directory = $fixtureDir
         fixture_files = $totalFiles; fixture_bytes = $sourceBytes; source_count = $SourceCount
         small_files_per_source = $Files; large_files_per_source = $LargeFilesPerSource; large_file_mib = $LargeFileMiB
+        small_file_kib = $SmallFileKiB
         content_workers = $ContentWorkers; scan_threads = $ScanThreads; concurrent_scans = $ConcurrentScans; source_readers = $SourceReaders
         crawl_timing = 'first scan request to all sources complete; source creation/policy setup excluded'
+        crawl_includes_controlled_pause = [bool]$CheckActivePause
         crawl = (Delta $before $after $elapsed)
         files_per_s = $totalFiles / $elapsed; source_bytes_per_s = $sourceBytes / $elapsed
         http_query_samples = $sorted.Count
         http_query_latencies_ms = $latencies.ToArray()
         query_interval_ms = $QueryIntervalMilliseconds
+        foreground_query = $foregroundQuery
+        completeness_query = $completenessQuery
         http_query_p95_ms = $sorted[[Math]::Max(0, [Math]::Ceiling($sorted.Count * 0.95) - 1)]
         http_query_p99_ms = $sorted[[Math]::Max(0, [Math]::Ceiling($sorted.Count * 0.99) - 1)]
         crawl_query_tail_sample_sufficient = $sorted.Count -ge 100
@@ -273,6 +398,8 @@ try {
         files_indexed = $activity.workers.files_indexed
         search_total = $search.total
         restart_after_idle = $restart
+        active_pause = $activePause
+        active_pause_attempts = $activePauseAttempts.ToArray()
     }
     $json = $report | ConvertTo-Json -Depth 8
     [IO.File]::WriteAllText((Join-Path $fixtureDir 'report.json'), $json, $utf8)
@@ -283,8 +410,11 @@ try {
     $failure = @{ measured_at_utc = [DateTime]::UtcNow.ToString('o'); status = 'failed'; error = $failed.Exception.Message
         binary_sha256 = $sha; fixture_directory = $fixtureDir
         fixture_files = $totalFiles; fixture_bytes = $sourceBytes; source_count = $SourceCount
-        content_workers = $ContentWorkers; scan_threads = $ScanThreads; concurrent_scans = $ConcurrentScans; device_readers = $DeviceReaders }
-    [IO.File]::WriteAllText((Join-Path $fixtureDir 'failure.json'), ($failure | ConvertTo-Json -Depth 5), $utf8)
+        content_workers = $ContentWorkers; scan_threads = $ScanThreads; concurrent_scans = $ConcurrentScans; device_readers = $DeviceReaders
+        foreground_query = $foregroundQuery; completeness_query = $completenessQuery
+        http_query_latencies_ms = if ($null -ne $latencies) { $latencies.ToArray() } else { @() }
+        last_activity = $activity; completeness_search = $search; restart_search = $retained; active_pause = $activePause }
+    [IO.File]::WriteAllText((Join-Path $fixtureDir 'failure.json'), ($failure | ConvertTo-Json -Depth 12), $utf8)
     # A caller that never received a report still learns which fixture to read.
     try { $failed.Exception.Data['recovery_fixture_directory'] = $fixtureDir } catch { }
     throw $failed
