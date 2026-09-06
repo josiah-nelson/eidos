@@ -34,6 +34,8 @@ import type {
   ResourceLimits,
   ResourceView,
   MemoryView,
+  DeviceLimits,
+  DeviceView,
   ResultMode,
   RetryBody,
   RetryReport,
@@ -167,6 +169,8 @@ export const api = {
   activity: () => request<ActivityView>('/api/activity'),
   resources: () => request<ResourceView>('/api/resources'),
   memory: () => request<MemoryView>('/api/memory'),
+  devices: () => request<DeviceView>('/api/devices'),
+  setDeviceLimits: (body: DeviceLimits) => request<DeviceView>('/api/devices', { method: 'POST', body: JSON.stringify(body) }),
   setResources: (body: ResourceLimits) =>
     request<ResourceView>('/api/resources', { method: 'POST', body: JSON.stringify(body) }),
   contentStatus: () => request<ContentStatusView>('/api/content/status'),

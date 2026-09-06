@@ -4,6 +4,36 @@ Measured results on the reference corpus and bounded synthetic fixtures. Numbers
 git-ignored `bench-results/*.jsonl` records produced by the commands in
 [development.md](development.md). Dates are absolute; existing corpora stay read-only.
 
+## Device-admission smoke (2026-09-06 UTC, development build)
+
+`scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15 -DeviceReaders 2`,
+Windows build 26100, two content workers/two requested enumeration threads.
+Re-measured on the review head after merging the memory work, so these numbers
+describe the branch as it stands. Required-web development binary SHA-256:
+`E5A32C5E280175F279896478E24E7AA7E2BAB061AB930803E95B6FAACC356554`.
+Raw record: `bench-results/device-admission-2026-09-06-02.json` (private).
+
+The 256-file / 1,084,562-byte fixture drained in 6.872 seconds; 26 HTTP queries
+had p95 9.4 ms and maximum 11.3 ms. The observed combined device reservations
+peaked at two, never above the saved ceiling; a resolved Windows backing device
+was observed rather than the unknown fallback. Both the device-limit write and
+the populated diagnostics CLI passed. An earlier smoke caught double-quoted
+numeric map keys; the shared JSON formatter now has an exact-integer map
+regression and the device API test exercises populated source membership.
+
+The 15.099-second unpolled idle used 0.125 CPU seconds (0.828% of one core),
+2,019,328 process read bytes and 78,280 write bytes. This remains unexplained
+idle I/O, not a quiet-idle qualification. After idle, resident memory was
+54,435,840 bytes, peak resident 116,363,264 bytes and private commit 63,610,880
+bytes. Catalog writer maximum wait/hold at drain was 18.86/19.74 ms.
+
+Only one temporary root was crawled. Separate integration tests cover shared
+roots, multi-disk accounting, topology changes and an eight-thread scan using
+only one remaining reader unit. Neither that nor this smoke establishes
+physical-media independence, multi-root throughput, measured presets or an
+installed candidate. The host was not isolated; native feeds remained active.
+Process I/O is not physical-disk I/O. See [device scope](device-budgets.md).
+
 ## Memory diagnostics smoke (2026-09-06 UTC, development build)
 
 `scripts/recovery-smoke.ps1 -Files 256 -IdleSeconds 15`, Windows build 26100,

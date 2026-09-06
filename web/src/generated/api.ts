@@ -32,6 +32,8 @@ export type ArchiveSummary = { container_id: ObjectId, depth: number, member_pat
 
 export type ArchiveView = { object_id: ObjectId, path: string | null, record: ArchiveRecord, members: Array<ArchiveMember>, total: ApiInt, query: MemberQuery, };
 
+export type BudgetSnapshot = { readers_per_device: number, unresolved_shared_fallback: boolean, topology_draining: boolean, devices: Array<DeviceSnapshot>, };
+
 export type CatalogMemoryConfig = { baseline_connections: number, page_cache_per_connection_bytes: ApiInt, page_cache_baseline_target_bytes: ApiInt, mmap_per_connection_limit_bytes: ApiInt, };
 
 export type CatalogWriterStats = { acquisitions: ApiInt, contended_acquisitions: ApiInt, waiting: ApiInt, total_wait_ms: number, max_wait_ms: number, total_hold_ms: number, max_hold_ms: number, };
@@ -77,6 +79,12 @@ export type CoverageKind = "offline" | "stale" | "degraded_feed" | "enumerating"
 export type CoverageReason = { kind: CoverageKind, severity: CoverageSeverity, detail: string, remediation?: string, };
 
 export type CoverageSeverity = "info" | "warning" | "error";
+
+export type DeviceLimits = { readers_per_device: number, };
+
+export type DeviceSnapshot = { key: string, sources: Array<ApiInt>, content_readers: number, scan_threads: number, peak_readers: number, };
+
+export type DeviceView = { budget: BudgetSnapshot, sample_age_s: ApiInt | null, stale: boolean, source_errors: { [key in ApiInt]: string }, source_roots: { [key in ApiInt]: string }, };
 
 export type Direction = "outbound" | "inbound";
 

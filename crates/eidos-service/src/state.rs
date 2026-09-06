@@ -73,6 +73,7 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
 }
 
 pub struct AppState {
+    pub devices: crate::device_control::DeviceControl,
     pub memory: crate::memory::MemoryTelemetry,
     /// Bounded gate in front of expensive HTTP operations.
     pub admission: Arc<crate::admission::Admission>,
@@ -247,6 +248,7 @@ impl AppState {
                 &config.data_dir,
                 config.scan_threads,
             )?),
+            devices: crate::device_control::DeviceControl::load(&config.data_dir)?,
             storage_refresh: Mutex::new(()),
             exec_opts: eidos_search::exec::ExecOptions::default(),
             export: export_limits,
@@ -268,6 +270,7 @@ impl AppState {
             startup_recovery,
             fleet: Mutex::new(None),
         };
+        crate::content_workers::refresh_budgets(&state)?;
         Ok(state)
     }
 

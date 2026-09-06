@@ -83,6 +83,8 @@ fn typescript_contract() -> String {
     // checked-in contract without another handwritten TypeScript mirror.
     types.add::<crate::api::ApiErrorBody>();
     types.add::<crate::api::Health>();
+    types.add::<crate::device_control::DeviceLimits>();
+    types.add::<crate::device_control::DeviceView>();
     types.add::<crate::api::SourceView>();
     types.add::<crate::api::AddSourceBody>();
     types.add::<crate::api::AddedSource>();

@@ -352,7 +352,7 @@ pub fn reserve_and_claim(
     state: &AppState,
     worker: &str,
     limit: u32,
-) -> eidos_catalog::Result<Option<(SourceReservation, Vec<JobRecord>)>> {
+) -> eidos_catalog::Result<Option<(ContentReservation, Vec<JobRecord>)>> {
     let _admission = state.content_pause.admission_guard();
     if !claiming_allowed(state) {
         return Ok(None);
@@ -372,13 +372,56 @@ pub fn reserve_and_claim(
         .collect();
     let budgets = state.content_workers.budgets.clone();
     let mut admit = |source: SourceId| {
-        (!active_scans.contains(&source))
-            .then(|| budgets.try_reserve(source))
-            .flatten()
+        if active_scans.contains(&source) {
+            return None;
+        }
+        // Check the shared-device gate before charging the source budget. A
+        // device refusal holds every source at once, and a source unit taken
+        // and immediately dropped here would still raise that source's peak
+        // reservation for work the device gate is what actually held.
+        state
+            .devices
+            .would_admit(source.0, crate::device_budget::WorkKind::Content, 1)
+            .ok()?;
+        let source_reservation = budgets.try_reserve(source)?;
+        let device = state
+            .devices
+            .try_reserve(source.0, crate::device_budget::WorkKind::Content, 1)
+            .ok()?;
+        Some(ContentReservation {
+            _source: source_reservation,
+            _device: device,
+        })
     };
-    state
-        .catalog
-        .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)
+    let mut claimed =
+        state
+            .catalog
+            .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)?;
+    // Count the units only once the claim is durable. `admit` runs inside the
+    // claiming transaction: a losing racer for the last device slot, and a
+    // transaction that then fails, both release without ever reading a file,
+    // and neither should leave a peak behind describing work nobody did.
+    if let Some((reservation, _)) = claimed.as_mut() {
+        reservation.confirm();
+    }
+    Ok(claimed)
+}
+
+pub struct ContentReservation {
+    _source: SourceReservation,
+    _device: crate::device_budget::DeviceLease,
+}
+
+impl ContentReservation {
+    /// Count these units towards the reported high-water marks. The caller
+    /// does this once the claim has committed, never from inside `admit`.
+    fn confirm(&mut self) {
+        self._source.confirm();
+    }
+
+    pub fn source(&self) -> SourceId {
+        self._source.source()
+    }
 }
 
 fn worker_loop(state: &AppState, index: usize, name: &str) {
@@ -661,6 +704,7 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
     let status = &state.content_workers;
     let by_source = state.catalog.jobs_by_source(JobStage::ContentText)?;
     let mut total = 0;
+    let mut device_work = false;
     for s in refresh_budgets(state)? {
         if !s.content_enabled
             || s.published_generation.is_none()
@@ -670,6 +714,7 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
             continue;
         }
         let queued = by_source.get(&s.id).map(|q| q.0).unwrap_or(0);
+        device_work |= by_source.get(&s.id).is_some_and(|q| q.0 > 0 || q.1 > 0);
         if queued >= QUEUE_LOW_WATER {
             continue;
         }
@@ -680,6 +725,9 @@ pub fn top_up_queue(state: &AppState) -> anyhow::Result<u64> {
         total += n;
     }
     status.enqueued.fetch_add(total, Ordering::Relaxed);
+    if device_work || total > 0 {
+        state.devices.refresh();
+    }
     Ok(total)
 }
 
@@ -694,6 +742,13 @@ pub fn refresh_budgets(state: &AppState) -> anyhow::Result<Vec<eidos_catalog::So
         .map(|s| (s.id, s.content_concurrency))
         .collect();
     state.content_workers.budgets.set_all(&budgets);
+    state.devices.set_sources(
+        sources
+            .iter()
+            .filter(|source| !source.kind.is_remote() && source.state != SourceState::Retired)
+            .map(|source| (source.id.0, std::path::PathBuf::from(&source.root_path)))
+            .collect(),
+    );
     Ok(sources)
 }
 

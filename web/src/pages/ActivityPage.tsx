@@ -12,6 +12,7 @@ import { ErrorBox, Spinner, StateBadge } from '../components'
 import { bytes, count, duration, integerNumber, when } from '../format'
 import ResourceControls from '../components/ResourceControls'
 import MemoryResources from '../components/MemoryResources'
+import DeviceResources from '../components/DeviceResources'
 
 const STATE_ORDER = ['indexed', 'partial', 'pending', 'stale', 'failed', 'unsupported', 'excluded']
 
@@ -297,6 +298,7 @@ export default function ActivityPage() {
 
       <ResourceControls />
       <MemoryResources />
+      <DeviceResources />
 
       <div className="stats">
         <div className="stat">

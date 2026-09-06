@@ -46,7 +46,7 @@ fn env() -> Env {
 
 /// A source with no scanned tree; only its identity matters here.
 fn add_source(state: &AppState, name: &str) -> SourceId {
-    state
+    let source = state
         .catalog
         .add_source(&NewSource {
             host_id: state.host_id,
@@ -55,7 +55,17 @@ fn add_source(state: &AppState, name: &str) -> SourceId {
             root_path: format!("\\\\fileserver\\share\\{name}"),
             aliases: vec![],
         })
-        .unwrap()
+        .unwrap();
+    state.devices.set_sources(
+        state
+            .catalog
+            .list_sources()
+            .unwrap()
+            .into_iter()
+            .map(|source| (source.id.0, source.root_path.into()))
+            .collect(),
+    );
+    source
 }
 
 /// Queue `n` content jobs. They carry no object, so claiming is all these

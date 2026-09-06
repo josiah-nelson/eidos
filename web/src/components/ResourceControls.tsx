@@ -82,7 +82,7 @@ export default function ResourceControls() {
         <LimitsEditor saved={q.data.limits} />
         <p className="muted small">
           Saved across restarts. The scan ceiling covers initial probes through publication; active scans keep their starting width.
-          The content pool below is separate. Source caps are not shared-device caps.
+          The content pool and source caps are separate; the shared-device ceiling also applies.
           Disk pressure holds new work, but does not stop current files, publication, native updates or fleet writes.
           A zero reserve disables the free-space check. These are admission limits, not a hard disk or memory quota.
         </p>
