@@ -4,6 +4,54 @@ Measured results on the reference corpus and bounded synthetic fixtures. Numbers
 git-ignored `bench-results/*.jsonl` records produced by the commands in
 [development.md](development.md). Dates are absolute; existing corpora stay read-only.
 
+## Larger resource comparison and active pause (2026-09-06 UTC)
+
+The larger comparison completed seven runs and **failed three performance
+gates**. It used the same reviewed development executable SHA-256
+`600E131A7D6B78D1D3288361A2A8E21B8D093C4D3445F7A8C5F333F5C0C22FE9`.
+Each new two-root fixture contained 2,056 files / 192 MiB of repetitive
+synthetic text: 1,024 exactly 64-KiB files and four 8-MiB files per root.
+Source caps were four; query sleep was 25 ms and unpolled idle was 30 seconds.
+The Windows host was not isolated, and sibling builds overlapped.
+
+| Run | Worker / scan / concurrent / device tuple | Crawl seconds | Queries | Query p99 ms | Resident peak MiB | Idle CPU, % one core | Outcome |
+|---|---|---:|---:|---:|---:|---:|---|
+| 1 | 1/1/1/1 | 9.325 | 170 | 23.48 | 353.59 | 0.571 | Pass |
+| 2 | 2/2/1/2 | 10.518 | 193 | 39.45 | 402.01 | 2.597 | Idle CPU failed |
+| 3 | 4/4/2/4 | 9.377 | 177 | 39.63 | 592.97 | 0.260 | Memory failed |
+| 4 | 4/4/2/4 | 9.366 | 172 | 38.70 | 600.45 | 0.363 | Memory failed |
+| 5 | 2/2/1/2 | 10.222 | 184 | 33.15 | 371.46 | 0.727 | Pass |
+| 6 | 1/1/1/1 | 9.466 | 178 | 24.00 | 346.48 | 0.623 | Pass |
+| 7, active pause | 2/2/1/2 | 12.353 | 142 | 23.98 | 351.00 | 0.623 | Pass |
+
+All seven retained exactly 2,056 searchable files and saved controls through
+restart, and respected the resolved shared-device ceiling. Writer hold stayed
+below 131 ms; idle process transfers stayed below 455,000 bytes. Both
+four-worker runs exceeded the unchanged 512-MiB resident-peak limit. One
+two-worker run exceeded the unchanged 1%-of-one-core idle limit. Those failures
+remain unresolved by this evidence; no run was discarded or reclassified.
+
+The active-pause run observed two 8-MiB files in flight with six queued jobs.
+Pause acknowledged in 4.077 ms, extraction drained in 1.207 seconds, and the
+backlog remained stopped for 3.013 seconds before explicit resume. Its crawl
+includes the 4.234-second controlled pause and is not an uninterrupted
+throughput result. This establishes bounded extraction drain for this fixture,
+not cancellation inside an OS read or recovery of a paused backlog on restart.
+
+An initial attempt stopped at the completeness check because the harness used
+a ranked query whose 5,000 matching-chunk cap made the total inexact. The
+original failed record remains in
+`bench-results/workload-54d4a97604894db99817630e44b1b35f/`. A diagnostic catalog
+copy returned all 2,056 files using exact-token mode. Before the second attempt,
+the plan changed only the separate completeness probe to exact-token mode;
+ranked foreground latency queries, fixture and thresholds stayed unchanged.
+The complete seven-run plan, executable, raw query arrays and outcomes are in
+`bench-results/workload-5458d422796a4972b5ac37c6b73a486c/`.
+
+The fixture still drains in seconds and shows no repeatable larger-pool
+throughput advantage. It does not qualify recommended presets, mixed real
+documents, physical-media I/O, installed upgrades or fleet rollout.
+
 ## Repeated resource comparison (2026-09-06 UTC, reviewed development build)
 
 All six runs of `scripts/recovery-matrix.ps1` passed the fixed synthetic gates.

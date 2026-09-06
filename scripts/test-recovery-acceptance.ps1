@@ -87,3 +87,4 @@ try {
     Check { param($r) $r.crawl.seconds = 7.25; $r.idle.cpu_one_core_percent = 0.5 }
 } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture }
 Write-Output "Recovery acceptance: $script:caseCount boundary/failure cases passed."
+& (Join-Path $PSScriptRoot 'test-recovery-workload.ps1')

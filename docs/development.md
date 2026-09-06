@@ -67,6 +67,7 @@ launch and restart, checking its hash before and after each run.
 ```powershell
 ./scripts/test-recovery-acceptance.ps1 # pure boundary/failure and script syntax tests
 ./scripts/recovery-matrix.ps1 -Binary ./target/debug/eidos.exe
+./scripts/recovery-workload.ps1 -Binary ./target/debug/eidos.exe # larger comparison + active pause
 ```
 
 Each run records individual crawl query latencies (25-ms sleep between polls),
@@ -90,6 +91,9 @@ controls/results retained across restart and successful explicit resume. Exact
 search totals must match all 772 files both after drain and after restart;
 these correctness queries are outside the crawl latency sample. Sample counts
 and percentiles must agree with the recorded crawl latencies.
+The foreground query is ranked `content:recoveryneedle`; completeness uses
+`content:=recoveryneedle` with exact counting. Ranked queries cap matching
+chunks and can legitimately return an inexact total even with `count=exact`.
 Missing, nonfinite or malformed gate measurements fail closed, and the retained
 outcome records what could not be read. Do not add idle queries to inflate the
 crawl sample count or relax criteria after a failure.
@@ -98,6 +102,19 @@ These are development evidence gates, not recommended performance presets.
 Host activity and reviewer builds may overlap; process transfers are not
 physical-disk I/O. Real-media, installed, mid-file pause and fleet/canary
 qualification remain separate. Curated observations belong in [benchmarks](benchmarks.md).
+
+The larger workload uses the same fixed gates and tuple order, with 1,024
+exactly 64-KiB files and four 8-MiB files per root: 2,056 files / 192 MiB per
+run. Six uninterrupted runs precede a seventh two-worker run that pauses with
+an observed large file and queued backlog. It requires a pause response within
+150 ms, current extraction drained within five seconds, three seconds held
+without new extraction, explicit resume and eventual complete results. The
+pause run's crawl includes its measured pause and is excluded from throughput
+comparisons. Every run has a 30-second unpolled idle interval and a forced
+restart after drain. This does not test a paused-backlog restart or cancellation
+inside an operating-system read. Seven new source fixtures total 1.3125 GiB;
+the runner keeps its plan, executable, reports and failed outcomes under
+`bench-results/workload-*`. No existing data is reused or removed.
 
 ```bash
 # macOS or another Unix host: the same steps in the same order.
