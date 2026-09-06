@@ -26,12 +26,16 @@ if the journal stops producing records, the remaining ignored tail can stay
 volatile. One read batch may cross the byte threshold before it is persisted.
 Do not log each irrelevant batch, since logging can itself create journal work.
 
-Only a *transient* snapshot failure retains the position. An access-denied,
-privilege-not-held or unsupported object returns the same failure on every
-replay, so it is counted as unreadable and skipped exactly as an unlistable
-file is during a scan. Blocking on it instead would stall the live feed until
-the journal wrapped and would abort every overlap replay, so one protected file
-inside an indexed root could stop the source indefinitely.
+A snapshot failure retains the position unless replaying the record cannot
+change its outcome. Access-denied, privilege-not-held, unsupported and
+unrepresentable-name objects are counted as unreadable and skipped exactly as
+an unlistable file is during a scan; blocking on them instead would stall the
+live feed until the journal wrapped and would abort every overlap replay, so
+one protected file inside an indexed root could stop the source indefinitely.
+Every other failure — including codes the classifier does not recognise, such
+as ERROR_IO_DEVICE — keeps the checkpoint, because acknowledging one would drop
+a change a retry could still have read. The match is exhaustive so that a new
+error kind must choose a side rather than default into dropping updates.
 
 The durable checkpoint remains the compare-and-swap fence. A scan/recovery or
 journal/volume replacement discards old read-ahead and reopens the proper handle.
