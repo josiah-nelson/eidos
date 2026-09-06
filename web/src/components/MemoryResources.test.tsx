@@ -9,6 +9,7 @@ const initial: MemoryView = {
   sample_age_s: '1', stale: false, error: null,
   catalog: { baseline_connections: 13, page_cache_per_connection_bytes: '67108864', page_cache_baseline_target_bytes: '872415232', mmap_per_connection_limit_bytes: '1099511627776' },
   catalog_writer_budget_bytes: '100663296', content_writer_budget_bytes: '268435456',
+  content_input_budget_bytes: '16777216',
 }
 let client: QueryClient
 beforeEach(() => {

@@ -39,6 +39,7 @@ export default function MemoryResources() {
           <tr><td>Catalog memory mapping</td><td>{bytes(memory.catalog.mmap_per_connection_limit_bytes)}</td><td>Effective maximum mapped file range per connection; not allocated RAM</td></tr>
           <tr><td>Name-index writer</td><td>{bytes(memory.catalog_writer_budget_bytes)}</td><td>Shared across its indexing threads</td></tr>
           <tr><td>Content-index writer</td><td>{bytes(memory.content_writer_budget_bytes)}</td><td>Shared across its indexing threads</td></tr>
+          <tr><td>Content-index input queue</td><td>{bytes(memory.content_input_budget_bytes)}</td><td>Queued text and document allowance, separate from the writer</td></tr>
         </tbody>
       </table>
       <p className="muted small">Budgets are not current consumption or a hard process memory limit. Do not add them to resident RAM.

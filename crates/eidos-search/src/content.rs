@@ -7,6 +7,8 @@
 //! original text, and every exact, case-sensitive, or regex clause is
 //! verified against it (ARCHITECTURE invariant 10).
 
+pub use crate::content_input::CONTENT_INPUT_MEMORY_BYTES;
+use crate::content_input::{InputBudget, InputDocument};
 use crate::{Result, SearchError};
 use eidos_catalog::Catalog;
 use eidos_content::Chunk;
@@ -25,7 +27,7 @@ use tantivy::schema::{
 use tantivy::tokenizer::{
     LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer,
 };
-use tantivy::{DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 use ts_rs::TS;
 
 pub const CONTENT_SCHEMA_VERSION: u32 = 2;
@@ -190,7 +192,8 @@ pub struct ContentIndex {
     dir: PathBuf,
     index: Index,
     reader: IndexReader,
-    writer: Mutex<IndexWriter>,
+    writer: Mutex<IndexWriter<InputDocument>>,
+    input_budget: Arc<InputBudget>,
     fields: ContentFields,
     /// Documents added since the last commit.
     uncommitted: AtomicU64,
@@ -358,6 +361,7 @@ impl ContentIndex {
             index,
             reader,
             writer: Mutex::new(writer),
+            input_budget: InputBudget::new(CONTENT_INPUT_MEMORY_BYTES),
             fields,
             uncommitted: AtomicU64::new(0),
             pending_ops: AtomicU64::new(0),
@@ -446,7 +450,8 @@ impl ContentIndex {
         let _gate = self.gate.read();
         let writer = self.writer();
         for c in chunks {
-            let mut d = TantivyDocument::new();
+            let mut input = self.input_budget.document(c.text.len())?;
+            let d = &mut input.document;
             d.add_u64(f.object_id, object.0 as u64);
             d.add_u64(f.source_id, source.0 as u64);
             d.add_u64(f.generation, generation as u64);
@@ -454,12 +459,12 @@ impl ContentIndex {
             d.add_text(f.text, &c.text);
             d.add_text(f.text_cs, &c.text);
             d.add_text(f.trigrams, &c.text);
-            writer.add_document(d)?;
+            writer.add_document(input)?;
+            // A later chunk can time out or exceed admission. Keep successful
+            // earlier additions dirty so publication/cleanup can commit them.
+            self.uncommitted.fetch_add(1, Ordering::Relaxed);
+            self.pending_ops.fetch_add(1, Ordering::Relaxed);
         }
-        self.uncommitted
-            .fetch_add(chunks.len() as u64, Ordering::Relaxed);
-        self.pending_ops
-            .fetch_add(chunks.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -488,7 +493,7 @@ impl ContentIndex {
         Ok(docs)
     }
 
-    fn writer(&self) -> parking_lot::MutexGuard<'_, IndexWriter> {
+    fn writer(&self) -> parking_lot::MutexGuard<'_, IndexWriter<InputDocument>> {
         self.writer.lock()
     }
 
@@ -610,7 +615,10 @@ impl ContentIndex {
                 if let Some(p) = &pacer {
                     p(docs).map_err(eidos_catalog::CatalogError::InvalidState)?;
                 }
-                let mut d = TantivyDocument::new();
+                let mut input = self.input_budget.document(text.len()).map_err(|e| {
+                    eidos_catalog::CatalogError::InvalidState(format!("index input: {e}"))
+                })?;
+                let d = &mut input.document;
                 d.add_u64(f.object_id, object.0 as u64);
                 d.add_u64(f.source_id, source.0 as u64);
                 d.add_u64(f.generation, generation as u64);
@@ -618,7 +626,7 @@ impl ContentIndex {
                 d.add_text(f.text, text);
                 d.add_text(f.text_cs, text);
                 d.add_text(f.trigrams, text);
-                self.writer().add_document(d).map_err(|e| {
+                self.writer().add_document(input).map_err(|e| {
                     eidos_catalog::CatalogError::InvalidState(format!("index write: {e}"))
                 })?;
                 docs += 1;
@@ -1404,6 +1412,81 @@ impl From<regex::Error> for SearchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_content_input_releases_capacity_and_preserves_all_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = ContentIndex::open(dir.path()).unwrap();
+        Arc::get_mut(&mut index).unwrap().input_budget = InputBudget::new(128 * 1024);
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let index = index.clone();
+                std::thread::spawn(move || {
+                    let text = "bounded content input needle\n".repeat(512);
+                    for ordinal in 0..100 {
+                        let chunk = Chunk {
+                            ordinal,
+                            byte_start: 0,
+                            byte_end: text.len() as u64,
+                            line_start: 0,
+                            line_end: 511,
+                            text: text.clone(),
+                            split_line: false,
+                        };
+                        index
+                            .add_chunks(ObjectId(worker + 1), SourceId(1), 1, &[chunk])
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        index.commit().unwrap();
+        let (used, peak) = index.input_budget.usage();
+        assert_eq!(used, 0, "commit consumed every document reservation");
+        assert!(peak > 0 && peak <= 128 * 1024);
+        assert_eq!(index.num_docs(), 400);
+        assert_eq!(
+            object_ids(&index).unwrap(),
+            vec![ObjectId(1), ObjectId(2), ObjectId(3), ObjectId(4)]
+        );
+        drop(index);
+        let reopened = ContentIndex::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.num_docs(),
+            400,
+            "input ownership does not change the stored schema"
+        );
+    }
+
+    #[test]
+    fn rejected_later_chunk_preserves_prior_pending_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = ContentIndex::open(dir.path()).unwrap();
+        Arc::get_mut(&mut index).unwrap().input_budget = InputBudget::new(4096);
+        let mut chunk = Chunk {
+            ordinal: 0,
+            byte_start: 0,
+            byte_end: 6,
+            line_start: 0,
+            line_end: 0,
+            text: "needle".into(),
+            split_line: false,
+        };
+        let first = chunk.clone();
+        chunk.ordinal = 1;
+        chunk.text = "x".repeat(4096);
+        assert!(index
+            .add_chunks(ObjectId(1), SourceId(1), 1, &[first, chunk])
+            .is_err());
+        assert!(index.is_dirty());
+        assert_eq!(index.uncommitted(), 1);
+        assert_eq!(index.commit().unwrap(), 1);
+        assert_eq!(index.num_docs(), 1);
+        assert_eq!(index.input_budget.usage().0, 0);
+    }
 
     #[test]
     fn trigram_tokenizer_matches_query_side() {
