@@ -155,9 +155,11 @@ PR #130 merged the reproducible measurement harness with cross-platform CI
 passing. The subsequent 192-MiB workload completed seven runs, retaining all
 2,056 content matches and saved controls across each restart. Both four-worker
 runs exceeded the 512-MiB resident-peak gate; one two-worker run exceeded the
-idle-CPU gate. The active-pause run passed: two current 8-MiB files drained in
-1.207 seconds after a 4.077-ms response, with queued work held for three seconds
-before explicit resume. The failures are retained and thresholds unchanged;
+idle-CPU gate. The active-pause run recorded a 4.077-ms response, a 1.207-second
+drain and queued work held for three seconds before explicit resume, but it
+observed its large files only before sending the pause, so it does not establish
+which extraction drained; the harness now requires that read-back and treats
+that record as historical. The failures are retained and thresholds unchanged;
 see [the larger comparison](benchmarks.md#larger-resource-comparison-and-active-pause-2026-09-06-utc).
 Memory under larger pools and the idle outlier require follow-up. This is
 synthetic evidence and still does not establish useful named presets.
