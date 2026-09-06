@@ -34,6 +34,8 @@ pub mod state;
 pub mod update_check;
 #[cfg(windows)]
 pub mod usn_apply;
+#[cfg(any(windows, test))]
+mod usn_checkpoint;
 pub mod watcher;
 pub mod web;
 

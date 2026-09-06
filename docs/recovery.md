@@ -109,6 +109,18 @@ sustained-directory-move behavior and real-workload qualification remain.
 OS-device admission is not a physical-media guarantee or hard I/O quota.
 Signed pushed updates remain chunk C.
 
+The expanded two-root synthetic baseline exposed additional Windows native-feed
+idle work. Unknown deletions became source events, and irrelevant journal
+progress still caused checkpoint writes. The follow-up filters those deletes
+and coalesces irrelevant checkpoint progress while keeping relevant changes
+immediate and restart-safe. Ten new USN/cursor/catalog-fault tests pass, as do
+the actual native change/restart/overflow tests and full Windows local gate.
+A rebuilt two-root candidate's 30-second idle recorded 368,640 process read
+bytes and 8,240 write bytes; see the [before/after evidence](benchmarks.md) and
+[ADR-0030](adr/0030-bound-irrelevant-journal-checkpoints.md). Review remains pending.
+Do not choose performance presets or waive quiet-idle acceptance from the
+reader-cap smoke alone.
+
 ## What must pass before rollout
 
 - Rust, generated API, frontend type/build and behavioral page tests.
