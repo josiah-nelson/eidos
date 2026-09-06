@@ -169,10 +169,12 @@ synthetic evidence and still does not establish useful named presets.
 The content-index input queue now has a separate byte allowance. A repeated
 seven-run development comparison brought four-worker resident peaks from
 593–600 MiB to about 243 MiB, with all memory, correctness, admission and
-restart gates passing. Two runs still exceeded the idle-CPU gate. The corrected
-active-pause probe confirmed large files after acknowledgement and passed;
+restart gates passing. Two runs still exceeded the idle-CPU gate. Its pause probe
+recorded both large files after the acknowledgement, but in the field layout that
+preceded active-pause schema 2, so the gate names that record historical too;
 see [the memory comparison](benchmarks.md#content-input-memory-comparison-2026-09-06-utc).
-This does not complete quiet-idle or deployment qualification.
+No schema-2 pause record exists yet. This does not complete quiet-idle or
+deployment qualification.
 
 PR #131 is merged with current-head cross-platform CI and the populated
 unsigned Windows installer lifecycle passing on a disposable runner. Upgrade,

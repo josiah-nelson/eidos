@@ -22,7 +22,7 @@ declared before execution. Plan, executable, query samples and every outcome:
 | 4 | 4/4/2/4 | 11.404 | 198 | 34.68 | 243.43 | 0.675 | Pass |
 | 5 | 2/2/1/2 | 11.456 | 206 | 24.59 | 240.91 | 0.934 | Pass |
 | 6 | 1/1/1/1 | 11.329 | 201 | 24.06 | 226.59 | 0.675 | Pass |
-| 7, active pause | 2/2/1/2 | 13.532 | 167 | 32.25 | 223.82 | 0.363 | Pass |
+| 7, active pause | 2/2/1/2 | 13.532 | 167 | 32.25 | 223.82 | 0.363 | Pass (pre-schema-2 pause record) |
 
 All seven passed the unchanged 512-MiB memory gate, exact 2,056-file search and
 restart-retention checks, device admission and query-latency gates. Four-worker
@@ -31,15 +31,24 @@ took 11.530/11.404 seconds versus 9.377/9.366 seconds in the previous candidate.
 The host remained non-isolated with sibling builds overlapping; this is a
 measured memory/throughput tradeoff on repetitive synthetic text.
 
-The corrected pause harness confirmed both 8-MiB files were still active
-**after** acknowledgement. Response took 7.467 ms; extraction drained in
-0.314 seconds, including the post-acknowledgement identity request. Six queued
-jobs remained held for 3.035 seconds, then explicit resume completed. The
-3.377-second controlled pause is included in run 7's crawl time. This does not
-measure cancellation within a filesystem syscall or a paused-backlog restart.
+The pause harness read the extracting set back **after** the acknowledgement
+and recorded both 8-MiB files there. Response took 7.467 ms; extraction drained
+in 0.314 seconds, measured from the acknowledgement and so including the
+post-acknowledgement identity request. Six queued jobs remained held for 3.035
+seconds, then explicit resume completed. The 3.377-second controlled pause is
+included in run 7's crawl time.
+
+That record predates active-pause schema 2. It was written before the read-back
+was renamed, so it carries the post-acknowledgement set as `observed_files` and
+the earlier snapshot as `observed_files_before_pause`, and it has no `schema`
+field. `Test-RecoveryActivePause` therefore names it historical rather than
+accepting it, as it does the previous candidate's run 7. The counters above are
+what that record holds; a schema-2 record needs a new run, which this evidence
+does not supply. Nothing here measures cancellation within a filesystem syscall
+or a paused-backlog restart.
 
 The sequence still failed overall: runs 1 and 3 exceeded the unchanged 1% idle
-CPU gate. Maximum writer hold was 109.63 ms and idle process transfers stayed
+CPU gate. Maximum writer hold was 109.62 ms and idle process transfers stayed
 below 640,000 bytes. Idle CPU remains an open recovery issue; these results do
 not recommend presets or qualify installed/fleet deployment. Earlier failures
 below remain intact.
