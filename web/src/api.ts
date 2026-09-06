@@ -27,6 +27,8 @@ import type {
   PeerBody,
   PeerView,
   ResolveView,
+  ResourceLimits,
+  ResourceView,
   ResultMode,
   RetryBody,
   RetryReport,
@@ -154,6 +156,9 @@ export const api = {
   parse: (q: string) => request<ParseView>(`/api/search/parse?q=${encodeURIComponent(q)}`),
   indexStatus: () => request<IndexStatus>('/api/index'),
   activity: () => request<ActivityView>('/api/activity'),
+  resources: () => request<ResourceView>('/api/resources'),
+  setResources: (body: ResourceLimits) =>
+    request<ResourceView>('/api/resources', { method: 'POST', body: JSON.stringify(body) }),
   contentStatus: () => request<ContentStatusView>('/api/content/status'),
   /** Stop or start claiming content jobs; answers with the resulting state. */
   setContentPaused: (paused: boolean) =>

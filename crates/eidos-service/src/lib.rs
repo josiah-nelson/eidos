@@ -10,6 +10,7 @@ pub mod api;
 #[cfg(test)]
 mod api_contract;
 mod api_json;
+mod background_probe;
 pub mod content_control;
 pub mod content_preview;
 pub mod content_workers;
@@ -19,6 +20,7 @@ pub mod follower;
 #[cfg(target_os = "macos")]
 mod fsevents_apply;
 pub mod interactions_api;
+pub mod resource_control;
 pub mod retry_api;
 pub mod scanner;
 pub mod source_budget;

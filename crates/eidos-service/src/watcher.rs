@@ -1092,6 +1092,19 @@ pub fn native_scan_sequence(
     source_id: SourceId,
     progress: &ScanProgress,
 ) -> anyhow::Result<ScanSummary> {
+    // Acquire before probing the source or taking its journal cursor: queue
+    // time must not inflate the overlap-replay window or cause journal wraps.
+    // Hold through publication; the long-lived watcher has its own lifecycle.
+    let reservation = scanner::wait_for_capacity(state, progress)?;
+    native_scan_sequence_admitted(state, source_id, progress, reservation.threads)
+}
+
+fn native_scan_sequence_admitted(
+    state: &Arc<AppState>,
+    source_id: SourceId,
+    progress: &ScanProgress,
+    threads: usize,
+) -> anyhow::Result<ScanSummary> {
     #[cfg(windows)]
     {
         use eidos_scanner::usn::{query_journal, VolumeHandle};
@@ -1111,7 +1124,7 @@ pub fn native_scan_sequence(
             .as_ref()
             .is_some_and(|v| v.supports_usn && !v.is_remote());
         if !native {
-            let summary = scanner::run_full_scan(state, source_id, progress)?;
+            let summary = scanner::run_full_scan_admitted(state, source_id, progress, threads)?;
             let _ = state.catalog.clear_checkpoint(source_id);
             return Ok(summary);
         }
@@ -1122,7 +1135,7 @@ pub fn native_scan_sequence(
             Ok(x) => x,
             Err(e) => {
                 tracing::warn!(source = source_id.0, error = %e, "USN journal unavailable; generic scan");
-                let summary = scanner::run_full_scan(state, source_id, progress)?;
+                let summary = scanner::run_full_scan_admitted(state, source_id, progress, threads)?;
                 let _ = state.catalog.clear_checkpoint(source_id);
                 let _ = state.catalog.set_source_state(
                     source_id,
@@ -1138,7 +1151,7 @@ pub fn native_scan_sequence(
             volume_root: vi.volume_root.clone(),
         };
         progress.set_phase("enumerating");
-        let session = scanner::enumerate(state, source_id, progress)?;
+        let session = scanner::enumerate_admitted(state, source_id, progress, threads)?;
         let mut feed = JournalFeed {
             vol: &vol,
             journal_id: cp.journal_id,
@@ -1180,7 +1193,7 @@ pub fn native_scan_sequence(
             None
         };
         let Some(cursor) = cursor else {
-            let summary = scanner::run_full_scan(state, source_id, progress)?;
+            let summary = scanner::run_full_scan_admitted(state, source_id, progress, threads)?;
             let _ = state.catalog.clear_checkpoint(source_id);
             if native {
                 let _ = state.catalog.set_source_state(
@@ -1196,7 +1209,7 @@ pub fn native_scan_sequence(
             return Ok(summary);
         };
         progress.set_phase("enumerating");
-        let session = scanner::enumerate(state, source_id, progress)?;
+        let session = scanner::enumerate_admitted(state, source_id, progress, threads)?;
         let checkpoint = FsEventsCheckpoint {
             cursor,
             root: root.display().to_string(),
@@ -1218,7 +1231,7 @@ pub fn native_scan_sequence(
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let summary = scanner::run_full_scan(state, source_id, progress)?;
+        let summary = scanner::run_full_scan_admitted(state, source_id, progress, threads)?;
         Ok(summary)
     }
 }

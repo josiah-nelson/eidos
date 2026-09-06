@@ -40,7 +40,7 @@ enum ContentCommand {
     },
     /// Show or set the global extraction worker pool.
     ///
-    /// The pool is shared across every source; per-volume concurrency caps
+    /// The pool is shared across every source; per-source concurrency caps
     /// apply on top. A new size takes effect at once and survives a
     /// restart (it is persisted next to the catalog and overrides
     /// `--content-workers`).

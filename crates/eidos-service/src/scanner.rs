@@ -315,7 +315,17 @@ pub fn run_full_scan(
     source_id: SourceId,
     progress: &ScanProgress,
 ) -> anyhow::Result<ScanSummary> {
-    let session = enumerate(state, source_id, progress)?;
+    let reservation = wait_for_capacity(state, progress)?;
+    run_full_scan_admitted(state, source_id, progress, reservation.threads)
+}
+
+pub(crate) fn run_full_scan_admitted(
+    state: &Arc<AppState>,
+    source_id: SourceId,
+    progress: &ScanProgress,
+    threads: usize,
+) -> anyhow::Result<ScanSummary> {
+    let session = enumerate_admitted(state, source_id, progress, threads)?;
     progress.set_phase("publishing");
     Ok(session.finish()?)
 }
@@ -329,6 +339,20 @@ pub fn enumerate(
     source_id: SourceId,
     progress: &ScanProgress,
 ) -> anyhow::Result<ScanSession> {
+    // Do not open a generation or probe source media while queued. The
+    // reservation covers enumeration; cancellation stays responsive while
+    // waiting for capacity or for the data volume to recover.
+    let reservation = wait_for_capacity(state, progress)?;
+    enumerate_admitted(state, source_id, progress, reservation.threads)
+}
+
+pub(crate) fn enumerate_admitted(
+    state: &Arc<AppState>,
+    source_id: SourceId,
+    progress: &ScanProgress,
+    threads: usize,
+) -> anyhow::Result<ScanSession> {
+    progress.set_phase("enumerating");
     let source = state
         .catalog
         .get_source(source_id)?
@@ -363,7 +387,7 @@ pub fn enumerate(
         }
     }
     let walk_opts = WalkOptions {
-        threads: state.scan_threads,
+        threads,
         cancel: Some(progress.cancel.clone()),
         ..Default::default()
     };
@@ -399,4 +423,22 @@ pub fn enumerate(
         anyhow::bail!("scan cancelled");
     }
     Ok(session)
+}
+
+pub(crate) fn wait_for_capacity(
+    state: &AppState,
+    progress: &ScanProgress,
+) -> anyhow::Result<crate::resource_control::ScanReservation> {
+    loop {
+        anyhow::ensure!(
+            !progress.cancel.load(Ordering::Relaxed) && !state.shutdown.load(Ordering::Relaxed),
+            "scan cancelled"
+        );
+        state.resources.refresh_disk();
+        match state.resources.try_scan() {
+            Ok(reservation) => return Ok(reservation),
+            Err(reason) => progress.set_phase(&reason),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

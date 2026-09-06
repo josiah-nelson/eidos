@@ -26,7 +26,7 @@ use eidos_search::pipeline::{process_object, ProcessResult};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ts_rs::TS;
@@ -74,6 +74,11 @@ pub struct ContentWorkersStatus {
     pub last_commit_ms: AtomicU64,
     pub last_error: Mutex<Option<String>>,
     pub pending_publish: Mutex<Vec<ObjectId>>,
+    /// Persistent publication faults stop new extraction until a retry lands.
+    pub publication_blocked: AtomicBool,
+    /// A commit/reader-reload failure needs the index step retried even when
+    /// it left no dirty operations. Catalog-only retries need no extra commit.
+    retry_index_commit: AtomicBool,
     /// `(instant, bytes)` samples for the last minute of throughput.
     pub samples: Mutex<VecDeque<(Instant, u64)>>,
     pub started: Mutex<Option<Instant>>,
@@ -209,8 +214,9 @@ pub fn spawn_content_workers(state: &Arc<AppState>, workers: usize) {
         .expect("spawn content coordinator");
 }
 
-/// Jobs claimed per worker round trip (all from one source).
-pub const CLAIM_BATCH: u32 = 16;
+/// One file per worker round trip: pause/shrink drains at most the current
+/// file, never a preclaimed backlog of up to sixteen large files per worker.
+pub const CLAIM_BATCH: u32 = 1;
 
 /// Durable operator override for the pool size, next to the pause marker.
 pub const WORKERS_MARKER: &str = "content-workers.json";
@@ -310,6 +316,22 @@ pub fn claiming_allowed(state: &AppState) -> bool {
     state.content_enabled.load(Ordering::Relaxed)
         && !state.content_pause.is_paused()
         && !state.content_index.is_rebuilding()
+        && admission_blocked_reason(state).is_none()
+}
+
+pub fn admission_blocked_reason(state: &AppState) -> Option<String> {
+    if state
+        .content_workers
+        .publication_blocked
+        .load(Ordering::Acquire)
+    {
+        Some(
+            "content publication failed; extraction waits for the automatic retry (see last error)"
+                .into(),
+        )
+    } else {
+        state.resources.blocked_reason()
+    }
 }
 
 /// Reserve one unit of a source's content budget and claim a batch from
@@ -483,6 +505,7 @@ fn coordinator_loop(state: &AppState) {
     let mut last_commit = Instant::now();
     let mut last_enqueue = Instant::now() - ENQUEUE_INTERVAL;
     loop {
+        state.resources.refresh_disk();
         if state.shutdown.load(Ordering::Relaxed) {
             // Final commit so finished files are not re-extracted at restart.
             let _ = commit_and_publish(state);
@@ -497,8 +520,12 @@ fn coordinator_loop(state: &AppState) {
         // only a deletion, and its old chunks stay searchable until it is
         // committed.
         if !rebuilding
-            && (pending > 0 || state.content_index.is_dirty())
-            && (last_commit.elapsed() >= COMMIT_INTERVAL || uncommitted >= COMMIT_DOCS)
+            && (pending > 0
+                || state.content_index.is_dirty()
+                || status.publication_blocked.load(Ordering::Acquire))
+            && (last_commit.elapsed() >= COMMIT_INTERVAL
+                || (uncommitted >= COMMIT_DOCS
+                    && !status.publication_blocked.load(Ordering::Acquire)))
         {
             if let Err(e) = commit_and_publish(state) {
                 tracing::error!(error = %e, "content index commit failed");
@@ -526,7 +553,7 @@ fn coordinator_loop(state: &AppState) {
             // Once a pause response completes, a coordinator that observed
             // the old state cannot still top the queue up behind it.
             let _admission = state.content_pause.admission_guard();
-            let outcome = if state.content_pause.is_paused() {
+            let outcome = if !claiming_allowed(state) {
                 refresh_budgets(state).map(|_| 0)
             } else {
                 top_up_queue(state)
@@ -544,17 +571,35 @@ pub fn commit_and_publish(state: &AppState) -> anyhow::Result<u64> {
     let status = &state.content_workers;
     let started = Instant::now();
     let objects: Vec<ObjectId> = std::mem::take(&mut *status.pending_publish.lock());
-    match state.content_index.commit() {
-        Ok(_) => {}
-        Err(e) => {
-            // Put the objects back; they stay `indexing` until a commit lands.
-            status.pending_publish.lock().extend(objects);
-            return Err(e.into());
+    // Pending IDs were queued only after their index operations. If those
+    // operations were already committed, retry only the catalog acknowledgement
+    // instead of rewriting/syncing clean index metadata every two seconds.
+    if state.content_index.is_dirty() || status.retry_index_commit.load(Ordering::Acquire) {
+        match state.content_index.commit() {
+            Ok(_) => {}
+            Err(e) => {
+                status.pending_publish.lock().extend(objects);
+                status.retry_index_commit.store(true, Ordering::Release);
+                status.publication_blocked.store(true, Ordering::Release);
+                return Err(e.into());
+            }
         }
+        status.retry_index_commit.store(false, Ordering::Release);
+        status.commits.fetch_add(1, Ordering::Relaxed);
     }
-    status.commits.fetch_add(1, Ordering::Relaxed);
-    let n = state.catalog.mark_content_indexed(&objects)?;
+    let n = match state.catalog.mark_content_indexed(&objects) {
+        Ok(n) => n,
+        Err(error) => {
+            // The index commit succeeded but the catalog acknowledgement did
+            // not. Keep IDs for a later coordinator attempt, merging them with
+            // anything workers finished while the commit was in progress.
+            status.pending_publish.lock().extend(objects);
+            status.publication_blocked.store(true, Ordering::Release);
+            return Err(error.into());
+        }
+    };
     status.published.fetch_add(n, Ordering::Relaxed);
+    status.publication_blocked.store(false, Ordering::Release);
     status
         .last_commit_ms
         .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);

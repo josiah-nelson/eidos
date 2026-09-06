@@ -80,6 +80,17 @@ test('master choice configures discovery before advancing', async () => {
   expect(api.setFleetCentral).toHaveBeenCalledWith({ central: true })
 })
 
+test('unavailable fleet status still requires standalone configuration to be saved', async () => {
+  vi.mocked(api.fleetStatus).mockRejectedValue(new Error('status unavailable'))
+  vi.mocked(api.setFleetCentral).mockRejectedValue(new Error('configuration could not be saved'))
+  mount()
+  await userEvent.click(await screen.findByLabelText(/Standalone/))
+  await userEvent.click(screen.getByRole('button', { name: 'Choose sources' }))
+  await screen.findByText('configuration could not be saved')
+  expect(api.setFleetCentral).toHaveBeenCalledWith({ central: false, listen: '' })
+  expect(screen.queryByRole('heading', { name: 'Choose drives' })).toBeNull()
+})
+
 test('role error is visible and does not silently advance', async () => {
   vi.mocked(api.setFleetCentral).mockRejectedValue(new Error('listener unavailable'))
   mount()

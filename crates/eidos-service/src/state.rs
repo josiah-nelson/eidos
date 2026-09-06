@@ -96,6 +96,9 @@ pub struct AppState {
     pub update_available: Mutex<Option<String>>,
     /// Whether the daily release check runs at all.
     pub update_check: bool,
+    pub(crate) volume_candidates:
+        Arc<crate::background_probe::BackgroundProbe<Vec<eidos_scanner::VolumeCandidate>>>,
+    pub resources: Arc<crate::resource_control::ResourceControl>,
     /// Serializes expired cache refreshes. Callers double-check the cache
     /// after acquiring this lock so a health-check burst performs one disk
     /// traversal and every waiter reuses its result.
@@ -117,7 +120,6 @@ pub struct AppState {
     reconciliation_deferrals: Mutex<HashMap<SourceId, StoredReconciliationDeferral>>,
     pub watchers: Mutex<HashMap<SourceId, Arc<WatcherStatus>>>,
     pub started_at: Instant,
-    pub scan_threads: usize,
     pub shutdown: Arc<AtomicBool>,
     /// Whether the reconciler may start periodic rescans on its own.
     pub auto_reconcile: bool,
@@ -235,6 +237,11 @@ impl AppState {
             storage_cache: Mutex::new(None),
             update_available: Mutex::new(None),
             update_check: config.update_check,
+            volume_candidates: Arc::new(crate::background_probe::BackgroundProbe::default()),
+            resources: Arc::new(crate::resource_control::ResourceControl::load(
+                &config.data_dir,
+                config.scan_threads,
+            )?),
             storage_refresh: Mutex::new(()),
             exec_opts: eidos_search::exec::ExecOptions::default(),
             export: export_limits,
@@ -250,7 +257,6 @@ impl AppState {
             reconciliation_deferrals: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
-            scan_threads: config.scan_threads,
             shutdown: Arc::new(AtomicBool::new(false)),
             auto_reconcile: config.auto_reconcile,
             content_rebuild: rebuild_content,

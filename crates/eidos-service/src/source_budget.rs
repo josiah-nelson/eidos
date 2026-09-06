@@ -1,8 +1,8 @@
 //! Per-source content concurrency budgets and atomic reservations.
 //!
 //! A source's `content_concurrency` bounds how many workers may read from
-//! that volume at once, so a slow HDD or an SMB share cannot be hammered by
-//! the whole pool. Capacity is taken through [`SourceBudgets::try_reserve`]
+//! that source at once. This is not a shared-device cap: multiple roots or
+//! partitions on the same disk can still contend. Capacity is taken through [`SourceBudgets::try_reserve`]
 //! **before** any job is claimed: the check and the increment happen under
 //! one mutex, so two workers can never both see the same free slot.
 //!

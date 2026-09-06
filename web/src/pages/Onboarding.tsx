@@ -84,7 +84,7 @@ export default function Onboarding({ onDone, onManual }: { onDone: () => void; o
               className="btn primary"
               disabled={roleChange.isPending || (!roleLocked && (!role || (role !== 'standalone' && !current) || role === 'join')) || Boolean(current?.pending_join?.rejected_reason)}
               onClick={() => {
-                if (roleLocked || (role === 'standalone' && fleet.isError)) setChoosingRoots(true)
+                if (roleLocked) setChoosingRoots(true)
                 else roleChange.mutate()
               }}
             >Choose sources</button>

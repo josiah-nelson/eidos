@@ -234,6 +234,10 @@ export type ResolveQuery = { source: ApiInt, path: string, };
 
 export type ResolveView = { object_id: ObjectId, path: string | null, };
 
+export type ResourceLimits = { scan_threads: number, concurrent_scans: number, minimum_free_mib: number, };
+
+export type ResourceView = { limits: ResourceLimits, active_scans: number, free_bytes: ApiInt | null, disk_sample_age_s: ApiInt | null, admission_blocked: string | null, };
+
 export type ResultMode = "files" | "directories" | "both";
 
 export type RetryBody = { class?: string | null, reason_prefix?: string | null, preview: boolean, limit?: number | null, as_of?: UnixNanos | null, confirmation?: string | null, };

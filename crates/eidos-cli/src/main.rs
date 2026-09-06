@@ -22,6 +22,7 @@ mod detach;
 mod fleet;
 mod logging;
 mod profile;
+mod resources;
 mod search;
 #[cfg(windows)]
 #[path = "service.rs"]
@@ -73,6 +74,8 @@ enum Command {
     Archive(archive::ArchiveArgs),
     /// Content job controls in the running service (retry failures).
     Content(content::ContentArgs),
+    /// Show or save metadata scan ceilings and data-volume free-space reserve.
+    Resources(resources::ResourceArgs),
     /// Fleet identity, master role, approved joining, and sync status.
     Fleet(fleet::FleetArgs),
 }
@@ -289,6 +292,7 @@ fn main() -> anyhow::Result<()> {
         Command::Activity(args) => activity::run(args),
         Command::Archive(args) => archive::run(args),
         Command::Content(args) => content::run(args),
+        Command::Resources(args) => resources::run(args),
         Command::Fleet(args) => fleet::run(args),
         #[cfg(any(windows, target_os = "macos"))]
         Command::Service(args) => service::run(args, cli.log, cli.log_json),
@@ -319,6 +323,28 @@ fn warn_if_exposed(bind: std::net::SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_replacement_requires_all_limits_and_enforces_ranges() {
+        assert!(Cli::try_parse_from(["eidos", "resources", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["eidos", "resources", "--scan-threads", "2"]).is_err());
+        for (threads, expected) in [("0", false), ("2", true), ("65", false)] {
+            assert_eq!(
+                Cli::try_parse_from([
+                    "eidos",
+                    "resources",
+                    "--scan-threads",
+                    threads,
+                    "--concurrent-scans",
+                    "1",
+                    "--minimum-free-mib",
+                    "1024"
+                ])
+                .is_ok(),
+                expected
+            );
+        }
+    }
 
     fn parse(args: &[&str]) -> ServeArgs {
         #[derive(Parser)]

@@ -304,9 +304,20 @@ fn unreachable_root_marks_offline_and_preserves() {
     assert_eq!(files_before, 2);
     // Simulate disconnection by renaming the root away.
     state.request_shutdown();
-    std::thread::sleep(Duration::from_millis(700));
+    if let Some(watcher) = state.watcher_status(sid) {
+        wait_until(Duration::from_secs(5), || {
+            watcher.view().state == WatcherState::Stopped
+        })
+        .expect("watcher stopped before disconnecting fixture");
+    }
+    // Scans now honor service shutdown even while awaiting admission. A new
+    // scan needs a reopened service, not reuse of a permanently stopped state.
+    wait_until(Duration::from_secs(5), || Arc::strong_count(&state) == 1)
+        .expect("background owners released before reopening the same stores");
+    drop(state);
     let gone = e.root.with_file_name("src-gone");
     std::fs::rename(&e.root, &gone).unwrap();
+    let state = open_state(&e.data);
     let p = start_scan(&state, sid).unwrap();
     let r = wait_for_scan(&p, Duration::from_secs(30)).unwrap();
     assert!(r.is_err());

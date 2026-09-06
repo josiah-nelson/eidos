@@ -270,7 +270,7 @@ pub fn content_status(state: &AppState) -> ContentStatusView {
                 ContentFlow::Draining,
                 format!(
                     "paused: no new jobs are claimed; {in_flight} batch(es) already claimed \
-                     finish and publish normally"
+                     finish and publish normally (at most one current file per worker)"
                 ),
             )
         } else {
@@ -279,6 +279,15 @@ pub fn content_status(state: &AppState) -> ContentStatusView {
                 "paused: no jobs are claimed and nothing is in flight".to_string(),
             )
         }
+    } else if let Some(reason) = crate::content_workers::admission_blocked_reason(state) {
+        (
+            if busy {
+                ContentFlow::Draining
+            } else {
+                ContentFlow::Waiting
+            },
+            reason,
+        )
     } else if busy {
         (
             ContentFlow::Running,

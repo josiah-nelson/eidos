@@ -841,6 +841,10 @@ pub(crate) fn flip_state(
 
 /// Move only steady metadata/content states. Feed and reachability states are
 /// stronger claims and must not be erased merely because extraction changed.
+const HAS_UNFINISHED_CONTENT: &str = "SELECT EXISTS(SELECT 1 FROM objects
+    WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file'
+      AND content_state IN ('pending','stale','failed'))";
+
 fn refresh_source_content_state_conn(conn: &Connection, source: SourceId) -> Result<bool> {
     let (state, published, content_enabled): (String, Option<i64>, bool) = conn.query_row(
         "SELECT state, published_generation, content_enabled FROM sources WHERE source_id = ?1",
@@ -858,22 +862,14 @@ fn refresh_source_content_state_conn(conn: &Connection, source: SourceId) -> Res
     {
         return Ok(false);
     }
-    let (pending, failed): (i64, i64) = conn.query_row(
-        "SELECT
-            SUM(CASE WHEN content_state IN ('pending','stale') THEN 1 ELSE 0 END),
-            SUM(CASE WHEN content_state = 'failed' THEN 1 ELSE 0 END)
-         FROM objects WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file'",
-        params![source.0],
-        |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-            ))
-        },
-    )?;
+    // This runs on each content finalization while holding the writer. Probe
+    // the existing (source_id, content_state) partial index and stop at the
+    // first unfinished file instead of summing the entire source repeatedly.
+    let unfinished: bool = content_enabled
+        && conn.query_row(HAS_UNFINISHED_CONTENT, params![source.0], |row| row.get(0))?;
     let next = if !content_enabled {
         SourceState::MetadataComplete
-    } else if pending > 0 || failed > 0 {
+    } else if unfinished {
         SourceState::ContentPending
     } else {
         SourceState::Complete
@@ -973,4 +969,48 @@ pub(crate) fn enqueue_content_for(
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod publication_cost_tests {
+    use super::*;
+    use rusqlite::StatementStatus;
+
+    #[test]
+    fn completion_probe_cost_does_not_grow_with_settled_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.db")).unwrap();
+        let host = catalog.ensure_host("fixture", "test").unwrap();
+        let source = catalog
+            .add_source(&crate::NewSource {
+                host_id: host,
+                name: "fixture".into(),
+                kind: eidos_domain::SourceKind::WindowsGeneric,
+                root_path: "fixture".into(),
+                aliases: vec![],
+            })
+            .unwrap();
+        catalog.with_writer(|conn| {
+            for total in [1, 1_000, 100_000] {
+                conn.execute("DELETE FROM objects WHERE source_id = ?1", [source.0])?;
+                conn.execute("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < ?2)
+                    INSERT INTO objects (source_id, kind, content_state, identity_confidence, first_seen_generation, last_seen_generation)
+                    SELECT ?1, 'file', 'indexed', 'path_derived', 1, 1 FROM n", params![source.0, total])?;
+                for unfinished in [false, true] {
+                    if unfinished {
+                        conn.execute("UPDATE objects SET content_state = 'failed'
+                            WHERE object_id = (SELECT MAX(object_id) FROM objects)", [])?;
+                    }
+                    let mut stmt = conn.prepare(HAS_UNFINISHED_CONTENT)?;
+                    let result: bool = stmt.query_row([source.0], |row| row.get(0))?;
+                    assert_eq!(result, unfinished);
+                    let steps = stmt.get_status(StatementStatus::VmStep);
+                    assert_eq!(stmt.get_status(StatementStatus::FullscanStep), 0);
+                    assert!(steps < 100, "{total} settled files: {steps} VM steps");
+                    eprintln!("completion probe: files={total}, unfinished={unfinished}, vm_steps={steps}");
+                }
+            }
+            Ok(())
+        }).unwrap();
+    }
 }

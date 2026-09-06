@@ -58,6 +58,7 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
         )
         .route("/sources/{id}/archives", post(requeue_archives))
         .merge(crate::content_control::routes())
+        .merge(crate::resource_control::routes())
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())
         .merge(crate::fleet_api::routes())
@@ -317,6 +318,17 @@ pub struct VolumeCandidateView {
 /// Local volumes for source selection. Empty on platforms without drive
 /// enumeration; the UI falls back to manual path entry.
 async fn volumes(State(st): State<Arc<AppState>>) -> ApiResult<Vec<VolumeCandidateView>> {
+    // Isolate OS discovery from the operator pool. A slow/stuck drive probe
+    // keeps its single dedicated thread, even after an HTTP deadline expires.
+    st.volume_candidates
+        .refresh(std::time::Duration::from_secs(60), || {
+            Ok(eidos_scanner::local_volume_candidates())
+        });
+    let candidates = st
+        .volume_candidates
+        .cached(std::time::Duration::from_secs(2))
+        .await
+        .map_err(|error| ApiError::unavailable(error, Some(2)))?;
     blocking(move || {
         let roots: Vec<String> = st
             .catalog
@@ -325,7 +337,7 @@ async fn volumes(State(st): State<Arc<AppState>>) -> ApiResult<Vec<VolumeCandida
             .map(|s| eidos_scanner::normalize_root(&s.root_path))
             .collect();
         Ok(ApiJson(
-            eidos_scanner::local_volume_candidates()
+            candidates
                 .into_iter()
                 .map(|c| VolumeCandidateView {
                     already_indexed: roots.contains(&eidos_scanner::normalize_root(&c.root)),
