@@ -158,6 +158,10 @@ pub fn run(args: ResourceArgs) -> anyhow::Result<()> {
             body["catalog"]["baseline_connections"], value(&body["catalog"]["page_cache_per_connection_bytes"]), value(&body["catalog"]["page_cache_baseline_target_bytes"]));
         println!("mapped file limit per connection: {}  name-index writer budget: {}  content-index writer budget: {}",
             value(&body["catalog"]["mmap_per_connection_limit_bytes"]), value(&body["catalog_writer_budget_bytes"]), value(&body["content_writer_budget_bytes"]));
+        println!(
+            "content-index input queue budget: {}",
+            value(&body["content_input_budget_bytes"])
+        );
         println!("Budgets are not allocated RAM or a hard process limit; scan connections and other allocations are additional.");
         if let Some(error) = body["error"].as_str() {
             println!("memory sample unavailable: {error}");

@@ -106,6 +106,9 @@ function Measure-ActivePause($activityBefore) {
     $pauseClock = [Diagnostics.Stopwatch]::StartNew()
     $paused = Invoke-RestMethod "$baseUrl/api/content/pause" -Method Post -TimeoutSec 10
     $pauseMs = $pauseClock.Elapsed.TotalMilliseconds
+    # Include the post-acknowledgement identity read in extraction drain time.
+    # A slow Activity response must not disappear from the five-second gate.
+    $drainClock = [Diagnostics.Stopwatch]::StartNew()
     if (-not $paused.paused) { throw 'Active pause was not acknowledged.' }
     if ([int]$paused.in_flight -eq 0) {
         return Resume-MissedActivePause 'no extraction was in flight when the pause landed' $pauseMs
@@ -118,7 +121,6 @@ function Measure-ActivePause($activityBefore) {
     # Allow the drain to overshoot the gate so an overrun is measured and
     # judged by Test-RecoveryActivePause, not hidden behind a harness abort.
     $drainAbortSeconds = 2 * $activePauseDrainSeconds
-    $drainClock = [Diagnostics.Stopwatch]::StartNew()
     do {
         $status = Invoke-RestMethod "$baseUrl/api/content/status" -TimeoutSec 5
         if (-not $status.paused) { throw 'Pause disappeared while extraction was draining.' }

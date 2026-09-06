@@ -38,6 +38,7 @@ pub struct MemoryView {
     pub catalog: eidos_catalog::CatalogMemoryConfig,
     pub catalog_writer_budget_bytes: u64,
     pub content_writer_budget_bytes: u64,
+    pub content_input_budget_bytes: u64,
 }
 
 pub struct MemoryTelemetry {
@@ -74,6 +75,7 @@ impl MemoryTelemetry {
             catalog: catalog.memory_config(),
             catalog_writer_budget_bytes: eidos_search::CATALOG_WRITER_MEMORY_BYTES as u64,
             content_writer_budget_bytes: eidos_search::content::CONTENT_WRITER_MEMORY_BYTES as u64,
+            content_input_budget_bytes: eidos_search::content::CONTENT_INPUT_MEMORY_BYTES as u64,
         };
         if let Some((_, result)) = sample {
             match result {

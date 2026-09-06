@@ -50,6 +50,7 @@ The running code supplies these values; the frontend does not duplicate them:
 | Catalog memory mapping | Effective `PRAGMA mmap_size` read at startup | Maximum mapped file range per connection, not allocated RAM |
 | Name-index writer | 96 MiB | Writer budget shared by its indexing threads |
 | Content-index writer | 256 MiB | Writer budget shared by its indexing threads |
+| Content-index input queue | 16 MiB | Queued text plus a fixed document allowance, before segment construction |
 
 SQLite may clamp the requested mapping range to its build/platform maximum;
 the API reports the effective result. SQLite's [cache pragma](https://www.sqlite.org/pragma.html#pragma_cache_size)
@@ -62,6 +63,13 @@ caches, allocator overhead and other runtime allocations remain outside these
 individual budgets. SQLite allocator tracking stays disabled to preserve the
 existing contention fix; this change does not turn its disabled counter into
 a misleading zero or re-enable a global allocation lock.
+
+The content input queue reserves bytes before copying text into its three
+indexed fields. Tantivy releases each reservation when it consumes or discards
+the document. Normal extraction and catalog rebuild share this limit; a stalled
+consumer fails admission after five seconds instead of waiting indefinitely.
+This bounds the application-owned queued documents, not Tantivy segment,
+tokenizer, merge or whole-process memory. The separate writer budget still applies.
 
 This visibility is a recovery diagnostic, not a hard memory limit, a performance
 profile or deployment qualification. Shared physical-device admission and

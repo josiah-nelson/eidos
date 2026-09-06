@@ -196,7 +196,7 @@ export type LocalSourceSync = { source_id: SourceId, name: string, policy: strin
 
 export type MemberQuery = { parent: string | null, prefix: string | null, offset: number, limit: number, };
 
-export type MemoryView = { process: ProcessMemory | null, sample_age_s: ApiInt | null, stale: boolean, error: string | null, catalog: CatalogMemoryConfig, catalog_writer_budget_bytes: ApiInt, content_writer_budget_bytes: ApiInt, };
+export type MemoryView = { process: ProcessMemory | null, sample_age_s: ApiInt | null, stale: boolean, error: string | null, catalog: CatalogMemoryConfig, catalog_writer_budget_bytes: ApiInt, content_writer_budget_bytes: ApiInt, content_input_budget_bytes: ApiInt, };
 
 export type NativeIdentity = { volume_serial: ApiInt, file_id_high: ApiInt, file_id_low: ApiInt, confidence: IdentityConfidence, };
 

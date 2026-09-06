@@ -7,6 +7,7 @@
 //! originals, and joins current state from the catalog.
 
 pub mod content;
+mod content_input;
 pub mod exec;
 pub mod facets;
 pub mod pipeline;

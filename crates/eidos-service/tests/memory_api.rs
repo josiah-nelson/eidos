@@ -52,6 +52,10 @@ async fn memory_api_is_read_only_uses_exact_counters_and_exposes_runtime_budgets
             body["content_writer_budget_bytes"],
             eidos_search::content::CONTENT_WRITER_MEMORY_BYTES.to_string()
         );
+        assert_eq!(
+            body["content_input_budget_bytes"],
+            eidos_search::content::CONTENT_INPUT_MEMORY_BYTES.to_string()
+        );
         assert!(
             !body["process"].is_null(),
             "the first request must carry a process sample: {body}"

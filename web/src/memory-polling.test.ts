@@ -21,6 +21,7 @@ const settled: MemoryView = {
   },
   catalog_writer_budget_bytes: '100663296',
   content_writer_budget_bytes: '268435456',
+  content_input_budget_bytes: '16777216',
 }
 
 test('a settled sample polls at the sampler refresh interval', () => {
