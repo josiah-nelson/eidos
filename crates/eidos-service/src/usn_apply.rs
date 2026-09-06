@@ -51,18 +51,27 @@ impl<'a> Translator<'a> {
         }
     }
 
-    fn in_scope(&self, parent_frn: u128, batch_dirs: &HashSet<u128>) -> bool {
+    fn in_scope(
+        &self,
+        parent_frn: u128,
+        batch_dirs: &HashSet<u128>,
+    ) -> eidos_catalog::Result<bool> {
         if batch_dirs.contains(&parent_frn) {
-            return true;
+            return Ok(true);
         }
-        self.catalog
-            .object_by_native(self.source_id, self.key(parent_frn))
-            .ok()
-            .flatten()
-            .is_some()
+        match self
+            .catalog
+            .object_by_native(self.source_id, self.key(parent_frn))?
+        {
+            Some(id) => Ok(!self.catalog.object_is_protected(self.source_id, id)?),
+            None => Ok(false),
+        }
     }
 
-    pub fn translate(&self, records: &[UsnRecord]) -> (Vec<ChangeEvent>, TranslateStats) {
+    pub fn translate(
+        &self,
+        records: &[UsnRecord],
+    ) -> eidos_catalog::Result<(Vec<ChangeEvent>, TranslateStats)> {
         let mut stats = TranslateStats {
             records: records.len() as u64,
             ..Default::default()
@@ -97,7 +106,7 @@ impl<'a> Translator<'a> {
             // Old names: unlink when the old parent is in scope.
             let mut any_in_scope = false;
             for (p, n) in &acc.old_names {
-                if self.in_scope(*p, &batch_dirs) {
+                if self.in_scope(*p, &batch_dirs)? {
                     any_in_scope = true;
                     events.push(ChangeEvent::Unlink {
                         parent: self.key(*p),
@@ -117,6 +126,7 @@ impl<'a> Translator<'a> {
                 .latest
                 .as_ref()
                 .map(|(p, _)| self.in_scope(*p, &batch_dirs))
+                .transpose()?
                 .unwrap_or(false);
             if !latest_in_scope && !any_in_scope && acc.reasons & USN_REASON_HARD_LINK_CHANGE == 0 {
                 stats.out_of_scope += 1;
@@ -141,15 +151,21 @@ impl<'a> Translator<'a> {
             let object = to_snapshot(&snap);
             if acc.reasons & USN_REASON_HARD_LINK_CHANGE != 0 && !snap.kind.is_directory_like() {
                 if let Some(path) = &snap.path {
-                    if self.resync_links(path, &object, &mut events, &batch_dirs) {
+                    if self.resync_links(path, &object, &mut events, &batch_dirs)? {
                         stats.link_resyncs += 1;
                         continue;
                     }
                 }
             }
             if let Some((p, n)) = acc.latest {
-                if self.in_scope(p, &batch_dirs) {
-                    if acc.is_dir || snap.kind.is_directory_like() {
+                if self.in_scope(p, &batch_dirs)? {
+                    let protected_path = snap
+                        .path
+                        .as_ref()
+                        .map(|path| self.catalog.path_is_protected(self.source_id, path))
+                        .transpose()?
+                        .unwrap_or(false);
+                    if (acc.is_dir || snap.kind.is_directory_like()) && !protected_path {
                         batch_dirs.insert(frn);
                     }
                     events.push(ChangeEvent::Link {
@@ -160,7 +176,7 @@ impl<'a> Translator<'a> {
                 }
             }
         }
-        (events, stats)
+        Ok((events, stats))
     }
 
     /// Emit Link events for every current hard-link name and Unlink events
@@ -172,10 +188,10 @@ impl<'a> Translator<'a> {
         object: &ObjectSnapshot,
         events: &mut Vec<ChangeEvent>,
         batch_dirs: &HashSet<u128>,
-    ) -> bool {
+    ) -> eidos_catalog::Result<bool> {
         let names = match hard_link_names(std::path::Path::new(path)) {
             Ok(n) => n,
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         };
         let root = self.vol.root.trim_end_matches('\\');
         let mut current: HashSet<(NativeKey, String)> = HashSet::new();
@@ -191,7 +207,7 @@ impl<'a> Translator<'a> {
                 Err(_) => continue,
             };
             let pk = NativeKey::from(parent_snap.native);
-            if !self.in_scope(pk.id, batch_dirs) {
+            if !self.in_scope(pk.id, batch_dirs)? {
                 continue;
             }
             current.insert((pk, name.clone()));
@@ -230,7 +246,7 @@ impl<'a> Translator<'a> {
                 }
             }
         }
-        true
+        Ok(true)
     }
 }
 

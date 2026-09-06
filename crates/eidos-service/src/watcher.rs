@@ -763,7 +763,14 @@ fn watch_loop(state: Arc<AppState>, source_id: SourceId, status: Arc<WatcherStat
                     catalog: &state.catalog,
                     source_id,
                 };
-                let (events, tstats) = translator.translate(&records);
+                let (events, tstats) = match translator.translate(&records) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        tracing::error!(error = %error, "USN policy/catalog read failed; retaining checkpoint for retry");
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
                 let new_cp = UsnCheckpoint {
                     next_usn,
                     ..cp.clone()
@@ -1073,8 +1080,10 @@ impl OverlapFeed for JournalFeed<'_> {
                     catalog: self.catalog,
                     source_id: self.source_id,
                 };
-                let (events, _) = translator.translate(&records);
-                ReplayStep::Batch { events, next_usn }
+                match translator.translate(&records) {
+                    Ok((events, _)) => ReplayStep::Batch { events, next_usn },
+                    Err(error) => ReplayStep::Failed(error.to_string()),
+                }
             }
             Ok(ReadOutcome::EntryDeleted) | Ok(ReadOutcome::JournalChanged) => {
                 ReplayStep::JournalInvalid

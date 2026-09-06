@@ -254,6 +254,7 @@ impl Catalog {
                 };
                 let sql = format!(
                     "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued' AND stage IN ({stage_list}) AND scheduled_at <= ?1{exclude}
+                     AND (stage != 'content_text' OR source_id NOT IN (SELECT source_id FROM source_policy WHERE phase != 'applied'))
                      ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT 1"
                 );
                 let first = match tx.query_row(&sql, params![now], job_from_row).optional()? {

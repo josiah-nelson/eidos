@@ -415,7 +415,10 @@ pub(crate) fn enumerate_admitted(
     let root = std::path::PathBuf::from(&source.root_path);
     let mut ingest_error: Option<eidos_catalog::CatalogError> = None;
     let cancel = progress.cancel.clone();
-    let stats = eidos_scanner::walk(&root, state.lister.as_ref(), &walk_opts, |ev| {
+    let protected_lister = state
+        .catalog
+        .protected_lister(source_id, state.lister.as_ref())?;
+    let stats = eidos_scanner::walk(&root, &protected_lister, &walk_opts, |ev| {
         if ingest_error.is_some() {
             return;
         }
@@ -456,6 +459,12 @@ pub(crate) fn wait_for_capacity(
             "scan cancelled"
         );
         state.resources.refresh_disk();
+        if state.catalog.policy_applying(progress.source_id)? {
+            progress
+                .set_phase("waiting for exclusion policy application (check source policy errors)");
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         match state.resources.try_scan() {
             Ok(reservation) => {
                 // Only now does this scan start touching the source. Content

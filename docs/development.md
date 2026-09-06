@@ -43,6 +43,11 @@ partial drive results, scan retry and state surviving query refreshes.
 Resource-control tests also exercise explicit saves, persistence errors and
 disk-pressure visibility; [resource-controls.md](resource-controls.md) has the
 bounded synthetic measurement procedure.
+
+Exclusion tests cover rendered drafts/preview/apply, optimistic conflicts,
+catalog-only application while a source is unavailable, native path changes,
+protected inventory boundaries and interrupted content cleanup. See
+[exclusions.md](exclusions.md) and [ADR-0028](adr/0028-versioned-content-exclusions.md).
 They do not replace installed-browser or real two-host acceptance; see
 [recovery.md](recovery.md).
 

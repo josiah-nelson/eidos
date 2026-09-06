@@ -59,6 +59,7 @@ pub fn router_with_web(state: Arc<AppState>, web: &WebAssets) -> Router {
         .route("/sources/{id}/archives", post(requeue_archives))
         .merge(crate::content_control::routes())
         .merge(crate::resource_control::routes())
+        .merge(crate::exclusions_api::routes())
         .merge(crate::retry_api::routes())
         .merge(crate::interactions_api::routes())
         .merge(crate::fleet_api::routes())
@@ -386,6 +387,7 @@ pub(crate) fn source_view(st: &AppState, s: SourceRecord) -> Result<SourceView, 
         eidos_catalog::read::completeness_from(&s, &counts, listing_errors)
     };
     let scan = st.scan_progress(s.id).map(|p| p.view());
+    st.catalog.decorate_policy_coverage(&mut completeness)?;
     let watcher = st.watcher_status(s.id).map(|w| w.view());
     let reconciliation_deferred = st.reconciliation_deferral(s.id);
     // A stored checkpoint only means "live" while a watcher is actually

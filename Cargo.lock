@@ -731,6 +731,7 @@ dependencies = [
  "eidos-sync",
  "getrandom 0.4.3",
  "parking_lot",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -19,6 +19,7 @@ mod archive;
 mod bench;
 mod content;
 mod detach;
+mod exclusions;
 mod fleet;
 mod logging;
 mod profile;
@@ -76,6 +77,8 @@ enum Command {
     Content(content::ContentArgs),
     /// Show or save metadata scan ceilings and data-volume free-space reserve.
     Resources(resources::ResourceArgs),
+    /// Preview, apply, and monitor content exclusion rules in the running service.
+    Exclusions(exclusions::ExclusionArgs),
     /// Fleet identity, master role, approved joining, and sync status.
     Fleet(fleet::FleetArgs),
 }
@@ -177,6 +180,7 @@ impl ServeArgs {
     pub fn service_config(&self) -> eidos_service::ServiceConfig {
         eidos_service::ServiceConfig {
             data_dir: self.data_dir.clone(),
+            log_dir: self.log_dir.clone(),
             bind: self.bind,
             web_dir: self.web_dir.clone(),
             embedded_web: !self.no_web,
@@ -298,6 +302,7 @@ fn main() -> anyhow::Result<()> {
         Command::Archive(args) => archive::run(args),
         Command::Content(args) => content::run(args),
         Command::Resources(args) => resources::run(args),
+        Command::Exclusions(args) => exclusions::run(args),
         Command::Fleet(args) => fleet::run(args),
         #[cfg(any(windows, target_os = "macos"))]
         Command::Service(args) => service::run(args, cli.log, cli.log_json),

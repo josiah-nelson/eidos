@@ -9,7 +9,7 @@
 
 use eidos_domain::{extension_of, FileAttributes, FileKind, ReasonCode};
 
-pub const POLICY_VERSION: u32 = 2;
+pub const POLICY_VERSION: u32 = 3;
 
 /// Reparse tags (winnt.h) that matter for the content policy. Values are
 /// ABI-stable.
@@ -65,6 +65,8 @@ pub mod reparse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyCtx {
     pub depth: u32,
+    /// Source-relative path with `/` separators (names retain their case).
+    pub relative: String,
     /// Folded name of this directory (`""` for the root).
     pub name_folded: String,
     /// Content exclusion inherited from this directory or an ancestor.
@@ -75,6 +77,7 @@ impl PolicyCtx {
     pub fn root() -> Self {
         Self {
             depth: 0,
+            relative: String::new(),
             name_folded: String::new(),
             inherited_content_exclusion: None,
         }
@@ -87,6 +90,8 @@ pub enum ContentDecision {
     Candidate,
     /// No extractor in this version (documents, archives).
     Unsupported,
+    /// Index into this engine's ordered operator rules.
+    Operator { include: bool, index: usize },
     /// Excluded by policy with a stable reason and the rule that fired.
     Excluded {
         reason: ReasonCode,
@@ -97,6 +102,11 @@ pub enum ContentDecision {
 #[derive(Debug, Clone)]
 pub struct PolicyEngine {
     pub version: u32,
+    pub(crate) revision: u32,
+    pub(crate) rules: Vec<crate::exclusions::CompiledRule>,
+    pub(crate) protected: Vec<String>,
+    pub(crate) absolute_protected: Vec<String>,
+    pub(crate) case_sensitive: bool,
 }
 
 impl Default for PolicyEngine {
@@ -109,6 +119,11 @@ impl PolicyEngine {
     pub fn new() -> Self {
         Self {
             version: POLICY_VERSION,
+            revision: 0,
+            rules: Vec::new(),
+            protected: Vec::new(),
+            absolute_protected: Vec::new(),
+            case_sensitive: false,
         }
     }
 
@@ -121,6 +136,7 @@ impl PolicyEngine {
         }
         PolicyCtx {
             depth: parent.depth + 1,
+            relative: Self::child_path(parent, name),
             name_folded: folded,
             inherited_content_exclusion: inherited,
         }
@@ -134,8 +150,12 @@ impl PolicyEngine {
         reparse_tag: u32,
         parent: &PolicyCtx,
     ) -> ContentDecision {
-        if let Some((reason, rule)) = parent.inherited_content_exclusion {
-            return ContentDecision::Excluded { reason, rule };
+        let relative = Self::child_path(parent, name);
+        if self.is_protected(&relative) {
+            return ContentDecision::Excluded {
+                reason: ReasonCode::SelfStore,
+                rule: "self-store",
+            };
         }
         if attributes.is_reparse() || reparse_tag != 0 {
             match reparse::content_rule(reparse_tag) {
@@ -181,6 +201,21 @@ impl PolicyEngine {
                 rule: "offline-attribute",
             };
         }
+        if let Some((index, r)) = self
+            .rules
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, r)| r.matches(&relative, self.case_sensitive))
+        {
+            return ContentDecision::Operator {
+                include: r.rule.include,
+                index,
+            };
+        }
+        if let Some((reason, rule)) = parent.inherited_content_exclusion {
+            return ContentDecision::Excluded { reason, rule };
+        }
         let ext = extension_of(name);
         match FileKind::from_extension(&ext) {
             FileKind::DiskImage => ContentDecision::Excluded {
@@ -207,6 +242,44 @@ impl PolicyEngine {
             | FileKind::Log
             | FileKind::Markup
             | FileKind::Unknown => ContentDecision::Candidate,
+        }
+    }
+
+    pub fn child_path(parent: &PolicyCtx, name: &str) -> String {
+        if parent.relative.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}/{name}", parent.relative)
+        }
+    }
+
+    pub fn is_protected(&self, relative: &str) -> bool {
+        self.protected
+            .iter()
+            .any(|root| crate::exclusions::within(relative, root, self.case_sensitive))
+    }
+}
+
+impl ContentDecision {
+    /// Keep successful extraction (and binary-sniff outcomes) stable when
+    /// metadata is unchanged. An explicit include may retry an unsupported file.
+    pub fn changes_state(self, old: &str) -> bool {
+        use eidos_domain::ContentState;
+        let next = self.initial_state();
+        if next == ContentState::Pending {
+            old == "excluded"
+                || (old == "unsupported" && matches!(self, Self::Operator { include: true, .. }))
+        } else {
+            old != next.as_str()
+        }
+    }
+
+    pub fn initial_state(self) -> eidos_domain::ContentState {
+        use eidos_domain::ContentState;
+        match self {
+            Self::Candidate | Self::Operator { include: true, .. } => ContentState::Pending,
+            Self::Unsupported => ContentState::Unsupported,
+            Self::Excluded { .. } | Self::Operator { include: false, .. } => ContentState::Excluded,
         }
     }
 }

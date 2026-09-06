@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router'
 import { api } from '../api'
 import { CompletenessBanner, ContentPolicyControl, ErrorBox, Spinner, StateBadge } from '../components'
 import { bytes, count, duration, humanState, when } from '../format'
+import ExclusionEditor from '../components/ExclusionEditor'
 
 export default function SourceDetailPage() {
   const { id } = useParams()
@@ -95,7 +96,8 @@ export default function SourceDetailPage() {
         </div>
       </div>
 
-      <h2>Content exclusions</h2>
+      <ExclusionEditor sourceId={sid} remote={s.kind === 'remote'} />
+      <h2>Recorded exclusions</h2>
       {d.exclusions.length === 0 ? (
         <div className="muted">No policy exclusions recorded.</div>
       ) : (
@@ -104,7 +106,7 @@ export default function SourceDetailPage() {
             <tr>
               <th>Stage</th>
               <th>Reason</th>
-              <th className="num">Files</th>
+              <th className="num">Objects</th>
               <th className="num">Bytes</th>
             </tr>
           </thead>

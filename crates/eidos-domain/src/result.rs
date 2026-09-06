@@ -248,6 +248,10 @@ pub struct SourceCompleteness {
     /// that the source cannot contribute matches.
     #[serde(default)]
     pub content_not_replicated: bool,
+    /// Intentional inventory boundaries or policy application in progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub policy_note: Option<String>,
     #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
     pub content_pending: u64,
     #[serde(deserialize_with = "crate::json::u64_string::deserialize")]
@@ -415,6 +419,7 @@ mod tests {
             metadata_complete: m,
             content_complete: c,
             content_not_replicated: false,
+            policy_note: None,
             content_pending: 0,
             content_failed: 0,
             listing_errors: 0,

@@ -3,6 +3,10 @@
 
 import type {
   ActivityView,
+  ApplyExclusions,
+  ExclusionPolicy,
+  ExclusionPreview,
+  PreviewExclusions,
   CentralBody,
   AddSourceBody,
   AddedSource,
@@ -111,6 +115,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  exclusionPolicy: (id: ApiRouteId) => request<ExclusionPolicy>(`/api/sources/${id}/policy`),
+  applyExclusions: (id: ApiRouteId, body: ApplyExclusions) => request<ExclusionPolicy>(`/api/sources/${id}/policy`, { method: 'POST', body: JSON.stringify(body) }),
+  previewExclusions: (id: ApiRouteId, body: PreviewExclusions) => request<ExclusionPreview[]>(`/api/sources/${id}/policy/preview`, { method: 'POST', body: JSON.stringify(body) }),
+  retryExclusions: (id: ApiRouteId) => request<ExclusionPolicy>(`/api/sources/${id}/policy/retry`, { method: 'POST' }),
   health: () => request<Health>('/api/health'),
   sources: () => request<SourceView[]>('/api/sources'),
   volumes: () => request<VolumeCandidateView[]>('/api/volumes'),

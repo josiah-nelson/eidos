@@ -20,6 +20,16 @@ use ts_rs::TS;
 
 pub const ZSTD_LEVEL: i32 = 1;
 
+fn ensure_content_generation(conn: &Connection, object: ObjectId, generation: u32) -> Result<()> {
+    let current: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE object_id = ?1 AND generation = ?2 AND deleted_at IS NULL AND content_state NOT IN ('excluded','not_applicable','not_replicated'))", params![object.0, generation], |r| r.get(0))?;
+    if !current {
+        return Err(CatalogError::InvalidState(
+            "content generation was superseded or excluded".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Size tiers (bytes) for content job priorities.
 pub const SMALL_TEXT_LIMIT: u64 = 256 * 1024;
 pub const NORMAL_TEXT_LIMIT: u64 = 16 * 1024 * 1024;
@@ -152,14 +162,21 @@ impl Catalog {
                 )
                 .optional()?
                 .unwrap_or(1);
+            let engine = self.cached_policy_conn(conn, SourceId(source_id))?;
+            let root: String = conn.query_row("SELECT root_path FROM sources WHERE source_id = ?1", [source_id], |r| r.get(0))?;
+            let absolute = crate::exclusions::normalized_absolute(&path);
+            let root = crate::exclusions::normalized_absolute(&root);
+            let relative = absolute.strip_prefix(&root).unwrap_or(&absolute).trim_start_matches('/');
+            let (attributes, tag): (u32, u32) = conn.query_row("SELECT attributes, reparse_tag FROM objects WHERE object_id = ?1", [object.0], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let policy_state = engine.path_decision(relative, eidos_domain::FileAttributes(attributes), tag).initial_state();
             Ok(Some(ContentTarget {
                 object_id: object,
                 source_id: SourceId(source_id),
                 generation: generation as u32,
                 size: size as u64,
                 path,
-                content_state: ContentState::parse(&state).unwrap_or(ContentState::Pending),
-                content_enabled: enabled != 0,
+                content_state: if policy_state == ContentState::Pending { ContentState::parse(&state).unwrap_or(ContentState::Pending) } else { policy_state },
+                content_enabled: enabled != 0 && !crate::exclusions::applying_conn(conn, SourceId(source_id))?,
             }))
         })
     }
@@ -172,6 +189,7 @@ impl Catalog {
         }
         self.with_writer(|conn| {
             let tx = conn.transaction()?;
+            ensure_content_generation(&tx, object, generation)?;
             {
                 let mut stmt = tx.prepare_cached(
                     "INSERT OR REPLACE INTO chunks (object_id, generation, ordinal, byte_start, byte_end, line_start, line_end, chars, text)
@@ -230,6 +248,7 @@ impl Catalog {
     ) -> Result<()> {
         self.with_writer(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            ensure_content_generation(&tx, rec.object_id, rec.generation)?;
             if !chunks.is_empty() {
                 let mut stmt = tx.prepare_cached(
                     "INSERT OR REPLACE INTO chunks (object_id, generation, ordinal, byte_start, byte_end, line_start, line_end, chars, text)
@@ -845,7 +864,10 @@ const HAS_UNFINISHED_CONTENT: &str = "SELECT EXISTS(SELECT 1 FROM objects
     WHERE source_id = ?1 AND deleted_at IS NULL AND kind = 'file'
       AND content_state IN ('pending','stale','failed'))";
 
-fn refresh_source_content_state_conn(conn: &Connection, source: SourceId) -> Result<bool> {
+pub(crate) fn refresh_source_content_state_conn(
+    conn: &Connection,
+    source: SourceId,
+) -> Result<bool> {
     let (state, published, content_enabled): (String, Option<i64>, bool) = conn.query_row(
         "SELECT state, published_generation, content_enabled FROM sources WHERE source_id = ?1",
         params![source.0],
@@ -897,7 +919,7 @@ pub(crate) fn enqueue_pending_content_conn(
         )
         .optional()?
         .unwrap_or(0);
-    if enabled == 0 {
+    if enabled == 0 || crate::exclusions::applying_conn(conn, source)? {
         return Ok(0);
     }
     let now = UnixNanos::now().0;

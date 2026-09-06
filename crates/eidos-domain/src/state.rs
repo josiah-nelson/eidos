@@ -204,6 +204,8 @@ str_enum! {
         UserInclude => "user_include",
         /// User override forcing exclusion.
         UserExclude => "user_exclude",
+        /// Eidos's configured data, index, or log storage.
+        SelfStore => "self_store",
         VmDiskImage => "vm_disk_image",
         SwapOrHibernation => "swap_or_hibernation",
         RecycleBin => "recycle_bin",

@@ -624,6 +624,31 @@ CREATE INDEX fleet_join_requests_status
 DROP TABLE fleet_invites;
 "#,
     ),
+    (
+        "versioned content rules and resumable policy application",
+        r#"
+CREATE TABLE source_policy (
+    source_id INTEGER PRIMARY KEY REFERENCES sources(source_id),
+    revision INTEGER NOT NULL,
+    rules TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'applying',
+    cursor INTEGER NOT NULL DEFAULT 0,
+    processed INTEGER NOT NULL DEFAULT 0,
+    changed INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
+CREATE TABLE protected_paths (path TEXT PRIMARY KEY) WITHOUT ROWID;
+-- Content-index deletes must commit before application is acknowledged.
+CREATE TABLE policy_cleanup (
+    object_id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL
+);
+CREATE INDEX policy_cleanup_source ON policy_cleanup(source_id, object_id);
+-- Keyset apply batches must never sort/rescan the whole source per page.
+CREATE INDEX objects_policy_apply ON objects(source_id, object_id)
+    WHERE deleted_at IS NULL AND kind IN ('file','directory');
+"#,
+    ),
 ];
 
 /// Apply pending migrations. Returns the versions applied.

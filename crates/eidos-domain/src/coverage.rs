@@ -82,6 +82,8 @@ pub enum CoverageKind {
     ContentFailed,
     /// Directories that could not be listed; previous contents preserved.
     ListingErrors,
+    /// Intentional policy boundaries or a policy transition in progress.
+    PolicyExclusion,
     /// The walk stopped at a budget; totals are a lower bound.
     Truncated,
     /// A deadline elapsed before the answer was complete.
@@ -117,6 +119,7 @@ impl std::fmt::Display for CoverageKind {
             Self::ContentPending => "content_pending",
             Self::ContentFailed => "content_failed",
             Self::ListingErrors => "listing_errors",
+            Self::PolicyExclusion => "policy_exclusion",
             Self::Truncated => "truncated",
             Self::Timeout => "timeout",
             Self::GenerationReset => "generation_reset",
@@ -289,7 +292,19 @@ fn source_coverage(
     // snapshot or aggregate publication is incomplete. That is not a search
     // index failure; the catalog has deliberately withheld publication.
     let replica_is_reconciling = c.state == SourceState::Reconciling && c.content_not_replicated;
-    if !c.metadata_complete && state_claims_complete && !replica_is_reconciling {
+    if let Some(note) = &c.policy_note {
+        degraded.push(CoverageReason {
+            kind: CoverageKind::PolicyExclusion,
+            severity: CoverageSeverity::Info,
+            detail: note.clone(),
+            remediation: Some("see this source's content rules and protected directories".into()),
+        });
+    }
+    if !c.metadata_complete
+        && state_claims_complete
+        && !replica_is_reconciling
+        && c.policy_note.is_none()
+    {
         degraded.push(CoverageReason {
             kind: CoverageKind::NotIndexed,
             severity: CoverageSeverity::Warning,
@@ -431,6 +446,7 @@ mod tests {
             metadata_complete: true,
             content_complete: true,
             content_not_replicated: false,
+            policy_note: None,
             content_pending: 0,
             content_failed: 0,
             listing_errors: 0,

@@ -197,6 +197,13 @@ impl PathTranslator<'_> {
             return Ok(true);
         };
         let parent_path = PathBuf::from(parent_path);
+        if self
+            .catalog
+            .path_is_protected(self.source_id, &parent_path.to_string_lossy())
+            .map_err(|e| ScanError::new(ScanErrorKind::Transient, 0, e.to_string(), &parent_path))?
+        {
+            return Ok(true);
+        }
         let entry = match self.lister.stat(&parent_path.join(name)) {
             Ok(entry) => entry,
             Err(error) if error.kind == ScanErrorKind::NotFound => return Ok(false),
@@ -233,9 +240,16 @@ impl PathTranslator<'_> {
     ) -> bool {
         let mut budget = MAX_EXPANDED_ENTRIES;
         let mut overflowed = false;
+        let protected_lister = match self.catalog.protected_lister(self.source_id, self.lister) {
+            Ok(lister) => lister,
+            Err(_) => {
+                stats.retryable_errors += 1;
+                return false;
+            }
+        };
         walk(
             path,
-            self.lister,
+            &protected_lister,
             &WalkOptions {
                 threads: 2,
                 ..Default::default()
@@ -430,6 +444,20 @@ impl PathTranslator<'_> {
                 stats.out_of_scope += 1;
                 continue;
             }
+            match self
+                .catalog
+                .path_is_protected(self.source_id, &change.path.to_string_lossy())
+            {
+                Ok(true) => {
+                    stats.out_of_scope += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    stats.retryable_errors += 1;
+                    return (Vec::new(), stats);
+                }
+            }
             if change.path == self.root {
                 // The root's own entry belongs to the source, not to a parent
                 // inside it; its aggregates are recomputed by the catalog.
@@ -554,6 +582,23 @@ mod tests {
     struct FaultingLister {
         inner: Box<dyn DirectoryLister>,
         fault: PathBuf,
+    }
+
+    #[test]
+    fn internal_notifications_are_ignored_before_stat_and_do_not_hold_the_cursor() {
+        let fixture = Fixture::new(false);
+        let store = fixture.root.join("store");
+        fixture
+            .catalog
+            .configure_protected_paths(std::slice::from_ref(&store))
+            .unwrap();
+        let changed = store.join("catalog.db");
+        let (events, stats) = fixture.translate_with_fault(&changed, &changed);
+        assert!(events.is_empty());
+        assert_eq!(stats.out_of_scope, 1);
+        assert_eq!(stats.snapshots, 0);
+        assert_eq!(stats.retryable_errors, 0);
+        assert!(!stats.needs_rescan);
     }
 
     impl DirectoryLister for FaultingLister {

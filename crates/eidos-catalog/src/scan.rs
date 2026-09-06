@@ -21,8 +21,8 @@ use crate::model::SourceRecord;
 use crate::policy::{ContentDecision, PolicyCtx, PolicyEngine};
 use crate::{Catalog, CatalogError, RecoveryReport, Result, WriterCoordination, WriterPermit};
 use eidos_domain::{
-    extension_of, ContentState, IdentityConfidence, ObjectId, ObjectKind, PolicyStage, SourceId,
-    SourceKind, SourceState, UnixNanos,
+    extension_of, ContentState, IdentityConfidence, ObjectId, ObjectKind, SourceId, SourceKind,
+    SourceState, UnixNanos,
 };
 use eidos_scanner::{DirEvent, RawEntry};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -133,6 +133,9 @@ impl Catalog {
         let now = UnixNanos::now().0;
         let (source, generation, root) = self.with_writer(|conn| {
             let tx = conn.transaction()?;
+            if crate::exclusions::applying_conn(&tx, source_id)? {
+                return Err(CatalogError::InvalidState("exclusions are being applied; wait for completion or retry the policy error".into()));
+            }
             let mut source = crate::read::get_source_conn(&tx, source_id)?
                 .ok_or_else(|| CatalogError::NotFound(format!("source {source_id}")))?;
             if source.kind == SourceKind::Remote {
@@ -192,8 +195,8 @@ impl Catalog {
                 SourceState::Enumerating
             };
             tx.execute(
-                "UPDATE sources SET state = ?2, state_reason = NULL, last_scan_started_at = ?3, updated_at = ?3 WHERE source_id = ?1",
-                params![source_id.0, state.as_str(), now],
+                "UPDATE sources SET state = ?2, state_reason = NULL, last_scan_started_at = ?3, updated_at = ?3, policy_version = ?4 WHERE source_id = ?1",
+                params![source_id.0, state.as_str(), now, crate::exclusions::engine_conn(&tx, source_id)?.version],
             )?;
             tx.commit()?;
             Ok((source, generation, root))
@@ -207,7 +210,7 @@ impl Catalog {
             generation,
             root,
             tokens: HashMap::new(),
-            policy: PolicyEngine::new(),
+            policy: self.exclusion_engine(source_id)?,
             in_tx: false,
             pending_rows: 0,
             last_commit: Instant::now(),
@@ -324,6 +327,13 @@ impl ScanSession {
                 }
             }
         };
+        if self.policy.is_protected(&ctx.relative) {
+            // Intentional inventory boundary, not a successful empty listing.
+            self.policy.record_boundary(&self.conn, dir)?;
+            self.unlisted.insert(dir);
+            self.account_row()?;
+            return Ok(());
+        }
         match ev.result {
             Err(err) => {
                 self.stats.errors += 1;
@@ -354,6 +364,7 @@ impl ScanSession {
                 self.account_row()?;
             }
             Ok(entries) => {
+                self.conn.execute("DELETE FROM policy_decisions WHERE object_id = ?1 AND stage = 'inventory' AND reason = 'self_store'", [dir.0])?;
                 self.stats.dirs_listed += 1;
                 self.stats.entries_seen += entries.len() as u64;
                 self.conn.execute(
@@ -452,8 +463,15 @@ impl ScanSession {
                 // ChangeTime moves on renames and attribute edits, so only size
                 // and LastWriteTime indicate new content (USN reasons refine
                 // this in Milestone 2; BLAKE3 verifies it in Milestone 4).
+                let policy_changed =
+                    e.kind == ObjectKind::File && decision.changes_state(&ex.content_state);
                 let content_changed = e.kind == ObjectKind::File
-                    && (ex.size != size || ex.modified != e.modified.map(|t| t.0));
+                    && (ex.size != size
+                        || ex.modified != e.modified.map(|t| t.0)
+                        || policy_changed);
+                if policy_changed {
+                    crate::exclusions::reapply_conn(&self.conn, self.source.id)?;
+                }
                 // Any shipped column moving marks the row for sync. Access
                 // time is deliberately excluded: where last-access updates
                 // are enabled every read moves it, and re-stamping the whole
@@ -550,32 +568,7 @@ impl ScanSession {
     }
 
     fn record_policy(&mut self, id: ObjectId, decision: ContentDecision) -> Result<()> {
-        match decision {
-            ContentDecision::Excluded { reason, rule } => {
-                self.conn
-                    .prepare_cached(
-                        "INSERT INTO policy_decisions (object_id, stage, included, reason, rule, policy_version)
-                         VALUES (?1, ?2, 0, ?3, ?4, ?5)
-                         ON CONFLICT(object_id, stage) DO UPDATE SET included = 0, reason = excluded.reason, rule = excluded.rule,
-                            policy_version = excluded.policy_version WHERE user_override = 0",
-                    )?
-                    .execute(params![
-                        id.0,
-                        PolicyStage::Content.as_str(),
-                        reason.as_str(),
-                        rule,
-                        self.policy.version as i64
-                    ])?;
-            }
-            _ => {
-                self.conn
-                    .prepare_cached(
-                        "DELETE FROM policy_decisions WHERE object_id = ?1 AND stage = ?2 AND user_override = 0",
-                    )?
-                    .execute(params![id.0, PolicyStage::Content.as_str()])?;
-            }
-        }
-        Ok(())
+        self.policy.record(&self.conn, id, decision)
     }
 
     fn upsert_entry(&mut self, parent: ObjectId, e: &RawEntry, obj: ObjectId) -> Result<()> {
@@ -1010,7 +1003,8 @@ pub fn run_scan(
     walk_opts.cancel = Some(cancel.clone());
     let root = std::path::PathBuf::from(&source.root_path);
     let mut ingest_error: Option<CatalogError> = None;
-    let stats = eidos_scanner::walk(&root, lister, &walk_opts, |ev| {
+    let protected_lister = catalog.protected_lister(source_id, lister)?;
+    let stats = eidos_scanner::walk(&root, &protected_lister, &walk_opts, |ev| {
         if ingest_error.is_some() {
             return;
         }
@@ -1051,11 +1045,7 @@ fn initial_content_state(decision: ContentDecision, kind: ObjectKind) -> Content
     if kind != ObjectKind::File {
         return ContentState::NotApplicable;
     }
-    match decision {
-        ContentDecision::Candidate => ContentState::Pending,
-        ContentDecision::Unsupported => ContentState::Unsupported,
-        ContentDecision::Excluded { .. } => ContentState::Excluded,
-    }
+    decision.initial_state()
 }
 
 fn eidos_scanner_display(p: &std::path::Path) -> String {

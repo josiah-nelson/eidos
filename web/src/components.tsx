@@ -119,6 +119,7 @@ export function CompletenessBanner({ c }: { c: SourceCompleteness }) {
       </div>
     )
   }
+  if (c.policy_note) return <div className="banner warn"><strong>{c.name}</strong>: {c.policy_note}</div>
   if (!c.metadata_complete) {
     return (
       <div className="banner bad">

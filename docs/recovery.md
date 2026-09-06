@@ -1,7 +1,7 @@
 # Recovery after v0.5.0
 
 Status: implementation in progress; not deployment-qualified.
-Updated: 2026-09-05.
+Updated: 2026-09-06.
 
 v0.5.0 failed in use. Passing tests did not establish acceptable disk load,
 initial throughput, idle behavior or a usable fleet workflow.
@@ -37,11 +37,12 @@ collector payloads, and the MSI service table contains only eidos. Workflow
 lint and macOS script syntax checks pass. This is not yet evidence of an
 installed, signed recovery candidate. PR #123 is merged; the unsigned Windows
 installer lifecycle passed on a disposable runner. Its macOS CI failed on a
-stale nextest filter naming the removed collector package; this follow-up
-removes that obsolete configuration. Signed and real-machine gates below
+stale nextest filter naming the removed collector package; #124 removed
+that obsolete configuration. Signed and real-machine gates below
 remain required.
 
-The next runtime-safety vertical adds durable metadata scan ceilings and a
+PR #124 is merged, with all cross-platform checks passing. It adds durable
+metadata scan ceilings and a
 data-volume reserve through Activity/API/CLI, single-file content claims,
 publication-failure backpressure/retry, and indexed source-completion checks.
 It also bounds discovery/update checks and fixes standalone setup advancing
@@ -55,8 +56,19 @@ files in 7.058 seconds; its 30-second idle observation used 0.125 CPU seconds
 but still performed process I/O. [Raw-counter summary](benchmarks.md) records
 the limits of that evidence. No signed/installed recovery claim follows.
 
-Chunk B is **not complete**: writable exclusions and cross-stage self-store
-protection form the next policy vertical. Shared-device admission, RAM/cache
+The policy vertical now implements a writable folder/regex editor, preview,
+explicit versioned Apply, resumable catalog-only application and protected
+data/index/log boundaries. Focused tests cover old-content removal, preserved
+metadata, native changes, unavailable sources and restart after a failed cleanup
+acknowledgement. The full Windows local integration gate passed: format,
+clippy, generated API, Rust tests/docs, 43 web utility tests, 21 rendered UI
+tests and the production web build. Cross-platform CI/review for this policy
+change remains pending. Final focused checks also passed: 22 service tests
+(including ten policy regressions), 20 catalog unit tests and all-target clippy.
+See
+[exclusion controls](exclusions.md) for semantics and path-alias limitations.
+
+Chunk B is **not complete**. Shared-device admission, RAM/cache
 visibility, measured profiles and real-workload qualification also remain.
 The current source cap is not a physical-device cap, and disk admission is
 not a hard quota. Signed pushed updates remain chunk C.

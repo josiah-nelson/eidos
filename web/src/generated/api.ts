@@ -18,6 +18,8 @@ export type AggStats = { directories: ApiInt, extension_rows: ApiInt, unreachabl
 
 export type ApiErrorBody = { error: string, kind: string, };
 
+export type ApplyExclusions = { expected_revision: number, rules: Array<ExclusionRule>, };
+
 export type ArchiveMember = { ordinal: number, path: string, name: string, parent: string, raw_name: string, is_dir: boolean, implicit: boolean, size: ApiInt, compressed: ApiInt, method: number, crc32: number, modified: UnixNanos | null, encrypted: boolean, flags: number, };
 
 export type ArchiveQuery = { parent: string | null, prefix: string | null, offset: number, limit: number, };
@@ -68,7 +70,7 @@ export type Coverage = "full" | "prefix" | "tail" | "sample" | "none";
 
 export type CoverageEnvelope = { full: boolean, degraded?: Array<CoverageReason>, sources: Array<SourceCoverage>, };
 
-export type CoverageKind = "offline" | "stale" | "degraded_feed" | "enumerating" | "reconciling" | "not_scanned" | "not_indexed" | "index_lag" | "content_pending" | "content_failed" | "listing_errors" | "truncated" | "timeout" | "generation_reset" | "content_not_replicated";
+export type CoverageKind = "offline" | "stale" | "degraded_feed" | "enumerating" | "reconciling" | "not_scanned" | "not_indexed" | "index_lag" | "content_pending" | "content_failed" | "listing_errors" | "policy_exclusion" | "truncated" | "timeout" | "generation_reset" | "content_not_replicated";
 
 export type CoverageReason = { kind: CoverageKind, severity: CoverageSeverity, detail: string, remediation?: string, };
 
@@ -90,7 +92,13 @@ export type ErrorRecord = { id: ApiInt, source_id: SourceId, object_id: ObjectId
 
 export type ErrorsQuery = { include_resolved: boolean, limit: number, };
 
+export type ExclusionPolicy = { revision: number, engine_version: number, rules: Array<ExclusionRule>, phase: string, processed: ApiInt, changed: ApiInt, error: string | null, protected_directories: Array<string>, case_sensitive: boolean, };
+
+export type ExclusionPreview = { path: string, state: ContentState, reason: string, rule: string, catalogued: boolean, };
+
 export type ExclusionRow = { stage: string, reason: string, count: ApiInt, bytes: ApiInt, };
+
+export type ExclusionRule = { id: string, kind: RuleKind, pattern: string, include: boolean, };
 
 export type Explanation = { readable: string, steps: Array<PlanStep>, };
 
@@ -208,6 +216,8 @@ export type PolicyDecision = { object_id: ObjectId, stage: string, included: boo
 
 export type PreviewChunk = { ordinal: number, byte_start: ApiInt, byte_end: ApiInt, line_start: ApiInt, line_end: ApiInt, chars: number, text: string, truncated: boolean, sanitized: boolean, };
 
+export type PreviewExclusions = { rules: Array<ExclusionRule>, paths: Array<string>, };
+
 export type PreviewLimits = { max_neighbors: number, max_bytes: number, max_lines: number, };
 
 export type PreviewQuery = { generation?: number | null, ordinal: number, before: number, after: number, };
@@ -244,6 +254,8 @@ export type RetryBody = { class?: string | null, reason_prefix?: string | null, 
 
 export type RetryReport = { preview: boolean, as_of: UnixNanos, confirmation: string | null, accepted: ApiInt, skipped: ApiInt, rejected: ApiInt, bytes: ApiInt, skipped_reasons: { [key in string]: ApiInt }, rejected_reasons: { [key in string]: ApiInt }, job_ids: Array<JobId>, };
 
+export type RuleKind = "directory" | "regex";
+
 export type ScanGeneration = { source_id: SourceId, generation: ApiInt, kind: string, state: string, started_at: UnixNanos, finished_at: UnixNanos | null, published_at: UnixNanos | null, dirs_listed: ApiInt, entries_seen: ApiInt, errors: ApiInt, tombstoned: ApiInt, note: string | null, };
 
 export type ScanProgress = { source_id: SourceId, running: boolean, phase: string, elapsed_ms: ApiInt, dirs: ApiInt, entries: ApiInt, errors: ApiInt, entries_per_sec: number, summary?: ScanSummary, error?: string, };
@@ -270,7 +282,7 @@ export type Sort = { field: SortField, descending: boolean, };
 
 export type SortField = "relevance" | "name" | "path" | "size" | "allocated_size" | "subtree_size" | "modified" | "created";
 
-export type SourceCompleteness = { source_id: SourceId, name: string, state: SourceState, metadata_complete: boolean, content_complete: boolean, content_not_replicated: boolean, content_pending: ApiInt, content_failed: ApiInt, listing_errors: ApiInt, last_scan_completed?: UnixNanos, checkpoint_age_ms?: ApiInt, freshness: Freshness, note?: string, remote?: RemoteCompleteness, };
+export type SourceCompleteness = { source_id: SourceId, name: string, state: SourceState, metadata_complete: boolean, content_complete: boolean, content_not_replicated: boolean, policy_note?: string, content_pending: ApiInt, content_failed: ApiInt, listing_errors: ApiInt, last_scan_completed?: UnixNanos, checkpoint_age_ms?: ApiInt, freshness: Freshness, note?: string, remote?: RemoteCompleteness, };
 
 export type SourceConcurrencyView = { source_id: SourceId, budget: number, reserved: number, peak_reserved: number, };
 
