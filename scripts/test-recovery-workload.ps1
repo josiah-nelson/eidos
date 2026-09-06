@@ -24,31 +24,48 @@ $report = @{
     restart_after_idle = @{ performed = $true; pause_and_limits_preserved = $true; resumed = $true
         retained_search_hits = 10; retained_search_total = @{ exact = $true; value = '2056' } }
 } | ConvertTo-Json -Depth 8 | ConvertFrom-Json
-if (-not (Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture).passed_synthetic_thresholds) {
-    throw 'Larger fixture boundary must pass'
+$script:fixtureCases = 0
+function CheckFixture([scriptblock]$Assert) { & $Assert; $script:fixtureCases++ }
+CheckFixture {
+    if (-not (Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture).passed_synthetic_thresholds) {
+        throw 'Larger fixture boundary must pass'
+    }
 }
-$report.small_file_kib = 4
-if ((Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture).passed_synthetic_thresholds) {
-    throw 'Wrong small-file workload must fail'
+CheckFixture {
+    $report.small_file_kib = 4
+    if ((Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture).passed_synthetic_thresholds) {
+        throw 'Wrong small-file workload must fail'
+    }
+    $report.small_file_kib = 64
 }
-$report.small_file_kib = 64
 $queries = @{ foreground = 'content:recoveryneedle'; completeness = 'content:=recoveryneedle' }
-if (-not (Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture -Queries $queries).passed_synthetic_thresholds) {
-    throw 'Separate ranked foreground and exact completeness queries must pass'
+CheckFixture {
+    if (-not (Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture -Queries $queries).passed_synthetic_thresholds) {
+        throw 'Separate ranked foreground and exact completeness queries must pass'
+    }
 }
-$report.completeness_query = 'content:recoveryneedle'
-if ((Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture -Queries $queries).passed_synthetic_thresholds) {
-    throw 'A capped ranked completeness query must fail the declared workload'
+CheckFixture {
+    $report.completeness_query = 'content:recoveryneedle'
+    if ((Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture -Queries $queries).passed_synthetic_thresholds) {
+        throw 'A capped ranked completeness query must fail the declared workload'
+    }
+    $report.completeness_query = 'content:=recoveryneedle'
 }
-$report.completeness_query = 'content:=recoveryneedle'
-$report.restart_after_idle.retained_search_total.value = '772'
-if ((Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture).passed_synthetic_thresholds) {
-    throw 'Old small-fixture restart total must fail'
+CheckFixture {
+    $report.restart_after_idle.retained_search_total.value = '772'
+    if ((Test-RecoveryMeasurement -Report $report -ExpectedHash 'synthetic' -Tuple $tuple -Fixture $fixture).passed_synthetic_thresholds) {
+        throw 'Old small-fixture restart total must fail'
+    }
+    $report.restart_after_idle.retained_search_total.value = '2056'
 }
+# The boundary report sits exactly on every published active-pause threshold.
+$pauseLimits = Get-RecoveryActivePauseThresholds
 $pauseJson = @{
     performed = $true; in_flight_at_pause = 2; queued_before_pause = '3'; queued_after_drain = '1'
-    observed_files = @(@{ size = '1048576' }); pause_response_ms = 150; extraction_drain_seconds = 5
-    hold_seconds = 3; total_seconds = 8.15; extraction_stayed_stopped = $true; resumed = $true
+    observed_files = @(@{ size = '1048576' }); pause_response_ms = $pauseLimits.response_ms
+    extraction_drain_seconds = $pauseLimits.extraction_drain_seconds
+    hold_seconds = $pauseLimits.hold_seconds_minimum; total_seconds = 8.15
+    extraction_stayed_stopped = $true; resumed = $true
 } | ConvertTo-Json -Depth 5
 $script:pauseCases = 0
 function CheckPause([scriptblock]$Mutate, [string]$Failure = '') {
@@ -57,7 +74,16 @@ function CheckPause([scriptblock]$Mutate, [string]$Failure = '') {
     $result = Test-RecoveryActivePause -Pause $pause -Tuple $tuple
     if ($Failure) {
         if ($result.passed_synthetic_thresholds -or $Failure -notin $result.failed_checks) { throw "Expected active-pause failure: $Failure" }
-    } elseif (-not $result.passed_synthetic_thresholds) { throw 'Active-pause boundary must pass' }
+        # A gate that closes on an unreadable field must name the field.
+        if ($Failure -eq 'valid_report' -and -not $result.rejected_because) {
+            throw 'A rejected active-pause report must say what could not be read'
+        }
+        if ($Failure -ne 'valid_report' -and $result.rejected_because) {
+            throw 'A readable active-pause report must not claim a rejection'
+        }
+    } elseif (-not $result.passed_synthetic_thresholds -or $result.rejected_because) {
+        throw 'Active-pause boundary must pass'
+    }
     $script:pauseCases++
 }
 CheckPause { param($p) }
@@ -76,4 +102,4 @@ CheckPause { param($p) $p.resumed = $false } 'resumed'
 CheckPause { param($p) $p.pause_response_ms = 'NaN' } 'valid_report'
 CheckPause { param($p) $p.hold_seconds = @(3) } 'valid_report'
 CheckPause { param($p) $p.total_seconds = 3 } 'timing'
-Write-Output "Recovery workload: 5 fixture/query and $script:pauseCases active-pause cases passed."
+Write-Output "Recovery workload: $script:fixtureCases fixture/query and $script:pauseCases active-pause cases passed."

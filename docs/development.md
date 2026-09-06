@@ -108,7 +108,11 @@ exactly 64-KiB files and four 8-MiB files per root: 2,056 files / 192 MiB per
 run. Six uninterrupted runs precede a seventh two-worker run that pauses with
 an observed large file and queued backlog. It requires a pause response within
 150 ms, current extraction drained within five seconds, three seconds held
-without new extraction, explicit resume and eventual complete results. The
+without new extraction, explicit resume and eventual complete results. A worker
+can finish the observed file and claim the next batch before the pause lands, so
+an attempt counts only when a file of at least 1 MiB is still extracting once the
+pause is acknowledged; a raced attempt is recorded as missed, resumed and retried
+up to eight times rather than reported as a large file's drain. The
 pause run's crawl includes its measured pause and is excluded from throughput
 comparisons. Every run has a 30-second unpolled idle interval and a forced
 restart after drain. This does not test a paused-backlog restart or cancellation

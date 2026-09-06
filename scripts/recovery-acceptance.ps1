@@ -18,6 +18,14 @@ function ConvertTo-RecoveryNumber {
     $parsed
 }
 
+function Get-RecoveryActivePauseThresholds {
+    [ordered]@{
+        response_ms = 150
+        extraction_drain_seconds = 5
+        hold_seconds_minimum = 3
+    }
+}
+
 function Get-RecoveryThresholds {
     [ordered]@{
         crawl_seconds = 180
@@ -138,7 +146,9 @@ function Test-RecoveryMeasurement {
 function Test-RecoveryActivePause {
     param([Parameter(Mandatory)]$Pause, [Parameter(Mandatory)]$Tuple)
     Set-StrictMode -Version Latest
+    $limits = Get-RecoveryActivePauseThresholds
     $checks = [ordered]@{}
+    $rejection = $null
     try {
         $checks.performed = $Pause.performed -is [bool] -and $Pause.performed
         $inFlight = ConvertTo-RecoveryNumber $Pause.in_flight_at_pause -Count
@@ -155,13 +165,23 @@ function Test-RecoveryActivePause {
         $drain = ConvertTo-RecoveryNumber $Pause.extraction_drain_seconds
         $hold = ConvertTo-RecoveryNumber $Pause.hold_seconds
         $total = ConvertTo-RecoveryNumber $Pause.total_seconds
-        $checks.response = $response -ge 0 -and $response -le 150
-        $checks.drain = $drain -ge 0 -and $drain -le 5
-        $checks.held = $hold -ge 3 -and $Pause.extraction_stayed_stopped -is [bool] -and $Pause.extraction_stayed_stopped
+        $checks.response = $response -ge 0 -and $response -le $limits.response_ms
+        $checks.drain = $drain -ge 0 -and $drain -le $limits.extraction_drain_seconds
+        $checks.held = $hold -ge $limits.hold_seconds_minimum -and
+            $Pause.extraction_stayed_stopped -is [bool] -and $Pause.extraction_stayed_stopped
         $checks.timing = $total -ge ($response / 1000 + $drain + $hold)
         $checks.resumed = $Pause.resumed -is [bool] -and $Pause.resumed
         $checks.valid_report = $true
-    } catch { $checks.valid_report = $false }
+    } catch {
+        # A closed gate must say what it could not read, not only that it closed.
+        $checks.valid_report = $false
+        $rejection = $_.Exception.Message
+    }
     $failed = @($checks.Keys | Where-Object { -not $checks[$_] })
-    [pscustomobject]@{ passed_synthetic_thresholds = $failed.Count -eq 0; failed_checks = $failed; checks = $checks }
+    [pscustomobject]@{
+        passed_synthetic_thresholds = $failed.Count -eq 0
+        failed_checks = $failed
+        rejected_because = $rejection
+        checks = $checks
+    }
 }

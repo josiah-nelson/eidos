@@ -37,6 +37,10 @@ backlog remained stopped for 3.013 seconds before explicit resume. Its crawl
 includes the 4.234-second controlled pause and is not an uninterrupted
 throughput result. This establishes bounded extraction drain for this fixture,
 not cancellation inside an OS read or recovery of a paused backlog on restart.
+Both files had been reading for about 30 ms when they were observed, immediately
+before the pause request; the harness now re-reads the still-extracting set after
+the pause is acknowledged, and this retained run predates that check. Its drain
+is far longer than a 64-KiB file takes, so the measured window is a large file's.
 
 An initial attempt stopped at the completeness check because the harness used
 a ranked query whose 5,000 matching-chunk cap made the total inexact. The
