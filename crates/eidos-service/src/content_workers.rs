@@ -393,9 +393,18 @@ pub fn reserve_and_claim(
             _device: device,
         })
     };
-    state
-        .catalog
-        .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)
+    let mut claimed =
+        state
+            .catalog
+            .claim_jobs_admitted(&[JobStage::ContentText], worker, limit, &mut admit)?;
+    // Count the units only once the claim is durable. `admit` runs inside the
+    // claiming transaction: a losing racer for the last device slot, and a
+    // transaction that then fails, both release without ever reading a file,
+    // and neither should leave a peak behind describing work nobody did.
+    if let Some((reservation, _)) = claimed.as_mut() {
+        reservation.confirm();
+    }
+    Ok(claimed)
 }
 
 pub struct ContentReservation {
@@ -404,6 +413,12 @@ pub struct ContentReservation {
 }
 
 impl ContentReservation {
+    /// Count these units towards the reported high-water marks. The caller
+    /// does this once the claim has committed, never from inside `admit`.
+    fn confirm(&mut self) {
+        self._source.confirm();
+    }
+
     pub fn source(&self) -> SourceId {
         self._source.source()
     }
