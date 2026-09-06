@@ -37,6 +37,15 @@ as ERROR_IO_DEVICE — keeps the checkpoint, because acknowledging one would dro
 a change a retry could still have read. The match is exhaustive so that a new
 error kind must choose a side rather than default into dropping updates.
 
+Retrying is bounded. A batch that has failed to translate for two minutes is
+not going to become readable by reading it again, so the watcher stops retrying
+that position and takes the reconciliation an invalid journal already takes:
+Degraded state with the reason, a cleared checkpoint and a recovery scan. That
+keeps a failing device from being re-read every two seconds forever, and lets a
+scan record the unreadable object as coverage loss instead of the feed silently
+stalling. Bounding the retry never shortens it below the window, so a genuinely
+transient failure still clears on its own.
+
 The durable checkpoint remains the compare-and-swap fence. A scan/recovery or
 journal/volume replacement discards old read-ahead and reopens the proper handle.
 Restart replays the ignored tail; a wrapped/replaced journal still follows the

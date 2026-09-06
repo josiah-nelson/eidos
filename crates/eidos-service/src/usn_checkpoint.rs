@@ -7,6 +7,50 @@ use std::time::{Duration, Instant};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LAG: i64 = 16 * 1024 * 1024;
+/// How long a batch may keep failing to translate before the watcher stops
+/// retrying that position. Retaining the checkpoint is the safe response to a
+/// failure that might clear; a failure that never clears must not retry the
+/// same position forever against a volume that is already answering badly.
+const RETRY_WINDOW: Duration = Duration::from_secs(120);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FailedBatch {
+    /// Keep the checkpoint and read the same position again.
+    Retry,
+    /// Stop retrying this position and reconcile instead.
+    Reconcile { failing_for: Duration },
+}
+
+/// Bounded retry for a batch that will not translate.
+pub(crate) struct BatchRetry {
+    failing_since: Option<Instant>,
+}
+
+impl BatchRetry {
+    pub fn new() -> Self {
+        Self {
+            failing_since: None,
+        }
+    }
+
+    /// A batch translated, so any earlier failure is over and a later one
+    /// starts its own window.
+    pub fn succeeded(&mut self) {
+        self.failing_since = None;
+    }
+
+    pub fn failed(&mut self, now: Instant) -> FailedBatch {
+        let since = *self.failing_since.get_or_insert(now);
+        let failing_for = now.saturating_duration_since(since);
+        if failing_for < RETRY_WINDOW {
+            return FailedBatch::Retry;
+        }
+        // Reconciliation replaces the checkpoint, so the next failure is a new
+        // problem rather than a continuation of this one.
+        self.failing_since = None;
+        FailedBatch::Reconcile { failing_for }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CheckpointPlan {
@@ -172,6 +216,44 @@ mod tests {
             CheckpointPlan::InvalidPosition
         );
         assert_eq!(pending.next_usn(), 200);
+    }
+
+    #[test]
+    fn a_batch_that_never_translates_reconciles_instead_of_retrying_forever() {
+        let now = Instant::now();
+        let mut retry = BatchRetry::new();
+        assert_eq!(retry.failed(now), FailedBatch::Retry);
+        assert_eq!(
+            retry.failed(now + Duration::from_secs(2)),
+            FailedBatch::Retry
+        );
+        assert_eq!(
+            retry.failed(now + RETRY_WINDOW - Duration::from_millis(1)),
+            FailedBatch::Retry
+        );
+        assert_eq!(
+            retry.failed(now + RETRY_WINDOW),
+            FailedBatch::Reconcile {
+                failing_for: RETRY_WINDOW
+            },
+            "a position that has not become readable must not be retried forever"
+        );
+        // Reconciliation replaces the checkpoint, so the window starts over.
+        assert_eq!(retry.failed(now + RETRY_WINDOW), FailedBatch::Retry);
+    }
+
+    #[test]
+    fn a_translated_batch_clears_an_earlier_failure() {
+        let now = Instant::now();
+        let mut retry = BatchRetry::new();
+        assert_eq!(retry.failed(now), FailedBatch::Retry);
+        retry.succeeded();
+        // A failure two hours later is its own problem, not a continuation.
+        assert_eq!(
+            retry.failed(now + Duration::from_secs(7200)),
+            FailedBatch::Retry,
+            "an intervening success must not leave a stale failure window"
+        );
     }
 
     #[test]
