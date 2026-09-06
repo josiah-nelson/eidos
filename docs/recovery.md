@@ -151,6 +151,19 @@ CI and the local gate. The small workload shows no repeatable throughput
 advantage for larger pools; measured presets and deployment qualification
 remain open.
 
+PR #130 merged the reproducible measurement harness with cross-platform CI
+passing. The subsequent 192-MiB workload completed seven runs, retaining all
+2,056 content matches and saved controls across each restart. Both four-worker
+runs exceeded the 512-MiB resident-peak gate; one two-worker run exceeded the
+idle-CPU gate. The active-pause run recorded a 4.077-ms response, a 1.207-second
+drain and queued work held for three seconds before explicit resume, but it
+observed its large files only before sending the pause, so it does not establish
+which extraction drained; the harness now requires that read-back and treats
+that record as historical. The failures are retained and thresholds unchanged;
+see [the larger comparison](benchmarks.md#larger-resource-comparison-and-active-pause-2026-09-06-utc).
+Memory under larger pools and the idle outlier require follow-up. This is
+synthetic evidence and still does not establish useful named presets.
+
 ## What must pass before rollout
 
 - Rust, generated API, frontend type/build and behavioral page tests.
@@ -170,5 +183,6 @@ Use temporary synthetic fixtures first. Record platform, build, duration and
 raw counters alongside each result. A protocol simulation, an empty health
 check or a successful installer build is not evidence of acceptable real I/O.
 
-Work in cohesive, reviewable changes with one implementation agent. Keep
-previous repairs and avoid repeated full CI runs for small follow-ups.
+Work in cohesive, reviewable changes and preserve previous repairs. Use
+isolated worktrees for parallel tracks and avoid repeating full CI for small
+follow-ups without a new change or failure to investigate.

@@ -1,5 +1,46 @@
 # Fixed gates for recovery-matrix.ps1. Passing is synthetic evidence only,
 # never an installed, physical-media or recommended-profile qualification.
+function ConvertTo-RecoveryNumber {
+    param($Value, [switch]$Count)
+    if ($null -eq $Value -or [Type]::GetTypeCode($Value.GetType()) -notin @(
+            'String', 'Byte', 'SByte', 'Int16', 'UInt16', 'Int32', 'UInt32',
+            'Int64', 'UInt64', 'Single', 'Double', 'Decimal')) {
+        throw 'missing or nonnumeric scalar field'
+    }
+    $parsed = 0.0
+    $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    if (-not [double]::TryParse($text, [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -or
+            [double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) {
+        throw 'invalid numeric field'
+    }
+    if ($Count -and ($parsed -lt 0 -or $parsed -ne [Math]::Truncate($parsed))) { throw 'invalid count field' }
+    $parsed
+}
+
+# Schema 1 active-pause records observed the large file only before the pause
+# request, so they cannot show which file was still extracting once the pause
+# was acknowledged. Schema 2 records that read-back. Schema 1 records keep
+# their counters and stay readable, but this gate does not accept them as
+# active-pause evidence; it names them instead of silently passing them.
+function Get-RecoveryActivePauseSchema { 2 }
+
+function Test-RecoveryHasField {
+    param($Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [Collections.IDictionary]) { return $Object.Contains($Name) }
+    $null -ne $Object.PSObject.Properties[$Name]
+}
+
+function Get-RecoveryActivePauseThresholds {
+    [ordered]@{
+        response_ms = 150
+        extraction_drain_seconds = 5
+        hold_seconds_minimum = 3
+        large_file_bytes = 1MB
+    }
+}
+
 function Get-RecoveryThresholds {
     [ordered]@{
         crawl_seconds = 180
@@ -18,7 +59,9 @@ function Test-RecoveryMeasurement {
     param(
         [Parameter(Mandatory)]$Report,
         [Parameter(Mandatory)][string]$ExpectedHash,
-        [Parameter(Mandatory)]$Tuple
+        [Parameter(Mandatory)]$Tuple,
+        $Fixture = @{ files = 772; bytes = 11642404; sources = 2; small_files = 384; small_kib = 0; large_files = 2; large_mib = 2 },
+        $Queries = $null
     )
     Set-StrictMode -Version Latest
     $limits = Get-RecoveryThresholds
@@ -27,34 +70,27 @@ function Test-RecoveryMeasurement {
     # Fail closed on missing fields, NaN, infinity, malformed numeric strings
     # or booleans disguised as numbers. Wire u64 fields are decimal strings.
     function Number($Value) {
-        if ($null -eq $Value -or [Type]::GetTypeCode($Value.GetType()) -notin @(
-                'String', 'Byte', 'SByte', 'Int16', 'UInt16', 'Int32', 'UInt32',
-                'Int64', 'UInt64', 'Single', 'Double', 'Decimal')) {
-            throw 'missing or nonnumeric scalar field'
-        }
-        $parsed = 0.0
-        $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
-        if (-not [double]::TryParse($text, [Globalization.NumberStyles]::Float,
-                [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -or
-                [double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) {
-            throw 'invalid numeric field'
-        }
-        $parsed
+        ConvertTo-RecoveryNumber $Value
     }
     function Count($Value) {
-        $parsed = Number $Value
-        if ($parsed -lt 0 -or $parsed -ne [Math]::Truncate($parsed)) { throw 'invalid count field' }
-        $parsed
+        ConvertTo-RecoveryNumber $Value -Count
     }
     function TrueBoolean($Value) { $Value -is [bool] -and $Value }
     try {
         $checks.binary = $Report.binary_sha256 -is [string] -and $Report.binary_sha256 -ceq $ExpectedHash
-        $checks.fixture = (Number $Report.fixture_files) -eq 772 -and
-            (Number $Report.fixture_bytes) -eq 11642404 -and
-            (Number $Report.source_count) -eq 2 -and
-            (Number $Report.small_files_per_source) -eq 384 -and
-            (Number $Report.large_files_per_source) -eq 2 -and
-            (Number $Report.large_file_mib) -eq 2
+        if ($null -ne $Queries) {
+            $checks.queries = $Report.foreground_query -is [string] -and
+                $Report.foreground_query -ceq $Queries.foreground -and
+                $Report.completeness_query -is [string] -and
+                $Report.completeness_query -ceq $Queries.completeness
+        }
+        $checks.fixture = (Number $Report.fixture_files) -eq $Fixture.files -and
+            (Number $Report.fixture_bytes) -eq $Fixture.bytes -and
+            (Number $Report.source_count) -eq $Fixture.sources -and
+            (Number $Report.small_files_per_source) -eq $Fixture.small_files -and
+            (Number $Report.large_files_per_source) -eq $Fixture.large_files -and
+            (Number $Report.large_file_mib) -eq $Fixture.large_mib -and
+            ($Fixture.small_kib -eq 0 -or (Number $Report.small_file_kib) -eq $Fixture.small_kib)
         $checks.settings = (Number $Report.content_workers) -eq $Tuple.workers -and
             (Number $Report.scan_threads) -eq $Tuple.scan_threads -and
             (Number $Report.concurrent_scans) -eq $Tuple.concurrent_scans -and
@@ -63,9 +99,9 @@ function Test-RecoveryMeasurement {
             (Number $Report.query_interval_ms) -eq 25
         $seconds = Number $Report.crawl.seconds
         $checks.crawl_and_indexed = $seconds -gt 0 -and $seconds -le $limits.crawl_seconds -and
-            (Number $Report.files_indexed) -eq 772
+            (Number $Report.files_indexed) -eq $Fixture.files
         $checks.search_results = (TrueBoolean $Report.search_total.exact) -and
-            (Count $Report.search_total.value) -eq 772
+            (Count $Report.search_total.value) -eq $Fixture.files
         $peakReaders = Count $Report.max_observed_device_reservations
         $checks.device_admission = $peakReaders -ge 1 -and $peakReaders -le $Tuple.device_readers -and
             (TrueBoolean $Report.resolved_device_observed) -and
@@ -105,7 +141,7 @@ function Test-RecoveryMeasurement {
         $checks.restart = (TrueBoolean $restart.performed) -and
             (TrueBoolean $restart.pause_and_limits_preserved) -and
             (TrueBoolean $restart.resumed) -and (Number $restart.retained_search_hits) -eq 10 -and
-            (TrueBoolean $restart.retained_search_total.exact) -and (Count $restart.retained_search_total.value) -eq 772
+            (TrueBoolean $restart.retained_search_total.exact) -and (Count $restart.retained_search_total.value) -eq $Fixture.files
         $checks.valid_report = $true
     } catch {
         # A closed gate must say what it could not read, not only that it closed.
@@ -119,5 +155,67 @@ function Test-RecoveryMeasurement {
         rejected_because = $rejection
         checks = $checks
         qualification = 'synthetic evidence only; no recommended profile or deployment qualification'
+    }
+}
+
+function Test-RecoveryLargeFile {
+    param($Files, [Parameter(Mandatory)][double]$MinimumBytes)
+    if ($Files -isnot [Array] -or $Files.Count -eq 0) { throw 'missing extracting-file list' }
+    $large = $false
+    foreach ($file in $Files) {
+        if ((ConvertTo-RecoveryNumber $file.size -Count) -ge $MinimumBytes) { $large = $true }
+    }
+    $large
+}
+
+function Test-RecoveryActivePause {
+    param([Parameter(Mandatory)]$Pause, [Parameter(Mandatory)]$Tuple)
+    Set-StrictMode -Version Latest
+    $limits = Get-RecoveryActivePauseThresholds
+    $checks = [ordered]@{}
+    $rejection = $null
+    try {
+        if (-not (Test-RecoveryHasField $Pause 'schema')) {
+            throw 'active-pause record predates post-acknowledgement identity (schema 1)'
+        }
+        $checks.schema = (ConvertTo-RecoveryNumber $Pause.schema -Count) -eq (Get-RecoveryActivePauseSchema)
+        $checks.performed = $Pause.performed -is [bool] -and $Pause.performed
+        $inFlight = ConvertTo-RecoveryNumber $Pause.in_flight_at_pause -Count
+        $queuedBefore = ConvertTo-RecoveryNumber $Pause.queued_before_pause -Count
+        $queuedAfter = ConvertTo-RecoveryNumber $Pause.queued_after_drain -Count
+        $checks.active_backlog = $inFlight -ge 1 -and $inFlight -le $Tuple.workers -and
+            $queuedBefore -gt $Tuple.workers -and $queuedAfter -gt 0
+        # The observation that triggered the attempt, and then the evidence:
+        # what the service reported still extracting after it acknowledged the
+        # pause. Only the second can support a large-file drain claim.
+        $checks.large_file_before_pause = Test-RecoveryLargeFile $Pause.observed_files $limits.large_file_bytes
+        if (-not (Test-RecoveryHasField $Pause 'in_flight_files_at_pause')) {
+            throw 'missing the files extracting when the pause was acknowledged'
+        }
+        $atPause = $Pause.in_flight_files_at_pause
+        $checks.large_file_at_pause = (Test-RecoveryLargeFile $atPause $limits.large_file_bytes) -and
+            $atPause.Count -le $Tuple.workers
+        $response = ConvertTo-RecoveryNumber $Pause.pause_response_ms
+        $drain = ConvertTo-RecoveryNumber $Pause.extraction_drain_seconds
+        $hold = ConvertTo-RecoveryNumber $Pause.hold_seconds
+        $total = ConvertTo-RecoveryNumber $Pause.total_seconds
+        $checks.response = $response -ge 0 -and $response -le $limits.response_ms
+        $checks.drain = $drain -ge 0 -and $drain -le $limits.extraction_drain_seconds
+        $checks.held = $hold -ge $limits.hold_seconds_minimum -and
+            $Pause.extraction_stayed_stopped -is [bool] -and $Pause.extraction_stayed_stopped
+        $checks.timing = $total -ge ($response / 1000 + $drain + $hold)
+        $checks.resumed = $Pause.resumed -is [bool] -and $Pause.resumed
+        $checks.valid_report = $true
+    } catch {
+        # A closed gate must say what it could not read, not only that it closed.
+        $checks.valid_report = $false
+        $rejection = $_.Exception.Message
+    }
+    $failed = @($checks.Keys | Where-Object { -not $checks[$_] })
+    [pscustomobject]@{
+        passed_synthetic_thresholds = $failed.Count -eq 0
+        failed_checks = $failed
+        rejected_because = $rejection
+        checks = $checks
     }
 }
