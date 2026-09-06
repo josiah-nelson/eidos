@@ -30,7 +30,10 @@ fn content_generation_source(
         .query_row(
             "SELECT source_id, attributes, reparse_tag FROM objects
              WHERE object_id = ?1 AND generation = ?2 AND deleted_at IS NULL
-               AND kind = 'file' AND content_state NOT IN ('excluded','not_applicable','not_replicated')",
+               AND kind = 'file' AND content_state NOT IN ('excluded','not_applicable','not_replicated')
+               AND NOT EXISTS (
+                   SELECT 1 FROM policy_cleanup c WHERE c.object_id = objects.object_id
+               )",
             params![object.0, generation],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -214,6 +217,11 @@ impl Catalog {
             let relative = absolute.strip_prefix(&root).unwrap_or(&absolute).trim_start_matches('/');
             let (attributes, tag): (u32, u32) = conn.query_row("SELECT attributes, reparse_tag FROM objects WHERE object_id = ?1", [object.0], |r| Ok((r.get(0)?, r.get(1)?)))?;
             let policy_state = engine.path_decision(relative, eidos_domain::FileAttributes(attributes), tag).initial_state();
+            let cleanup_pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM policy_cleanup WHERE object_id = ?1)",
+                [object.0],
+                |r| r.get(0),
+            )?;
             Ok(Some(ContentTarget {
                 object_id: object,
                 source_id: SourceId(source_id),
@@ -221,7 +229,9 @@ impl Catalog {
                 size: size as u64,
                 path,
                 content_state: if policy_state == ContentState::Pending { ContentState::parse(&state).unwrap_or(ContentState::Pending) } else { policy_state },
-                content_enabled: enabled != 0 && !crate::exclusions::applying_conn(conn, SourceId(source_id))?,
+                content_enabled: enabled != 0
+                    && !cleanup_pending
+                    && !crate::exclusions::applying_conn(conn, SourceId(source_id))?,
             }))
         })
     }
@@ -378,6 +388,24 @@ impl Catalog {
                     tx.execute("UPDATE content_records SET state = 'stale' WHERE object_id = ?1", params![o.0])?;
                     continue;
                 }
+                let cleanup_pending: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM policy_cleanup WHERE object_id = ?1)",
+                    [o.0],
+                    |r| r.get(0),
+                )?;
+                if cleanup_pending {
+                    // An object-wide delete from an older generation can race
+                    // a worker that was already running. Invalidate the newly
+                    // committed content and advance the durable cleanup token;
+                    // a replacement job stays fenced until that delete is
+                    // committed and its exact token is acknowledged.
+                    crate::exclusions::defer_content_for_cleanup_conn(
+                        &tx,
+                        SourceId(source_id),
+                        *o,
+                    )?;
+                    continue;
+                }
                 // The content index committed before this acknowledgement.
                 // Re-check the current path policy inside the publication
                 // transaction so a move between extraction/storage and index
@@ -389,9 +417,19 @@ impl Catalog {
                         SourceId(source_id),
                         *o,
                     )?;
-                    tx.execute(
-                        "INSERT OR IGNORE INTO policy_cleanup(object_id, source_id) VALUES (?1, ?2)",
-                        params![o.0, source_id],
+                    let cleanup_generation: i64 = tx
+                        .query_row(
+                            "SELECT generation FROM objects WHERE object_id = ?1",
+                            [o.0],
+                            |r| r.get(0),
+                        )
+                        .optional()?
+                        .unwrap_or(gen);
+                    crate::exclusions::enqueue_policy_cleanup_conn(
+                        &tx,
+                        SourceId(source_id),
+                        *o,
+                        cleanup_generation,
                     )?;
                     continue;
                 }

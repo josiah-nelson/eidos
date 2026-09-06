@@ -281,6 +281,10 @@ impl Catalog {
                              SELECT 1 FROM policy_repair_frontier f
                              WHERE f.source_id = jobs.source_id AND f.object_id = jobs.object_id
                          )
+                         AND NOT EXISTS (
+                             SELECT 1 FROM policy_cleanup c
+                             WHERE c.source_id = jobs.source_id AND c.object_id = jobs.object_id
+                         )
                      ))
                      ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT 1"
                 );
@@ -302,6 +306,10 @@ impl Catalog {
                        AND (stage != 'content_text' OR NOT EXISTS (
                            SELECT 1 FROM policy_repair_frontier f
                            WHERE f.source_id = jobs.source_id AND f.object_id = jobs.object_id
+                       ))
+                       AND (stage != 'content_text' OR NOT EXISTS (
+                           SELECT 1 FROM policy_cleanup c
+                           WHERE c.source_id = jobs.source_id AND c.object_id = jobs.object_id
                        ))
                      ORDER BY priority ASC, scheduled_at ASC, job_id ASC LIMIT ?4"
                 );

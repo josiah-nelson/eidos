@@ -680,6 +680,9 @@ CREATE TABLE policy_repair_frontier (
 -- materialization and keeps work independent of unrelated source size.
 CREATE INDEX entries_policy_repair_children
     ON entries(parent_id, entry_id) WHERE deleted_at IS NULL;
+-- Bind each cross-index acknowledgement to the invalidation that queued it.
+-- Existing cleanup rows predate this token and safely drain as generation 0.
+ALTER TABLE policy_cleanup ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
 "#,
     ),
 ];

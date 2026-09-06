@@ -64,6 +64,9 @@ the whole subtree in memory. Unaffected content claims continue while the UI
 shows checked, changed and pending-frontier counts. Coverage remains incomplete
 until affected content deletions commit and are acknowledged. Repair resumes
 after restart, and a recorded repair error uses the same Retry action.
+An outstanding delete fences only that object from new content work. Its
+generation-bound acknowledgement cannot clear cleanup advanced by a later
+in-flight publication.
 
 The bound is catalog work rather than a hard byte/time limit on deleting one
 very large object's cached chunks or archive manifest. Current-path evaluation

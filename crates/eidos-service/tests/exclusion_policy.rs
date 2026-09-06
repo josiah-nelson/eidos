@@ -673,7 +673,13 @@ fn only_objects_that_stored_content_queue_a_derived_index_deletion() {
     // 299 of them never produced chunks or a content record, so queuing them
     // would commit a page of no-op index deletions for each 128 objects.
     assert_eq!(
-        f.state.catalog.policy_cleanup_batch(f.source).unwrap(),
+        f.state
+            .catalog
+            .policy_cleanup_batch(f.source)
+            .unwrap()
+            .iter()
+            .map(|cleanup| cleanup.object_id)
+            .collect::<Vec<_>>(),
         vec![indexed]
     );
     f.settle();
@@ -1130,7 +1136,8 @@ fn an_in_flight_move_is_fenced_at_publication_and_a_second_move_cannot_ack_stale
         .catalog
         .policy_cleanup_batch(f.source)
         .unwrap()
-        .contains(&id));
+        .iter()
+        .any(|cleanup| cleanup.object_id == id));
     assert_ne!(
         f.state
             .catalog
@@ -1150,7 +1157,8 @@ fn an_in_flight_move_is_fenced_at_publication_and_a_second_move_cannot_ack_stale
         .catalog
         .policy_cleanup_batch(f.source)
         .unwrap()
-        .contains(&id));
+        .iter()
+        .any(|cleanup| cleanup.object_id == id));
     f.settle();
     assert_eq!(f.state.content_index.num_docs(), 0);
     assert_eq!(
@@ -1165,6 +1173,152 @@ fn an_in_flight_move_is_fenced_at_publication_and_a_second_move_cannot_ack_stale
     let status = f.state.catalog.exclusion_policy(f.source).unwrap();
     assert_eq!(status.repair_phase, "applied");
     assert!(status.repair_processed >= 2);
+}
+
+#[test]
+fn an_old_cleanup_fences_only_its_object_and_cannot_delete_the_reincluded_generation() {
+    use eidos_domain::JobStage;
+    let f = Fx::new(1, false);
+    f.index("docs/n0.txt");
+    f.apply(vec![folder("hidden")]);
+    f.settle();
+    let id = f.id("docs/n0.txt");
+
+    move_root_directory(&f, "docs", "hidden");
+    for _ in 0..10 {
+        f.state.catalog.apply_policy_repair_batch(f.source).unwrap();
+        if f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase
+            == "purging"
+        {
+            break;
+        }
+    }
+    let old_cleanup = f.state.catalog.policy_cleanup_batch(f.source).unwrap();
+    assert_eq!(old_cleanup.len(), 1);
+
+    // Re-inclusion can finish its frontier while the prior object-wide index
+    // delete is still pending. That object must remain inadmissible even though
+    // the rest of the source stays open.
+    move_root_directory(&f, "hidden", "docs");
+    for _ in 0..10 {
+        f.state.catalog.apply_policy_repair_batch(f.source).unwrap();
+        if f.state
+            .catalog
+            .exclusion_policy(f.source)
+            .unwrap()
+            .repair_phase
+            == "purging"
+        {
+            break;
+        }
+    }
+    assert!(!f.state.catalog.policy_applying(f.source).unwrap());
+    assert_eq!(
+        f.state
+            .catalog
+            .get_object(id)
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Pending
+    );
+    top_up_queue(&f.state).unwrap();
+    assert!(f
+        .state
+        .catalog
+        .claim_job(&[JobStage::ContentText], "cleanup-fenced")
+        .unwrap()
+        .is_none());
+    assert!(
+        !f.state
+            .catalog
+            .content_target(id)
+            .unwrap()
+            .unwrap()
+            .content_enabled
+    );
+
+    // Model a worker that crossed its admission check just before cleanup was
+    // recorded: let it store the current generation, then restore the older
+    // token before its staged index write is committed and acknowledged.
+    f.state
+        .catalog
+        .with_writer(|conn| {
+            conn.execute("DELETE FROM policy_cleanup WHERE object_id = ?1", [id.0])?;
+            Ok(())
+        })
+        .unwrap();
+    let in_flight_generation = f.state.catalog.get_object(id).unwrap().unwrap().generation;
+    let result = eidos_search::pipeline::process_object(
+        &f.state.catalog,
+        &f.state.content_index,
+        id,
+        in_flight_generation,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        result,
+        eidos_search::pipeline::ProcessResult::Indexed(_)
+    ));
+    f.state
+        .catalog
+        .with_writer(|conn| {
+            conn.execute(
+                "INSERT INTO policy_cleanup(object_id, source_id, generation)
+                 VALUES (?1, ?2, ?3)",
+                [id.0, f.source.0, i64::from(old_cleanup[0].generation)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    f.state.content_workers.pending_publish.lock().push(id);
+    assert_eq!(commit_and_publish(&f.state).unwrap(), 0);
+    assert_eq!(
+        f.state
+            .catalog
+            .get_object(id)
+            .unwrap()
+            .unwrap()
+            .content_state,
+        ContentState::Pending
+    );
+    assert!(f.state.catalog.get_object(id).unwrap().unwrap().generation > in_flight_generation);
+
+    // The final publication fence advanced cleanup, so an acknowledgement for
+    // the older selected token cannot erase the newer request.
+    f.state
+        .catalog
+        .acknowledge_policy_cleanup(f.source, &old_cleanup)
+        .unwrap();
+    let current_cleanup = f.state.catalog.policy_cleanup_batch(f.source).unwrap();
+    assert_eq!(current_cleanup.len(), 1);
+    assert!(current_cleanup[0].generation > old_cleanup[0].generation);
+
+    f.state.content_index.delete_object(id);
+    f.state.content_index.commit().unwrap();
+    assert!(f
+        .state
+        .catalog
+        .claim_job(&[JobStage::ContentText], "between-delete-and-ack")
+        .unwrap()
+        .is_none());
+    f.state
+        .catalog
+        .acknowledge_policy_cleanup(f.source, &current_cleanup)
+        .unwrap();
+
+    // Only the exact cleanup acknowledgement opens this object. The current
+    // generation can then publish and a later repair turn cannot wipe it.
+    f.index("docs/n0.txt");
+    apply_policies_once(&f.state).unwrap();
+    assert_eq!(f.state.content_index.num_docs(), 1);
+    assert_eq!(f.hits("content:constellation"), 1);
 }
 
 #[test]

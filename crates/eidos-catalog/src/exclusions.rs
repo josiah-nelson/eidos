@@ -58,6 +58,13 @@ pub struct ExclusionPolicy {
     pub case_sensitive: bool,
 }
 
+/// A generation-bound request to delete one object's derived content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyCleanup {
+    pub object_id: ObjectId,
+    pub generation: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyExclusions {
@@ -288,6 +295,64 @@ pub(crate) fn enqueue_repair_conn(
     Ok(())
 }
 
+pub(crate) fn enqueue_policy_cleanup_conn(
+    conn: &Connection,
+    source: SourceId,
+    object: ObjectId,
+    generation: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO policy_cleanup (object_id, source_id, generation) VALUES (?1, ?2, ?3)
+         ON CONFLICT(object_id) DO UPDATE SET
+             source_id = excluded.source_id,
+             generation = MAX(policy_cleanup.generation, excluded.generation)",
+        params![object.0, source.0, generation],
+    )?;
+    Ok(())
+}
+
+fn reset_object_content_conn(
+    conn: &Connection,
+    source: SourceId,
+    id: ObjectId,
+    next: ContentState,
+) -> Result<(usize, i64)> {
+    conn.execute(
+        "UPDATE objects SET generation = generation + 1, content_id = NULL WHERE object_id = ?1",
+        [id.0],
+    )?;
+    crate::content::flip_state(conn, id, next, None)?;
+    crate::sync::touch_conn(conn, source, id)?;
+    let stored = conn.execute("DELETE FROM chunks WHERE object_id = ?1", [id.0])?
+        + conn.execute("DELETE FROM content_records WHERE object_id = ?1", [id.0])?;
+    crate::archive::retire_virtual_tree(conn, id, eidos_domain::UnixNanos::now().0)?;
+    conn.execute("DELETE FROM archive_members WHERE object_id = ?1", [id.0])?;
+    conn.execute("DELETE FROM archive_records WHERE object_id = ?1", [id.0])?;
+    let generation: i64 = conn.query_row(
+        "SELECT generation FROM objects WHERE object_id = ?1",
+        [id.0],
+        |r| r.get(0),
+    )?;
+    crate::jobs::outbox_append_conn(conn, source, id, "subtree", generation)?;
+    conn.execute(
+        "UPDATE jobs SET state = 'superseded' WHERE object_id = ?1 AND stage = 'content_text' AND state = 'queued'",
+        [id.0],
+    )?;
+    Ok((stored, generation))
+}
+
+/// An object-wide derived delete from an older generation is still pending.
+/// Supersede content that reached publication after that cleanup was queued,
+/// and advance the cleanup token so the older acknowledgement cannot erase it.
+pub(crate) fn defer_content_for_cleanup_conn(
+    conn: &Connection,
+    source: SourceId,
+    object: ObjectId,
+) -> Result<()> {
+    let (_, generation) = reset_object_content_conn(conn, source, object, ContentState::Pending)?;
+    enqueue_policy_cleanup_conn(conn, source, object, generation)
+}
+
 /// Re-evaluate one live catalog object against its current canonical path.
 /// The caller owns the transaction, so decision changes, generation fencing,
 /// cached-row removal, outbox work, and cleanup intent are atomic.
@@ -340,32 +405,9 @@ fn apply_object_policy(
     if !change {
         return Ok(false);
     }
-    conn.execute(
-        "UPDATE objects SET generation = generation + 1, content_id = NULL WHERE object_id = ?1",
-        [id.0],
-    )?;
-    crate::content::flip_state(conn, id, next, None)?;
-    crate::sync::touch_conn(conn, source, id)?;
-    let stored = conn.execute("DELETE FROM chunks WHERE object_id = ?1", [id.0])?
-        + conn.execute("DELETE FROM content_records WHERE object_id = ?1", [id.0])?;
-    crate::archive::retire_virtual_tree(conn, id, eidos_domain::UnixNanos::now().0)?;
-    conn.execute("DELETE FROM archive_members WHERE object_id = ?1", [id.0])?;
-    conn.execute("DELETE FROM archive_records WHERE object_id = ?1", [id.0])?;
-    let generation: i64 = conn.query_row(
-        "SELECT generation FROM objects WHERE object_id = ?1",
-        [id.0],
-        |r| r.get(0),
-    )?;
-    crate::jobs::outbox_append_conn(conn, source, id, "subtree", generation)?;
-    conn.execute(
-        "UPDATE jobs SET state = 'superseded' WHERE object_id = ?1 AND stage = 'content_text' AND state = 'queued'",
-        [id.0],
-    )?;
+    let (stored, generation) = reset_object_content_conn(conn, source, id, next)?;
     if stored > 0 {
-        conn.execute(
-            "INSERT OR IGNORE INTO policy_cleanup (object_id, source_id) VALUES (?1, ?2)",
-            params![id.0, source.0],
-        )?;
+        enqueue_policy_cleanup_conn(conn, source, id, generation)?;
     }
     Ok(true)
 }
@@ -948,15 +990,38 @@ impl Catalog {
         })
     }
 
-    pub fn policy_cleanup_batch(&self, source: SourceId) -> Result<Vec<ObjectId>> {
-        self.with_reader(|conn| Ok(conn.prepare_cached("SELECT object_id FROM policy_cleanup WHERE source_id = ?1 ORDER BY object_id LIMIT 128")?.query_map([source.0], |r| r.get::<_, i64>(0).map(ObjectId))?.collect::<rusqlite::Result<_>>()?))
+    pub fn policy_cleanup_batch(&self, source: SourceId) -> Result<Vec<PolicyCleanup>> {
+        self.with_reader(|conn| {
+            Ok(conn
+                .prepare_cached(
+                    "SELECT object_id, generation FROM policy_cleanup
+                     WHERE source_id = ?1 ORDER BY object_id LIMIT 128",
+                )?
+                .query_map([source.0], |r| {
+                    Ok(PolicyCleanup {
+                        object_id: ObjectId(r.get(0)?),
+                        generation: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?)
+        })
     }
 
     /// Call only after the content-index deletes have committed successfully.
-    pub fn acknowledge_policy_cleanup(&self, source: SourceId, objects: &[ObjectId]) -> Result<()> {
+    pub fn acknowledge_policy_cleanup(
+        &self,
+        source: SourceId,
+        objects: &[PolicyCleanup],
+    ) -> Result<()> {
         self.with_writer(|conn| {
             let tx = conn.transaction()?;
-            for object in objects { tx.execute("DELETE FROM policy_cleanup WHERE object_id = ?1 AND source_id = ?2", params![object.0, source.0])?; }
+            for object in objects {
+                tx.execute(
+                    "DELETE FROM policy_cleanup
+                     WHERE object_id = ?1 AND source_id = ?2 AND generation = ?3",
+                    params![object.object_id.0, source.0, object.generation],
+                )?;
+            }
             let ready: Option<bool> = tx.query_row(
                 "SELECT restart_requested != 0 FROM source_policy
                  WHERE source_id = ?1 AND phase = 'purging' AND error IS NULL

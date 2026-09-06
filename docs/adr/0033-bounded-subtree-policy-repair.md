@@ -47,6 +47,13 @@ resets the affected frontier without deleting an existing cleanup row. Full
 revision phase, cursor, progress and errors remain independent, so completion
 of an older path repair cannot mark a newer operator revision applied.
 
+Cleanup rows also fence content admission for their individual objects. Each
+row carries the generation that queued or advanced it. A derived-index delete
+must commit before the catalog acknowledges that exact generation; an older
+acknowledgement cannot erase cleanup advanced by an in-flight publication.
+Re-included objects become admissible after their prior cleanup is acknowledged,
+without closing admission for unaffected source objects.
+
 Missing or tombstoned frontier objects are removed without filesystem access.
 Hard-linked files retain the existing canonical-path rule: policy uses the
 first live catalog entry, while the frontier deduplicates work by object.
